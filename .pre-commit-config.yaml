@@ -1,0 +1,47 @@
+# Pre-commit hooks. Install once:
+#
+#     pip install pre-commit
+#     pre-commit install
+#
+# After install, ``git commit`` runs the hooks on staged files. Run
+# manually against the whole repo with::
+#
+#     pre-commit run --all-files
+#
+# The same hooks fire in CI (.github/workflows/ci.yml) so a clean local
+# commit can't fail CI on style alone.
+repos:
+  # Trailing-whitespace / EOF / large-file / merge-conflict / debug-stmt
+  # are the standard guardrails. Cheap, prevent embarrassing diffs.
+  - repo: https://github.com/pre-commit/pre-commit-hooks
+    rev: v5.0.0
+    hooks:
+      - id: trailing-whitespace
+      - id: end-of-file-fixer
+      - id: check-merge-conflict
+      - id: check-yaml
+      - id: check-toml
+      - id: check-added-large-files
+        args: ['--maxkb=2000']
+      - id: debug-statements   # accidental ``breakpoint()`` / ``pdb`` left in
+
+  # Ruff for lint + format. Driven by [tool.ruff] in pyproject.toml so a
+  # bump to the rule set here propagates to every contributor + CI.
+  - repo: https://github.com/astral-sh/ruff-pre-commit
+    rev: v0.7.4
+    hooks:
+      - id: ruff
+        args: [--fix, --exit-non-zero-on-fix]
+      - id: ruff-format
+
+  # py_compile catches the most obvious "you broke imports" mistakes
+  # before they reach CI. Cheap (parses, doesn't run).
+  - repo: local
+    hooks:
+      - id: py-compile
+        name: python -m py_compile
+        entry: python -m py_compile
+        language: system
+        types: [python]
+        # exclude generated / build artefacts
+        exclude: '^(client/python/build/|.*/__pycache__/)'

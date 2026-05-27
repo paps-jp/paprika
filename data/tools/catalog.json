@@ -1,0 +1,46 @@
+{
+  "$schema_doc": "paprika v2 plugin catalog -- a directory of plugins known to paprika (whether or not they are currently installed). Edit this file to advertise a new plugin; operators can then 'install' it from the Plugins admin tab. Installed plugins live under data/tools/installed/{name}/; the catalog is purely the discoverability layer.",
+  "version": 1,
+  "updated_at": "2026-05-27",
+  "plugins": [
+    {
+      "name": "paprika-flare",
+      "version": "0.1.0",
+      "kind": "python_lib",
+      "category": "cloudflare_bypass",
+      "summary": "Cloudflare bypass via paprika Worker Chrome (auto-clear JS challenges, optional vision agent for Turnstile)",
+      "capabilities": ["cloudflare_challenge", "ip_matched_cookies", "vision_assisted_bypass"],
+      "source": "paprika-native",
+      "homepage": null,
+      "default": true,
+      "added_at": "2026-05-27",
+      "added_by": "paps-jp"
+    },
+    {
+      "name": "paprika-proxy-fetch",
+      "version": "0.1.0",
+      "kind": "python_lib",
+      "category": "cloudflare_bypass",
+      "summary": "Proxied httpx GET for IP-banned hosts (bypasses CF 1020 / region blocks). Complements paprika-flare.",
+      "capabilities": ["cloudflare_challenge", "ip_pool_rotation", "geo_bypass"],
+      "source": "paprika-native",
+      "homepage": null,
+      "default": true,
+      "added_at": "2026-05-27",
+      "added_by": "paps-jp"
+    },
+    {
+      "name": "paprika-ytdlp",
+      "version": "1.0.0",
+      "kind": "python_lib",
+      "category": "video_extraction",
+      "summary": "yt-dlp wrapper with live HLS auto-detection. Records the first N seconds when no #EXT-X-ENDLIST is present.",
+      "capabilities": ["video_download", "stream_extraction"],
+      "source": "paprika-native",
+      "homepage": "https://github.com/yt-dlp/yt-dlp",
+      "default": true,
+      "added_at": "2026-05-27",
+      "added_by": "paps-jp"
+    }
+  ]
+}

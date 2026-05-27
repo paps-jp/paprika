@@ -1,0 +1,1172 @@
+"""POST /codegen -- ask the configured LLM to write a paprika-client script.
+
+The user describes a browser-automation task in natural language; the
+hub forwards the request to an OpenAI-compatible ``/v1/chat/completions``
+endpoint (by default the same Qwen / gpt-oss the agent loop uses) with a
+system prompt that teaches it the paprika-client API. The response is
+a runnable Python script.
+
+Server-side execution is deliberately out of scope for V1 (RCE risk).
+The admin UI shows the generated code with a Copy button; operators
+run it themselves.
+"""
+from __future__ import annotations
+
+import json
+import os
+import re
+import time
+from dataclasses import dataclass, field
+from typing import Optional
+
+import httpx
+
+from . import web_search
+
+
+CODEGEN_LLM_URL = os.environ.get(
+    "CODEGEN_LLM_URL",
+    os.environ.get("AGENT_LLM_URL", "http://<gpu-host>:15082"),
+).rstrip("/")
+CODEGEN_MODEL_NAME = os.environ.get(
+    "CODEGEN_MODEL_NAME",
+    os.environ.get("AGENT_MODEL_NAME", "qwen2.5-vl-72b"),
+)
+CODEGEN_REQUEST_TIMEOUT_S = float(os.environ.get("CODEGEN_REQUEST_TIMEOUT_S", "180"))
+
+
+@dataclass
+class LLMTarget:
+    """Where to send an OpenAI-compatible chat-completions request.
+
+    Encapsulates the four moving parts that vary across hosts:
+      * ``url``     -- the full chat-completions endpoint URL
+                       (e.g. ``https://api.openai.com/v1/chat/completions``
+                       OR ``http://<vllm>:15082/v1/chat/completions``).
+                       The full URL is stored, not a base + suffix, so
+                       endpoints that put the path in a different place
+                       (legacy OpenAI ``/v1/chat/completions``,
+                       Anthropic-via-LiteLLM, Azure deployment URLs)
+                       work without a router.
+      * ``model``   -- ``model`` field of the request body.
+      * ``headers`` -- extra HTTP headers (including ``Authorization``
+                       when the engine has an API key).
+      * ``timeout`` -- request timeout in seconds.
+
+    Constructed by ``resolve_engine_target(slug, registry)``. Pass to
+    ``generate_script`` / ``judge_attempt`` / ``plan_goal`` to use a
+    specific engine instead of the env-var defaults.
+    """
+    url: str
+    model: str
+    headers: dict = field(default_factory=dict)
+    timeout: float = 180.0
+    # Whether this endpoint accepts OpenAI-style function-calling. Set
+    # from EngineRecord.supports_tools in resolve_engine_target. Default
+    # is False: the env-var default target points at the legacy
+    # CODEGEN_LLM_URL (typically a vLLM-served Qwen / gpt-oss) where
+    # tool-calling support depends on vLLM launch flags
+    # (``--enable-auto-tool-choice --tool-call-parser hermes`` etc) and
+    # is unreliable to assume. Models served there often treat a
+    # ``tools`` array as plaintext context and hallucinate ``web_search()``
+    # calls in the generated PYTHON instead of issuing them as tool
+    # calls -- a strict regression for operators on the default
+    # endpoint. Operators who know their default endpoint speaks tools
+    # cleanly can either flip the engine record's ``supports_tools`` in
+    # the admin UI or set CODEGEN_SUPPORTS_TOOLS=true at hub launch.
+    supports_tools: bool = False
+    # Engine slug this target was resolved from, or empty for the env-
+    # default fallback. Used by the per-engine daily quota check +
+    # usage counter (see EngineUsageRegistry). Threaded through every
+    # LLM-calling site so the quota layer can charge tokens back to
+    # the right engine identity.
+    engine_slug: str = ""
+
+
+def _env_default_target() -> LLMTarget:
+    """Build a target from the legacy CODEGEN_LLM_URL + CODEGEN_MODEL_NAME
+    env vars. Used when no engine slug is specified -- preserves the
+    pre-engine-registry behaviour.
+
+    ``supports_tools`` defaults False here (see ``LLMTarget``); set
+    ``CODEGEN_SUPPORTS_TOOLS=true`` when the env endpoint is known to
+    handle OpenAI function-calling properly (e.g. a vLLM launched with
+    ``--enable-auto-tool-choice --tool-call-parser hermes`` for Qwen,
+    or pointing at OpenAI directly).
+    """
+    return LLMTarget(
+        url=f"{CODEGEN_LLM_URL}/v1/chat/completions",
+        model=CODEGEN_MODEL_NAME,
+        headers={},
+        timeout=CODEGEN_REQUEST_TIMEOUT_S,
+        supports_tools=(
+            os.environ.get("CODEGEN_SUPPORTS_TOOLS", "").strip().lower()
+            in ("1", "true", "yes", "on")
+        ),
+    )
+
+
+def adapt_chat_body(target: LLMTarget, body: dict) -> dict:
+    """Rewrite an OpenAI-shape chat-completions body to whatever
+    quirks the target model needs. Idempotent + lossless when the
+    target doesn't need adjustment (vLLM / Ollama / older OpenAI
+    models pass through unchanged).
+
+    Adjustments applied:
+
+    * **gpt-5 / o1 / o3 / o4 family**: OpenAI's "reasoning"-class
+      models reject the legacy ``max_tokens`` field in favour of
+      ``max_completion_tokens`` ("Unsupported parameter: 'max_tokens'
+      is not supported with this model"). Rename if present.
+
+    * Same family also rejects custom ``temperature`` (only the
+      default ``temperature=1`` is accepted). Drop the field when
+      it's set to anything else.
+
+    * **Qwen 3 / 3.5 family**: thinking mode is ON by default and
+      emits a long ``<think>...</think>`` block before the actual
+      content. For codegen / planner / judge use-cases we want the
+      content directly, so set ``chat_template_kwargs.enable_thinking
+      = false`` (vLLM's Qwen3 chat template honors this flag and
+      skips the reasoning preamble). Without this, a 700-token cap
+      is consumed entirely by the thinking preamble and the response
+      ``content`` comes back ``null``.
+
+    * ``response_format: {"type": "json_object"}`` -- some legacy
+      models reject the field outright. Keep it for OpenAI (modern
+      gpt-4o / gpt-5 / o1 all support it) and vLLM (which respects
+      the structured-output hint); strip elsewhere if needed -- not
+      done for now since the parser falls back gracefully on
+      unparseable output.
+
+    The detector is name-based: matches ``gpt-5`` / ``gpt-5-*`` /
+    ``o1`` / ``o1-*`` / ``o3`` / ``o3-*`` / ``o4-*`` / ``qwen3*`` /
+    ``qwen3.5*``. Conservative by design; new model families that
+    introduce similar restrictions are added here as they ship.
+    """
+    model = (body.get("model") or "").lower()
+    is_reasoning_class = (
+        model.startswith("gpt-5")
+        or model.startswith("o1") or model == "o1"
+        or model.startswith("o3") or model == "o3"
+        or model.startswith("o4")
+    )
+    if is_reasoning_class:
+        body = dict(body)  # don't mutate caller's dict
+        # max_tokens -> max_completion_tokens. Also bump the budget
+        # significantly: reasoning-class models silently use
+        # "reasoning tokens" out of the same budget before emitting
+        # the visible completion, so a 700-token cap that's plenty
+        # for a Qwen JSON plan can truncate gpt-5's output mid-
+        # sentence and leave the caller with unparseable JSON.
+        # Multiply by 4x with a floor so callers don't need to know
+        # the model family. The cost ceiling is the operator's
+        # OpenAI account quota, not paprika's.
+        if "max_tokens" in body and "max_completion_tokens" not in body:
+            limit = int(body.pop("max_tokens"))
+            body["max_completion_tokens"] = max(limit * 4, 4000)
+        # temperature -- drop when explicitly set to non-default;
+        # OpenAI accepts the field's ABSENCE but not custom values.
+        if body.get("temperature") not in (None, 1, 1.0):
+            body.pop("temperature", None)
+
+    # Qwen 3 / 3.5 family: disable thinking via chat template flag.
+    # Matches "qwen3", "qwen3.5", "qwen3-7b-instruct", etc. -- but
+    # NOT "qwen2.5-vl" or other older variants. Safe to set this on
+    # non-Qwen vLLM endpoints too (unknown chat_template_kwargs are
+    # ignored), but we scope it to qwen3* to avoid surprising
+    # operators who set up their own custom templates.
+    is_qwen3 = model.startswith("qwen3")
+    if is_qwen3:
+        body = dict(body)
+        existing = dict(body.get("chat_template_kwargs") or {})
+        # Operator-specified value wins -- only inject the default
+        # when the caller didn't already pick a side. This lets the
+        # vision-chat path (where thinking might help) override.
+        existing.setdefault("enable_thinking", False)
+        body["chat_template_kwargs"] = existing
+
+    # DeepSeek R1 family (deepseek-reasoner, deepseek-r1*, plus distill
+    # variants). The R1 line emits an internal <think>...</think> block
+    # that counts against max_tokens before the actual content, so the
+    # default 700/2048 budgets common in paprika's call sites truncate
+    # mid-thought and leave content empty. Floor the budget at 8192 and
+    # match DeepSeek's recommended temperature (0.5-0.7). Also drop
+    # response_format=json_object: R1 does not yet officially support
+    # the OpenAI structured-outputs flag and rejects it on some routes.
+    is_deepseek_r1 = (
+        "deepseek-reasoner" in model
+        or "deepseek-r1" in model
+        or model.startswith("r1-")
+    )
+    if is_deepseek_r1:
+        body = dict(body)
+        if "max_tokens" in body:
+            body["max_tokens"] = max(int(body["max_tokens"]), 8192)
+        else:
+            body["max_tokens"] = 8192
+        # Public DeepSeek-R1 recommendation is 0.5-0.7; pick 0.6 unless
+        # the caller explicitly set something. This avoids "temperature
+        # not supported" surprises across model variants.
+        if body.get("temperature") is None or body.get("temperature") == 0:
+            body["temperature"] = 0.6
+        # response_format -- R1 doesn't speak it. Strip if present.
+        body.pop("response_format", None)
+        # DeepSeek-R1 (deepseek-reasoner) is text-only. Callers that
+        # support both vision and text-only judges -- notably the
+        # legacy judge_attempt -- send messages as a multipart array
+        # with image_url parts. R1 rejects those with HTTP 400
+        # ("unknown variant `image_url`, expected `text`"). Flatten
+        # any multipart user/system messages to text-only by joining
+        # the text parts and dropping image_url / audio_url chunks.
+        msgs = body.get("messages")
+        if isinstance(msgs, list):
+            flat_msgs: list[dict] = []
+            for m in msgs:
+                if not isinstance(m, dict):
+                    flat_msgs.append(m)
+                    continue
+                c = m.get("content")
+                if isinstance(c, list):
+                    text_parts: list[str] = []
+                    for part in c:
+                        if not isinstance(part, dict):
+                            continue
+                        ptype = part.get("type")
+                        if ptype == "text":
+                            text_parts.append(str(part.get("text") or ""))
+                        # silently drop image_url, audio_url, etc.
+                    m = dict(m)
+                    m["content"] = "\n\n".join(p for p in text_parts if p)
+                flat_msgs.append(m)
+            body["messages"] = flat_msgs
+    return body
+
+
+# ----------------------------------------------------------------------------
+# Per-engine quota: check before dispatch, record after success.
+# ----------------------------------------------------------------------------
+#
+# Every LLM-calling site (generate_script, plan_goal, judge_attempt,
+# distill_skill_from_job, distill_convention_from_diff) calls
+# ``check_engine_quota`` BEFORE httpx.post and ``record_engine_usage``
+# AFTER receiving a successful response. The check raises a
+# PermissionError-shape exception with the operator-readable reason
+# in str(e); callers convert that to HTTPException 429 / similar at
+# their own boundary.
+#
+# Both functions are no-ops when:
+#   * state.engine_usage hasn't been initialised yet (boot ordering)
+#   * the target was built from env defaults (engine_slug == "")
+#   * the registry doesn't know the slug (operator deleted it after
+#     a long-running job started)
+#
+# Lazy imports of state to avoid a hub <-> codegen circular at module
+# import time. The lookups are O(1) JSON reads so the per-call cost
+# is negligible.
+
+
+class EngineQuotaExceeded(Exception):
+    """Raised by check_engine_quota when an engine has hit its daily
+    cap. Callers convert to HTTP 429 / job-fail at their own boundary."""
+
+
+def check_engine_quota(target: "LLMTarget") -> None:
+    """Raise :class:`EngineQuotaExceeded` if the engine's daily
+    token / request budget is already exhausted. Safe to call when
+    the target has no slug (= env fallback) -- this is a no-op."""
+    slug = getattr(target, "engine_slug", "") or ""
+    if not slug:
+        return
+    from server.hub._state import state
+    reg = getattr(state, "engines", None)
+    usage = getattr(state, "engine_usage", None)
+    if reg is None or usage is None:
+        return
+    rec = reg.get(slug)
+    if rec is None:
+        return
+    result = usage.check_quota(rec)
+    if not result.allowed:
+        raise EngineQuotaExceeded(result.reason)
+    if result.warning:
+        import sys as _sys
+        print(f"[engine-quota] {result.warning}", file=_sys.stderr)
+
+
+def record_engine_usage(target: "LLMTarget", usage_payload: dict) -> None:
+    """Add the (prompt_tokens, completion_tokens) numbers from an
+    OpenAI-shape usage block to today's per-engine counter.
+
+    ``usage_payload`` is the ``usage`` object from a chat-completions
+    response: ``{prompt_tokens, completion_tokens, total_tokens, ...}``.
+    Missing / zero values are tolerated -- we just increment by 0.
+    """
+    slug = getattr(target, "engine_slug", "") or ""
+    if not slug:
+        return
+    from server.hub._state import state
+    reg = getattr(state, "engine_usage", None)
+    if reg is None:
+        return
+    prompt = int((usage_payload or {}).get("prompt_tokens") or 0)
+    completion = int((usage_payload or {}).get("completion_tokens") or 0)
+    try:
+        reg.record(slug, prompt, completion)
+    except Exception:
+        # Counter writes are best-effort; don't crash the job for it.
+        pass
+
+
+def resolve_engine_target(
+    slug: Optional[str], registry: Optional[object],
+) -> LLMTarget:
+    """Look up an engine slug in the registry, return an LLMTarget.
+
+    ``registry`` is duck-typed (anything with a ``.get(slug)``
+    returning an EngineRecord-shaped object works); we accept Any
+    because importing ``EngineRegistry`` would create a circular
+    import (codegen <- engines <- codegen). Falls back to env-var
+    defaults when slug is None / empty / not found.
+
+    Auth handling:
+      * ``api_key_env`` -> read from ``os.environ`` at request time.
+      * ``api_key`` (literal in registry) -> use as-is.
+      * Whichever resolves first becomes the ``Authorization: Bearer``
+        header (unless the engine's own ``headers`` already sets it).
+
+    URL normalisation: engines whose ``endpoint`` already ends with
+    ``/chat/completions`` (e.g. OpenAI's API where operators paste the
+    full URL) are used verbatim. Others get ``/v1/chat/completions``
+    appended (vLLM / Ollama / LM Studio convention).
+    """
+    if not slug or registry is None:
+        return _env_default_target()
+    rec = None
+    try:
+        rec = registry.get(slug)
+    except Exception:
+        rec = None
+    if rec is None:
+        # Unknown slug -- log + use defaults rather than failing the
+        # job. The codegen-loop already tolerates LLM-unreachable
+        # via the existing exception path, so a stale engine ref
+        # shouldn't be catastrophic.
+        import sys as _sys
+        print(
+            f"[codegen] engine slug {slug!r} not found in registry; "
+            f"falling back to env defaults",
+            file=_sys.stderr,
+        )
+        return _env_default_target()
+
+    # Build headers. ``rec.headers`` operator-set values take
+    # precedence over the auto-built Authorization header so a
+    # custom ``X-API-Key`` / non-Bearer scheme can be specified
+    # without code changes.
+    headers = dict(getattr(rec, "headers", {}) or {})
+    api_key = ""
+    raw_env = getattr(rec, "api_key_env", "") or ""
+    if raw_env:
+        # Heuristic: many operators paste the actual API key into the
+        # "api_key_env" field, mistaking it for "api_key value". The
+        # field is meant to hold an ENV VAR NAME (e.g. "OPENAI_API_KEY")
+        # so we resolve via os.environ. Detect a literal key by its
+        # shape (sk-/sk_proj- prefix, claude-/anthropic-, .../=, etc.)
+        # and treat as literal rather than env-var name. Avoids
+        # silent 401s after a copy-paste-from-OpenAI-dashboard typo.
+        looks_literal = (
+            raw_env.startswith(("sk-", "sk_", "claude-", "anthropic-"))
+            or any(c in raw_env for c in (".", "/", "="))
+            or len(raw_env) > 60
+        )
+        if looks_literal:
+            api_key = raw_env
+            import sys as _sys
+            print(
+                f"[codegen] engine {slug!r}: api_key_env looks like a "
+                f"literal key (len={len(raw_env)}, prefix="
+                f"{raw_env[:7]!r}); using as Bearer token. Move it to "
+                f"the api_key field to silence this hint.",
+                file=_sys.stderr,
+            )
+        else:
+            api_key = os.environ.get(raw_env, "")
+    if not api_key and getattr(rec, "api_key", ""):
+        api_key = rec.api_key
+    if api_key and not any(k.lower() == "authorization" for k in headers):
+        headers["Authorization"] = f"Bearer {api_key}"
+
+    endpoint = (getattr(rec, "endpoint", "") or "").rstrip("/")
+    if endpoint.endswith("/chat/completions"):
+        url = endpoint
+    else:
+        url = f"{endpoint}/v1/chat/completions"
+
+    return LLMTarget(
+        url=url,
+        model=getattr(rec, "model", "") or CODEGEN_MODEL_NAME,
+        headers=headers,
+        timeout=float(getattr(rec, "timeout_s", 0) or CODEGEN_REQUEST_TIMEOUT_S),
+        supports_tools=bool(getattr(rec, "supports_tools", True)),
+        engine_slug=getattr(rec, "slug", "") or slug,
+    )
+
+
+# Compact, accurate reference for what the model is allowed to emit.
+# Kept inline (not loaded from disk) so the docker image always carries
+# the same docs as the running hub -- no drift between deploy + LLM.
+_API_REF = """\
+paprika-client API reference (USE ONLY THESE; do not import other libraries):
+
+```python
+import asyncio
+import paprika_client as pap
+from paprika_client import async_paprika, act
+
+async def main():
+    # connect() with no argument: PAPRIKA_HUB env var (set by the
+    # runner sandbox) -> http://localhost:8000 fallback. Do NOT
+    # hardcode a HUB constant.
+    async with async_paprika.connect() as cli:
+        async with cli.session(initial_url="https://...") as page:
+            # -- Navigation
+            await page.goto("https://...")
+            await page.back()                      # browser back button
+
+            # -- Actions
+            await page.click(".some.css-selector")
+            await page.fill("#input-id", "text")   # also fires input/change
+            await page.scroll("down", 800)         # direction, pixels
+
+            # -- Keyboard
+            await page.press("Enter")              # single W3C key name
+            await page.press("Backspace", count=3) # repeat N times (~50ms apart)
+            await page.press("Ctrl+A")             # combo string (+-separated)
+            await page.press("Ctrl+Shift+T")       # multiple modifiers
+            await page.press("a", modifiers=["Ctrl"])  # equivalent to "Ctrl+a"
+            # Modifier names: Ctrl / Shift / Alt / Meta and aliases
+            # (Cmd, Command, Option, Win, Super, Control) -- all case-insensitive.
+
+            # -- Type into focused element (no selector needed)
+            await page.type("hello world")         # insert_text on whatever is focused
+            # When you need to fill a specific <input>, prefer page.fill():
+            await page.fill("#search", "query")    # focus + value + events as one shot
+
+            # -- Wait helpers (no HTTP round-trip, pure client-side)
+            await page.wait_for(seconds=2)         # Playwright-style alias
+            await asyncio.sleep(2)                 # plain alternative (also fine)
+
+            # -- Inspection (returns data, no side effect)
+            s = await page.state()                 # {url, title, lane_idx, ...}
+            outline_text = await page.outline()    # text view of clickable elements
+            urls = await page.visited_urls()       # list of canonical URLs visited
+            png = await page.screenshot(path="shot.png")
+
+            # -- Locator (lazy, Playwright-style)
+            await page.locator(".btn-primary").click()
+            await page.get_by_text("Login").click()      # matches outline text
+            await page.get_by_role("button").click()
+
+            # -- Capture (saves HTML + PNG + outline server-side, returns metadata)
+            await page.capture("step-1")
+
+            # -- Agent fallback for unknown / dynamic UI --------------
+            # Hand control to a vision/LLM agent for a few turns when
+            # the script can't predict what's on the page (age gates,
+            # popups, login dialogs, "click the third video thumbnail
+            # on this grid", "find the play button on whatever video
+            # widget this site uses").
+            #
+            # SIGNATURE -- READ CAREFULLY:
+            #     page.agent(
+            #         goal: str,              # POSITIONAL first arg.
+            #                                  # NOT prompt=, NOT task=,
+            #                                  # NOT subgoal=.
+            #         *,
+            #         max_steps: int = 5,
+            #         engine: str = "auto",   # "auto" | "qwen" | "cogagent"
+            #     ) -> dict
+            #
+            #   - engine="auto" (default): CogAgent first, falls back
+            #     to Qwen-VL when CogAgent's grounding looks wrong.
+            #     Right choice 90% of the time.
+            #   - engine="cogagent": force pixel-grounded vision agent.
+            #     Best for visually-distinctive targets (image
+            #     thumbnails, canvas, iframe-embedded UI).
+            #   - engine="qwen": force outline/selector LLM. Best for
+            #     well-structured DOM with clear text labels.
+            #
+            # JP/CN goals are auto-translated to English on the worker
+            # side, so writing the goal in Japanese or Chinese works.
+            result = await page.agent(
+                "If an age verification dialog appears, accept it. "
+                "Otherwise return done immediately.",
+                max_steps=3,
+            )
+            # Click an image thumbnail by visual position:
+            await page.agent(
+                "Click the third video thumbnail in the trending grid.",
+                engine="cogagent",
+                max_steps=2,
+            )
+            # result = {"completed": bool, "steps_taken": int,
+            #           "summary": str, "last_action": dict, "error": str|None}
+            if not result.completed:
+                print("agent gave up:", result.get("summary"))
+
+            # -- Multi-tab: closing popup tabs opened by a click ----
+            # When a click / agent step opens a popup tab (target=_blank,
+            # window.open, "photo detail" overlays on gallery sites),
+            # DO NOT write `await page[-1].close()`
+            # to dismiss it. The SDK's local tab cache only tracks tabs
+            # opened via `sess.open(...)` -- popups spawned by clicks
+            # are not in `page._pages`, so `page[-1] is page` (the
+            # Session itself), and Session.close() is UNCONDITIONAL:
+            # it DELETEs the whole session and the next action gets
+            # HTTP 404. Use this instead -- it refreshes the tab list
+            # and closes everything except the default tab:
+            await page.close_popups()       # idempotent (returns int)
+            # Equivalent long form if you need per-tab control:
+            #   await page.refresh()
+            #   for p in list(page)[1:]:
+            #       await p.close()
+
+asyncio.run(main())
+```
+
+One-shot helpers (for SINGLE-page tasks, don't open a session manually):
+
+```python
+png  = await pap.snapshot("https://example.com")        # bytes
+text = await pap.outline("https://example.com")         # outline string
+st   = await pap.state("https://example.com")           # {url,title}
+
+# Recipe of dict actions; opens + closes a session for you:
+result = await pap.run([
+    act.goto("https://hn.com"),
+    act.wait(1.5),
+    act.click(".athing .titleline > a"),
+    act.wait(2.0),
+    act.state(),
+    act.back(),
+    act.capture("hn"),
+])
+```
+"""
+
+
+_SYSTEM_PROMPT = """\
+You are a code generator for paprika, a browser-automation HTTP API.
+
+A user will describe a browsing task in natural language. Output ONE
+complete, runnable Python script that accomplishes it using the
+paprika-client library.
+
+Rules
+-----
+1. Output ONLY Python code. No prose, no markdown fences, no commentary.
+   The first character of your reply must be valid Python.
+2. Use ONLY the API surface documented below. Do not import requests,
+   selenium, playwright, beautifulsoup, etc. for browser work --
+   paprika-client covers that. Python stdlib IS allowed for pure data
+   handling: ``re``, ``json``, ``sys``, ``pathlib``, ``urllib.parse``
+   (for urljoin / urlparse on the URLs you pulled from outline) etc.
+3. Start with `import asyncio` + the imports shown in the reference.
+   Define `HUB` (use the value provided in the user message; do not
+   invent a host). If the script uses ``re`` / ``json`` / ``sys`` /
+   ``pathlib`` / ``urllib.parse`` they MUST be imported at the top.
+4. Use `asyncio.run(main())` at the bottom. Define everything as
+   `async def`.
+5. Prefer the SESSION pattern (`async with cli.session(...) as page:`)
+   over the one-shot helpers when the task involves more than one
+   page interaction. One-shot helpers are for single-page snapshots.
+6. For "visit each link in the list" / "do X for each Y" patterns,
+   parse `await page.outline()` to extract the items. The outline is
+   a TEXT view with one line per interactive element:
+       [@N] tag "visible text" href=https://...
+       [@N] tag "visible text" href=/relative/path
+       [@N] tag "visible text" href=https://... visited=true
+       [@N] tag href=https://...                     # text-less link
+   Important: the "visible text" segment may be MISSING entirely (link
+   wraps only an image, icon, etc.), so do NOT blindly index into
+   `line.split('"')[1]`. Use a regex with optional groups, or
+   `re.search(r'"([^"]*)"', line)` and fall back to "" when None.
+
+   *** href values can be RELATIVE ("/path", "?q=x", "#anchor") or
+   protocol-relative ("//cdn.example.com/x"), NOT just absolute. ***
+   Most real sites use relative hrefs for in-site navigation, so a
+   regex like `href=(https://...)` will silently drop every internal
+   link and your crawl loop will exit immediately with "no links
+   found". Use a permissive regex such as:
+       m = re.search(r'href=(\\S+)', line)
+       if m:
+           href = m.group(1).rstrip('"')
+   then normalise to an absolute URL with
+   `urllib.parse.urljoin(state.url, href)` where
+   `state = await page.state()`. After that, host-comparison with
+   `urllib.parse.urlparse(absolute).netloc == "www.example.com"` is
+   safe. (`import urllib.parse` is allowed -- it's stdlib.)
+
+   Lines that contain `visited=true` are pages the session has already
+   opened; skip them when iterating fresh links. A simple
+   `"visited=true" not in line` test is enough.
+7. Always cap loops with a max iteration count (e.g. `for i in range(50)`)
+   so a runaway script can't hammer a site indefinitely.
+8. Wrap individual page actions in try/except when failure is plausible
+   (e.g. a popup that may or may not appear). Print errors to stderr
+   so the operator running the script can diagnose.
+9. Print useful progress to stdout: which URL was visited, how many
+   items collected, etc. The operator will run the script in a
+   terminal.
+9b. Use ``page.agent(goal, max_steps=N)`` for short LOCAL unknowns
+    that the script can't predict (age gates, cookie/consent dialogs,
+    SPA elements that vary across visits, click-to-play video widgets,
+    login flows where the layout shifts). The script keeps writing
+    the deterministic loops; only the ambiguous spots get delegated
+    to the LLM. Typical ``N`` is 2-5; never above 10.
+
+    SIGNATURE (read carefully -- frequent mistake):
+
+        result = await page.agent(
+            "Click the play button.",   # POSITIONAL first arg.
+                                         # The keyword name is `goal`,
+                                         # NOT `prompt`, NOT `task`,
+                                         # NOT `subgoal`.
+            max_steps=3,
+            engine="auto",               # optional; see below
+        )
+
+    ``engine`` selects the driver:
+
+      - ``"auto"`` (default):  CogAgent first (good for visual /
+                               canvas / iframe targets); falls back
+                               to Qwen-VL when CogAgent's box looks
+                               suspect (top-left corner, repeated
+                               box, out-of-viewport).
+      - ``"qwen"``:            Qwen-VL only (DOM outline -> CSS
+                               selector). Best for clean DOMs.
+      - ``"cogagent"``:        CogAgent only (screenshot -> pixel
+                               box). Best when DOM selectors are
+                               hash-garbled or the target lives
+                               inside a <canvas> / <iframe>.
+
+    JP/CN goals are auto-translated to English on the worker side
+    before being shown to either engine, so you can write the goal
+    in any language and it will work.
+
+    Return value::
+
+        {"completed": bool, "steps_taken": int, "summary": str,
+         "last_action": dict, "error": str|None}
+9c. ORDER MATTERS for popups / age gates: when the task is to crawl
+    a site that has an age gate or consent overlay, you MUST handle
+    it BEFORE the first ``page.outline()`` call -- not lazily inside
+    the loop after the first goto. The outline returned while a modal
+    overlay is present often contains only the overlay's buttons (no
+    real ``<a href>`` links), so the crawl loop sees "no links to
+    visit" on iteration 1 and exits immediately.
+
+9c-bis. CLOSING POPUP TABS -- USE ``page.close_popups()``.
+
+    When a click or ``page.agent()`` step opens content in a new tab
+    (gallery thumbnails, target=_blank links, photo-detail overlays
+    on gallery sites, etc.) and the loop body needs to clean it up
+    before the next iteration, ALWAYS call:
+
+        await page.close_popups()    # refreshes + closes non-default tabs
+
+    NEVER write ``await page[-1].close()`` or ``await sess[-1].close()``
+    to dismiss a popup. The SDK's local tab cache only tracks tabs
+    opened via ``sess.open(...)``, so popups spawned by worker-side
+    clicks are NOT in the cache. ``sess[-1]`` then resolves to
+    ``sess`` itself, and ``Session.close()`` is UNCONDITIONAL --
+    this silently DELETEs the whole session and every subsequent
+    action returns ``HTTP 404 session not found``.
+
+    ``close_popups()`` is idempotent (returns 0 if no popups exist),
+    so it's safe to call after every gallery click regardless of
+    whether you actually expect a popup.
+
+__VIDEO_SECTION_BEGIN__
+9c-ter. DOWNLOADING A VIDEO THAT OPENED IN A CLICK-SPAWNED POPUP.
+
+    CRITICAL for video-aggregator / gallery sites where clicking a
+    thumbnail opens the real video in a NEW TAB. The naive
+    "click thumbnail -> page.download_video()" pattern downloads from
+    the WRONG tab (the listing page you clicked FROM still has no
+    video) and yt-dlp returns 0 files. Job 31379b374bb1 burned all 3
+    attempts this way -- every download_video() returned in ~600ms
+    (= found nothing) and the only .mp4s saved were ad-popup junk the
+    passive listener happened to catch.
+
+    The trap: ``list(page)`` / ``page[i]`` only see tabs the SDK
+    opened via ``sess.open(...)``. A popup spawned by a CLICK is NOT
+    in the cache, so ``list(page)`` returns just ``[page]`` (the
+    default tab) and any "iterate list(page)[1:]" loop does NOTHING.
+    You MUST call ``await page.refresh()`` first -- that re-reads the
+    live tab list from the browser and is the ONLY way the
+    click-spawned popup becomes visible to ``list(page)``.
+
+    (Do not believe a retry hint that tells you to *remove*
+    page.refresh() to "detect tabs" -- that is backwards. refresh()
+    is what POPULATES the tab list. Job 31379b374bb1's judge gave
+    exactly this wrong hint and attempt 3 detected zero popups.)
+
+    Correct recipe::
+
+        await page.agent("click video thumbnail N", engine="cogagent",
+                         max_steps=3)
+        await page.wait_for(seconds=3)
+        await page.refresh()              # <-- REQUIRED: surface popups
+        tabs = list(page)
+        for p in tabs[1:]:                # tabs[0] is the listing page
+            await p.switch()
+            r = await p.download_video(timeout_s=600)
+            if r.get("file_count", 0):
+                total += r.file_count
+        await page.close_popups()         # tidy up before next click
+
+    If after refresh() there is still only one tab (the click
+    navigated in-place rather than spawning a popup), fall back to a
+    single ``await page.download_video()`` on the current tab.
+
+9d-bis. VIDEO DOWNLOADS -- USE ``page.download_video()``.
+
+    Streaming-video sites (YouTube, Vimeo, Twitch, Dailymotion, etc.)
+    serve content as fragmented .m3u8/.ts/.m4s. The passive CDP
+    listener only catches fragments -- not a playable file. For real
+    video capture, call ``await page.download_video()`` which shells
+    out to yt-dlp under the hood and uploads a single playable .mp4
+    to the parent job's /assets.
+
+    Use it when the goal mentions "download video", "save video",
+    "動画を取得", "動画をダウンロード", etc. Pass ``url=...`` to
+    target a specific URL; default is the current page. Returns::
+
+        {
+          "ok":         bool,        # yt-dlp succeeded
+          "url":        str,         # the URL that was attempted
+          "message":    str,         # yt-dlp's last-line stdout / error tail
+          "files":      list[str],   # SAVED FILENAMES, e.g. ["foo.mp4"].
+                                     # NOT a list of dicts -- each element
+                                     # is just the basename str. To open
+                                     # one from the hub later, percent-
+                                     # encode the name FIRST -- titles
+                                     # often contain ``#``/spaces and a
+                                     # bare URL silently 404s:
+                                     #   from urllib.parse import quote
+                                     #   f"/jobs/{job_id}/assets/{quote(name, safe='')}"
+          "file_count": int,         # len(files)
+        }
+
+    Use ``r.file_count`` (or ``r.get("file_count", 0)``) to count
+    successes -- it's the simplest. DO NOT iterate ``r.files`` and
+    call ``.get("filename")`` / ``.get("url")`` on each element; those
+    methods don't exist on a string and your script will crash with
+    ``'str' object has no attribute 'get'``. (Job 8d367858c2df hit
+    exactly this.)
+
+    Example::
+
+        async for visit in pap.walk(page, target_pages=20, ...):
+            if "/video." in visit.url:        # site-specific test
+                r = await page.download_video(timeout_s=600)
+                print(f"  -> downloaded {r.file_count} file(s)")
+                # If you need the names:
+                #   for name in r.get("files", []):
+                #       print(f"    {name}")
+
+    DO NOT call page.download_video() on every visit unconditionally
+    -- it can take minutes and the per-attempt timeout will trip.
+    Only call it on pages you know are video pages.
+
+    FALLBACK -- when the walk found no matching page.
+    If the loop exits without finding any video-detail URL (the
+    site's pattern guess was wrong, the trending listing already IS
+    the playable page, the test was too strict, etc.), DO NOT raise
+    or exit with "no video found". yt-dlp is surprisingly tolerant
+    of "wrong" pages -- it inspects the DOM/network for any playable
+    media and often succeeds on listing/landing pages too. The
+    correct fallback is to call ``page.download_video()`` on the
+    current (trending / index / search-result) page itself before
+    giving up::
+
+        downloaded_any = False
+        async for visit in pap.walk(page, target_pages=20, ...):
+            if looks_like_video_page(visit.url):
+                r = await page.download_video(timeout_s=600)
+                if r.get("file_count", 0) > 0:
+                    downloaded_any = True
+
+        # Fallback: try yt-dlp on the listing page itself.
+        # Many sites embed playable videos directly in the index /
+        # trending grid; yt-dlp's site-specific extractors often
+        # know how to enumerate them from one URL.
+        if not downloaded_any:
+            await page.goto(start_url)            # re-anchor if needed
+            r = await page.download_video(timeout_s=600)
+            print(f"  -> fallback downloaded {r.file_count} file(s)")
+
+    The rule of thumb: an empty result from page.download_video()
+    is cheap relative to a failed attempt (yt-dlp probes and gives
+    up; the per-call timeout caps the cost), whereas raising
+    ``RuntimeError("no video found")`` wastes the entire attempt
+    and forces a retry from scratch. Always try the fallback before
+    giving up.
+__VIDEO_SECTION_END__
+
+    Same idea applies more generally: when the "find candidate URL
+    -> act on it" pattern produces an empty candidate list (no
+    target_video_url, no target_link, no match), DO NOT raise --
+    fall back to acting on whatever the script already has open
+    (the trending / listing / search-result page). One attempted
+    action on the wrong page is usually still more useful than zero
+    actions plus a hard failure.
+
+9d. CRAWLING N PAGES -- USE ``pap.walk()``, NOT A HAND-ROLLED LOOP.
+    For any task shaped "visit / crawl / scrape multiple pages of
+    site X", the FIRST thing you should reach for is the high-level
+    walker primitive. It owns the brittle parts that hand-rolled
+    crawl loops keep getting wrong:
+
+      * queue management (BFS / DFS / random)
+      * URL deduplication (canonical, ``www.``-tolerant)
+      * dead-end filter (.xml / .json / /feed / /sitemap / etc.
+        baked in -- so the loop never wanders into RSS endpoints)
+      * off-scope redirect handling (auto page.back() + skip)
+      * same-domain restriction with www-normalisation
+      * depth bound
+
+    Correct pattern:
+
+        import paprika_client as pap
+        from paprika_client import async_paprika
+
+        async with async_paprika.connect() as cli:
+            async with cli.session(initial_url="https://example.com/") as page:
+                # 1) clear startup modals BEFORE the first walk step.
+                await page.agent(
+                    "If an age verification or consent dialog appears, "
+                    "accept it. Otherwise return done immediately.",
+                    max_steps=3,
+                )
+                # 2) hand off the crawl bookkeeping to the walker.
+                async for visit in pap.walk(
+                    page,
+                    start_url="https://example.com/",
+                    target_pages=100,
+                    same_domain=True,      # stays on example.com (www-tolerant)
+                    order="bfs",            # default; "dfs" / "random" also valid
+                    max_depth=5,            # optional
+                ):
+                    print(f"[{visit.n}/{visit.target}] depth={visit.depth} {visit.url}")
+                    # ...per-page work here. DO NOT call page.goto() --
+                    # navigation is the walker's job. Reading is fine:
+                    await page.capture(f"page-{visit.n}")
+                    # visit.outline holds the already-fetched outline of
+                    # this page, so use it instead of calling
+                    # page.outline() again.
+
+    Only roll your own loop when the task is genuinely NOT a generic
+    crawl -- e.g. you need to follow a very specific click path, or
+    walk pagination on a single endpoint. For "crawl N pages of site
+    X", always start with pap.walk().
+10. If the user's task does NOT make sense or is unsafe (e.g. mass
+    spam, credential stuffing), respond with a Python script whose
+    only content is `raise SystemExit("refused: <one-line reason>")`.
+
+11. URL CONSTANT — REQUIRED. Define the START URL ONCE at the top of
+    the script as a module-level constant ``TARGET_URL = "..."`` and
+    reference that constant from every place that needs the start
+    URL (most importantly the ``cli.session(initial_url=...)`` /
+    ``cli.fetch(...)`` call). DO NOT inline the URL literal inside
+    ``cli.session(initial_url="https://...")``.
+
+    Why this matters: scripts that succeed are routinely saved as
+    host recipes and re-played against a DIFFERENT URL on the same
+    host. A single TARGET_URL constant makes that substitution
+    trivial (one string to replace); inline URL literals scatter
+    the replacement across the script and break replay.
+
+    Correct shape::
+
+        TARGET_URL = "https://example.com/video/12345"
+
+        async def main():
+            async with async_paprika.connect() as cli:
+                async with cli.session(initial_url=TARGET_URL) as page:
+                    ...
+
+        asyncio.run(main())
+
+    For multi-URL tasks (start URL + URLs derived from outline /
+    walk), still define TARGET_URL = the START URL and compute the
+    rest from it. The constant must appear at module scope, BEFORE
+    ``async def main():``.
+
+Use CSS selectors or `page.get_by_text()` for element matching. Do not
+make up `aria-label=...` style selectors -- they often don't exist on
+real pages. Prefer text-matching via `get_by_text` for buttons whose
+text is stable, and CSS classes (`.athing`, `#login-form`) when they
+look semantic.
+
+""" + _API_REF
+
+
+def _strip_fences(text: str) -> str:
+    """Models sometimes wrap output in ```python ... ``` despite the
+    rule above. Strip the fence if present, leave plain code alone."""
+    s = text.strip()
+    if not s.startswith("```"):
+        return s
+    # Drop opening fence (and optional language tag) + trailing fence.
+    s = re.sub(r"^```[a-zA-Z]*\n", "", s)
+    s = re.sub(r"\n```\s*$", "", s)
+    return s.strip()
+
+
+def _filter_video_section(prompt: str, *, download_video: bool) -> str:
+    """Strip / keep the ``__VIDEO_SECTION_BEGIN__ ... __VIDEO_SECTION_END__``
+    block in :data:`_SYSTEM_PROMPT` based on the job's ``download_video``
+    flag.
+
+    The block contains rules 9c-ter (popup-spawned download recipe) and
+    9d-bis (``page.download_video()`` reference) plus their fallbacks --
+    everything that tells the LLM how to use the video-DL machinery.
+    When ``download_video=False`` (the common cheap-extraction case) we
+    remove the whole block AND append a single negative line so the
+    model doesn't reach back to its training distribution and emit
+    ``page.download_video()`` on its own.
+    """
+    if download_video:
+        # Keep the section content; just strip the sentinel markers
+        # so the LLM doesn't see them.
+        return prompt.replace("__VIDEO_SECTION_BEGIN__\n", "").replace(
+            "__VIDEO_SECTION_END__\n", ""
+        )
+    # Strip the entire block (sentinels included) and add a negative
+    # instruction at the end. Using DOTALL because the block spans many
+    # paragraphs / newlines.
+    stripped = re.sub(
+        r"__VIDEO_SECTION_BEGIN__\n.*?__VIDEO_SECTION_END__\n",
+        "",
+        prompt,
+        count=1,
+        flags=re.DOTALL,
+    )
+    stripped = stripped.rstrip() + (
+        "\n\nVIDEO-DOWNLOAD MACHINERY IS DISABLED FOR THIS TASK. "
+        "Do NOT call ``page.download_video()``, do NOT emit yt-dlp / "
+        "ffmpeg shell-outs, do NOT include any video-saving fallback. "
+        "The operator opted out by leaving 'Download video' unchecked. "
+        "Focus on data extraction: page.evaluate / page.outline / "
+        "page.click / page.fill etc only.\n"
+    )
+    return stripped
+
+
+async def generate_script(
+    goal: str,
+    *,
+    hub_url: str,
+    extra_context: Optional[str] = None,
+    system_addendum: Optional[str] = None,
+    max_tokens: int = 2000,
+    temperature: float = 0.1,
+    target: Optional[LLMTarget] = None,
+    download_video: bool = False,
+) -> dict:
+    """Call the configured LLM, return ``{code, model, elapsed_ms, raw}``.
+
+    ``system_addendum`` is appended to the base system prompt before
+    sending. Used to inject curated "conventions" (foot-gun rules
+    distilled from prior failure→success diffs) into every codegen
+    attempt without rewriting the static prompt.
+
+    ``download_video`` gates the video-DL rules (9c-ter / 9d-bis) in
+    the system prompt. Default False = those rules are stripped AND
+    an explicit negative instruction is appended so the model doesn't
+    reach back to training defaults and emit ``page.download_video()``.
+    Threaded from ``JobOptions.download_video``.
+
+    Raises :class:`httpx.HTTPError` on transport/HTTP failures; the
+    caller is expected to translate that to an HTTP 502.
+    """
+    if not goal or not goal.strip():
+        raise ValueError("goal is empty")
+
+    # The runner sandbox sets PAPRIKA_HUB so async_paprika.connect()
+    # resolves automatically; the LLM should not hardcode a HUB
+    # constant. Leave hub_url available in the parameter list for
+    # tests / callers that want to log it, but don't feed it to the
+    # model.
+    _ = hub_url
+    user_msg_parts = [
+        "Task:",
+        goal.strip(),
+    ]
+    if extra_context:
+        user_msg_parts += ["", "Additional context:", extra_context.strip()]
+    user_msg = "\n".join(user_msg_parts)
+
+    system_content = _filter_video_section(_SYSTEM_PROMPT, download_video=download_video)
+    if system_addendum:
+        # Two blank lines so the addendum reads as a clearly separate
+        # section, not a continuation of the static reference.
+        system_content = system_content.rstrip() + "\n\n" + system_addendum.strip() + "\n"
+
+    tgt = target or _env_default_target()
+
+    # web_search tool wiring. We attach the OpenAI ``tools`` array (and
+    # mention the tool in the system prompt) only when ALL of these
+    # hold: SearXNG is configured AND web_search_max_calls > 0 (admin-
+    # UI runtime knobs), AND the engine supports function calls. When
+    # the tool is off the call is exactly what it used to be -- one
+    # POST, no loop -- so legacy text-completion endpoints keep working
+    # unchanged.
+    tools_active = bool(web_search.is_enabled() and tgt.supports_tools)
+    if tools_active:
+        system_content = (
+            system_content.rstrip()
+            + "\n\n"
+            + web_search.SYSTEM_PROMPT_ADDENDUM.strip()
+            + "\n"
+        )
+
+    messages: list[dict] = [
+        {"role": "system", "content": system_content},
+        {"role": "user", "content": user_msg},
+    ]
+    base_body: dict = {
+        "model": tgt.model,
+        "temperature": temperature,
+        "max_tokens": max_tokens,
+    }
+    if tools_active:
+        base_body["tools"] = [web_search.TOOL_DEFINITION]
+        # tool_choice="auto" is the OpenAI default but we set it
+        # explicitly so vLLM / Anthropic-via-LiteLLM see the same hint.
+        base_body["tool_choice"] = "auto"
+    base_body = adapt_chat_body(tgt, base_body)
+
+    t0 = time.time()
+    raw = ""
+    finish_reason: Optional[str] = None
+    last_payload: dict = {}
+    tool_calls_log: list[dict] = []     # what searches the LLM ran
+    total_usage = {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0}
+
+    # Pre-call quota gate. Raises EngineQuotaExceeded for the engine
+    # registry's caller to surface as a 429-shape failure. No-op for
+    # env-default targets (engine_slug empty).
+    check_engine_quota(tgt)
+    async with httpx.AsyncClient(timeout=tgt.timeout) as client:
+        # Tool-call loop: at most TOOL_CALL_MAX_ITERATIONS round trips
+        # if the model keeps asking for searches; falls through to the
+        # final-response path the moment the model emits content with
+        # no further tool_calls. With tools_active=False this loop
+        # runs exactly once (no tool_calls in the response), preserving
+        # the single-POST shape of the original code path.
+        max_iters = web_search.get_max_calls() + 1 if tools_active else 1
+        for _iter in range(max_iters):
+            body = dict(base_body, messages=messages)
+            r = await client.post(tgt.url, json=body, headers=tgt.headers)
+            if r.status_code >= 400:
+                # Surface the API's error body in the exception so the
+                # operator can see why OpenAI / Anthropic / vLLM
+                # rejected the request -- common causes are wrong
+                # model name, parameter restrictions on newer models
+                # (gpt-5+ wants ``max_completion_tokens``, not
+                # ``max_tokens``; doesn't accept non-default
+                # ``temperature``), or rate limits.
+                import sys as _sys
+                print(
+                    f"[codegen] LLM {r.status_code} from {tgt.url} "
+                    f"model={tgt.model}: {r.text[:600]}",
+                    file=_sys.stderr,
+                )
+                r.raise_for_status()
+            last_payload = r.json()
+
+            # Accumulate usage across loop iterations so the caller
+            # sees total tokens spent (not just the last round-trip).
+            u = last_payload.get("usage") or {}
+            for k in ("prompt_tokens", "completion_tokens", "total_tokens"):
+                if isinstance(u.get(k), (int, float)):
+                    total_usage[k] += int(u[k])
+            # Charge tokens back to the per-engine daily counter.
+            # Done per iteration so a multi-round tool-call exchange
+            # bills the engine for every round, not just the final.
+            record_engine_usage(tgt, u)
+
+            choices = last_payload.get("choices") or []
+            if not choices:
+                break
+            msg = choices[0].get("message") or {}
+            finish_reason = choices[0].get("finish_reason")
+            requested_calls = msg.get("tool_calls") or []
+
+            if not requested_calls:
+                # Final assistant turn -- the model is handing us code.
+                raw = msg.get("content") or ""
+                break
+
+            # Tool calls present. Echo the assistant message into the
+            # transcript so the next round-trip carries proper history,
+            # then execute each call and append a "tool" reply.
+            messages.append({
+                "role": "assistant",
+                "content": msg.get("content") or "",
+                "tool_calls": requested_calls,
+            })
+            for call in requested_calls:
+                fn = (call.get("function") or {})
+                name = fn.get("name") or ""
+                args_raw = fn.get("arguments") or "{}"
+                try:
+                    args = json.loads(args_raw) if isinstance(args_raw, str) else dict(args_raw or {})
+                except Exception:
+                    args = {}
+                t_call_0 = time.time()
+                result = await web_search.run_tool(name, args)
+                tool_ms = int((time.time() - t_call_0) * 1000)
+                tool_calls_log.append({
+                    "name": name,
+                    "query": (args or {}).get("query"),
+                    "results": len(result.get("results") or []),
+                    "cached": bool(result.get("cached")),
+                    "error": result.get("error"),
+                    "elapsed_ms": tool_ms,
+                })
+                messages.append({
+                    "role": "tool",
+                    "tool_call_id": call.get("id") or "",
+                    "name": name,
+                    "content": json.dumps(result, ensure_ascii=False),
+                })
+            # Loop continues with the new tool replies in scope; the
+            # next POST asks the model what to do with them.
+        else:
+            # Hit the iteration cap without the model ever emitting
+            # content. Treat the last assistant turn (which may have
+            # been pure tool calls) as a non-result; the caller will
+            # see empty ``code`` and surface a sensible error upstream.
+            finish_reason = "tool_call_cap_exceeded"
+
+    elapsed_ms = int((time.time() - t0) * 1000)
+
+    code = _strip_fences(raw)
+    return {
+        "code": code,
+        "raw": raw,
+        "model": (last_payload or {}).get("model") or tgt.model,
+        "finish_reason": finish_reason,
+        "usage": total_usage,
+        "elapsed_ms": elapsed_ms,
+        # New: per-attempt list of web searches the LLM ran. Empty when
+        # tools are off / the model didn't search. iterative_codegen.py
+        # surfaces this in the live job log so operators can see what
+        # the model looked up before writing code.
+        "tool_calls": tool_calls_log,
+    }

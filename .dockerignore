@@ -1,0 +1,16 @@
+.venv/
+venv/
+__pycache__/
+*.pyc
+*.pyo
+data/
+assets/
+*.html
+*.log
+log.txt
+page.html
+iframe.html
+.git/
+.gitignore
+.idea/
+.vscode/

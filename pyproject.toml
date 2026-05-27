@@ -1,0 +1,75 @@
+# Repo-root tool configuration. Does NOT declare a package here -- the
+# installable SDK lives under client/python and keeps its own pyproject.
+# This file exists so ruff / pre-commit / pytest have a single, version-
+# controlled config they discover automatically when run from the repo
+# root.
+
+[tool.ruff]
+line-length = 100
+target-version = "py311"
+extend-exclude = [
+  # The embedded admin-UI HTML/JS lives inside app.py as Python string
+  # literals. Linting those f-strings catches a lot of false positives
+  # (HTML inside ``"""..."""`` reads as long lines, ``//`` in JS reads
+  # as Python comments, etc.). Until #2A extracts them to static files,
+  # leave app.py with the same rule set as the rest but tolerate the
+  # noise -- adjust the rule list under [tool.ruff.lint] to keep the
+  # signal high.
+  "client/python/build/",
+  "**/__pycache__/",
+]
+
+[tool.ruff.lint]
+# Start conservative. The codebase has never been linted, so a huge
+# initial diff would obscure real review work. Keep the rule set tight
+# until a "fix everything" PR lands; broaden once green.
+select = [
+  "E",  # pycodestyle errors
+  "F",  # pyflakes (unused imports / names, undefined names)
+  "W",  # pycodestyle warnings
+  "I",  # isort (import ordering)
+  "B",  # flake8-bugbear (likely bugs)
+  "UP", # pyupgrade (modern syntax)
+]
+ignore = [
+  "E501",  # line too long -- many long inline f-string SQL / JS blocks
+  "E402",  # module-level import not at top -- some files do lazy
+           # imports inside functions to dodge circular-import races;
+           # the existing patterns are deliberate.
+  "B008",  # function-call-in-default -- FastAPI Depends(...) is the
+           # idiomatic exception. Re-enable if/when we extract Depends
+           # helpers to module scope.
+  "B904",  # ``raise ... from`` -- HTTPException re-raises don't need
+           # cause chaining for the operator-facing error body.
+]
+
+[tool.ruff.lint.per-file-ignores]
+# The hub's app.py has admin-UI HTML/JS inline; until #2A extracts it,
+# tolerate the linter noise it produces. Targeted by-file so we don't
+# weaken the rule set repo-wide.
+"server/hub/app.py" = ["E741"]  # ambiguous variable names in JS
+
+[tool.ruff.format]
+quote-style = "double"
+indent-style = "space"
+line-ending = "lf"
+
+# ---------------------------------------------------------------------------
+# pytest configuration
+# ---------------------------------------------------------------------------
+[tool.pytest.ini_options]
+# tests/ is the canonical home; addopts keeps runs quiet by default.
+# Use ``pytest -v`` locally for full output.
+testpaths = ["tests"]
+addopts = "-q --tb=short"
+asyncio_mode = "auto"
+# Put the repo root on sys.path so ``from server.hub import ...``
+# resolves without an editable install. pytest doesn't add cwd by
+# default, which silently bit CI: locally the test runner inherited
+# cwd from the shell, the docker image did not.
+pythonpath = ["."]
+filterwarnings = [
+  # Pydantic v1 -> v2 deprecation noise from third-party libs we don't
+  # control. Re-enable once dependencies migrate.
+  "ignore::DeprecationWarning:pydantic",
+]

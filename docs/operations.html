@@ -1,0 +1,318 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+<meta charset="utf-8">
+<title>サーバー — Paprika Hub・Worker のセットアップと運用 (Docker / CLI)</title>
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<link rel="stylesheet" href="style.css">
+<meta name="description" content="Paprika サーバー (Hub / Worker) のセットアップと運用ガイド。3 つの構成パターン (1 台で全部・ハブ+リモート worker 分散・Hub のみ開発)、Docker Compose / コマンドライン起動、環境変数、自己更新、HTTP API、トラブルシュート。">
+<link rel="canonical" href="https://paps-jp.github.io/paprika/operations.html">
+<meta property="og:type" content="website">
+<meta property="og:site_name" content="Paprika">
+<meta property="og:title" content="サーバー — Paprika Hub・Worker のセットアップと運用 (Docker / CLI)">
+<meta property="og:description" content="Paprika サーバー (Hub / Worker) のセットアップと運用ガイド。3 つの構成パターン (1 台で全部・ハブ+リモート worker 分散・Hub のみ開発)、Docker Compose / コマンドライン起動、環境変数、自己更新、HTTP API、トラブルシュート。">
+<meta property="og:url" content="https://paps-jp.github.io/paprika/operations.html">
+<meta property="og:image" content="https://paps-jp.github.io/paprika/img/admin-submit.png">
+<meta property="og:locale" content="ja_JP">
+<meta name="twitter:card" content="summary_large_image">
+<meta name="twitter:title" content="サーバー — Paprika Hub・Worker のセットアップと運用 (Docker / CLI)">
+<meta name="twitter:description" content="Paprika サーバー (Hub / Worker) のセットアップと運用ガイド。3 つの構成パターン (1 台で全部・ハブ+リモート worker 分散・Hub のみ開発)、Docker Compose / コマンドライン起動、環境変数、自己更新、HTTP API、トラブルシュート。">
+<meta name="twitter:image" content="https://paps-jp.github.io/paprika/img/admin-submit.png">
+<script type="application/ld+json">{
+  "@context": "https://schema.org",
+  "@type": "Organization",
+  "name": "特定非営利活動法人ぱっぷす",
+  "alternateName": ["paps", "PAPS", "ぱっぷす"],
+  "url": "https://www.paps.jp",
+  "logo": "https://paps-jp.github.io/paprika/icon.svg",
+  "sameAs": [
+    "https://github.com/paps-jp",
+    "https://paps-jp.github.io/paprika/"
+  ]
+}</script>
+</head>
+<body>
+
+<nav class="topnav">
+  <a class="brand" href="index.html"><span class="logo"><img src="icon.svg" alt=""></span> Paprika</a>
+  <span class="links">
+    <a href="index.html">Home</a>
+    <a href="intro.html">はじめに</a>
+    <a href="guides.html">ガイド</a>
+    <a href="admin.html">管理画面</a>
+    <a href="api.html">API</a>
+    <a href="operations.html" class="active">サーバー</a>
+  </span>
+  <a class="gh" href="https://github.com/paps-jp/paprika">GitHub ↗</a>
+</nav>
+
+<div class="layout">
+  <aside class="sidebar">
+    <h4>サーバー</h4>
+    <ul>
+      <li><a href="#patterns">3 つの構成パターン</a></li>
+      <li><a href="#install">インストール・起動</a></li>
+      <li><a href="#install-a">　· A. 1 台で全部</a></li>
+      <li><a href="#install-b">　· B. ハブ + リモート worker</a></li>
+      <li><a href="#install-c">　· C. Hub のみ（開発）</a></li>
+      <li><a href="#env">環境変数</a></li>
+      <li><a href="#update">更新・フリート運用</a></li>
+      <li><a href="#storage">保存場所</a></li>
+      <li><a href="#arch">アーキテクチャ（詳細）</a></li>
+      <li><a href="#http">HTTP API</a></li>
+      <li><a href="#trouble">トラブルシュート</a></li>
+    </ul>
+  </aside>
+
+  <main class="content">
+    <h1>サーバー</h1>
+    <p class="lead">Paprika を動かすサーバー側（Hub・Worker）のセットアップ・運用ガイド。
+    操作する側（SDK）の使い方は <a href="intro.html">はじめに</a> へ。</p>
+
+    <!-- 1. PATTERNS ---------------------------------------------------- -->
+    <h2 id="patterns">3 つの構成パターン</h2>
+    <p>サーバーをどう配置するか。用途に合わせて選びます（後で組み替えも可能、例: A → B にスケールアップ）。</p>
+
+    <div class="cards">
+      <a class="card" href="#install-a">
+        <h3>A. 1 台で全部</h3>
+        <p>お試し・小〜中規模向けです。<strong>Docker 一発</strong>で redis + hub + worker(+agent) を1ホストにまとめて起動します。最も簡単です。</p>
+      </a>
+      <a class="card" href="#install-b">
+        <h3>B. ハブ + リモート worker</h3>
+        <p>並列を増やしたい・分散したいときに使います。<strong>ハブを1台</strong>、<strong>worker を別マシン N 台</strong>で WebSocket 接続します。フリート運用に向いています。</p>
+      </a>
+      <a class="card" href="#install-c">
+        <h3>C. Hub のみ（開発）</h3>
+        <p>SDK 開発や軽い検証用に <strong>Docker なしで Python から直接</strong>起動。Worker は別途・任意。</p>
+      </a>
+    </div>
+
+    <p>図にすると：</p>
+<pre><code>A.  [host]   redis ── hub ── worker (Chrome × N lanes)
+              http://localhost:8000
+
+
+B.  [hub-host]   redis ── hub  ── WebSocket ── [worker-host #1]  worker
+                  http://paprika.lan:8000                        worker
+                                                  ── WebSocket ── [worker-host #2]  worker
+                                                  …
+                                                  ── WebSocket ── [worker-host #N]  worker
+
+
+C.  [dev-host]   python -m server --mode hub   (Worker は CLI / 別 Docker / なし)
+                  http://localhost:8000
+</code></pre>
+
+    <table>
+      <thead><tr><th></th><th>A. 1 台</th><th>B. 分散</th><th>C. Hub のみ</th></tr></thead>
+      <tbody>
+        <tr><td>主用途</td><td>お試し・小〜中規模</td><td>本番・並列を増やす</td><td>開発・検証</td></tr>
+        <tr><td>必要なもの</td><td>Docker</td><td>Docker（各ホスト）</td><td>Python 3.10+</td></tr>
+        <tr><td>起動コマンド</td><td><code>docker compose up -d --build</code></td><td>同上 + 各 worker で <code>-f docker-compose-worker.yml up -d</code></td><td><code>python -m server --mode hub</code></td></tr>
+        <tr><td>Redis</td><td>同梱（自動）</td><td>同梱（自動）</td><td>任意（無ければインメモリ）</td></tr>
+      </tbody>
+    </table>
+
+    <!-- 2. INSTALL ----------------------------------------------------- -->
+    <h2 id="install">インストール・起動</h2>
+
+    <h3 id="install-a">A. 1 台で全部（Docker Compose）</h3>
+    <pre><code>git clone https://github.com/paps-jp/paprika.git
+cd paprika
+cp .env.example .env
+docker compose up -d --build</code></pre>
+    <p>起動後：</p>
+    <ul>
+      <li>管理画面 → <code>http://localhost:8000</code>（<a href="admin.html">管理画面ガイド</a>）</li>
+      <li>noVNC（Lane 0）→ <code>http://localhost:6080/vnc_lite.html?autoconnect=1</code></li>
+      <li>Swagger（HTTP API）→ <code>http://localhost:8000/docs</code></li>
+    </ul>
+    <p>前提: Docker + Docker Compose v2、Linux ホスト推奨。1 レーンあたり ~500MB–1GB RAM（既定 2 レーン）。
+    LLM 機能（codegen / vision-agent / <code>page.agent</code>）を使うときだけ OpenAI 互換の LLM エンドポイントが必要、Fetch だけなら不要。</p>
+
+    <h3 id="install-b">B. ハブ + リモート worker（分散）</h3>
+    <p><strong>① ハブホスト</strong>：A と同じ手順で立ち上げる。ただし他マシンからアクセスするので <code>.env</code> で公開アドレスを設定：</p>
+    <pre><code># .env (ハブホスト)
+NOVNC_PUBLIC_HOST=paprika.lan            # 管理画面の noVNC リンクが指すホスト名/IP
+PUBLIC_BASE_URL=http://paprika.lan:8000  # worker がアセットを POST する先
+LANE_POOL=2                              # ローカル worker のレーン数（不要なら 0）</code></pre>
+    <p><strong>② worker ホスト</strong>（追加したい台数だけ）：</p>
+    <pre><code>git clone https://github.com/paps-jp/paprika.git /opt/paprika
+cd /opt/paprika && cp .env.example .env
+# .env を編集:
+#   HUB_URL=ws://paprika.lan:8000
+#   NOVNC_PUBLIC_HOST=<このホストの LAN IP/DNS>
+docker compose -f docker-compose-worker.yml up -d</code></pre>
+    <p><strong>③ 接続確認</strong>：ハブの <code>GET /workers</code>（管理画面の「ワーカー」タブでも可）に <code>alive=true</code> で現れれば OK。</p>
+    <div class="callout tip"><strong>スケールアップ</strong>
+    手順 ② を別のホストで繰り返すだけでワーカーが増えます。クローン時の worker_id 衝突や noVNC ホスト名は Hub が自動補正するので、ホスト名の被りは気にしなくて大丈夫（→ <a href="#update">フリート運用</a>）。</div>
+
+    <h3 id="install-c">C. Hub のみ（CLI／開発）</h3>
+    <p>Docker を使わず Python から直接起動できます。SDK の開発や軽い検証向けです。</p>
+    <pre><code>git clone https://github.com/paps-jp/paprika.git
+cd paprika
+python -m venv .venv && source .venv/bin/activate   # 任意
+pip install -r requirements.txt
+
+# ハブのみ起動（最小・インメモリ）
+python -m server --mode hub --host 0.0.0.0 --port 8000
+
+# Redis 永続化付き
+python -m server --mode hub --port 8000 \
+  --redis-url redis://localhost:6379 \
+  --data-dir ./data/jobs</code></pre>
+    <p>Worker も CLI で立てる場合：</p>
+    <pre><code># 別ターミナルで（要: Chrome + Xvfb + noVNC = Linux）
+python -m server --mode worker \
+  --hub-url ws://localhost:8000 \
+  --lane-pool 1 \
+  --novnc-public-host localhost --novnc-base-port 6080</code></pre>
+    <div class="callout info"><strong>Worker は Docker 推奨</strong>
+    Worker は実ブラウザを動かすため、<code>--lane-pool</code> 使用時は Chrome + Xvfb + noVNC を自前で用意する必要があります。本格運用では Docker 版が圧倒的に楽です（依存込みで一発）。</div>
+
+    <p><strong>主な CLI オプション：</strong></p>
+    <table>
+      <thead><tr><th>オプション</th><th>対象</th><th>説明</th></tr></thead>
+      <tbody>
+        <tr><td><code>--mode hub / worker / all</code></td><td>—</td><td>動作モード（all = hub 既定）</td></tr>
+        <tr><td><code>--host</code> / <code>--port</code></td><td>hub</td><td>バインドアドレス / ポート（既定 0.0.0.0 / 8000）</td></tr>
+        <tr><td><code>--redis-url</code></td><td>hub</td><td>Redis DSN。無指定はインメモリ</td></tr>
+        <tr><td><code>--data-dir</code></td><td>hub</td><td>ジョブ作業ディレクトリ（既定 ./data/jobs）</td></tr>
+        <tr><td><code>--public-base-url</code></td><td>hub</td><td>worker に教える公開 URL</td></tr>
+        <tr><td><code>--reload</code></td><td>hub</td><td>コード変更で自動リロード（開発用）</td></tr>
+        <tr><td><code>--hub-url</code></td><td>worker</td><td>接続先ハブの WS URL</td></tr>
+        <tr><td><code>--lane-pool N</code></td><td>worker</td><td>レーン（専用 Chrome+noVNC）を N 本起動</td></tr>
+        <tr><td><code>--novnc-public-host</code> / <code>--novnc-base-port</code></td><td>worker</td><td>noVNC の公開ホスト / 先頭ポート</td></tr>
+        <tr><td><code>--labels K=V,…</code></td><td>worker</td><td>ルーティング用ラベル</td></tr>
+        <tr><td><code>--worker-secret</code></td><td>both</td><td>worker↔hub 認証の共有シークレット（両側一致）</td></tr>
+      </tbody>
+    </table>
+
+    <div class="callout warn"><strong>LAN 内信頼前提</strong>
+    Hub は codegen 用に Docker ソケットを使い、認証もありません。インターネットに公開せず LAN 内で運用するか、公開時はリバースプロキシで basic-auth / IP 制限を。</div>
+
+    <!-- 3. ENV --------------------------------------------------------- -->
+    <h2 id="env">環境変数</h2>
+    <p>Docker は <code>.env</code> ファイルから読み、CLI は引数で渡せます。よく使うものだけ抜粋（全項目は Hub 起動時のログでも確認できます）。</p>
+    <h3>Hub 側</h3>
+    <table>
+      <thead><tr><th>変数</th><th>デフォルト</th><th>説明</th></tr></thead>
+      <tbody>
+        <tr><td><code>PUBLIC_BASE_URL</code></td><td><code>http://hub:8000</code></td><td>worker に教える hub URL</td></tr>
+        <tr><td><code>WORKER_SECRET</code></td><td>(無)</td><td>worker WS handshake 認証</td></tr>
+        <tr><td><code>CODEGEN_LLM_URL</code> / <code>CODEGEN_MODEL_NAME</code></td><td>—</td><td>codegen 用 LLM endpoint / model</td></tr>
+        <tr><td><code>PAPRIKA_RUNNER_IMAGE</code> / <code>..._MAX_CONCURRENT</code></td><td><code>...:latest</code> / <code>3</code></td><td>runner イメージ / 同時数</td></tr>
+      </tbody>
+    </table>
+    <h3>Worker 側</h3>
+    <table>
+      <thead><tr><th>変数</th><th>デフォルト</th><th>説明</th></tr></thead>
+      <tbody>
+        <tr><td><code>HUB_URL</code></td><td><code>ws://paprika.lan:8000</code></td><td>hub の WS URL</td></tr>
+        <tr><td><code>WORKER_SECRET</code></td><td>(無)</td><td>hub と一致が必要</td></tr>
+        <tr><td><code>LANE_POOL</code></td><td>(file)</td><td>Lane (ブラウザ) 数</td></tr>
+        <tr><td><code>MAX_CONCURRENT</code></td><td><code>2</code></td><td>同時ジョブ数</td></tr>
+        <tr><td><code>NOVNC_PUBLIC_HOST</code> / <code>NOVNC_BASE_PORT</code></td><td><code>localhost</code> / <code>6080</code></td><td>noVNC（hub 自動補正あり）</td></tr>
+        <tr><td><code>AGENT_URL</code> / <code>AGENT_LLM_URL</code> / <code>COGAGENT_URL</code></td><td>—</td><td>LLM / vision エンドポイント</td></tr>
+        <tr><td><code>PAPRIKA_WORKER_AUTO_FETCH_SOURCE</code></td><td><code>1</code></td><td>tarball 自己更新</td></tr>
+      </tbody>
+    </table>
+    <h3>paprika-client / Runner</h3>
+    <table>
+      <thead><tr><th>変数</th><th>デフォルト</th><th>説明</th></tr></thead>
+      <tbody>
+        <tr><td><code>PAPRIKA_HUB</code></td><td><code>http://localhost:8000</code></td><td>SDK の接続先</td></tr>
+        <tr><td><code>PAPRIKA_JOB_ID</code></td><td>(無)</td><td>runner が session に紐づける parent job（自動セット）</td></tr>
+        <tr><td><code>PAPRIKA_CLIENT_ACTION_LOG</code></td><td><code>1</code></td><td><code>[paprika] page.X(...)</code> ログ</td></tr>
+      </tbody>
+    </table>
+
+    <!-- 4. UPDATE / FLEET --------------------------------------------- -->
+    <h2 id="update">更新・フリート運用</h2>
+    <h3>Hub を更新する</h3>
+    <pre><code>ssh root@paprika.lan
+cd /opt/paprika && git pull && docker compose restart hub</code></pre>
+    <p><code>server/worker/*.py</code> を変えた場合も、hub 再起動で新ソース tarball が配信され、worker は次の handshake で<strong>自己更新</strong>します。pip 依存を増やしたときだけ <code>docker compose up -d --build hub</code>。</p>
+
+    <h3>worker を追加する（B構成のスケールアップ）</h3>
+    <p>新しい Linux ホストで <a href="#install-b">B 構成の手順 ②</a> を繰り返すだけ。Hub に自動接続されレーンが増えます。</p>
+
+    <h3>自己更新・クローン検知・noVNC 補正</h3>
+    <ul>
+      <li><strong>自己更新</strong>: worker は handshake 時に Hub と自分の version（<code>server</code>+<code>core</code> の全 <code>.py</code> の SHA-256）を比較し、不一致なら最新ソースを取得・展開して再起動。手動 VERSION bump 不要。詳細: <a href="worker-autodeploy.html">Worker 自動配信の仕組み</a></li>
+      <li><strong>クローン検知</strong>: worker ホストを複製して worker_id が重複しても、Hub が接続元 IP の差で検知し新 ID を発行。<strong>運用上は何もしなくて OK</strong></li>
+      <li><strong>noVNC 補正</strong>: stale な <code>NOVNC_PUBLIC_HOST</code> を Hub が接続元 IP で書き換え、さらに hub プロキシ経由 URL に変換。外部から worker の LAN IP に直接届く必要はありません。iframe 埋め込み: <a href="vnc-embed.html">VNC 埋め込み API</a></li>
+    </ul>
+
+    <!-- 5. STORAGE ----------------------------------------------------- -->
+    <h2 id="storage">保存場所</h2>
+    <p>収集物は Hub の Docker volume（<code>paprika_paprika-data</code>）／CLI なら <code>--data-dir</code> 配下に集約されます。</p>
+    <table>
+      <thead><tr><th>パス</th><th>内容</th></tr></thead>
+      <tbody>
+        <tr><td><code>{data}/jobs/{id}/assets/</code></td><td>画像 / 動画 / etc.</td></tr>
+        <tr><td><code>{data}/jobs/{id}/log.txt</code></td><td>ジョブログ</td></tr>
+        <tr><td><code>{data}/jobs/{id}/attempts/{n}/</code></td><td>codegen の各 attempt 出力</td></tr>
+        <tr><td><code>{data}/jobs/{id}/state/{key}.json</code></td><td><code>page.set_state()</code> の永続データ</td></tr>
+        <tr><td><code>{data}/jobs/hosts/</code> · <code>presets/</code> · <code>skills/</code></td><td>ホスト別 cookie / preset / skill snippets</td></tr>
+      </tbody>
+    </table>
+
+    <!-- 6. ARCH (details, late) ---------------------------------------- -->
+    <h2 id="arch">アーキテクチャ（詳細）</h2>
+    <p>中央集権型です。<strong>Operator / SDK → Hub → Worker（Lane = Chrome）</strong>。収集物は Hub に集約され、worker は通り道です。</p>
+    <table>
+      <thead><tr><th>コンポーネント</th><th>役割</th><th>規模</th></tr></thead>
+      <tbody>
+        <tr><td>Hub</td><td>API サーバ、ジョブ管理、ワーカー登録、管理 UI</td><td>1 プロセス</td></tr>
+        <tr><td>Worker</td><td>Xvfb + Chrome の Lane を保持、CDP 経由でページ操作</td><td>多数の LAN ホスト</td></tr>
+        <tr><td>Lane</td><td>独立 Chrome + noVNC viewer</td><td>1 worker あたり 1–2</td></tr>
+        <tr><td>Runner</td><td>codegen / rerun の使い捨て sandbox</td><td>job ごとに spawn → 削除</td></tr>
+        <tr><td>Agent service</td><td>LLM / VLM プロキシ（任意。LLM 機能を使う場合）</td><td>1 プロセス</td></tr>
+        <tr><td>Redis</td><td>job state の永続化（任意。無ければインメモリ）</td><td>Hub 同居</td></tr>
+      </tbody>
+    </table>
+    <p><strong>データの流れ:</strong> <code>POST /jobs</code> → Hub がキュー → WS で worker に割当 → worker が実行し <code>POST /jobs/{id}/assets</code> で Hub にアップロード → <code>GET /jobs/{id}/result</code> で取得。進捗は <code>WS /jobs/{id}/events</code> でライブ配信。</p>
+
+    <!-- 7. HTTP API ---------------------------------------------------- -->
+    <h2 id="http">HTTP API</h2>
+    <p>全エンドポイントはフラット（<code>/api/</code> prefix なし）、<strong>認証なし（LAN 内信頼前提）</strong>。インタラクティブな一覧は Swagger UI <a href="https://paprika.lan/docs">/docs</a>。SDK 経由が基本ですが、未ラップのレジストリ系は <code>await cli._json("GET", "/hosts")</code> でも叩けます。</p>
+    <table>
+      <thead><tr><th>グループ</th><th>主なエンドポイント</th></tr></thead>
+      <tbody>
+        <tr><td>Jobs</td><td><code>POST /jobs</code> · <code>GET /jobs[/{id}]</code> · <code>/result</code> · <code>/assets.json</code> · <code>/cancel</code> · <code>DELETE</code> · <code>WS /jobs/{id}/events</code></td></tr>
+        <tr><td>Sessions</td><td><code>POST /sessions</code> · action 群（<code>/navigate</code> <code>/click</code> <code>/evaluate</code> <code>/set_input_files</code> …）· <code>/cookies</code> · <code>/network</code></td></tr>
+        <tr><td>Workers</td><td><code>GET /workers</code> · <code>WS /workers/{id}/link</code> · <code>POST /workers/{id}/status</code></td></tr>
+        <tr><td>Registries</td><td><code>/hosts</code> · <code>/profiles</code> · <code>/presets</code> · <code>/engines</code> · <code>/skills</code> · <code>/conventions</code> · <code>/settings</code></td></tr>
+      </tbody>
+    </table>
+
+    <!-- 8. TROUBLESHOOT ------------------------------------------------ -->
+    <h2 id="trouble">トラブルシュート</h2>
+    <h3>worker が hub に繋がらない</h3>
+    <ol>
+      <li><code>docker logs paprika-worker-1</code> でログ確認</li>
+      <li><code>HUB_URL</code> が正しいか / <code>curl http://paprika.lan:8000/health</code> で到達性</li>
+      <li><code>WORKER_SECRET</code> 不一致だと <code>bad worker secret</code> で切断</li>
+    </ol>
+    <h3>セッションが 404 になる</h3>
+    <p>無操作が続くと reaper が回収します（既定 idle: SDK セッション 300 秒 / fetch keep_session 60 秒）。長時間動かすなら投入時に延長：</p>
+    <pre><code>cli.session("...", idle_ttl_s=3600)
+# あるいは: await page.keepalive(idle_ttl_s=600)</code></pre>
+    <h3>ジョブが queued のまま</h3>
+    <p><code>GET /workers</code> で <code>alive=true</code> な worker と空きレーンがあるか確認。全レーン埋まりで <code>POST /jobs</code> すると 503（"fleet at capacity"）が返るので、クライアントは指数バックオフを。</p>
+    <h3>codegen-loop が同じスクリプトで失敗し続ける</h3>
+    <p>Live パネル → コードタブで各 attempt の script.py を確認。共通の失敗パターンは <code>conventions</code> / <code>skills</code> に登録すると次回以降の prompt に注入されます。</p>
+
+    <div class="footer">
+      Paprika &copy; 2026 <a href="https://www.paps.jp">paps-jp</a>
+    </div>
+    <div class="pager">
+      <a href="api.html"><div class="dir">← 戻る</div><div class="ttl">API リファレンス</div></a>
+      <span></span>
+    </div>
+  </main>
+</div>
+</body>
+</html>

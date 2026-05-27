@@ -1,0 +1,650 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+<meta charset="utf-8">
+<title>Paprika · Worker 自動配信</title>
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="description" content="Paprika fleet で hub の更新が worker 群へ自動伝搬する仕組みの解説">
+<style>
+  :root {
+    --paprika-yellow: #f5b800;
+    --paprika-stem: #5c9138;
+    --fg: #24292f;
+    --fg-muted: #57606a;
+    --bg: #ffffff;
+    --bg-soft: #f6f8fa;
+    --bg-code: #f6f8fa;
+    --border: #d0d7de;
+    --border-soft: #e6e8eb;
+    --link: #0969da;
+    --warn: #9a6700;
+    --warn-bg: #fff8c5;
+    --danger: #cf222e;
+    --danger-bg: #ffebe9;
+    --ok: #1a7f37;
+    --ok-bg: #dafbe1;
+    --sidebar-w: 240px;
+  }
+  * { box-sizing: border-box; }
+  html, body { margin: 0; padding: 0; background: var(--bg); color: var(--fg);
+    font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", "Helvetica Neue",
+                 "Hiragino Kaku Gothic ProN", "Meiryo", sans-serif;
+    font-size: 15px; line-height: 1.65; }
+  a { color: var(--link); text-decoration: none; }
+  a:hover { text-decoration: underline; }
+  code, pre { font-family: ui-monospace, "SF Mono", Consolas, "Liberation Mono", monospace;
+              font-size: 13px; }
+  code { background: var(--bg-code); padding: 1px 5px; border-radius: 4px; font-size: 0.9em; }
+  pre { background: var(--bg-code); padding: 12px 14px; border-radius: 6px;
+        overflow-x: auto; line-height: 1.5; border: 1px solid var(--border-soft); }
+  pre code { background: transparent; padding: 0; font-size: inherit; }
+  table { border-collapse: collapse; width: 100%; margin: 12px 0; font-size: 0.93em; }
+  th, td { border: 1px solid var(--border); padding: 6px 10px; vertical-align: top;
+           text-align: left; }
+  th { background: var(--bg-soft); font-weight: 600; }
+  tr:nth-child(even) td { background: #fbfbfd; }
+  h1, h2, h3, h4 { font-weight: 600; line-height: 1.3; margin-top: 1.6em; }
+  h1 { font-size: 2em; border-bottom: 2px solid var(--paprika-yellow); padding-bottom: 8px;
+       margin-top: 0; }
+  h2 { font-size: 1.5em; border-bottom: 1px solid var(--border); padding-bottom: 5px; }
+  h3 { font-size: 1.18em; }
+  h4 { font-size: 1.04em; color: var(--fg-muted); }
+  blockquote { margin: 12px 0; padding: 8px 14px; border-left: 4px solid var(--border);
+               color: var(--fg-muted); background: var(--bg-soft); border-radius: 0 4px 4px 0; }
+  .topbanner { background: #c0392b; color: #fff; padding: 14px 28px;
+               box-shadow: 0 1px 4px rgba(0,0,0,.15); position: sticky; top: 0;
+               z-index: 30; display: flex; align-items: center; gap: 14px; }
+  .topbanner h1 { margin: 0; font-size: 1.4rem; font-weight: 600;
+                  display: inline-flex; align-items: center; gap: 12px;
+                  border: none; padding: 0; }
+  .topbanner h1 .logo { width: 32px; height: 32px; flex-shrink: 0; }
+  .topbanner .sub { margin-left: auto; font-size: 0.88rem; opacity: 0.9;
+                    display: flex; align-items: center; gap: 12px; }
+  .topbanner .sub a { color: #fff; text-decoration: none; padding: 2px 8px;
+                      border: 1px solid rgba(255,255,255,0.4); border-radius: 4px; }
+  .topbanner .sub a:hover { background: rgba(255,255,255,0.12); }
+  @media (max-width: 700px) {
+    .topbanner { padding: 10px 16px; flex-wrap: wrap; }
+    .topbanner .sub { width: 100%; margin-left: 0; margin-top: 6px;
+                      justify-content: flex-start; font-size: 0.8rem; }
+  }
+  .layout { display: grid; grid-template-columns: var(--sidebar-w) 1fr;
+            max-width: 1180px; margin: 0 auto; gap: 32px; padding: 24px; }
+  aside { position: sticky; top: 24px; align-self: start;
+          max-height: calc(100vh - 48px); overflow-y: auto;
+          padding-right: 8px; font-size: 13px; }
+  aside .brand { display: flex; align-items: center; gap: 8px; font-weight: 600;
+                 font-size: 16px; margin-bottom: 12px; padding-bottom: 8px;
+                 border-bottom: 1px solid var(--border-soft); }
+  aside ol { list-style: none; padding-left: 0; margin: 0; counter-reset: sec; }
+  aside li { margin: 4px 0; }
+  aside a { color: var(--fg); display: block; padding: 2px 6px; border-radius: 3px; }
+  aside a:hover { background: var(--bg-soft); text-decoration: none; }
+  main { min-width: 0; }
+  .header { margin-bottom: 24px; }
+  .header .tagline { color: var(--fg-muted); font-size: 1.1em; margin-top: 4px; }
+  .meta { color: var(--fg-muted); font-size: 0.9em; margin-bottom: 24px; }
+  .callout { padding: 10px 14px; border-radius: 6px; margin: 14px 0;
+             border-left: 4px solid; }
+  .callout.warn { background: var(--warn-bg); border-color: var(--warn); }
+  .callout.danger { background: var(--danger-bg); border-color: var(--danger); }
+  .callout.ok { background: var(--ok-bg); border-color: var(--ok); }
+  .callout.info { background: #ddf4ff; border-color: var(--link); }
+  .callout strong { display: block; margin-bottom: 4px; }
+  .endpoint { font-family: ui-monospace, monospace; font-size: 0.9em;
+              background: var(--bg-soft); padding: 4px 8px; border-radius: 4px;
+              display: inline-block; border: 1px solid var(--border-soft); }
+  .endpoint .method { display: inline-block; font-weight: 700; padding: 0 6px;
+                      border-radius: 3px; margin-right: 4px; color: #fff; font-size: 0.85em; }
+  .method.get { background: #0969da; }
+  .method.post { background: #1a7f37; }
+
+  /* ASCII diagrams */
+  .arch-diagram { background: var(--bg-soft); padding: 16px; border-radius: 6px;
+                  font-family: ui-monospace, monospace; font-size: 12.5px;
+                  white-space: pre; overflow-x: auto;
+                  border: 1px solid var(--border-soft); line-height: 1.5; }
+
+  /* SVG sequence diagram */
+  figure.diagram { margin: 16px 0; padding: 0; }
+  figure.diagram svg { display: block; width: 100%; height: auto;
+                       max-width: 820px; margin: 0 auto;
+                       background: var(--bg-soft); padding: 18px 12px;
+                       border-radius: 6px; border: 1px solid var(--border-soft);
+                       box-sizing: border-box; }
+  figure.diagram figcaption { text-align: center; color: var(--fg-muted);
+                              font-size: 0.85em; margin-top: 6px; }
+  .d-box.hub      { fill: #fff8d6; stroke: #f5b800; stroke-width: 2; rx:6; ry:6; }
+  .d-box.worker   { fill: #ecf6e8; stroke: #5c9138; stroke-width:1.5; rx:6; ry:6; }
+  .d-box.docker   { fill: #f3eaff; stroke: #8250df; stroke-width:1.5; rx:6; ry:6; }
+  .d-title    { font: 600 14px -apple-system, "Segoe UI", sans-serif; fill: #24292f; }
+  .d-subtitle { font: 11px -apple-system, "Segoe UI", sans-serif; fill: #57606a; }
+  .d-label    { font: 11px ui-monospace, monospace; fill: #57606a; }
+  .d-step     { font: 600 11px ui-monospace, monospace; fill: #c0392b; }
+  .d-arrow    { stroke: #57606a; stroke-width: 1.5; fill: none; }
+  .d-arrow.dashed { stroke-dasharray: 4 3; stroke: #8a9199; }
+  .d-lifeline { stroke: #d0d7de; stroke-width: 1; stroke-dasharray: 3 4; }
+
+  hr { border: 0; border-top: 1px solid var(--border-soft); margin: 32px 0; }
+  .anchor-link { color: var(--fg-muted); margin-left: 6px; opacity: 0;
+                 text-decoration: none; font-weight: normal; }
+  h2:hover .anchor-link, h3:hover .anchor-link { opacity: 1; }
+  .footer { color: var(--fg-muted); font-size: 0.88em; text-align: center;
+            padding: 32px 0 16px; border-top: 1px solid var(--border-soft); margin-top: 48px; }
+  .badge { display: inline-block; padding: 1px 8px; font-size: 0.78em; border-radius: 10px;
+           background: var(--bg-soft); border: 1px solid var(--border-soft);
+           color: var(--fg-muted); }
+  @media (max-width: 900px) {
+    .layout { grid-template-columns: 1fr; padding: 16px; gap: 16px; }
+    aside { position: static; max-height: none;
+            border-bottom: 1px solid var(--border-soft); padding-bottom: 16px; }
+  }
+</style>
+</head>
+<body>
+
+<header class="topbanner">
+  <h1>
+    <svg class="logo" xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1254 1254" aria-hidden="true">
+      <defs><style>.b0{fill:#5c9138}.b1{fill:#f5b800}</style></defs>
+      <path class="b1" d="M486.2,486.1c68.1-6.4,95,45.1,159.4,45,56.2-.1,81.5-41.9,134.4-45.5,117.4-7.9,145.8,135.5,143.3,225.8-3.5,123.4-50,342.8-129.3,439.3-80,97.3-221.9,89.2-299.5-6.7-76.3-94.2-125.2-307.3-129.3-427.4-2.7-80.1,20.5-221.3,121-230.7Z"/>
+      <path class="b0" d="M479.5,372.1c3.2-3.3,0-12.9.7-18.6,4.1-30.7,46.3-42.4,72.1-35.5,6.7,1.8,12.9,7.4,18,8.7s2.1,1.1,3.4-.8c2.5-3.7,3.9-25.9,5.1-32.2,17.6-95.9,76.8-212.3,183.1-231.1,48.4-8.5,88.8,31.3,63.1,76.4-16.6,29.3-44.8,21.9-69.9,38-36.3,23.2-61,93.4-58.2,135,1.6,24.5,6.3,13.8,21.4,8,25.3-9.8,66.2-3.8,75.5,25.6,2.3,7.2.4,19.8,2.9,23.7s12.6,5.9,17,8.3c23.6,12.9,36.2,46.1,13.8,66.2s-16.7,3.6-28.6,3.2c-23-.8-46.6.6-68.2,9.1-29.3,11.6-44.9,33.1-79.6,34.9-46.4,2.5-66.7-27-107-38.3-18.5-5.2-39-6.7-58.2-5.7s-18.3,6.6-30.6-2.7c-23.6-17.7-12.2-51.2,9.6-65,3.3-2.1,13.1-5.5,14.7-7.2Z"/>
+    </svg>
+    Paprika — Worker 自動配信
+  </h1>
+  <span class="sub">
+    <a href="./index.html">マニュアル</a>
+    <a href="https://github.com/paps-jp/paprika">GitHub</a>
+  </span>
+</header>
+
+<div class="layout">
+
+<aside>
+  <div class="brand">📡 Auto-Deploy</div>
+  <ol>
+    <li><a href="#overview">1. 概要</a></li>
+    <li><a href="#why">2. なぜ自動配信が必要か</a></li>
+    <li><a href="#arch">3. アーキテクチャ</a></li>
+    <li><a href="#flow">4. 配信フロー</a></li>
+    <li><a href="#version">5. version の正体 (source hash)</a></li>
+    <li><a href="#code">6. コード参照点</a></li>
+    <li><a href="#config">7. 環境変数</a></li>
+    <li><a href="#endpoints">8. エンドポイント</a></li>
+    <li><a href="#runbook">9. 運用 runbook</a></li>
+    <li><a href="#orphan">10. Runner orphan 防止</a></li>
+    <li><a href="#limits">11. 既知の制約</a></li>
+    <li><a href="#faq">12. FAQ</a></li>
+  </ol>
+</aside>
+
+<main>
+
+<div class="header">
+  <h1>Worker 自動配信の仕組み</h1>
+  <p class="tagline">Hub の更新を fleet 全体に <strong>1 コマンドで</strong> 伝搬する設計</p>
+</div>
+
+<div class="meta">
+  対象: paprika fleet を運用する人 / hub と worker の関係を理解したい人 ·
+  関連 commit: <code>378d62a</code> (source hash 化) · <code>7edde33</code> (orphan runner 防止)
+</div>
+
+<div class="callout info">
+<strong>TL;DR</strong>
+hub に <code>git pull &amp;&amp; docker compose restart hub</code> するだけで、25 台の worker 全部が新コードに勝手に張り替わる。Worker hosts に SSH ループしてコマンドを撃つ必要なし。VERSION ファイルを手で bump する運用もなし。仕掛けは「ソースツリーの SHA-256 を version の正体にする」というシンプルな話。
+</div>
+
+<h2 id="overview">1. 概要 <a class="anchor-link" href="#overview">#</a></h2>
+
+<p>Paprika は <strong>1 hub + 25 worker</strong> の分散構成で動いている。コード更新が hub に入ったら、worker 全機に伝搬しないと意味がない。だが SSH で 25 台に <code>git pull</code> + <code>docker compose restart</code> を手で回すのは:</p>
+
+<ul>
+  <li>手間 (フルだと数分かかる)</li>
+  <li>取りこぼし発生源 (1 台失敗してもループは続行、後で気づく)</li>
+  <li>並列実行時のレース ―― hub と worker の version 差で job が壊れる</li>
+</ul>
+
+<p>そこで <strong>hub が「俺は今このバージョン」と全 worker に hand­shake のたびに通知</strong>、worker は自分のバージョンと比較し、不一致なら hub から最新ソースを fetch して自殺再起動する仕掛けを内蔵した。Docker registry も Watchtower も不要、git push → hub restart で全機追従する。</p>
+
+<h2 id="why">2. なぜ自動配信が必要か <a class="anchor-link" href="#why">#</a></h2>
+
+<p>2 つの "ある事件" が背景にある。</p>
+
+<h3>事件 1: VERSION ファイルが永遠に <code>"dev"</code></h3>
+
+<p>古い設計では <code>repo の VERSION ファイル</code> を version の真実としていた。問題:</p>
+
+<ul>
+  <li>repo にコミットされた VERSION は文字列リテラル <code>"dev"</code></li>
+  <li><code>git pull</code> しても VERSION は <code>"dev"</code> のまま (誰も bump コミットしない)</li>
+  <li>比較関数に「片方が <code>"dev"</code> なら一致とみなす」セーフガードがあり、結果 <strong>常に no-mismatch</strong></li>
+  <li>つまり自動配信機構は実装されていたが <strong>1 度も発火しなかった</strong></li>
+</ul>
+
+<p>気付かれぬまま運用者は SSH ループで手動配布していた。</p>
+
+<h3>事件 2: orphan runner が hub を麻痺させる</h3>
+
+<p>2026-05-16 に paprika-runner コンテナが 1 つ取り残された。そのスクリプト (LLM が書いたクロールコード) は session expired 例外を握り潰してリトライし続ける作りで、<strong>4 日間にわたって毎秒数百回</strong> <code>GET /sessions/&lt;消えた sid&gt;/state</code> を hub に叩き続けた。</p>
+
+<p>結果:</p>
+<ul>
+  <li>hub log が同じ 404 で flood (1 時間あたり 160 万行)</li>
+  <li>hub の CPU / event loop を消費、worker の WebSocket keepalive ping が timeout</li>
+  <li>25 worker のうち <strong>22 個が連鎖切断</strong>、admin UI に 3 つしか映らなくなった</li>
+</ul>
+
+<p>これらの実害を踏まえて、自動配信 + runner orphan 保護の両方を作り込んだ。本書はその設計を documentation する。</p>
+
+<h2 id="arch">3. アーキテクチャ <a class="anchor-link" href="#arch">#</a></h2>
+
+<div class="arch-diagram">
+                    .------------------------.
+                    |        Hub             |   git pull + docker compose restart hub
+                    |  (paprika-hub:latest)  | ← operator はここだけ更新する
+                    |  /app/server, /app/core|
+                    |  hash = sha256(.py)[:12]|
+                    '------------+-----------'
+                                 ▲
+                  WebSocket      | HubRegistered(expected_worker_version=&lt;hash&gt;)
+                  handshake/HB   |
+                                 |    (worker が自分の hash と比較)
+                                 |
+       .-------------------------+-------------------------.
+       ▼                         ▼                         ▼
+   .------------.            .------------.            .------------.
+   |   Worker   |            |   Worker   |    ...     |   Worker   |
+   | 192.168.1.140|           | 192.168.1.141|           | 192.168.1.164|
+   '------+-----'            '------+-----'            '------+-----'
+          | mismatch                | mismatch                | (match → no-op)
+          |                         |                         |
+          ▼ GET /worker-source.tar.gz                         ▼
+          | (server/ + core/ + VERSION)                       (継続稼働)
+          |
+          ▼ 展開 /app/server, /app/core
+          ▼ exit 42
+          ▼ docker restart-policy: unless-stopped が再起動
+          ▼ 新コードで boot → hash 一致 → handshake 完了
+</div>
+
+<p>ポイント:</p>
+<ul>
+  <li><strong>fan-out は hub → worker (pull 型)</strong>。Worker hosts が自発的に GitHub を見に行くわけではない</li>
+  <li><strong>git registry / docker push 不要</strong>。Tarball は hub プロセスがメモリで gzip して serve</li>
+  <li><strong>失敗時の影響範囲が 1 台</strong>。Worker A の自己更新が失敗しても他に伝染しない</li>
+</ul>
+
+<h2 id="flow">4. 配信フロー (sequence diagram) <a class="anchor-link" href="#flow">#</a></h2>
+
+<figure class="diagram">
+<svg viewBox="0 0 780 560" xmlns="http://www.w3.org/2000/svg" role="img" aria-label="auto-deploy sequence">
+  <!-- actor lanes -->
+  <g>
+    <rect class="d-box hub"    x="40"  y="20" width="170" height="40"/>
+    <text class="d-title"      x="125" y="42" text-anchor="middle">Hub</text>
+    <text class="d-subtitle"   x="125" y="55" text-anchor="middle">paprika-hub:latest</text>
+
+    <rect class="d-box worker" x="305" y="20" width="170" height="40"/>
+    <text class="d-title"      x="390" y="42" text-anchor="middle">Worker (1台)</text>
+    <text class="d-subtitle"   x="390" y="55" text-anchor="middle">paprika-worker:latest</text>
+
+    <rect class="d-box docker" x="570" y="20" width="170" height="40"/>
+    <text class="d-title"      x="655" y="42" text-anchor="middle">Docker daemon</text>
+    <text class="d-subtitle"   x="655" y="55" text-anchor="middle">restart: unless-stopped</text>
+  </g>
+
+  <!-- lifelines -->
+  <line class="d-lifeline" x1="125" y1="60"  x2="125" y2="540"/>
+  <line class="d-lifeline" x1="390" y1="60"  x2="390" y2="540"/>
+  <line class="d-lifeline" x1="655" y1="60"  x2="655" y2="540"/>
+
+  <!-- step 0: deploy -->
+  <text class="d-step"  x="40" y="90">0</text>
+  <text class="d-label" x="60" y="90">operator: git pull + docker compose restart hub</text>
+  <line class="d-arrow" x1="125" y1="100" x2="125" y2="120" />
+  <text class="d-label" x="40" y="118" >hub boots,</text>
+  <text class="d-label" x="40" y="132" >hash="378d62aaaa11"</text>
+
+  <!-- step 1: WS connect -->
+  <text class="d-step"  x="40" y="170">1</text>
+  <line class="d-arrow" x1="390" y1="178" x2="135" y2="178" marker-end="url(#arrowL)"/>
+  <text class="d-label" x="230" y="172" text-anchor="middle">WS dial /workers/&lt;wid&gt;/link</text>
+
+  <!-- step 2: HubRegistered -->
+  <text class="d-step"  x="40" y="210">2</text>
+  <line class="d-arrow" x1="135" y1="218" x2="380" y2="218" marker-end="url(#arrowR)"/>
+  <text class="d-label" x="258" y="212" text-anchor="middle">HubRegistered { expected_worker_version: "378d62aaaa11" }</text>
+
+  <!-- step 3: compare -->
+  <text class="d-step"  x="325" y="252">3</text>
+  <rect x="345" y="240" width="180" height="30" fill="#fff" stroke="#5c9138" rx="4"/>
+  <text class="d-label" x="435" y="259" text-anchor="middle">compare: local "5897f71xxxx" ≠ "378d62..."</text>
+
+  <!-- step 4: fetch tarball -->
+  <text class="d-step"  x="40" y="298">4</text>
+  <line class="d-arrow" x1="390" y1="306" x2="135" y2="306" marker-end="url(#arrowL)"/>
+  <text class="d-label" x="262" y="300" text-anchor="middle">GET /worker-source.tar.gz</text>
+
+  <text class="d-step"  x="40" y="334">5</text>
+  <line class="d-arrow" x1="135" y1="342" x2="380" y2="342" marker-end="url(#arrowR)"/>
+  <text class="d-label" x="258" y="336" text-anchor="middle">200 OK · gzip(server/ + core/ + VERSION) ~few MB</text>
+
+  <!-- step 6: extract -->
+  <text class="d-step"  x="325" y="378">6</text>
+  <rect x="345" y="366" width="180" height="30" fill="#fff" stroke="#5c9138" rx="4"/>
+  <text class="d-label" x="435" y="385" text-anchor="middle">extract → /app/server, /app/core</text>
+
+  <!-- step 7: exit 42 -->
+  <text class="d-step"  x="325" y="418">7</text>
+  <line class="d-arrow" x1="400" y1="426" x2="645" y2="426" marker-end="url(#arrowR)"/>
+  <text class="d-label" x="525" y="420" text-anchor="middle">sys.exit(42)</text>
+
+  <!-- step 8: docker restart -->
+  <text class="d-step"  x="610" y="460">8</text>
+  <rect x="540" y="448" width="230" height="30" fill="#fff" stroke="#8250df" rx="4"/>
+  <text class="d-label" x="655" y="467" text-anchor="middle">restart-policy 発火 → container 再起動</text>
+
+  <!-- step 9: handshake again -->
+  <text class="d-step"  x="40" y="502">9</text>
+  <line class="d-arrow d-arrow dashed" x1="390" y1="510" x2="135" y2="510" marker-end="url(#arrowL)"/>
+  <text class="d-label" x="262" y="504" text-anchor="middle">WS dial · 今度は hash 一致 → 通常稼働へ</text>
+
+  <defs>
+    <marker id="arrowR" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="6" markerHeight="6" orient="auto">
+      <path d="M0,0 L10,5 L0,10 Z" fill="#57606a"/>
+    </marker>
+    <marker id="arrowL" viewBox="0 0 10 10" refX="1" refY="5" markerWidth="6" markerHeight="6" orient="auto">
+      <path d="M10,0 L0,5 L10,10 Z" fill="#57606a"/>
+    </marker>
+  </defs>
+</svg>
+<figcaption>1 台の worker から見た 1 サイクル。25 台同時に同じことが起きる。</figcaption>
+</figure>
+
+<p>所要時間の目安:</p>
+<ul>
+  <li>Step 0 (hub restart): ~3 秒</li>
+  <li>Step 1 (worker → hub WS): 即時 (heartbeat 間隔 10 秒以内)</li>
+  <li>Step 4-5 (tarball fetch): ~1 秒 (~5 MB)</li>
+  <li>Step 6 (extract): &lt; 1 秒</li>
+  <li>Step 7-8 (exit & restart): ~5 秒</li>
+  <li>Step 9 (再接続): ~1 秒</li>
+</ul>
+
+<p><strong>git push → fleet 全体新コード化まで <em>10〜15 秒</em></strong>。</p>
+
+<h2 id="version">5. version の正体 (source hash) <a class="anchor-link" href="#version">#</a></h2>
+
+<p>「俺のバージョン」 「お前のバージョン」を比較するために、両者は同じ計算式で <strong>ソースツリーから決定論的な短い ID</strong> を導出する。</p>
+
+<pre><code>def _compute_source_version() -&gt; str:
+    """SHA-256 of every .py file under /app/server and /app/core,
+    truncated to 12 hex chars."""
+    h = hashlib.sha256()
+    for root in (Path("/app/server"), Path("/app/core")):
+        for p in sorted(root.rglob("*.py")):
+            h.update(p.relative_to("/app").as_posix().encode())
+            h.update(b"\0")
+            h.update(p.read_bytes())
+    return h.hexdigest()[:12]
+</code></pre>
+
+<p>同じロジックが <code>server/hub/app.py</code> (<code>_compute_hub_source_version</code>) と <code>server/worker/agent.py</code> (<code>_compute_source_version</code>) の両方に置いてある。同じ入力 → 同じ出力なので、tarball 展開直後の worker は hub と同じ hash を返すようになる ―― <strong>展開しても version が一致しないと無限ループする</strong>、という旧 VERSION 方式の罠を構造的に回避している。</p>
+
+<h3>fallback chain</h3>
+
+<ol>
+  <li>ソースツリー hash (新規・通常パス)</li>
+  <li><code>/app/VERSION</code> ファイル (旧パス、後方互換)</li>
+  <li><code>PAPRIKA_VERSION</code> / <code>WORKER_VERSION</code> 環境変数</li>
+  <li>文字列 <code>"dev"</code> (sentinel: 「自分の version 不明」)</li>
+</ol>
+
+<h3>"dev" センチネルの新しい意味</h3>
+
+<p>旧設計では <strong>片方が <code>"dev"</code> なら比較スキップ</strong>だった。新設計では <strong>両方 <code>"dev"</code> のときだけスキップ</strong>に緩和。意味は:</p>
+
+<table>
+  <thead><tr><th>local</th><th>expected (hub)</th><th>判定</th><th>解釈</th></tr></thead>
+  <tbody>
+    <tr><td>hash a</td><td>hash a</td><td>一致</td><td>同期済 ✓</td></tr>
+    <tr><td>hash a</td><td>hash b</td><td>不一致</td><td>自動更新発火</td></tr>
+    <tr><td><code>"dev"</code></td><td>hash a</td><td>不一致</td><td>worker は自分を知らない、hub に従って更新</td></tr>
+    <tr><td>hash a</td><td><code>"dev"</code></td><td>不一致</td><td>hub は自分を知らない、worker は念のため更新試行</td></tr>
+    <tr><td><code>"dev"</code></td><td><code>"dev"</code></td><td>スキップ</td><td>どちらも version 不明 → no-op</td></tr>
+  </tbody>
+</table>
+
+<h2 id="code">6. コード参照点 <a class="anchor-link" href="#code">#</a></h2>
+
+<table>
+  <thead><tr><th>場所</th><th>役割</th></tr></thead>
+  <tbody>
+    <tr>
+      <td><code>server/hub/app.py</code><br/><code>_compute_hub_source_version()</code><br/><code>_hub_version()</code></td>
+      <td>hub 側の hash 算出 + キャッシュ。handshake 応答の <code>HubRegistered.expected_worker_version</code> に乗せて全 worker に通知する。</td>
+    </tr>
+    <tr>
+      <td><code>server/worker/agent.py</code><br/><code>_compute_source_version()</code><br/><code>default_worker_version()</code></td>
+      <td>worker 側の hash 算出。worker boot 時にキャッシュし、handshake で送信する。</td>
+    </tr>
+    <tr>
+      <td><code>server/worker/agent.py</code><br/><code>_versions_meaningfully_differ()</code></td>
+      <td>比較関数。両方 <code>"dev"</code> なら no-op、それ以外は単純文字列比較。</td>
+    </tr>
+    <tr>
+      <td><code>server/worker/agent.py</code><br/><code>_fetch_and_apply_source_from_hub()</code></td>
+      <td>tarball を hub から GET → 検証 → 展開 → 削除されたファイルの prune。50 MB cap、path traversal 拒否。</td>
+    </tr>
+    <tr>
+      <td><code>server/hub/app.py</code><br/><code>_build_worker_source_tarball()</code><br/><code>GET /worker-source.tar.gz</code></td>
+      <td>hub 側で <code>server/</code> + <code>core/</code> + <code>VERSION</code> を gzip して serve。<code>__pycache__</code> / <code>*.pyc</code> / 隠しファイル除外。</td>
+    </tr>
+    <tr>
+      <td><code>server/hub/runner.py</code><br/><code>sweep_orphan_runners()</code></td>
+      <td>hub 起動時に <code>paprika-runner-*</code> 残骸を一掃。<a href="#orphan">§10</a> 参照。</td>
+    </tr>
+  </tbody>
+</table>
+
+<h2 id="config">7. 環境変数 <a class="anchor-link" href="#config">#</a></h2>
+
+<p>デフォルトのままで動く。下記は無効化したい / 振る舞いを変えたいときだけ触る。</p>
+
+<h3>Worker 側</h3>
+
+<table>
+  <thead><tr><th>変数</th><th>デフォルト</th><th>説明</th></tr></thead>
+  <tbody>
+    <tr><td><code>PAPRIKA_WORKER_AUTO_FETCH_SOURCE</code></td><td><code>1</code></td>
+      <td>mismatch 検知時に tarball を取得・展開するか。<code>0</code> にすると警告 banner を出すだけで自己更新しない (= operator 手動更新運用)。</td></tr>
+    <tr><td><code>PAPRIKA_WORKER_AUTO_EXIT_ON_VERSION_MISMATCH</code></td><td><code>1</code></td>
+      <td>mismatch 検知時に <code>sys.exit(42)</code> するか。<code>0</code> にすると warn のみで継続動作。</td></tr>
+    <tr><td><code>PAPRIKA_GITHUB_REPO</code></td><td>(未設定)</td>
+      <td>GitHub releases から最新タグを取得するセカンダリ check を有効化する (例: <code>paps-jp/paprika</code>)。hub 経由更新が機能しない孤立 worker 向け。</td></tr>
+    <tr><td><code>WORKER_VERSION</code></td><td>(未設定)</td>
+      <td>fallback chain の上書き。診断用。</td></tr>
+  </tbody>
+</table>
+
+<h3>Hub 側</h3>
+
+<table>
+  <thead><tr><th>変数</th><th>デフォルト</th><th>説明</th></tr></thead>
+  <tbody>
+    <tr><td><code>PAPRIKA_VERSION</code></td><td>(未設定)</td>
+      <td>hash 算出が空を返した場合の fallback。診断用。</td></tr>
+  </tbody>
+</table>
+
+<h2 id="endpoints">8. エンドポイント <a class="anchor-link" href="#endpoints">#</a></h2>
+
+<div class="endpoint-row">
+  <span class="endpoint"><span class="method get">GET</span>/worker-source.tar.gz</span>
+  <span class="desc">★ 自動配信の本体 ★ hub の <code>server/</code> + <code>core/</code> + <code>VERSION</code> を gzip tarball で返す。worker が mismatch 時に hit する。</span>
+</div>
+<div class="endpoint-row">
+  <span class="endpoint"><span class="method get">GET</span>/health</span>
+  <span class="desc"><code>{status, store, workers, version}</code>。<code>version</code> フィールドが hub の現在 hash。外部監視で fleet drift を検知するのに使える。</span>
+</div>
+<div class="endpoint-row">
+  <span class="endpoint"><span class="method get">GET</span>/workers</span>
+  <span class="desc">各 worker の <code>version</code> フィールドを含む。hub の <code>/health.version</code> と比較すれば「まだ追従できていない worker」が分かる。</span>
+</div>
+<div class="endpoint-row">
+  <span class="endpoint"><span class="method ws" style="background:#8250df;display:inline-block;font-weight:700;padding:0 6px;border-radius:3px;color:#fff;font-size:0.85em;margin-right:4px;">WS</span>/workers/{wid}/link</span>
+  <span class="desc">handshake で hub が <code>HubRegistered.expected_worker_version</code> を返す。version 比較はここで起きる。</span>
+</div>
+
+<h2 id="runbook">9. 運用 runbook <a class="anchor-link" href="#runbook">#</a></h2>
+
+<h3>通常 deploy (1 コマンド)</h3>
+
+<pre><code># Hub host (&lt;hub-ip&gt;) で:
+ssh &lt;hub-ip&gt; 'cd /opt/paprika && git pull --ff-only origin main && docker compose restart hub'
+</code></pre>
+
+<p>Worker への伝搬は <strong>放置で OK</strong>。完了確認:</p>
+
+<pre><code># 1. Hub の現在 version を取得
+curl -s http://&lt;hub-ip&gt;:8000/health | python -c "import json,sys; print(json.load(sys.stdin)['version'])"
+# → 378d62aaaa11 (例)
+
+# 2. 全 worker の version を取得して drift をチェック
+curl -s http://&lt;hub-ip&gt;:8000/workers | python -c "
+import json,sys
+d = json.load(sys.stdin)
+versions = {}
+for w in d['workers']:
+    versions.setdefault(w.get('version','?'), []).append(w['address'])
+for v, ips in sorted(versions.items()):
+    print(f'{v}: {len(ips)} workers · {\", \".join(ips[:3])}{\"...\" if len(ips)>3 else \"\"}')
+"
+# → 378d62aaaa11: 25 workers · 192.168.1.140, 192.168.1.141, 192.168.1.142...
+</code></pre>
+
+<p>全 worker が hub と同じ hash を返していれば fleet 整合状態。</p>
+
+<h3>遅れている worker の追い込み</h3>
+
+<p>大抵は数十秒で自動追従するが、まれに network 一過性問題で取り残される個体がある。手動 trigger:</p>
+
+<pre><code>ssh root@&lt;worker-ip&gt; docker compose -f /opt/paprika/docker-compose-worker.yml restart worker
+</code></pre>
+
+<p>再起動して fresh handshake すれば次の cycle で必ず追従する。</p>
+
+<h3>緊急: 全 worker 強制再起動</h3>
+
+<p>hub の log flood などで多数の worker が WS half-open に陥った場合 (実際に <a href="#orphan">§10</a> の事件で発生):</p>
+
+<pre><code>ssh &lt;hub-ip&gt; 'for IP in 140 141 142 143 144 145 146 147 148 149 150 151 152 153 154 155 156 157 158 159 160 161 162 163 164; do
+  ssh -o ConnectTimeout=3 -o BatchMode=yes root@192.168.1.$IP \
+    "docker compose -f /opt/paprika/docker-compose-worker.yml restart worker" &
+done; wait'
+</code></pre>
+
+<h3>自動配信を一時的に止めたい (Worker single host 単位)</h3>
+
+<pre><code># 該当 host の .env に追記
+PAPRIKA_WORKER_AUTO_FETCH_SOURCE=0
+PAPRIKA_WORKER_AUTO_EXIT_ON_VERSION_MISMATCH=0
+
+# Restart
+docker compose -f /opt/paprika/docker-compose-worker.yml restart worker
+</code></pre>
+
+<p>Hub の VERSION が変わっても、この worker は警告 banner を出すだけで動き続ける。Debug 中に worker 上で手で <code>vim</code> したコードを保護したい時などに便利。</p>
+
+<h2 id="orphan">10. Runner orphan 防止 <a class="anchor-link" href="#orphan">#</a></h2>
+
+<p>自動配信は worker 単位の話。だが <strong>paprika-runner</strong> (codegen-loop が LLM 生成スクリプトを実行するための ephemeral sandbox container) が orphan 化するリスクも別軸で存在する。前述の事件 (<a href="#why">§2</a>) はまさにこれが引き金になった。</p>
+
+<h3>orphan が消えなかった原因</h3>
+
+<p><code>execute_in_sandbox()</code> の旧実装は timeout / cancel 時に <code>proc.kill()</code> で <code>docker run</code> CLI に SIGKILL を送るだけだった。</p>
+
+<ul>
+  <li>SIGKILL は forward されない (CLI が瞬時に死んで signal を中身に伝達できない)</li>
+  <li>結果 inner container は生き続ける</li>
+  <li><code>--rm</code> は clean exit でしか発火しない。無限ループのスクリプトには無力</li>
+</ul>
+
+<h3>対策 (commit <code>7edde33</code>)</h3>
+
+<ol>
+  <li><strong>spawn 時に <code>--name paprika-runner-&lt;uuid12&gt;</code> を付与</strong>。後から name 指定で container を target できるようにする。</li>
+  <li><strong><code>_docker_stop_best_effort(name)</code></strong> ヘルパー追加。timeout / cancel パスで <code>proc.kill()</code> の前に <code>docker stop -t 5</code> → <code>docker kill</code> → <code>docker rm -f</code> を順に試行。これで inner container にも SIGTERM が tini 経由で届く。</li>
+  <li><strong><code>sweep_orphan_runners()</code></strong> を hub 起動時に呼ぶ。<code>docker ps --filter name=paprika-runner-*</code> で生き残りを列挙、全部 stop。前世の hub が残した残骸を automatic に回収。</li>
+</ol>
+
+<div class="callout warn">
+<strong>互換性メモ:</strong> 既存の orphan (この修正前に取り残されたもの) は次回 hub 起動時の sweep で殺される。だが古い container は無名 (<code>thirsty_heisenberg</code> のような docker auto-generated 名前) なので filter にマッチしない。1 回だけ手動で <code>docker ps -a --filter ancestor=paprika-runner:latest</code> で確認して掃除する必要がある。
+</div>
+
+<h2 id="limits">11. 既知の制約 <a class="anchor-link" href="#limits">#</a></h2>
+
+<h3>① Dockerfile の変更は自動伝搬しない</h3>
+
+<p>自動配信は <code>server/</code> + <code>core/</code> の Python ファイルのみを対象としている。<code>Dockerfile</code> / <code>requirements.txt</code> / 包含 binary が変わった場合は <strong>image rebuild が必要</strong>。その時は <code>REBUILD=1 ./scripts/git-pull-workers.sh</code> で全 worker に <code>docker compose up -d --build worker</code> を撒く。</p>
+
+<h3>② Worker host へは事前に SSH key 配布が必要</h3>
+
+<p>自動配信パス (= tarball 取得) は不要だが、<strong>緊急 restart 経路</strong> (<a href="#runbook">§9</a>) のため hub host から各 worker host への passwordless SSH は事前に張る。設定は <a href="./index.html#ops">マニュアル §9</a> 参照。</p>
+
+<h3>③ Bind-mount された <code>./server</code> しか上書きしない</h3>
+
+<p>Worker compose は <code>./server</code>, <code>./core</code>, <code>./VERSION</code> を bind-mount している。tarball 展開はこれらのみを対象とする <em>(security: hub が tarball で <code>/etc/passwd</code> を上書きしようとしても拒否される)</em>。<code>.env</code> やデータディレクトリは触らない。</p>
+
+<h3>④ ROLLBACK は git で</h3>
+
+<p>不具合のあるコードを deploy してしまったら、hub で <code>git checkout &lt;前のSHA&gt; && docker compose restart hub</code> するだけで全 worker が自動的に古いコードに張り替わる。「やらかし時の戻し」も同じ自動伝搬経路で動くので簡単。</p>
+
+<h2 id="faq">12. FAQ <a class="anchor-link" href="#faq">#</a></h2>
+
+<h3>Q. なぜ docker pull じゃダメなのか?</h3>
+
+<p>3 つの理由:</p>
+<ol>
+  <li>Registry を立てる手間 (private な GHCR / Harbor を運用したくない)</li>
+  <li>イメージ全体 (Chrome + Xvfb + noVNC で ~2 GB) を 25 host にコピーするのは遅い。実コード変更は数 KB</li>
+  <li>Bind-mount + restart で十分速い (~10 秒)。docker pull だと数分かかる</li>
+</ol>
+
+<h3>Q. Watchtower でいいんじゃない?</h3>
+
+<p>Watchtower は registry 監視 + container 再起動の汎用ツール。Paprika は <strong>hub と worker の version drift を hub 自身が検知する</strong> = アプリ層で整合性を保証できる。Watchtower にこれは無理 (registry tag だけでは「hub-worker pair の整合」までは見えない)。</p>
+
+<h3>Q. tarball が改ざんされたら?</h3>
+
+<p>Hub と worker は同一 LAN 上の信頼境界内で動く前提。LAN 外から来る可能性のあるエンドポイントは別途 <code>WORKER_SECRET</code> でゲートしている。tarball endpoint そのものは認証なしだが、LAN 外公開しないこと <em>(reverse proxy で <code>/worker-source.tar.gz</code> を blocklist してもよい)</em>。</p>
+
+<h3>Q. 部分的に新コードを試したい (canary deploy)</h3>
+
+<p>v1 ではサポートしていない。Hub の hash は 1 つしかなく、全 worker が同じ目標値を見る。やるなら:</p>
+<ul>
+  <li>テスト用 hub container を別ポートで立てて、テスト用 worker host を pointing させる</li>
+  <li>または <code>PAPRIKA_WORKER_AUTO_FETCH_SOURCE=0</code> でその host だけ自動更新を止め、SSH で手動 git checkout</li>
+</ul>
+
+<h3>Q. ハッシュ計算は性能負担にならない?</h3>
+
+<p><code>server/</code> + <code>core/</code> の Python ファイル合計 ~28 個 / 数 MB を SHA-256。手元計測で <strong>~50 ms</strong>。さらに hub / worker 共に boot 時に 1 度だけ計算してプロセス内キャッシュする。handshake 毎に再計算しない。</p>
+
+<h3>Q. デプロイ直前と直後で in-flight な job はどうなる?</h3>
+
+<p>Worker 再起動時に走っていた lane 上の Chrome は強制終了する。Hub は WS 切断を検知して、worker_id に紐づいた in-flight ジョブを失敗扱いに分類する (<code>_recover_orphan_running_jobs</code> 経路)。job 単位のステータスは <code>failed</code>、エラーメッセージは <code>"orchestrator killed by hub restart"</code>。重要な crawl 直前は時間帯を見て deploy する。</p>
+
+<hr/>
+
+<div class="footer">
+  <p>このページは <code>docs/worker-autodeploy.html</code> として paprika repo に含まれている。<br/>
+     誤りや改善案は <a href="https://github.com/paps-jp/paprika/issues">issue</a> へ。</p>
+</div>
+
+</main>
+</div>
+
+</body>
+</html>

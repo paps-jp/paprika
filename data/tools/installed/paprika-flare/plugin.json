@@ -1,0 +1,24 @@
+{
+  "name": "paprika-flare",
+  "version": "0.1.0",
+  "kind": "python_lib",
+  "capabilities": ["cloudflare_challenge", "ip_matched_cookies", "vision_assisted_bypass"],
+  "actions": {
+    "get_cookies": {
+      "description": "paprika-native Cloudflare bypass. Opens an ephemeral session on a paprika Worker, lets the Worker's real Chrome navigate to the URL (which auto-clears most CF JS challenges), optionally invokes page.agent() to click any visible 'I'm not a robot' / Turnstile widget, then snapshots the cookies via GET /sessions/{sid}/cookies. The cookies are IP-matched to the Worker that will run the eventual job (no IP mismatch unlike FlareSolverr running on Hub), and no extra Docker container is needed.",
+      "entry": "adapter:get_cookies",
+      "timeout_s": 90,
+      "input_schema": {
+        "url": "string",
+        "wait_s": "int=10",
+        "use_vision_agent": "bool=true",
+        "use_profile": "string?"
+      },
+      "output_schema": {"cookies": "dict[str,str]", "status_code": "int", "elapsed_ms": "int", "worker_id": "string"}
+    }
+  },
+  "source": "paprika-native",
+  "installed_at": "2026-05-27",
+  "installed_by": "paps-jp",
+  "notes": "First paprika-native plugin in the v2 Tool Registry. Unique value: (1) reuses the existing Worker fleet -- no separate container; (2) cookies are tied to the actual Worker's egress IP -- they will WORK for the subsequent job dispatched to the same NAT pool; (3) fallback to page.agent(engine='cogagent') for visual challenges (Turnstile checkbox). Trade-off: consumes one Worker lane briefly during the solve (~10-20s)."
+}

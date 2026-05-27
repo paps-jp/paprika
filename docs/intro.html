@@ -1,0 +1,254 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+<meta charset="utf-8">
+<title>はじめに — Paprika SDK のインストール・接続・最初のスクリプト</title>
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<link rel="stylesheet" href="style.css">
+<meta name="description" content="paprika-client (Python SDK) のインストール、ハブへの接続、最初のスクリプトまで5分。Playwright スタイルの API で実ブラウザを動かす分散自動化基盤 Paprika の入門ガイド。">
+<script>(function(){try{var m=localStorage.getItem('paprika.api.mode')||'async';if(!['async','sync','php'].includes(m))m='async';document.documentElement.classList.add('mode-'+m);}catch(_){document.documentElement.classList.add('mode-async');}})();</script>
+<link rel="canonical" href="https://paps-jp.github.io/paprika/intro.html">
+<meta property="og:type" content="website">
+<meta property="og:site_name" content="Paprika">
+<meta property="og:title" content="はじめに — Paprika SDK のインストール・接続・最初のスクリプト">
+<meta property="og:description" content="paprika-client (Python SDK) のインストール、ハブへの接続、最初のスクリプトまで5分。Playwright スタイルの API で実ブラウザを動かす分散自動化基盤 Paprika の入門ガイド。">
+<meta property="og:url" content="https://paps-jp.github.io/paprika/intro.html">
+<meta property="og:image" content="https://paps-jp.github.io/paprika/img/admin-submit.png">
+<meta property="og:locale" content="ja_JP">
+<meta name="twitter:card" content="summary_large_image">
+<meta name="twitter:title" content="はじめに — Paprika SDK のインストール・接続・最初のスクリプト">
+<meta name="twitter:description" content="paprika-client (Python SDK) のインストール、ハブへの接続、最初のスクリプトまで5分。Playwright スタイルの API で実ブラウザを動かす分散自動化基盤 Paprika の入門ガイド。">
+<meta name="twitter:image" content="https://paps-jp.github.io/paprika/img/admin-submit.png">
+<script type="application/ld+json">{
+  "@context": "https://schema.org",
+  "@type": "Organization",
+  "name": "特定非営利活動法人ぱっぷす",
+  "alternateName": ["paps", "PAPS", "ぱっぷす"],
+  "url": "https://www.paps.jp",
+  "logo": "https://paps-jp.github.io/paprika/icon.svg",
+  "sameAs": [
+    "https://github.com/paps-jp",
+    "https://paps-jp.github.io/paprika/"
+  ]
+}</script>
+</head>
+<body>
+
+<nav class="topnav">
+  <a class="brand" href="index.html"><span class="logo"><img src="icon.svg" alt=""></span> Paprika</a>
+  <span class="links">
+    <a href="index.html">Home</a>
+    <a href="intro.html" class="active">はじめに</a>
+    <a href="guides.html">ガイド</a>
+    <a href="admin.html">管理画面</a>
+    <a href="api.html">API</a>
+    <a href="operations.html">サーバー</a>
+  </span>
+  <a class="gh" href="https://github.com/paps-jp/paprika">GitHub ↗</a>
+</nav>
+
+<div class="layout">
+  <aside class="sidebar">
+    <h4>はじめに</h4>
+    <ul>
+      <li><a href="#overview">Paprika の動かし方</a></li>
+      <li><a href="#install">SDK をインストール</a></li>
+      <li><a href="#connect">ハブに接続</a></li>
+      <li><a href="#first">最初のスクリプト</a></li>
+      <li><a href="#concepts">コア概念</a></li>
+      <li><a href="#modes">ジョブモード</a></li>
+      <li><a href="#paths">2 つの取得経路</a></li>
+      <li><a href="#next">次のステップ</a></li>
+    </ul>
+  </aside>
+
+  <main class="content">
+    <h1>はじめに</h1>
+    <p class="lead">Paprika を使い始めます。インストールから最初のスクリプトまで 5 分です。</p>
+
+    <h2 id="overview">Paprika の動かし方</h2>
+    <p>Paprika は 2 つの部分に分かれます。役割を分けて考えると分かりやすいです。</p>
+    <table>
+      <thead><tr><th></th><th>これは何</th><th>どう用意する</th></tr></thead>
+      <tbody>
+        <tr><td><strong>本体</strong></td><td>Hub・Worker・管理画面（ブラウザを動かすサーバ群）</td><td><strong>Docker / CLI で起動</strong> → <a href="operations.html#patterns">サーバー → 3つの構成パターン</a></td></tr>
+        <tr><td><strong>SDK</strong></td><td>paprika-client（本体を操作する Python / PHP ライブラリ）</td><td><strong>このページ</strong>（<code>pip install</code> / <code>composer require</code>）</td></tr>
+      </tbody>
+    </table>
+    <p>本体を触らずに試すだけなら <strong><a href="admin.html">管理画面</a></strong>（ブラウザだけで URL を投げて収集）から始めるのが一番手軽です。
+    このページは、稼働中のハブに対して <strong>スクリプトから操作する</strong> 人向けです。</p>
+
+    <h2 id="install">SDK をインストール</h2>
+    <div class="api-toggle" role="tablist" aria-label="SDK language">
+      <button data-mode="async">Python Async（推奨）</button>
+      <button data-mode="sync">Python Sync</button>
+      <button data-mode="php">PHP</button>
+      <span class="hint">言語を切り替え</span>
+    </div>
+    <div class="ex-async">
+    <p>必要なのは Python 3.10+ と、稼働中ハブへの到達性だけ（依存は <code>httpx</code> のみ）。</p>
+    <pre><code># ソースツリーから
+pip install -e ./client/python
+
+# または直接
+pip install "git+https://github.com/paps-jp/paprika.git#subdirectory=client/python"</code></pre>
+    </div>
+    <div class="ex-sync">
+    <p>必要なのは Python 3.10+ と、稼働中ハブへの到達性だけ（依存は <code>httpx</code> のみ）。</p>
+    <pre><code># ソースツリーから
+pip install -e ./client/python
+
+# または直接
+pip install "git+https://github.com/paps-jp/paprika.git#subdirectory=client/python"</code></pre>
+    </div>
+    <div class="ex-php">
+    <p>必要なのは PHP 8.1+ と <code>ext-curl</code>、稼働中ハブへの到達性だけ。</p>
+    <pre><code>composer require paprika/client</code></pre>
+    </div>
+
+    <h2 id="connect">ハブに接続</h2>
+    <p>接続先は <strong>引数 → 環境変数 <code>PAPRIKA_HUB</code> → <code>http://localhost:8000</code></strong> の順で解決されます。
+    引数なしの <code>connect()</code> にしておくと、ローカルでもサンドボックス内でも同じスクリプトが動きます。</p>
+    <pre><code>export PAPRIKA_HUB=http://paprika.lan:8000</code></pre>
+    <div class="ex-async">
+    <pre><code>import asyncio
+from paprika_client import async_paprika
+
+async def main():
+    async with async_paprika.connect() as cli:   # PAPRIKA_HUB を自動参照
+        print(await cli.health())
+
+asyncio.run(main())</code></pre>
+    </div>
+    <div class="ex-sync">
+    <pre><code>from paprika_client import sync_paprika
+
+with sync_paprika.connect() as cli:              # PAPRIKA_HUB を自動参照
+    print(cli.health())</code></pre>
+    </div>
+    <div class="ex-php">
+    <pre><code>&lt;?php
+require 'vendor/autoload.php';
+
+use Paprika\Client\Paprika;
+
+$cli = Paprika::connect();   // PAPRIKA_HUB or http://localhost:8000
+echo $cli-&gt;health(), "\n";</code></pre>
+    </div>
+
+    <h2 id="first">最初のスクリプト</h2>
+    <p>ページを開いてタイトルとリンクを取得する：</p>
+    <div class="ex-async">
+    <pre><code>import asyncio
+from paprika_client import async_paprika
+
+async def main():
+    async with async_paprika.connect() as cli:
+        async with cli.session("https://news.ycombinator.com") as page:
+            print(await page.title())
+            for url in await page.links(urls_only=True):
+                print(url)
+
+asyncio.run(main())</code></pre>
+    <p><code>async with cli.session(url)</code> がブラウザのタブを 1 つ確保し、ブロックを抜けると自動で閉じます。
+    操作 API は Playwright とほぼ同じ（<code>goto</code> / <code>click</code> / <code>fill</code> / <code>evaluate</code> …）。一覧は <a href="api.html">API リファレンス</a>。</p>
+    </div>
+    <div class="ex-sync">
+    <pre><code>from paprika_client import sync_paprika
+
+with sync_paprika.connect() as cli:
+    with cli.session("https://news.ycombinator.com") as page:
+        print(page.title())
+        for url in page.links(urls_only=True):
+            print(url)</code></pre>
+    <p><code>with cli.session(url)</code> がブラウザのタブを 1 つ確保し、ブロックを抜けると自動で閉じます。
+    <code>await</code> を外すだけで async 版と同じ API です。一覧は <a href="api.html">API リファレンス</a>。</p>
+    </div>
+    <div class="ex-php">
+    <pre><code>&lt;?php
+require 'vendor/autoload.php';
+
+use Paprika\Client\Paprika;
+
+$cli = Paprika::connect();
+$job = $cli-&gt;fetch('https://news.ycombinator.com', scroll: true);
+echo "status: {$job['status']}\n";
+
+foreach ($cli-&gt;jobImages($job['job_id']) as $url) {
+    echo $url, "\n";
+}</code></pre>
+    <p>PHP SDK は現在 <strong>Phase 1</strong>（Job API + Session ライフサイクル）。
+    Page 操作は Phase 2 で対応予定です。詳しくは <a href="api.html#php">API → PHP SDK</a>。</p>
+    </div>
+    <div class="ex-async">
+    <div class="callout tip"><strong>async が苦手なら同期版</strong>
+    ノートブックや簡単なスクリプトには、<code>await</code> を外すだけの同期ファサード <code>sync_paprika</code> もあります（<a href="api.html#sync">API → 同期版</a>）。上のタブで「Python Sync」を選ぶと同期版のコード例が表示されます。</div>
+    </div>
+
+    <h2 id="concepts">コア概念</h2>
+    <table>
+      <thead><tr><th>用語</th><th>意味</th></tr></thead>
+      <tbody>
+        <tr><td><strong>Hub</strong></td><td>中央サーバ。ジョブを受け、ワーカーに配り、結果を集める。管理 UI / API もここ</td></tr>
+        <tr><td><strong>Worker</strong></td><td>Chrome を抱えたコンテナ。多数が並列で動く</td></tr>
+        <tr><td><strong>Lane</strong></td><td>1 つの独立した Chrome（+ noVNC）。ワーカー 1 台に複数</td></tr>
+        <tr><td><strong>Session</strong></td><td>1 Lane の予約。<code>cli.session()</code> が握る対話的ブラウザ。タブ複数可</td></tr>
+        <tr><td><strong>Job</strong></td><td>「URL を収集する」作業単位。投入 → 実行 → 結果（assets）</td></tr>
+        <tr><td><strong>Asset</strong></td><td>収集された 1 ファイル（画像 / 動画 / …）。Hub に集約される</td></tr>
+      </tbody>
+    </table>
+
+    <h2 id="modes">ジョブモード</h2>
+    <p>ジョブ投入時に <code>mode</code> を選びます。</p>
+    <table>
+      <thead><tr><th>mode</th><th>用途</th></tr></thead>
+      <tbody>
+        <tr><td><code>fetch</code></td><td><strong>既定。</strong>URL を開いて画像/動画/HTML を取得。LLM 不要・最速</td></tr>
+        <tr><td><code>codegen-loop</code></td><td>自然言語のゴール → LLM がスクリプト生成 → 実行 → 失敗時リトライ</td></tr>
+        <tr><td><code>vision-agent</code></td><td>スクリーンショットを見て LLM がクリック。CSS が効かない画面に強い</td></tr>
+        <tr><td><code>rerun</code></td><td>既存スクリプトをそのまま実行（Simple Macro が compile した Python もこれ）</td></tr>
+      </tbody>
+    </table>
+
+    <h2 id="paths">2 つの取得経路</h2>
+    <p>「画像を取得する」には用途の違う 2 つの入口があります。混同しないようご注意ください。</p>
+    <table>
+      <thead><tr><th>経路</th><th>入口</th><th>こういう時</th></tr></thead>
+      <tbody>
+        <tr><td><strong>Job 経路</strong></td><td><code>cli.fetch()</code> / <code>cli.job_*()</code></td><td>URL を渡して一括取得（まとめ DL）</td></tr>
+        <tr><td><strong>Session 経路</strong></td><td><code>cli.session()</code> + <code>page.*()</code></td><td>クリックやログインを挟んでから取得</td></tr>
+      </tbody>
+    </table>
+
+    <h2 id="next">次のステップ</h2>
+    <div class="cards">
+      <a class="card" href="guides.html"><h3>ガイド →</h3><p>画像/動画の取得、ログイン、ブラウザ操作、LLM の使い分け。</p></a>
+      <a class="card" href="api.html"><h3>API リファレンス →</h3><p>SDK の全関数：引数・戻り値・例。</p></a>
+      <a class="card" href="admin.html"><h3>管理画面 →</h3><p>コードを書かずに UI から投げる・観察する。</p></a>
+      <a class="card" href="operations.html"><h3>サーバー →</h3><p>本体（Hub/Worker）を Docker / CLI で立ち上げる。3つの構成パターン解説。</p></a>
+    </div>
+
+    <div class="pager">
+      <a href="index.html"><div class="dir">← 戻る</div><div class="ttl">Home</div></a>
+      <a class="next" href="guides.html"><div class="dir">次へ →</div><div class="ttl">ガイド</div></a>
+    </div>
+  </main>
+</div>
+<script>
+(function(){
+  const MODES = ['async', 'sync', 'php'];
+  const btns = document.querySelectorAll('.api-toggle button');
+  function apply(m){
+    if (!MODES.includes(m)) m = 'async';
+    MODES.forEach(x => document.documentElement.classList.toggle('mode-' + x, m === x));
+    btns.forEach(b => b.classList.toggle('active', b.dataset.mode === m));
+    try { localStorage.setItem('paprika.api.mode', m); } catch (_) {}
+  }
+  btns.forEach(b => b.addEventListener('click', () => apply(b.dataset.mode)));
+  let m = 'async';
+  try { m = localStorage.getItem('paprika.api.mode') || 'async'; } catch (_) {}
+  apply(m);
+})();
+</script>
+</body>
+</html>

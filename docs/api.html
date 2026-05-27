@@ -1,0 +1,445 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+<meta charset="utf-8">
+<title>API リファレンス — paprika-client (Python / PHP SDK) 全関数仕様</title>
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<link rel="stylesheet" href="style.css">
+<script>(function(){try{var m=localStorage.getItem('paprika.api.mode')||'async';if(!['async','sync','php'].includes(m))m='async';document.documentElement.classList.add('mode-'+m);}catch(_){document.documentElement.classList.add('mode-async');}})();</script>
+<meta name="description" content="paprika-client (Python async / sync) と PHP SDK (Phase 1) の API リファレンス。Playwright スタイルのページ操作・DOM 取得・JS 実行・画像/動画収集・Cookie 操作・サイト巡回 (walk)・同期版 sync_paprika・PHP からの Job/Session 操作の引数・戻り値・実行結果。">
+<link rel="canonical" href="https://paps-jp.github.io/paprika/api.html">
+<meta property="og:type" content="website">
+<meta property="og:site_name" content="Paprika">
+<meta property="og:title" content="API リファレンス — paprika-client (Python / PHP SDK) 全関数仕様">
+<meta property="og:description" content="paprika-client (Python async / sync) と PHP SDK (Phase 1) の API リファレンス。Playwright スタイルのページ操作・DOM 取得・JS 実行・画像/動画収集・Cookie 操作・サイト巡回 (walk)・同期版 sync_paprika・PHP からの Job/Session 操作。">
+<meta property="og:url" content="https://paps-jp.github.io/paprika/api.html">
+<meta property="og:image" content="https://paps-jp.github.io/paprika/img/admin-submit.png">
+<meta property="og:locale" content="ja_JP">
+<meta name="twitter:card" content="summary_large_image">
+<meta name="twitter:title" content="API リファレンス — paprika-client (Python / PHP SDK) 全関数仕様">
+<meta name="twitter:description" content="paprika-client (Python async / sync) と PHP SDK (Phase 1) の API リファレンス。Playwright スタイルのページ操作・DOM 取得・JS 実行・画像/動画収集・Cookie 操作・サイト巡回 (walk)・同期版 sync_paprika・PHP からの Job/Session 操作。">
+<meta name="twitter:image" content="https://paps-jp.github.io/paprika/img/admin-submit.png">
+<script type="application/ld+json">{
+  "@context": "https://schema.org",
+  "@type": "Organization",
+  "name": "特定非営利活動法人ぱっぷす",
+  "alternateName": ["paps", "PAPS", "ぱっぷす"],
+  "url": "https://www.paps.jp",
+  "logo": "https://paps-jp.github.io/paprika/icon.svg",
+  "sameAs": [
+    "https://github.com/paps-jp",
+    "https://paps-jp.github.io/paprika/"
+  ]
+}</script>
+</head>
+<body>
+
+<nav class="topnav">
+  <a class="brand" href="index.html"><span class="logo"><img src="icon.svg" alt=""></span> Paprika</a>
+  <span class="links">
+    <a href="index.html">Home</a>
+    <a href="intro.html">はじめに</a>
+    <a href="guides.html">ガイド</a>
+    <a href="admin.html">管理画面</a>
+    <a href="api.html" class="active">API</a>
+    <a href="operations.html">サーバー</a>
+  </span>
+  <a class="gh" href="https://github.com/paps-jp/paprika">GitHub ↗</a>
+</nav>
+
+<div class="layout">
+  <aside class="sidebar">
+    <h4>API リファレンス</h4>
+    <ul>
+      <li><a href="#connect">接続</a></li>
+      <li><a href="#sync">同期版 (sync)</a></li>
+      <li><a href="#php">PHP SDK (Phase 1)</a></li>
+      <li><a href="#client">PaprikaClient</a></li>
+      <li><a href="#nav">Page: ナビ・操作</a></li>
+      <li><a href="#getters">Page: 取得・待機</a></li>
+      <li><a href="#evaluate">Page: JS・DOM</a></li>
+      <li><a href="#assets">Page: 収集・状態</a></li>
+      <li><a href="#tabs">Page: タブ・寿命</a></li>
+      <li><a href="#session">Session 固有</a></li>
+      <li><a href="#locator">Locator</a></li>
+      <li><a href="#walk">サイト巡回 (walk)</a></li>
+      <li><a href="#oneshot">ワンショット</a></li>
+      <li><a href="#errors">例外</a></li>
+    </ul>
+  </aside>
+
+  <main class="content">
+    <h1>API リファレンス</h1>
+    <p class="lead">paprika_client の全公開関数。
+    <code>Session</code> は <code>Page</code> を継承するので <code>page.*</code> はセッションでもそのまま使えます。</p>
+    <div class="api-toggle" role="tablist" aria-label="Code example mode">
+      <button data-mode="async">Python Async（推奨）</button>
+      <button data-mode="sync">Python Sync</button>
+      <button data-mode="php">PHP</button>
+      <span class="hint">コード例の表示モード</span>
+    </div>
+
+    <h2 id="connect">接続</h2>
+    <h3><code>async_paprika.connect(base_url=None, *, token=None, timeout=180.0)</code> → PaprikaClient</h3>
+    <p>ハブへの接続。接続先は <strong>引数 → <code>PAPRIKA_HUB</code> → <code>http://localhost:8000</code></strong>。</p>
+    <div class="ex-async"><pre><code>async with async_paprika.connect() as cli:
+    ...</code></pre></div>
+    <div class="ex-sync"><pre><code>with sync_paprika.connect() as cli:
+    ...</code></pre></div>
+    <div class="ex-php"><pre><code>use Paprika\Client\Paprika;
+
+$cli = Paprika::connect();   // PAPRIKA_HUB or http://localhost:8000
+// ...</code></pre></div>
+
+    <h2 id="sync">同期版（sync_paprika）</h2>
+    <p>async/await を使えない・使いたくない場面（簡単なスクリプト、ノートブック、既存の同期コード）向けに、
+    <strong>非同期 API を 1:1 でブロッキングに写した同期ファサード</strong>があります。裏でバックグラウンドの
+    asyncio ループに橋渡しするだけなので、メソッド名・引数・戻り値は async 版と同一（<code>await</code> を外すだけ）。</p>
+    <h3>例1: セッションを動かす</h3>
+    <p>Hacker News のトップ記事をクリックして、辿り着いた先の URL とタイトルを表示します。</p>
+    <pre><code>from paprika_client import sync_paprika
+
+with sync_paprika.connect() as cli:                      # await 不要
+    with cli.session("https://news.ycombinator.com") as page:
+        page.locator(".athing .titleline > a").first.click()
+        st = page.state()
+        print("url:  ", st.url)
+        print("title:", st.title)</code></pre>
+    <p><strong>実行結果（例）:</strong></p>
+    <pre><code>url:   https://www.anthropic.com/research/glasswing-initial-update
+title: Project Glasswing: An initial update \ Anthropic</code></pre>
+
+    <h3>例2: fetch で画像を一括取得</h3>
+    <p>Wikipedia の記事を fetch ジョブで丸ごと取得し、保存された画像の URL を表示します。</p>
+    <pre><code>from paprika_client import sync_paprika
+
+with sync_paprika.connect() as cli:
+    job = cli.fetch("https://en.wikipedia.org/wiki/Cat", scroll=True)
+    imgs = cli.job_images(job.job_id)
+    print("status:", job.status)
+    print("images:", len(imgs))
+    print("first 3:")
+    for u in imgs[:3]:
+        print(" ", u)</code></pre>
+    <p><strong>実行結果（例）:</strong></p>
+    <pre><code>status: completed
+images: 49
+first 3:
+  http://paprika.lan:8000/jobs/08dbe3379087/assets/120px-Felis_chaus_-_…jpg
+  http://paprika.lan:8000/jobs/08dbe3379087/assets/120px-Gustav_chocolate.jpg
+  http://paprika.lan:8000/jobs/08dbe3379087/assets/120px-Orange_tabby_cat_…jpg</code></pre>
+    <p>本リファレンスの <code>cli.*</code> / <code>page.*</code> / <code>loc.*</code> がそのまま（同期で）使えます。
+    <code>connect(base_url=None, *, token=None, timeout=180.0, auto_start=True)</code> が既定でループを起動します。
+    既定では各アクションが <code>[paprika] page.X(...)</code> 形式でログに流れます（無効化は <code>PAPRIKA_CLIENT_ACTION_LOG=0</code>）。</p>
+
+    <h2 id="php">PHP SDK (Phase 1)</h2>
+    <p>PHP からも同じハブを叩けます。<strong>同期・外部依存なし (ext-curl のみ)・PHP 8.1+</strong>。
+    Composer パッケージ <code>paprika/client</code>。命名は Python 版を <code>snake_case → camelCase</code>
+    に直したもの (例: <code>job_images</code> → <code>jobImages</code>)。</p>
+    <p>現在の <strong>Phase 1</strong> は <em>Job API + Session ライフサイクル</em>。
+    Page/Locator/walk は <strong>Phase 2</strong> で対応予定です。</p>
+
+    <h3>インストール</h3>
+    <pre><code>composer require paprika/client</code></pre>
+
+    <h3>例: fetch ジョブを投げて画像を集める</h3>
+    <pre><code>&lt;?php
+require 'vendor/autoload.php';
+
+use Paprika\Client\Paprika;
+
+$cli = Paprika::connect();   // PAPRIKA_HUB or http://localhost:8000
+$job = $cli-&gt;fetch('https://en.wikipedia.org/wiki/Cat', scroll: true);
+echo "status: {$job['status']}\n";
+
+foreach ($cli-&gt;jobImages($job['job_id']) as $u) {
+    echo $u, "\n";
+}</code></pre>
+
+    <h3>例: ライブセッションを開く</h3>
+    <pre><code>use Paprika\Client\Paprika;
+use Paprika\Client\Session;
+
+$cli = Paprika::connect();
+$cli-&gt;session('https://example.com', function (Session $sess) use ($cli) {
+    echo "noVNC: ", $cli-&gt;baseUrl() . $sess-&gt;novncUrl, "\n";
+    // Phase 2: $sess-&gt;goto(...), $sess-&gt;locator(...) ...
+});</code></pre>
+
+    <h3>Phase 1 で使える <code>$cli-&gt;*</code> メソッド (Python 版と1:1)</h3>
+    <table>
+      <thead><tr><th>PHP メソッド</th><th>説明 / Python 版</th></tr></thead>
+      <tbody>
+        <tr><td><code>$cli-&gt;health()</code></td><td>疎通確認 / <code>cli.health()</code></td></tr>
+        <tr><td><code>$cli-&gt;listWorkers() / listSessions()</code></td><td>一覧 / <code>list_workers / list_sessions</code></td></tr>
+        <tr><td><code>$cli-&gt;createJob($url, $opts)</code></td><td><code>POST /jobs</code> / <code>create_job</code></td></tr>
+        <tr><td><code>$cli-&gt;fetch($url, $opts = [], wait: true, ...)</code></td><td>fetch 投入＋完了待ち / <code>fetch</code></td></tr>
+        <tr><td><code>$cli-&gt;getJob($id) / listJobs() / jobResult($id)</code></td><td>状態 / <code>get_job / list_jobs / job_result</code></td></tr>
+        <tr><td><code>$cli-&gt;waitJob($id, pollInterval: 2.0, timeout: 600.0)</code></td><td>終端まで待機 / <code>wait_job</code></td></tr>
+        <tr><td><code>$cli-&gt;cancelJob($id) / deleteJob($id)</code></td><td>中止 / 削除</td></tr>
+        <tr><td><code>$cli-&gt;jobAssets($id, kind: null, absolute: true, details: false)</code></td><td>asset 一覧 / <code>job_assets</code></td></tr>
+        <tr><td><code>$cli-&gt;jobImages($id)</code></td><td>画像ショートカット / <code>job_images</code></td></tr>
+        <tr><td><code>$cli-&gt;downloadJobAssets($id, $destDir, kind: 'image')</code></td><td>ローカル保存 / <code>download_job_assets</code></td></tr>
+        <tr><td><code>$cli-&gt;openSession(initialUrl: null, ...)</code> → Session</td><td>セッション確保 / <code>open_session</code></td></tr>
+        <tr><td><code>$cli-&gt;session($url, $closure, $kwargs = [])</code></td><td>クロージャ自動 close 形 / Python の <code>async with cli.session(...)</code></td></tr>
+      </tbody>
+    </table>
+
+    <h3><code>Session</code> の Phase 1 サーフェス</h3>
+    <ul>
+      <li>プロパティ (readonly): <code>$sess-&gt;sessionId</code> / <code>workerId</code> / <code>laneIdx</code> / <code>novncUrl</code></li>
+      <li><code>$sess-&gt;close()</code> — <code>DELETE /sessions/{id}</code> (idempotent / 安全)</li>
+      <li><code>$sess-&gt;detach()</code> — <code>POST /sessions/{id}/detach</code>。クロージャ form の自動 close をスキップ</li>
+      <li>(Phase 2) <code>goto / click / fill / locator / screenshot / state / outline / ...</code></li>
+    </ul>
+
+    <h3>例外</h3>
+    <table>
+      <thead><tr><th>クラス</th><th>用途</th></tr></thead>
+      <tbody>
+        <tr><td><code>Paprika\Client\PaprikaError</code></td><td>HTTP/トランスポート系エラー。<code>$e-&gt;statusCode</code> で HTTP コード取得 (transport なら null)</td></tr>
+        <tr><td><code>Paprika\Client\PaprikaActionError</code></td><td>Page/Locator 系の失敗 (Phase 2 で本格使用)</td></tr>
+      </tbody>
+    </table>
+
+    <h2 id="client">PaprikaClient (<code>cli.*</code>)</h2>
+    <table>
+      <thead><tr><th>メソッド</th><th>説明</th></tr></thead>
+      <tbody>
+        <tr><td><code>cli.health()</code> → dict</td><td>疎通確認</td></tr>
+        <tr><td><code>cli.list_workers()</code> → list</td><td>接続中ワーカー一覧</td></tr>
+        <tr><td><code>cli.list_sessions()</code> → list</td><td>セッション一覧</td></tr>
+        <tr><td><code>cli.session(url=None, **kw)</code></td><td>セッションを開く（async with / await）。<code>kw</code>: parent_job_id / worker_id / lane_hint / idle_ttl_s / absolute_ttl_s / use_profile</td></tr>
+        <tr><td><code>cli.open_session(...)</code> → Session</td><td>手動でセッション確保（<code>await page.close()</code> で解放）</td></tr>
+      </tbody>
+    </table>
+    <h3>Job ライフサイクル</h3>
+    <table>
+      <thead><tr><th>メソッド</th><th>説明</th></tr></thead>
+      <tbody>
+        <tr><td><code>cli.create_job(url, **opts)</code> → dict</td><td><code>POST /jobs</code>。投入のみ。<code>opts</code> は JobOptions（mode / scroll / goal / use_profile / cookies_from …）</td></tr>
+        <tr><td><code>cli.fetch(url, *, wait=True, poll_interval=2.0, timeout=600.0, scroll=True, **opts)</code> → dict</td><td>fetch 投入 ＋ 完了待ち。<code>wait=False</code> で投げっぱなし</td></tr>
+        <tr><td><code>cli.get_job(id)</code> → dict</td><td>現在の状態（status / progress …）</td></tr>
+        <tr><td><code>cli.list_jobs()</code> → list</td><td>全ジョブ（新しい順）</td></tr>
+        <tr><td><code>cli.wait_job(id, *, poll_interval=2.0, timeout=600.0)</code> → dict</td><td>終了状態まで待つ</td></tr>
+        <tr><td><code>cli.job_result(id)</code> → dict</td><td>最終結果（assets / links / 最終URL）</td></tr>
+        <tr><td><code>cli.cancel_job(id)</code> / <code>delete_job(id)</code> → dict</td><td>中止 / 削除</td></tr>
+      </tbody>
+    </table>
+    <h3>asset（画像・動画）取得</h3>
+    <table>
+      <thead><tr><th>メソッド</th><th>説明</th></tr></thead>
+      <tbody>
+        <tr><td><code>cli.job_assets(id, *, kind=None, absolute=True, details=False)</code> → list</td><td>キャプチャ済み asset 一覧。<code>kind</code>=image/video/audio/other/None、<code>details</code>=メタ付き dict</td></tr>
+        <tr><td><code>cli.job_images(id, **kw)</code> → list</td><td><code>job_assets(kind="image")</code> のショートカット</td></tr>
+        <tr><td><code>cli.download_job_assets(id, dest_dir, *, kind="image")</code> → list[str]</td><td>ディスクに保存。保存パス一覧を返す</td></tr>
+      </tbody>
+    </table>
+
+    <h2 id="nav">Page — ナビゲーション・操作</h2>
+    <p>プロパティ（I/O なし）: <code>page.url</code> / <code>session_id</code> / <code>worker_id</code> / <code>lane_idx</code> / <code>novnc_url</code> / <code>page_id</code>。</p>
+    <table>
+      <thead><tr><th>メソッド</th><th>説明</th></tr></thead>
+      <tbody>
+        <tr><td><code>page.goto(url)</code> → dict</td><td>ページ遷移</td></tr>
+        <tr><td><code>page.back()</code> / <code>forward()</code> / <code>history_first()</code> / <code>reload()</code></td><td>履歴移動・再読み込み（境界で安全）</td></tr>
+        <tr><td><code>page.click(selector)</code> → dict</td><td>クリック。<code>[@N]</code> は <code>[data-paprika-id="N"]</code> に展開</td></tr>
+        <tr><td><code>page.fill(selector, value)</code> → dict</td><td>input/textarea に値セット（input/change 発火）</td></tr>
+        <tr><td><code>page.press(key, *, count=1, modifiers=None)</code> → dict</td><td>キー押下（<code>"Enter"</code> / <code>modifiers=["Ctrl"]</code>）</td></tr>
+        <tr><td><code>page.type(text)</code> → dict</td><td>フォーカス要素に文字挿入</td></tr>
+        <tr><td><code>page.scroll(direction="down", pixels=800)</code> → dict</td><td>スクロール</td></tr>
+        <tr><td><code>page.hover / dblclick / focus / scroll_into_view_if_needed (selector, *, index=0)</code> → bool</td><td>入力デバイス（合成イベント）</td></tr>
+        <tr><td><code>page.select_option(selector, value, *, index=0)</code> → bool</td><td><code>&lt;select&gt;</code> を選択</td></tr>
+        <tr><td><code>page.check / uncheck (selector, *, index=0)</code> → bool</td><td>チェック ON/OFF</td></tr>
+        <tr><td><code>page.set_input_files(selector, files)</code> → dict</td><td>ファイルアップロード（CDP）。<code>files</code> はパス or リスト</td></tr>
+      </tbody>
+    </table>
+    <div class="ex-async"><pre><code>await page.goto("https://example.com")
+await page.fill("#email", "user@example.com")
+await page.press("Enter")
+await page.set_input_files("input[type=file]", ["a.jpg", "b.jpg"])</code></pre></div>
+    <div class="ex-sync"><pre><code>page.goto("https://example.com")
+page.fill("#email", "user@example.com")
+page.press("Enter")
+page.set_input_files("input[type=file]", ["a.jpg", "b.jpg"])</code></pre></div>
+    <div class="ex-php"><div class="callout info"><strong>PHP は Phase 2 で対応予定</strong>です（現在の Phase 1 は <a href="#php">Job API + Session ライフサイクル</a>のみ）。</div></div>
+
+    <h2 id="getters">Page — 取得・待機・状態</h2>
+    <table>
+      <thead><tr><th>メソッド</th><th>説明</th></tr></thead>
+      <tbody>
+        <tr><td><code>page.text_content / inner_text / inner_html / input_value (selector, *, index=0)</code></td><td>テキスト・HTML・値</td></tr>
+        <tr><td><code>page.get_attribute(selector, name, *, index=0)</code></td><td>属性値</td></tr>
+        <tr><td><code>page.count(selector)</code> → int</td><td>一致要素数</td></tr>
+        <tr><td><code>page.is_visible / is_checked / is_enabled / is_disabled / is_editable (selector, *, index=0)</code> → bool</td><td>状態判定</td></tr>
+        <tr><td><code>page.exists(selector)</code> → bool</td><td>存在チェック（確定的・LLM不要）</td></tr>
+        <tr><td><code>page.wait_for_selector(selector, *, state="visible", timeout=30.0)</code> → bool</td><td>出現/消失待ち。state=attached/detached/visible/hidden</td></tr>
+        <tr><td><code>page.wait_for(*, seconds=None, ms=None)</code> → None</td><td>単純待機</td></tr>
+        <tr><td><code>page.state()</code> → dict</td><td>{url, title, lane_idx, visited_count}</td></tr>
+        <tr><td><code>page.title()</code> → str / <code>page.outline()</code> → str</td><td>タイトル / 要素一覧（[@N] 付き）</td></tr>
+        <tr><td><code>page.links(*, urls_only=False)</code> → list</td><td>全 <code>&lt;a href&gt;</code> 絶対URL</td></tr>
+        <tr><td><code>page.visited_urls()</code> → list[str]</td><td>踏んだURL</td></tr>
+        <tr><td><code>page.screenshot(*, path=None)</code> → bytes</td><td>ビューポート PNG</td></tr>
+      </tbody>
+    </table>
+
+    <h2 id="evaluate">Page — JS 実行・ロケータ生成</h2>
+    <h3><code>page.evaluate(expression, *, await_promise=False)</code> → 値</h3>
+    <p>任意 JS を実行し評価値を返す（<strong>JSON 化可能な値のみ</strong>）。取得・待機・入力系はこれが土台。</p>
+    <div class="ex-async"><pre><code>title = await page.evaluate("document.title")
+data  = await page.evaluate("fetch('/api').then(r=>r.json())", await_promise=True)</code></pre></div>
+    <div class="ex-sync"><pre><code>title = page.evaluate("document.title")
+data  = page.evaluate("fetch('/api').then(r=>r.json())", await_promise=True)</code></pre></div>
+    <div class="ex-php"><div class="callout info"><strong>PHP は Phase 2 で対応予定</strong>です（<code>evaluate</code> は <a href="#php">Page サーフェスの一部</a>として Phase 2 に含まれます）。</div></div>
+    <table>
+      <thead><tr><th>ロケータ生成</th><th>意味</th></tr></thead>
+      <tbody>
+        <tr><td><code>page.locator(selector)</code> → Locator</td><td>CSS セレクタ</td></tr>
+        <tr><td><code>page.get_by_text(text)</code> → Locator</td><td>可視テキスト一致</td></tr>
+        <tr><td><code>page.get_by_role(role, *, name=None)</code> → Locator</td><td><code>[role=]</code></td></tr>
+        <tr><td><code>page.get_by_test_id / get_by_placeholder / get_by_title / get_by_alt_text (text)</code> → Locator</td><td>属性セレクタ</td></tr>
+      </tbody>
+    </table>
+
+    <h2 id="assets">Page — 収集・Cookie・LLM・永続状態</h2>
+    <table>
+      <thead><tr><th>メソッド</th><th>説明</th></tr></thead>
+      <tbody>
+        <tr><td><code>page.capture(label="capture")</code> → dict</td><td>HTML + スクショ + outline を保存</td></tr>
+        <tr><td><code>page.assets(*, kind="image", absolute=True, refresh=True, details=False)</code> → list</td><td>このセッションでキャプチャ済みの asset（<strong>要 parent_job_id</strong>）</td></tr>
+        <tr><td><code>page.save_assets(dest_dir, *, kind="image", refresh=True)</code> → list[str]</td><td>↑をディスク保存</td></tr>
+        <tr><td><code>page.download_video(url=None, *, referer=None, timeout_s=1800)</code> → dict</td><td>yt-dlp で動画取得</td></tr>
+        <tr><td><code>page.cookies(*, host=None, all_cookies=False)</code> → dict</td><td>現在の Cookie</td></tr>
+        <tr><td><code>page.save_cookies_to_host(*, host=None, notes=None, all_cookies=False)</code> → dict</td><td>Cookie を Host レジストリへ保存</td></tr>
+        <tr><td><code>page.network(*, since=0.0)</code> → dict</td><td>メディアのネットワークログ</td></tr>
+        <tr><td><code>page.ask(question, *, engine="auto")</code> → bool</td><td>LLM に yes/no 質問</td></tr>
+        <tr><td><code>page.agent(goal, *, max_steps=5, engine="auto")</code> → dict</td><td>vision/LLM エージェントに委譲</td></tr>
+        <tr><td><code>page.get_state(key) / set_state(key, value)</code></td><td>親 job に紐づく永続データ（<strong>要 parent_job_id</strong>）</td></tr>
+        <tr><td><code>page.solve_cloudflare(*, timeout_s=25.0)</code> → dict</td><td>Cloudflare チャレンジを待つ/通す</td></tr>
+        <tr><td><code>page.resize_window(width, height)</code> → dict</td><td>ウィンドウサイズ変更</td></tr>
+      </tbody>
+    </table>
+
+    <h2 id="tabs">Page — タブ・ライフサイクル</h2>
+    <table>
+      <thead><tr><th>メソッド</th><th>説明</th></tr></thead>
+      <tbody>
+        <tr><td><code>page.new_page(url) / open(url)</code> → Page</td><td>新規タブ（<code>switch=True</code> で既定に）</td></tr>
+        <tr><td><code>page.pages()</code> → list[Page]</td><td>全タブ</td></tr>
+        <tr><td><code>page.switch()</code> → dict</td><td>このタブを前面に</td></tr>
+        <tr><td><code>page.close()</code> → None</td><td>タブを閉じる（最後の1枚ならセッション終了）</td></tr>
+        <tr><td><code>page.keepalive(*, idle_ttl_s=120, absolute_ttl_s=86400)</code> → HandoffInfo</td><td>スクリプト終了後も残し noVNC で人手に引き継ぐ（別名 <code>detach</code>）</td></tr>
+      </tbody>
+    </table>
+
+    <h2 id="session">Session 固有</h2>
+    <p><code>Session</code> は <code>Page</code> ＋ 複数タブ操作の拡張：</p>
+    <ul>
+      <li>シーケンス操作: <code>len(sess)</code> / <code>sess[i]</code> / <code>for t in sess</code></li>
+      <li><code>sess.front</code> / <code>front_index</code> / <code>current</code>（プロパティ）— 前面タブ</li>
+      <li><code>sess.refresh()</code> → list[Page] — タブ一覧を再取得する</li>
+      <li><code>sess.switch(idx=None)</code> → dict — <code>idx</code> のタブを前面に</li>
+      <li><code>sess.close_popups()</code> → int — 既定タブ以外（popup）を全部閉じる</li>
+    </ul>
+    <div class="callout warn"><strong>注意</strong> popup を閉じるのに <code>await sess[-1].close()</code> は使わないこと（セッション全体を殺すことがある）。<code>sess.close_popups()</code> を使う。</div>
+
+    <h2 id="locator">Locator</h2>
+    <p><code>page.locator(sel)</code> / <code>get_by_*()</code> が返す。<strong>解決はアクション時</strong>。</p>
+    <table>
+      <thead><tr><th>メソッド</th><th>説明</th></tr></thead>
+      <tbody>
+        <tr><td><code>loc.click() / fill(v) / press(k) / type(t)</code></td><td>操作</td></tr>
+        <tr><td><code>loc.hover() / dblclick() / focus() / check() / uncheck() / select_option(v) / set_input_files(f) / scroll_into_view_if_needed()</code></td><td>入力デバイス</td></tr>
+        <tr><td><code>loc.text_content() / inner_text() / inner_html() / input_value() / get_attribute(name)</code></td><td>取得</td></tr>
+        <tr><td><code>loc.is_visible() / is_checked() / is_enabled() / is_disabled() / is_editable()</code> → bool</td><td>状態</td></tr>
+        <tr><td><code>loc.nth(i) / first / last / count() / all()</code></td><td>チェーン</td></tr>
+        <tr><td><code>loc.wait_for(*, state="visible", timeout=30.0)</code> → bool</td><td>この要素が state になるまで待つ</td></tr>
+      </tbody>
+    </table>
+    <div class="ex-async"><pre><code>rows = page.locator(".item")
+for r in await rows.all():
+    print(await r.get_attribute("data-id"))
+await rows.first.click()</code></pre></div>
+    <div class="ex-sync"><pre><code>rows = page.locator(".item")
+for r in rows.all():
+    print(r.get_attribute("data-id"))
+rows.first.click()</code></pre></div>
+    <div class="ex-php"><div class="callout info"><strong>PHP の Locator は Phase 2 で対応予定</strong>です（チェーン API <code>$page-&gt;locator(...)-&gt;first()-&gt;click()</code> を実装予定）。</div></div>
+
+    <h2 id="walk">サイト巡回（walk / Walker）</h2>
+    <p>「サイト X のページを N 件巡回」のような<strong>クロール</strong>を、キュー・重複除去・ドメイン/パスのフィルタ・
+    オフスコープ redirect 対応まで込みで回す高レベルヘルパー。手書きのループより堅牢です。
+    <code>walk(page, **opts)</code> は <code>Visit</code> を yield する非同期イテレータ（クラス版は <code>Walker</code>）。</p>
+    <div class="ex-async"><pre><code>from paprika_client import async_paprika, walk
+
+async with async_paprika.connect() as cli:
+    async with cli.session("https://example.com", parent_job_id="crawl") as page:
+        async for visit in walk(page, target_pages=50, same_domain=True):
+            print(visit.n, visit.depth, visit.url)
+            await page.save_assets("out/images")   # 各ページで画像保存など</code></pre></div>
+    <div class="ex-sync"><div class="callout info"><strong>walk は現状 async API のみ</strong>
+    sync ファサードからは未公開です。同期スクリプトの中で使う場合は、<code>asyncio.run()</code> で
+    上の async 例をラップしてください（または walk 部分だけ async で書き、結果を集めてから同期処理に戻す）。</div></div>
+    <div class="ex-php"><div class="callout info"><strong>PHP の walk は Phase 3 で対応予定</strong>です（Walker / Visit クラスを Python 版と同シェイプで移植）。</div></div>
+    <p><code>Visit</code> は <code>n</code> / <code>url</code> / <code>requested_url</code> / <code>depth</code> /
+    <code>outline</code> / <code>page</code> を持ちます（<code>page</code> はそのページに居る Page）。</p>
+    <table>
+      <thead><tr><th>主なオプション</th><th>既定</th><th>説明</th></tr></thead>
+      <tbody>
+        <tr><td><code>start_url</code></td><td>現在地</td><td>巡回の起点</td></tr>
+        <tr><td><code>target_pages</code></td><td>100</td><td>訪問ページ数の上限</td></tr>
+        <tr><td><code>same_domain</code> / <code>allowed_domains</code></td><td>True / —</td><td>ドメイン制限</td></tr>
+        <tr><td><code>allow_paths</code> / <code>deny_paths</code> / <code>deny_defaults</code></td><td>— / — / True</td><td>パスの許可・除外（既定の除外パターンあり）</td></tr>
+        <tr><td><code>order</code></td><td>"bfs"</td><td>探索順（bfs / dfs）</td></tr>
+        <tr><td><code>max_depth</code></td><td>—</td><td>リンク深さの上限</td></tr>
+        <tr><td><code>per_page_timeout_s</code></td><td>30.0</td><td>1 ページあたりの上限秒</td></tr>
+        <tr><td><code>persist_state</code></td><td>True</td><td>進捗を parent job に永続化（attempt 跨ぎ再開）</td></tr>
+        <tr><td><code>host_dedup</code></td><td>False</td><td>ホスト横断の既訪 URL 重複除去</td></tr>
+      </tbody>
+    </table>
+
+    <h2 id="oneshot">ワンショットヘルパー</h2>
+    <p>1 動作だけしてセッションを閉じる糖衣です。インポートは <code>from paprika_client import snapshot, outline, state, run</code> です。</p>
+    <table>
+      <thead><tr><th>関数</th><th>説明</th></tr></thead>
+      <tbody>
+        <tr><td><code>await snapshot(url, *, wait=2.0, full_page=False, path=None)</code> → bytes</td><td>開いて PNG</td></tr>
+        <tr><td><code>await outline(url, *, wait=2.0)</code> → str</td><td>outline 文字列</td></tr>
+        <tr><td><code>await state(url, *, wait=2.0)</code> → dict</td><td>url/title…</td></tr>
+        <tr><td><code>await run(actions, *, initial_url=None)</code> → dict</td><td>act.* のアクション列を実行</td></tr>
+      </tbody>
+    </table>
+
+    <h2 id="errors">例外</h2>
+    <table>
+      <thead><tr><th>例外</th><th>発生条件</th></tr></thead>
+      <tbody>
+        <tr><td><code>PaprikaError</code></td><td>HTTP レベルのエラー（404 / 5xx / ネットワーク）</td></tr>
+        <tr><td><code>PaprikaActionError</code></td><td>200 だが action が <code>NO_MATCH</code> / <code>ERR:</code> を返した（<code>.status</code> に生文字列）</td></tr>
+      </tbody>
+    </table>
+
+    <div class="pager">
+      <a href="guides.html"><div class="dir">← 戻る</div><div class="ttl">ガイド</div></a>
+      <a class="next" href="operations.html"><div class="dir">次へ →</div><div class="ttl">サーバー</div></a>
+    </div>
+  </main>
+</div>
+<script>
+(function(){
+  const MODES = ['async', 'sync', 'php'];
+  const btns = document.querySelectorAll('.api-toggle button');
+  function apply(m){
+    if (!MODES.includes(m)) m = 'async';
+    MODES.forEach(x => document.documentElement.classList.toggle('mode-' + x, m === x));
+    btns.forEach(b => b.classList.toggle('active', b.dataset.mode === m));
+    try { localStorage.setItem('paprika.api.mode', m); } catch (_) {}
+  }
+  btns.forEach(b => b.addEventListener('click', () => apply(b.dataset.mode)));
+  let m = 'async';
+  try { m = localStorage.getItem('paprika.api.mode') || 'async'; } catch (_) {}
+  apply(m);
+})();
+</script>
+</body>
+</html>

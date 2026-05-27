@@ -1,0 +1,317 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+
+    <!--
+    paprika-customised noVNC lite. Based on noVNC's stock vnc_lite.html
+    plus a small floating clipboard panel (clipboard button bottom-
+    right) so operators can copy/paste between their local machine
+    and the worker's Chrome without switching to the full vnc.html UI.
+
+    Connect parameters: ?host=&port=&password=&scale=true&view_only=
+    Same as upstream.
+    -->
+    <meta charset="utf-8">
+    <title>noVNC (paprika)</title>
+
+    <style>
+
+        body {
+            margin: 0;
+            background-color: dimgrey;
+            height: 100%;
+            display: flex;
+            flex-direction: column;
+        }
+        html {
+            height: 100%;
+        }
+
+        #top_bar {
+            background-color: #6e84a3;
+            color: white;
+            font: bold 12px Helvetica;
+            padding: 6px 5px 4px 5px;
+            border-bottom: 1px outset;
+        }
+        #status {
+            text-align: center;
+        }
+        #sendCtrlAltDelButton {
+            position: fixed;
+            top: 0px;
+            right: 0px;
+            border: 1px outset;
+            padding: 5px 5px 4px 5px;
+            cursor: pointer;
+        }
+
+        #screen {
+            flex: 1; /* fill remaining space */
+            overflow: hidden;
+        }
+
+        /* paprika clipboard overlay */
+        #paprika_clip_btn {
+            position: fixed; right: 8px; bottom: 8px;
+            background: rgba(40,40,40,.78); color: #fff;
+            border: 1px solid rgba(255,255,255,.4); border-radius: 18px;
+            padding: 4px 10px; font: 13px/1.2 sans-serif;
+            cursor: pointer; z-index: 1000;
+            box-shadow: 0 2px 6px rgba(0,0,0,.4);
+            user-select: none;
+        }
+        #paprika_clip_btn:hover { background: rgba(40,40,40,.92); }
+        #paprika_clip_btn .clip_dot {
+            display: inline-block; width: 6px; height: 6px;
+            border-radius: 50%; background: #4caf50; margin-left: 6px;
+            vertical-align: middle; opacity: 0; transition: opacity .25s;
+        }
+        #paprika_clip_btn.has_unread .clip_dot { opacity: 1; }
+
+        #paprika_clip_panel {
+            position: fixed; right: 8px; bottom: 44px;
+            width: 360px; max-width: calc(100vw - 24px);
+            background: rgba(30,30,32,.96); color: #f0f0f0;
+            border: 1px solid rgba(255,255,255,.18); border-radius: 8px;
+            padding: 10px 12px; z-index: 1000;
+            box-shadow: 0 6px 22px rgba(0,0,0,.55);
+            font: 12px/1.4 sans-serif;
+            display: none;
+        }
+        #paprika_clip_panel.open { display: block; }
+        #paprika_clip_panel h4 {
+            margin: 0 0 6px; font-size: 12px; font-weight: 600;
+            display: flex; align-items: center; gap: 6px;
+        }
+        #paprika_clip_panel h4 .hint {
+            margin-left: auto; font-weight: normal; color: #aaa; font-size: 11px;
+        }
+        #paprika_clip_panel textarea {
+            width: 100%; box-sizing: border-box; height: 130px;
+            background: #1d1d1f; color: #f0f0f0;
+            border: 1px solid #444; border-radius: 4px;
+            padding: 6px; font: 12.5px/1.4 ui-monospace, Consolas, monospace;
+            resize: vertical;
+        }
+        #paprika_clip_panel .row {
+            display: flex; gap: 6px; align-items: center;
+            margin-top: 6px;
+        }
+        #paprika_clip_panel button {
+            background: #3b82f6; color: #fff; border: 0;
+            padding: 4px 10px; border-radius: 4px; cursor: pointer;
+            font: 12px/1 sans-serif;
+        }
+        #paprika_clip_panel button:hover { background: #2563eb; }
+        #paprika_clip_panel button.secondary { background: #555; }
+        #paprika_clip_panel button.secondary:hover { background: #666; }
+        #paprika_clip_panel .status {
+            margin-left: auto; color: #4caf50; font-size: 11px;
+            opacity: 0; transition: opacity .3s;
+        }
+        #paprika_clip_panel .status.show { opacity: 1; }
+
+    </style>
+
+    <script type="module" crossorigin="anonymous">
+        // RFB holds the API to connect and communicate with a VNC server
+        import RFB from './core/rfb.js';
+
+        let rfb;
+        let desktopName;
+
+        // When this function is called we have
+        // successfully connected to a server
+        function connectedToServer(e) {
+            status("Connected to " + desktopName);
+        }
+
+        // This function is called when we are disconnected
+        function disconnectedFromServer(e) {
+            if (e.detail.clean) {
+                status("Disconnected");
+            } else {
+                status("Something went wrong, connection is closed");
+            }
+        }
+
+        // When this function is called, the server requires
+        // credentials to authenticate
+        function credentialsAreRequired(e) {
+            const password = prompt("Password required:");
+            rfb.sendCredentials({ password: password });
+        }
+
+        // When this function is called we have received
+        // a desktop name from the server
+        function updateDesktopName(e) {
+            desktopName = e.detail.name;
+        }
+
+        // Since most operating systems will catch Ctrl+Alt+Del
+        // before they get a chance to be intercepted by the browser,
+        // we provide a way to emulate this key sequence.
+        function sendCtrlAltDel() {
+            rfb.sendCtrlAltDel();
+            return false;
+        }
+
+        // Show a status text in the top bar
+        function status(text) {
+            document.getElementById('status').textContent = text;
+        }
+
+        // This function extracts the value of one variable from the
+        // query string. If the variable isn't defined in the URL
+        // it returns the default value instead.
+        function readQueryVariable(name, defaultValue) {
+            const re = new RegExp('.*[?&]' + name + '=([^&#]*)'),
+                  match = document.location.href.match(re);
+
+            if (match) {
+                return decodeURIComponent(match[1]);
+            }
+
+            return defaultValue;
+        }
+
+        document.getElementById('sendCtrlAltDelButton')
+            .onclick = sendCtrlAltDel;
+
+        // Read parameters specified in the URL query string
+        const host = readQueryVariable('host', window.location.hostname);
+        let port = readQueryVariable('port', window.location.port);
+        const password = readQueryVariable('password');
+        const path = readQueryVariable('path', 'websockify');
+
+        status("Connecting");
+
+        // Build the websocket URL used to connect
+        let url;
+        if (window.location.protocol === "https:") {
+            url = 'wss';
+        } else {
+            url = 'ws';
+        }
+        url += '://' + host;
+        if(port) {
+            url += ':' + port;
+        }
+        url += '/' + path;
+
+        // Creating a new RFB object will start a new connection
+        rfb = new RFB(document.getElementById('screen'), url,
+                      { credentials: { password: password } });
+
+        // Add listeners to important events from the RFB module
+        rfb.addEventListener("connect",  connectedToServer);
+        rfb.addEventListener("disconnect", disconnectedFromServer);
+        rfb.addEventListener("credentialsrequired", credentialsAreRequired);
+        rfb.addEventListener("desktopname", updateDesktopName);
+
+        // Set parameters that can be changed on an active connection
+        rfb.viewOnly = readQueryVariable('view_only', false);
+        rfb.scaleViewport = readQueryVariable('scale', false);
+
+        // ---- paprika clipboard panel ---------------------------------------
+        // RFB exposes:
+        //   * clipboardPasteFrom(text)  -- send our clipboard to the server
+        //   * "clipboard" event         -- server sent clipboard to us
+        // Wire both directions to a small floating panel so vnc_lite users
+        // can still use copy-paste without switching to the full vnc.html UI.
+
+        const clipBtn   = document.getElementById('paprika_clip_btn');
+        const clipPanel = document.getElementById('paprika_clip_panel');
+        const clipArea  = document.getElementById('paprika_clip_text');
+        const clipSend  = document.getElementById('paprika_clip_send');
+        const clipCopy  = document.getElementById('paprika_clip_copy');
+        const clipStatus= document.getElementById('paprika_clip_status');
+
+        function flashStatus(msg) {
+            clipStatus.textContent = msg;
+            clipStatus.classList.add('show');
+            setTimeout(() => clipStatus.classList.remove('show'), 1200);
+        }
+
+        clipBtn.addEventListener('click', () => {
+            const open = clipPanel.classList.toggle('open');
+            if (open) {
+                clipBtn.classList.remove('has_unread');
+                setTimeout(() => clipArea.focus(), 30);
+            }
+        });
+
+        // Server -> us. Land in the textarea and flash a green dot on the
+        // button so the operator knows new content arrived.
+        rfb.addEventListener('clipboard', (e) => {
+            const text = e.detail && e.detail.text;
+            if (typeof text !== 'string') return;
+            clipArea.value = text;
+            // Best-effort: also push to the OS clipboard via Clipboard API
+            // (needs HTTPS / localhost + user gesture). Silent on failure.
+            try {
+                if (navigator.clipboard && navigator.clipboard.writeText) {
+                    navigator.clipboard.writeText(text).catch(() => {});
+                }
+            } catch (e) {}
+            if (!clipPanel.classList.contains('open')) {
+                clipBtn.classList.add('has_unread');
+            }
+        });
+
+        // Us -> server. Sends the textarea contents to the remote clipboard.
+        clipSend.addEventListener('click', () => {
+            try {
+                rfb.clipboardPasteFrom(clipArea.value || '');
+                flashStatus('✓ sent');
+            } catch (err) {
+                flashStatus('send failed');
+            }
+        });
+
+        // Convenience: paste-from-OS into the textarea (Clipboard API).
+        // Avoids the operator manually selecting + paste-ing.
+        clipCopy.addEventListener('click', async () => {
+            try {
+                if (!navigator.clipboard || !navigator.clipboard.readText) {
+                    flashStatus('Clipboard API unavailable');
+                    return;
+                }
+                const t = await navigator.clipboard.readText();
+                clipArea.value = t;
+                flashStatus('✓ pasted from OS');
+            } catch (err) {
+                flashStatus('OS clipboard blocked');
+            }
+        });
+    </script>
+</head>
+
+<body>
+    <div id="top_bar">
+        <div id="status">Loading</div>
+        <div id="sendCtrlAltDelButton">Send CtrlAltDel</div>
+    </div>
+    <div id="screen">
+        <!-- This is where the remote screen will appear -->
+    </div>
+
+    <!-- paprika clipboard overlay -->
+    <button id="paprika_clip_btn" title="Clipboard: send/receive text between your machine and the remote browser">
+        📋 Clipboard<span class="clip_dot" title="new content from remote"></span>
+    </button>
+    <div id="paprika_clip_panel" role="dialog" aria-label="Clipboard sync">
+        <h4>
+            📋 Clipboard
+            <span class="hint">remote ⇄ local</span>
+        </h4>
+        <textarea id="paprika_clip_text" placeholder="ここに貼って [Send to remote] か、リモートでコピーすると自動で表示されます"></textarea>
+        <div class="row">
+            <button id="paprika_clip_send" title="このテキストエリアの内容をリモートのクリップボードへ送信">▶ Send to remote</button>
+            <button id="paprika_clip_copy" class="secondary" title="ローカル OS のクリップボードからテキストエリアに貼る (HTTPS or localhost のみ)">📥 Paste from OS</button>
+            <span class="status" id="paprika_clip_status"></span>
+        </div>
+    </div>
+</body>
+</html>

@@ -1,0 +1,91 @@
+# venv / Python
+.venv/
+venv/
+__pycache__/
+*.py[cod]
+*$py.class
+*.egg-info/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# Editor / OS
+.idea/
+.vscode/
+.DS_Store
+Thumbs.db
+
+# paprika runtime artifacts — ignore data/ except the plugin registry.
+# Pattern: ignore everything under data/ with data/*; then un-ignore
+# the plugin catalog AND the plugin adapters so git tracks both:
+#   data/tools/catalog.json     ← directory of known plugins (operator-edited)
+#   data/tools/installed/<n>/   ← bundled plugin sources
+# Worker .lib / venv dirs INSIDE an installed plugin are still ignored.
+# Runtime audit log (invocations.jsonl) is excluded too -- regenerated.
+data/*
+!data/tools/
+data/tools/*
+!data/tools/catalog.json
+!data/tools/installed/
+data/tools/installed/*
+!data/tools/installed/*/
+data/tools/installed/*/venv/
+data/tools/installed/*/lib/
+data/tools/installed/*/__pycache__/
+data/tools/invocations.jsonl
+assets/
+downloaded-paps/
+downloaded/
+
+# CLI scratch files
+page.html
+iframe.html
+log.txt
+*.log
+
+# Local environment overrides
+.env
+.env.local
+.env.agent
+*.local
+scripts/workers.env
+scripts/extra-hosts.env
+scripts/llm.env
+
+# Local-only ops notes (contains internal IPs / SSH key paths)
+CLAUDE.md
+.claude/
+
+# paprika_client example-script run artifacts
+client/python/*.png
+client/python/*.jpg
+client/python/build/
+client/python/dist/
+client/python/*.egg-info/
+
+# Docker
+*.tar.gz
+*.tar
+
+# Windows build artefacts (PyInstaller --onedir output + bundled binaries
+# fetched by windows/build.ps1; never checked in -- regenerated each build)
+build/
+dist/
+windows/bin/redis/
+windows/bin/vnc/
+*.spec.bak
+
+# Internal-only docs / notes (contains real site names, IPs, etc.)
+internal/
+
+# Scratch / one-off / temp dumps. These accumulate in the repo root
+# during exploratory work; never check them in.
+tmp_*.json
+tmp_*.txt
+*.orig
+*.rej
+patch_*.py
+extracted-from-*
+orig.png
+orig.jpg
+*.scratch

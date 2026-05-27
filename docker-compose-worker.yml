@@ -1,0 +1,117 @@
+# Stand-alone Worker deployment (no Hub on this machine).
+# Use this on a remote server to add a worker to an existing Hub.
+#
+# Usage:
+#   docker compose -f docker-compose-worker.yml up -d --build
+#
+# Customize via environment / .env file (all optional; everything has a default):
+#   HUB_URL=ws://192.168.1.10:8000        (default: ws://paprika.lan:8000)
+#   LANE_POOL=4                            (default: 2; legacy SLOT_POOL accepted)
+#   NOVNC_PUBLIC_HOST=myworker.lan         (default: auto = container hostname)
+#   WORKER_ID=worker-tokyo-1               (default: auto-generated & persisted)
+
+services:
+  worker:
+    build:
+      context: .
+      dockerfile: docker/worker/Dockerfile
+    image: paprika-worker:latest
+    restart: unless-stopped
+    shm_size: "2gb"
+    # See docker-compose.yml worker.cap_add comment -- needed for the
+    # opt-in egress firewall (PAPRIKA_WORKER_EGRESS_FIREWALL=1).
+    cap_add:
+      - NET_ADMIN
+    ports:
+      # Match LANE_POOL — bump both together if you want more lanes.
+      - "6080-6081:6080-6081"
+    environment:
+      - HUB_URL=${HUB_URL:-ws://paprika.lan:8000}
+      # SSRF deep-defence firewall (see docker/worker/egress-firewall.sh).
+      - PAPRIKA_WORKER_EGRESS_FIREWALL=${PAPRIKA_WORKER_EGRESS_FIREWALL:-0}
+      - PAPRIKA_FIREWALL_ALLOW_HOSTS=${PAPRIKA_FIREWALL_ALLOW_HOSTS:-}
+      - PAPRIKA_FIREWALL_ALLOW_IPS=${PAPRIKA_FIREWALL_ALLOW_IPS:-}
+      # LANE_POOL is the new name; SLOT_POOL is kept as a fallback so old
+      # .env files keep working. Entrypoint resolves them.
+      - LANE_POOL=${LANE_POOL:-}
+      - SLOT_POOL=${SLOT_POOL:-2}
+      - MAX_CONCURRENT=${MAX_CONCURRENT:-2}
+      - NOVNC_PUBLIC_HOST=${NOVNC_PUBLIC_HOST:-auto}
+      - NOVNC_BASE_PORT=6080
+      - LABELS=${LABELS:-}
+      - WORKER_ID=${WORKER_ID:-}
+      # URL of the paprika-agent service for LLM-driven jobs (set when
+      # using JobOptions.goal). The agent now runs inside the hub
+      # stack, so external workers point at the hub host's LAN IP.
+      - AGENT_URL=${AGENT_URL:-http://paprika.lan:8001}
+      # Tab/popup containment hooks (target=_blank rewrite +
+      # window.open override). On by default. Set AGENT_TAB_HOOKS=0
+      # when these interfere with a site's own click handlers.
+      - AGENT_TAB_HOOKS=${AGENT_TAB_HOOKS:-1}
+      # Physical (CDP-level) suppression of new tabs. Runs underneath
+      # AGENT_TAB_HOOKS and catches cross-origin window.open and other
+      # cases the DOM hook misses. Default on. AGENT_TAB_KILL_REDIRECT=0
+      # makes us silently drop popups instead of redirecting same-origin
+      # ones into the main tab.
+      - AGENT_TAB_KILL=${AGENT_TAB_KILL:-1}
+      - AGENT_TAB_KILL_REDIRECT=${AGENT_TAB_KILL_REDIRECT:-1}
+      - AGENT_TAB_KILL_URL_SETTLE_S=${AGENT_TAB_KILL_URL_SETTLE_S:-0.5}
+      # Safety net: end the agent loop after N actions in a row with
+      # no capture/done call. Default 0 (disabled). Set to a positive
+      # value to re-arm -- useful if a flaky model gets stuck in
+      # "click the first link forever" loops.
+      - AGENT_MAX_NO_CAPTURE_STREAK=${AGENT_MAX_NO_CAPTURE_STREAK:-0}
+      # Physical no-new-tab mode at the Chrome level. When 1, passes
+      # --block-new-web-contents to Chrome so window.open returns null
+      # and target=_blank clicks are silently dropped (Chrome's
+      # kBlockNewWebContents flag). Off by default because it can
+      # break clicks on sites that rely on new-window navigation.
+      # See AGENT_TAB_KILL for a softer alternative.
+      - CHROME_BLOCK_NEW_TABS=${CHROME_BLOCK_NEW_TABS:-0}
+      # PAGE TEXT section (body innerText excerpt) in the outline.
+      # Set AGENT_INCLUDE_BODY_TEXT=0 on sites whose prose triggers
+      # safety-trained model refusals (gpt-oss-* on adult content etc).
+      - AGENT_INCLUDE_BODY_TEXT=${AGENT_INCLUDE_BODY_TEXT:-1}
+      # Per-step PNG screenshot for vision LLMs (Qwen2.5-VL etc.).
+      # Off by default; turn on when AGENT_MODEL_NAME is a vision model.
+      - AGENT_SEND_SCREENSHOTS=${AGENT_SEND_SCREENSHOTS:-0}
+      # NOTE: COGAGENT_URL / COGAGENT_REQUEST_TIMEOUT_S env vars were
+      # removed in the v2 cleanup along with the vision-agent mode and
+      # the cogagent_service GPU-host process. Vision-grounded actions
+      # now go through Qwen-VL (vision-chat kind) + plugin auto-invocation.
+      # Direct vLLM URL of the chat LLM (Qwen2.5-VL by default).
+      # Worker uses it to translate Japanese page.agent() goals to
+      # English before invoking the agent engine.
+      - AGENT_LLM_URL=${AGENT_LLM_URL:-http://<gpu-host>:15082}
+      - AGENT_MODEL_NAME=${AGENT_MODEL_NAME:-qwen2.5-vl-72b}
+      - VISION_WHEEL_STEP_PX=${VISION_WHEEL_STEP_PX:-100}
+      # yt-dlp timeout per HLS/DASH playlist that vision-agent
+      # follows. Default 30 min covers a full feature-length video
+      # at slow CDN speeds; lower for crawls that prefer to give up
+      # on stragglers.
+      - VISION_YTDLP_TIMEOUT_S=${VISION_YTDLP_TIMEOUT_S:-1800}
+      # Diagnostic: when 1, log every Network.ResponseReceived
+      # in the passive asset capture, even ones filtered out by
+      # MIME. Useful when investigating "saved nothing despite
+      # popup-follow landing on a video URL". Off by default.
+      - SESSION_ASSETS_DEBUG=${SESSION_ASSETS_DEBUG:-0}
+      - PYTHONUNBUFFERED=1
+    volumes:
+      # Auto-generated WORKER_ID is persisted here.
+      - paprika-worker-state:/root/.paprika
+      # Bind-mount the Python source from the host so iterating on
+      # agent_runner.py etc. only needs `docker compose restart worker`
+      # (no rebuild = no Chrome reinstall). The image still ships a copy
+      # of the same files baked in for fresh hosts that don't have the
+      # source tree on disk -- the bind mount just shadows it.
+      - ./server:/app/server
+      - ./core:/app/core
+      # VERSION file populated by scripts/sync-workers.sh so the admin
+      # UI can show which build each worker is running.
+      - ./VERSION:/app/VERSION:ro
+      # Plugin registry — same layout as the hub container so workers can
+      # import plugin adapters directly (e.g. paprika-ytdlp/adapter.py).
+      - ./data/tools:/data/tools
+
+volumes:
+  paprika-worker-state:

@@ -1,0 +1,4 @@
+User-agent: *
+Allow: /
+
+Sitemap: https://paps-jp.github.io/paprika/sitemap.xml

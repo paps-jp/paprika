@@ -1,0 +1,31 @@
+{
+  "name": "paprika-ytdlp",
+  "version": "1.0.0",
+  "kind": "python_lib",
+  "capabilities": ["video_download"],
+  "actions": {
+    "download": {
+      "description": "yt-dlp でHLS/DASH/直URL動画をダウンロードする。liveストリームは自動検出してN秒録画に切り替える。",
+      "entry": "adapter:download",
+      "timeout_s": 660,
+      "input_schema": {
+        "url":                  "string",
+        "output_dir":           "string",
+        "referer":              "string?",
+        "cookies_file":         "string?",
+        "cookies_from_browser": "string?",
+        "timeout":              "int?",
+        "live_record_s":        "int?",
+        "extra_args":           "list?"
+      },
+      "output_schema": {
+        "ok":        "bool",
+        "message":   "string",
+        "log_lines": "list[string]"
+      }
+    }
+  },
+  "notes": "fetcher.py の run_ytdlp() をプラグインに移植。live HLS 自動検出・fMP4マージは adapter 内で完結。",
+  "installed_at": "2026-05-27",
+  "installed_by": "paps-jp"
+}

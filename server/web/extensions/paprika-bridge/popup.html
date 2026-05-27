@@ -1,0 +1,90 @@
+<!doctype html>
+<html lang="ja">
+<head>
+<meta charset="utf-8">
+<title>Paprika Bridge</title>
+<style>
+  body { font: 13px -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
+         min-width: 320px; max-width: 380px; margin: 0; padding: 14px 16px;
+         color: #222; }
+  h1   { font-size: 14px; margin: 0 0 8px; display: flex; align-items: center; gap: 6px; }
+  h1 img.logo { width: 18px; height: 18px; vertical-align: middle; }
+  label { display: block; font-weight: 600; margin: 12px 0 4px; font-size: 12px;
+          color: #444; }
+  input, select { width: 100%; padding: 6px 8px; border: 1px solid #ccc;
+                  border-radius: 4px; font-size: 13px; box-sizing: border-box; }
+  button { background: #fef5e7; border: 1px solid #d4a13d; color: #8a5a00;
+           padding: 8px 14px; border-radius: 4px; font-weight: 600; cursor: pointer;
+           font-size: 13px; }
+  button:hover { background: #fce5b2; }
+  button:disabled { opacity: .5; cursor: not-allowed; }
+  .row { display: flex; gap: 6px; align-items: center; margin-top: 12px; }
+  .row > button { flex: 1; }
+  .muted { color: #888; font-size: 11px; margin-top: 4px; }
+  #status { margin-top: 12px; padding: 8px 10px; border-radius: 4px;
+            font-size: 12px; white-space: pre-wrap; word-break: break-all;
+            display: none; }
+  #status.ok    { background: #e6f5e6; color: #2a7a2a; display: block; }
+  #status.err   { background: #fbe9e7; color: #a23822; display: block; }
+  #status.info  { background: #eef4fb; color: #3a5a8b; display: block; }
+  .toggle { display: flex; gap: 8px; align-items: center; margin-top: 10px; }
+  .toggle input { width: auto; }
+  details { margin-top: 12px; font-size: 12px; }
+  details summary { cursor: pointer; color: #666; }
+  details code { background: #f5f5fa; padding: 1px 4px; border-radius: 3px; }
+</style>
+</head>
+<body>
+
+<h1><img src="icon-48.png" alt="paprika" class="logo"> Paprika Bridge</h1>
+
+<label for="hub">Hub URL</label>
+<input id="hub" type="text" placeholder="http://paprika.lan" />
+<div class="muted">最初の1回だけ入力すれば、次回以降は保存されます。</div>
+
+<label for="scope">Scope</label>
+<select id="scope">
+  <option value="active-host">現在のタブのホストだけ (推奨)</option>
+  <option value="all">全 host の cookie を一括 push</option>
+</select>
+<div class="muted" id="scopeHint">現在のタブ: <span id="activeHost">(loading)</span></div>
+
+<div class="toggle">
+  <input type="checkbox" id="includeSessionCookies" checked />
+  <label for="includeSessionCookies" style="display:inline; margin:0; font-weight:normal;">
+    セッション cookie (期限なし) も含める
+  </label>
+</div>
+
+<div class="row">
+  <button id="pushBtn">Push cookies to hub</button>
+</div>
+
+<div id="status"></div>
+
+<details>
+  <summary>使い方 / FAQ</summary>
+  <p>
+    現在の Chrome のクッキーを paprika hub の <code>/hosts/{host}</code> に
+    PUT します。送ったホストはハブ側で
+    <code>options.cookies_from="example.com"</code> として
+    ジョブから参照できます。
+  </p>
+  <p>
+    <strong>送られるもの:</strong> name, value, domain, path,
+    expires, secure, httpOnly, sameSite。
+    <br>
+    <strong>送られないもの:</strong> Login Data, IndexedDB, Local Storage,
+    saved passwords — これらは Chrome 拡張 API では読めません。
+    完全な profile は CLI (<code>paprika-client upload-profile</code>) を
+    使ってください。
+  </p>
+  <p>
+    オープン中の Chrome の状態をそのまま送るので、Chrome を閉じる必要も
+    なし、tarball を作る必要もなし。即時。
+  </p>
+</details>
+
+<script src="popup.js"></script>
+</body>
+</html>

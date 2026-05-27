@@ -1,0 +1,197 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+<meta charset="utf-8">
+<title>管理画面ガイド — Paprika の Web UI でブラウザ自動化を実行</title>
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<link rel="stylesheet" href="style.css">
+<meta name="description" content="Paprika 管理画面（Web UI）の使い方。コードを書かずに URL を投げ、ライブパネルで Log / noVNC / ギャラリーを確認。実行モード（Fetch / LLM / Macro / Code）、ワーカー一覧、Live preview をスクショ付きで解説。">
+<link rel="canonical" href="https://paps-jp.github.io/paprika/admin.html">
+<meta property="og:type" content="website">
+<meta property="og:site_name" content="Paprika">
+<meta property="og:title" content="管理画面ガイド — Paprika の Web UI でブラウザ自動化を実行">
+<meta property="og:description" content="Paprika 管理画面（Web UI）の使い方。コードを書かずに URL を投げ、ライブパネルで Log / noVNC / ギャラリーを確認。実行モード（Fetch / LLM / Macro / Code）、ワーカー一覧、Live preview をスクショ付きで解説。">
+<meta property="og:url" content="https://paps-jp.github.io/paprika/admin.html">
+<meta property="og:image" content="https://paps-jp.github.io/paprika/img/admin-submit.png">
+<meta property="og:locale" content="ja_JP">
+<meta name="twitter:card" content="summary_large_image">
+<meta name="twitter:title" content="管理画面ガイド — Paprika の Web UI でブラウザ自動化を実行">
+<meta name="twitter:description" content="Paprika 管理画面（Web UI）の使い方。コードを書かずに URL を投げ、ライブパネルで Log / noVNC / ギャラリーを確認。実行モード（Fetch / LLM / Macro / Code）、ワーカー一覧、Live preview をスクショ付きで解説。">
+<meta name="twitter:image" content="https://paps-jp.github.io/paprika/img/admin-submit.png">
+<script type="application/ld+json">{
+  "@context": "https://schema.org",
+  "@type": "Organization",
+  "name": "特定非営利活動法人ぱっぷす",
+  "alternateName": ["paps", "PAPS", "ぱっぷす"],
+  "url": "https://www.paps.jp",
+  "logo": "https://paps-jp.github.io/paprika/icon.svg",
+  "sameAs": [
+    "https://github.com/paps-jp",
+    "https://paps-jp.github.io/paprika/"
+  ]
+}</script>
+</head>
+<body>
+
+<nav class="topnav">
+  <a class="brand" href="index.html"><span class="logo"><img src="icon.svg" alt=""></span> Paprika</a>
+  <span class="links">
+    <a href="index.html">Home</a>
+    <a href="intro.html">はじめに</a>
+    <a href="guides.html">ガイド</a>
+    <a href="admin.html" class="active">管理画面</a>
+    <a href="api.html">API</a>
+    <a href="operations.html">サーバー</a>
+  </span>
+  <a class="gh" href="https://github.com/paps-jp/paprika">GitHub ↗</a>
+</nav>
+
+<div class="layout">
+  <aside class="sidebar">
+    <h4>管理画面ガイド</h4>
+    <ul>
+      <li><a href="#access">開く</a></li>
+      <li><a href="#header">ヘッダー</a></li>
+      <li><a href="#tabs">タブ一覧</a></li>
+      <li><a href="#submit">Submit（送信）</a></li>
+      <li><a href="#live">Live パネル</a></li>
+      <li><a href="#jobs">Recent jobs</a></li>
+      <li><a href="#workers">Workers</a></li>
+      <li><a href="#screens">Live preview</a></li>
+      <li><a href="#registries">レジストリ各種</a></li>
+    </ul>
+  </aside>
+
+  <main class="content">
+    <h1>管理画面ガイド</h1>
+    <p class="lead">ブラウザだけで Paprika を操作できる管理 UI の使い方。コードを書かずに URL を投げ、進行をライブで見て、収集物を確認できます。</p>
+
+    <img class="shot" src="img/admin-submit.png" alt="Paprika 管理画面の実行（Submit）タブ">
+    <p class="shot-cap">実行（Submit）タブ。上の赤いヘッダー＋タブが管理画面。このドキュメントのヘッダーと同じ配色です。</p>
+
+    <h2 id="access">開く</h2>
+    <p>ブラウザで <strong><a href="http://paprika.lan:8000">http://paprika.lan:8000</a></strong>（または <code>http://&lt;hub&gt;:8000</code>）を開きます。
+    赤いヘッダーと、その下のタブが管理画面です。右上の言語切替で日本語 / English を切り替えられます。</p>
+    <div class="callout info"><strong>3 つの操作経路</strong>
+    管理画面（このページ）/ <a href="api.html">HTTP API・SDK</a> / <a href="https://paprika.lan/docs">Swagger</a> はどれも同じハブを操作します。まずは管理画面が手軽です。</div>
+
+    <h2 id="header">ヘッダー</h2>
+    <p>画面上部に固定される赤いバー（このドキュメントのヘッダーと同じ配色）。</p>
+    <img class="shot" src="img/cap-header.png" alt="管理画面ヘッダー">
+    <table>
+      <thead><tr><th>要素</th><th>意味</th></tr></thead>
+      <tbody>
+        <tr><td><strong>Paprika</strong></td><td>ロゴ。クリックで Submit へ戻る</td></tr>
+        <tr><td>ステータス</td><td>ハブとの接続状態・エラー表示</td></tr>
+        <tr><td>Manual</td><td>このマニュアル（GitHub Pages）を新規タブで開く</td></tr>
+        <tr><td>言語切替</td><td>日本語 / English</td></tr>
+      </tbody>
+    </table>
+
+    <h2 id="tabs">タブ一覧</h2>
+    <p>ヘッダー直下のタブで画面を切り替えます。各タブはURL の <code>#hash</code> に対応（例 <code>/#jobs</code>）し、ブックマーク・直リンク可能。数字バッジは件数。</p>
+    <img class="shot" src="img/cap-tabs.png" alt="管理画面のタブバー">
+    <table>
+      <thead><tr><th>タブ</th><th>何ができるか</th></tr></thead>
+      <tbody>
+        <tr><td><strong>実行</strong>（Submit）</td><td>URL とモードを指定してジョブを投入。既定の入口</td></tr>
+        <tr><td><strong>ワーカー</strong>（Workers）</td><td>接続中ワーカーの一覧・状態・レーン使用状況</td></tr>
+        <tr><td><strong>最近のジョブ</strong>（Recent jobs）</td><td>投入済みジョブの一覧・状態・成果物への導線</td></tr>
+        <tr><td><strong>定義済みジョブ</strong>（Preset job）</td><td>よく使う実行設定を保存して再投入</td></tr>
+        <tr><td><strong>ライブプレビュー</strong>（Live preview）</td><td>全レーンのライブ画面をタイル表示</td></tr>
+        <tr><td colspan="2" style="background:#fafafa;"><em>「…その他」メニュー内（高度な設定）</em></td></tr>
+        <tr><td>Sessions</td><td>生きているセッション（対話的ブラウザ）一覧</td></tr>
+        <tr><td>Hosts</td><td>ホスト別の Cookie / ログイン情報の登録・管理</td></tr>
+        <tr><td>Profiles</td><td>アップロード済み Chrome プロファイル</td></tr>
+        <tr><td>Extensions</td><td>ワーカー Chrome に入れる拡張</td></tr>
+        <tr><td>AI Engines</td><td>LLM / VLM バックエンドの登録</td></tr>
+        <tr><td>Skills / Conventions</td><td>codegen に注入する再利用スニペット / 運用ルール</td></tr>
+        <tr><td>Settings</td><td>ハブ全体の設定（最小ファイルサイズ等）</td></tr>
+      </tbody>
+    </table>
+
+    <h2 id="submit">実行（Submit）</h2>
+    <p>URL を入れて <strong>実行モード</strong>を選び <strong>実行</strong>。投入すると下に Live パネルが開きます。モードは 4 つ：</p>
+    <img class="shot" src="img/cap-modes.png" alt="実行モードの選択（Fetch / LLM / Macro / Code）">
+    <p class="shot-cap">実行モードのカードです。クリックで切り替えできます。</p>
+    <table>
+      <thead><tr><th>モード</th><th>内部 mode</th><th>用途</th></tr></thead>
+      <tbody>
+        <tr><td><strong>Fetch</strong></td><td><code>fetch</code></td><td>単発ページ取得。URL を開いて画像・動画・HTML を収集（LLM 不要・最速）。スクロール / 動画再生 / Cookie 注入などのオプションあり</td></tr>
+        <tr><td><strong>LLM（コード生成）</strong></td><td><code>codegen-loop</code></td><td>自然言語のゴールを渡すと LLM がスクリプト生成 → sandbox 実行 → 失敗時リトライ</td></tr>
+        <tr><td><strong>Macro</strong></td><td><code>rerun</code></td><td>UI でアクションを順に並べる簡易マクロ。LLM 不要で即実行</td></tr>
+        <tr><td><strong>Code</strong></td><td><code>rerun</code></td><td>paprika-client の Python を直接貼り付けて 1 回実行（過去ジョブの再実行も）</td></tr>
+      </tbody>
+    </table>
+    <p>CSS セレクタが効かない画面を「見て」操作させたいときは、Fetch オプションや LLM の設定から <code>vision-agent</code> を選べます。</p>
+    <div class="callout tip"><strong>最小ファイルサイズ</strong>
+    小さなアイコン等を除外したいときは Fetch オプション（または Settings の既定値）でバイト数を指定。<code>0</code> = フィルタ無効。</div>
+
+    <h2 id="live">Live パネル</h2>
+    <p>ジョブ投入直後や「watch live」から開く、実行中のジョブを観察するパネル。上部に LIVE バッジ・ジョブID・ステータス・収集数、その下のタブで見方を切り替えます。</p>
+    <img class="shot" src="img/cap-gallery.png" alt="Live パネルのギャラリータブ（収集画像のサムネイル）">
+    <p class="shot-cap">Live パネルの「ギャラリー」タブ。収集した画像のサムネイルが並ぶ（例: Wikipedia 記事の画像 50 点）。</p>
+    <table>
+      <thead><tr><th>タブ</th><th>内容</th></tr></thead>
+      <tbody>
+        <tr><td><strong>ログ</strong></td><td>ライブログ（<code>tail -f</code> 相当）。paprika-client の各操作と結果が 1 行にまとまって流れる</td></tr>
+        <tr><td><strong>noVNC</strong></td><td>実行中の実ブラウザをそのまま表示・手動操作も可能</td></tr>
+        <tr><td><strong>スクリーンショット</strong></td><td>各ステップで撮られたスクショ</td></tr>
+        <tr><td><strong>リンク</strong></td><td>ページから抽出した <code>&lt;a href&gt;</code> 一覧</td></tr>
+        <tr><td><strong>ネットワーク</strong></td><td>読み込んだメディアのネットワークログ</td></tr>
+        <tr><td><strong>コード</strong></td><td>codegen が生成した script.py / 各 attempt</td></tr>
+        <tr><td><strong>ギャラリー</strong></td><td>収集された画像・動画のサムネイル</td></tr>
+      </tbody>
+    </table>
+
+    <h2 id="jobs">最近のジョブ（Recent jobs）</h2>
+    <p>投入済みジョブの一覧。各行に id / モード / ステータス / URL / 収集数 / 開始・終了 / ワーカー・レーン / 操作メニュー。</p>
+    <img class="shot" src="img/cap-jobs.png" alt="最近のジョブ一覧（IP・URL は伏字）">
+    <p class="shot-cap">最近のジョブ。※このスクショは公開用に IP / URL を伏字化しています。</p>
+    <ul>
+      <li><strong>columns</strong> ボタンで表示する列を選択（開始/終了時刻・所要などを出し入れ）</li>
+      <li>行の <strong>actions</strong> メニュー: watch live / live log / screenshots / 結果 JSON / 再実行 / 削除 など</li>
+      <li><strong>cleanup old…</strong> で古い完了ジョブを一括削除（最新は常に保持）</li>
+      <li>ステータス: <code>queued</code> / <code>running</code> / <code>completed</code> / <code>failed</code> / <code>cancelled</code></li>
+    </ul>
+
+    <h2 id="workers">ワーカー（Workers）</h2>
+    <p>接続中のワーカー一覧。各ワーカーのレーン数・実行中ジョブ数・状態（active / drain / standby）が見えます。
+    レーンが空いているワーカーがいないと新規ジョブは投入できず 503（混雑時）になります。詳しい挙動は <a href="operations.html#update">サーバー → 更新・フリート運用</a>。</p>
+    <img class="shot" src="img/cap-workers.png" alt="ワーカー一覧（ID・IP は伏字）">
+    <p class="shot-cap">ワーカー一覧。※公開用に ワーカーID / IP を伏字化しています。</p>
+
+    <h2 id="screens">Live preview</h2>
+    <p>フリート全レーンのライブ画面をタイル表示。状態は 3 色：</p>
+    <ul>
+      <li><span class="badge" style="color:#c0392b;">● RUNNING</span> — スクリプト操作 / noVNC 操作が進行中</li>
+      <li><span class="badge" style="color:#a07000;">● KEEPALIVE</span> — 生きているが誰も触っていない</li>
+      <li><span class="badge">IDLE</span> — 閉じられ回収済み（レーン解放）</li>
+    </ul>
+
+    <h2 id="registries">レジストリ各種</h2>
+    <table>
+      <thead><tr><th>タブ</th><th>使いどころ</th></tr></thead>
+      <tbody>
+        <tr><td><strong>Hosts</strong></td><td>会員サイトのログイン後 Cookie を保存。以後の収集で <code>cookies_from</code> 指定すれば自動再利用。自動再ログインのレシピも登録可</td></tr>
+        <tr><td><strong>Profiles</strong></td><td>ログイン済み Chrome プロファイルをアップロードし <code>use_profile</code> で利用</td></tr>
+        <tr><td><strong>Extensions</strong></td><td>uBlock 等の拡張をワーカー Chrome に配布</td></tr>
+        <tr><td><strong>AI Engines</strong></td><td>codegen / vision に使う LLM・VLM の接続先を登録</td></tr>
+        <tr><td><strong>Skills / Conventions</strong></td><td>codegen が再利用するスニペット / 「やってはいけない」運用ルール。失敗パターンを登録すると次回 prompt に注入される</td></tr>
+        <tr><td><strong>Settings</strong></td><td>最小ファイルサイズなどハブ全体のデフォルト</td></tr>
+      </tbody>
+    </table>
+    <img class="shot" src="img/cap-settings.png" alt="Settings タブ（Submit デフォルト / 学習動作）">
+    <p class="shot-cap">Settings タブです。「…その他」メニューから開けます。Submit のデフォルトや codegen の学習動作を設定できます。</p>
+
+    <div class="callout info"><strong>同じことを自動化したい</strong>
+    管理画面でできる「URL を投げて画像を取得する」「ログインして Cookie を保存」などは、すべて <a href="api.html">SDK / API</a> から実行できます。手順が固まったらスクリプト化を。</div>
+
+    <div class="pager">
+      <a href="guides.html"><div class="dir">← 戻る</div><div class="ttl">ガイド</div></a>
+      <a class="next" href="api.html"><div class="dir">次へ →</div><div class="ttl">API リファレンス</div></a>
+    </div>
+  </main>
+</div>
+</body>
+</html>

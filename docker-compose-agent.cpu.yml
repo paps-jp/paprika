@@ -1,0 +1,79 @@
+# GPU-less (CPU) variant of the agent stack: Ollama + paprika-agent.
+#
+# Why this file exists
+# --------------------
+# hub / worker themselves DO NOT need a GPU -- they build on python:3.13-slim
+# and call the LLM only at job time. Fetch / Macro(Simple) modes work with no
+# LLM at all. A GPU is only needed by the LLM "brain" (this stack), and only
+# for AI / codegen-loop / vision-agent modes.
+#
+# The default docker-compose-agent.yml reserves an NVIDIA GPU
+# (deploy.resources.reservations.devices: nvidia), so it FAILS to start on a
+# host without a GPU + nvidia-container-toolkit:
+#     "could not select device driver "nvidia" with capabilities: [[gpu]]"
+# This file is identical EXCEPT the GPU reservation is removed, so Ollama runs
+# on CPU. It lets you bring up the whole thing -- including AI modes -- on a
+# machine with no GPU.
+#
+# Trade-off: CPU inference is SLOW. Use a small instruct model (default below)
+# and expect codegen/agent steps to take many seconds. For real throughput,
+# point the hub/workers at a GPU box (scripts/llm.env) instead.
+#
+# Usage (on the GPU-less host):
+#   docker compose -f docker-compose-agent.cpu.yml up -d --build
+#   # one-time: pull the model into the ollama volume
+#   docker compose -f docker-compose-agent.cpu.yml exec ollama ollama pull qwen2.5:7b
+#   curl http://localhost:8001/health
+#
+# Then make hub/workers use it. If this runs on the same host as the main
+# stack, set in .env (or shell):
+#   AGENT_URL=http://<this-host>:8001        # paprika-runner / page.agent()
+#   AGENT_LLM_URL=http://<this-host>:11434   # raw chat-completions (vision/JP->EN)
+#   CODEGEN_LLM_URL=http://<this-host>:11434/v1
+# (Ollama exposes an OpenAI-compatible API at /v1.)
+#
+# Customize via env:
+#   MODEL_NAME=qwen2.5:7b   (smaller = faster on CPU; 3b is snappier, 14b smarter)
+#   AGENT_PORT=8001
+#   OLLAMA_PORT=11434
+
+services:
+  ollama:
+    image: ollama/ollama:latest
+    restart: unless-stopped
+    ports:
+      - "${OLLAMA_PORT:-11434}:11434"
+    volumes:
+      - ollama-models:/root/.ollama
+    environment:
+      # Keep the model resident so back-to-back calls skip the cold reload.
+      - OLLAMA_KEEP_ALIVE=${OLLAMA_KEEP_ALIVE:--1}
+    # NOTE: no `deploy.resources.reservations.devices` block here -- that is
+    # the ONLY difference from docker-compose-agent.yml. Ollama auto-detects
+    # "no GPU" and runs on CPU.
+    healthcheck:
+      test: ["CMD-SHELL", "ollama list >/dev/null 2>&1 || exit 1"]
+      interval: 10s
+      timeout: 3s
+      retries: 30
+
+  agent:
+    build:
+      context: ./agent_service
+      dockerfile: Dockerfile
+    image: paprika-agent:latest
+    restart: unless-stopped
+    depends_on:
+      ollama:
+        condition: service_healthy
+    ports:
+      - "${AGENT_PORT:-8001}:8001"
+    environment:
+      - OLLAMA_URL=http://ollama:11434
+      # CPU-friendly default. Override with a bigger model if your CPU/RAM
+      # can take it, or a smaller one (qwen2.5:3b) for snappier responses.
+      - MODEL_NAME=${MODEL_NAME:-qwen2.5:7b}
+      - REQUEST_TIMEOUT_S=${REQUEST_TIMEOUT_S:-300}
+
+volumes:
+  ollama-models:

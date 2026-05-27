@@ -1,0 +1,32 @@
+{
+  "name": "paprika-proxy-fetch",
+  "version": "0.1.0",
+  "kind": "python_lib",
+  "capabilities": ["cloudflare_challenge", "ip_pool_rotation", "geo_bypass"],
+  "actions": {
+    "get_cookies": {
+      "description": "Proxied HTTP GET for hosts that block paprika's egress IP. Sends a browser-shaped GET through a configured HTTP/SOCKS5 proxy and returns whatever cookies the response sets, plus a short body excerpt for diagnosis. Strategy 4 in the Cloudflare bake-off: complements paprika-flare (which handles JS challenges but cannot bypass an outright IP ban). Use when HostKnowledge.per_page.barriers.cloudflare_challenge.subtype = 'ip_banned'.",
+      "entry": "adapter:get_cookies",
+      "timeout_s": 60,
+      "input_schema": {
+        "url":      "string",
+        "proxy":    "string?  (HTTP(S) or SOCKS5 URL; falls back to env PAPRIKA_PROXY_URL)",
+        "headers":  "dict?    (extra headers merged over the default browser-shape)",
+        "timeout_s":"int=30",
+        "verify":   "bool=true"
+      },
+      "output_schema": {
+        "cookies":     "dict[str,str]",
+        "status_code": "int",
+        "elapsed_ms":  "int",
+        "final_url":   "string",
+        "via_proxy":   "string",
+        "body_excerpt":"string"
+      }
+    }
+  },
+  "source": "paprika-native",
+  "installed_at": "2026-05-27",
+  "installed_by": "paps-jp",
+  "notes": "Paired with paprika-flare. Where paprika-flare uses a Worker Chrome to clear JS challenges from inside the LAN (cookies are IP-matched to the Worker NAT pool), paprika-proxy-fetch routes the request through a clean external proxy so it bypasses IP-level blocks (CF error 1020 / region geo-fence). The proxy URL is supplied per-call (HostKnowledge.barriers.*.tool_params.proxy) or via PAPRIKA_PROXY_URL env. v0.1 does NOT auto-rotate -- operator points it at a single residential / datacenter proxy; rotation will be added once we have a pool to feed it."
+}

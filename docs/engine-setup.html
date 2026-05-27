@@ -1,0 +1,394 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+<meta charset="utf-8">
+<title>AI エンジン追加ガイド — Paprika</title>
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<link rel="stylesheet" href="style.css">
+<meta name="description" content="Paprika に Ollama / vLLM / OpenAI 互換の AI エンジンを追加する手順。Qwen3-VL, GPT-4o, Claude 等を PaprikaEngine として登録し、page.agent() や codegen-loop で利用する方法。">
+<link rel="canonical" href="https://paps-jp.github.io/paprika/engine-setup.html">
+</head>
+<body>
+
+<nav class="topnav">
+  <a class="brand" href="index.html"><span class="logo"><img src="icon.svg" alt=""></span> Paprika</a>
+  <span class="links">
+    <a href="index.html">Home</a>
+    <a href="intro.html">はじめに</a>
+    <a href="guides.html">ガイド</a>
+    <a href="admin.html">管理画面</a>
+    <a href="api.html">API</a>
+    <a href="operations.html">サーバー</a>
+  </span>
+  <a class="gh" href="https://github.com/paps-jp/paprika">GitHub ↗</a>
+</nav>
+
+<div class="layout">
+  <aside class="sidebar">
+    <h4>エンジン追加</h4>
+    <ul>
+      <li><a href="#overview">概要</a></li>
+      <li><a href="#architecture">アーキテクチャ</a></li>
+      <li><a href="#ollama-install">1. Ollama インストール</a></li>
+      <li><a href="#model-pull">2. モデル取得</a></li>
+      <li><a href="#network">3. ネットワーク公開</a></li>
+      <li><a href="#register">4. エンジン登録</a></li>
+      <li><a href="#verify">5. 動作確認</a></li>
+      <li><a href="#usage">使い方</a></li>
+      <li><a href="#models">推奨モデル一覧</a></li>
+      <li><a href="#vllm">vLLM で構築する場合</a></li>
+      <li><a href="#openai">外部 API を登録</a></li>
+      <li><a href="#troubleshoot">トラブルシューティング</a></li>
+    </ul>
+  </aside>
+
+  <main>
+    <h1>AI エンジン追加ガイド</h1>
+    <p class="lead">
+      Paprika に自前の LLM / VLM を追加して、<code>page.agent()</code>・<code>page.ask()</code>・codegen-loop で利用する手順です。
+    </p>
+
+    <!-- ============================================================ -->
+    <h2 id="overview">概要</h2>
+    <p>
+      PaprikaEngine は OpenAI 互換 API (<code>/v1/chat/completions</code>) を話す任意の AI バックエンドを登録できる仕組みです。
+      Ollama / vLLM / LM Studio / OpenRouter / LiteLLM など、OpenAI 互換エンドポイントを持つサービスならすべて利用可能です。
+    </p>
+
+    <table>
+      <thead><tr><th>Engine の種類 (kind)</th><th>入力</th><th>用途</th></tr></thead>
+      <tbody>
+        <tr><td><code>chat</code></td><td>テキスト → テキスト</td><td><code>page.ask()</code>、codegen-loop、翻訳</td></tr>
+        <tr><td><code>vision-chat</code></td><td>テキスト + 画像 → テキスト</td><td><code>page.agent()</code>、画像解析</td></tr>
+        <tr><td><code>gui-agent</code></td><td>スクリーンショット + タスク → 座標操作</td><td>GUI 自動操作 (CogAgent 等)</td></tr>
+      </tbody>
+    </table>
+
+    <!-- ============================================================ -->
+    <h2 id="architecture">アーキテクチャ</h2>
+    <pre><code>┌─────────────┐     PUT /engines/slug     ┌──────────┐
+│  管理画面     │ ──────────────────────→ │  Hub     │
+│  or API      │                          │ :8000    │
+└─────────────┘                          └────┬─────┘
+                                              │ /v1/chat/completions
+                                              ▼
+                                    ┌──────────────────┐
+                                    │  Ollama / vLLM    │
+                                    │  :11434           │
+                                    │  (GPU or CPU)     │
+                                    └──────────────────┘</code></pre>
+    <p>
+      Hub はスクリプト実行時に <code>/engines/{slug}/resolve</code> でエンドポイント情報を取得し、
+      Worker が直接 AI サーバへリクエストします。
+      <code>endpoint</code> が <code>/chat/completions</code> で終わっていなければ、
+      自動的に <code>/v1/chat/completions</code> が付加されます。
+    </p>
+
+    <!-- ============================================================ -->
+    <h2 id="ollama-install">1. Ollama インストール</h2>
+    <p>AI エンジン用のマシン (GPU マシンまたは CPU サーバ) で実行:</p>
+    <pre><code># Ollama をインストール (Linux)
+curl -fsSL https://ollama.com/install.sh | sh
+
+# 確認
+ollama --version</code></pre>
+
+    <div class="note">
+      <strong>GPU について:</strong>
+      NVIDIA GPU があれば自動検出されます。GPU が無い場合は CPU モードで動作します
+      (推論速度は遅くなりますが、8B クラスの量子化モデルなら実用可能)。
+    </div>
+
+    <!-- ============================================================ -->
+    <h2 id="model-pull">2. モデル取得</h2>
+
+    <h3>Qwen3-VL 8B (Vision-Language Model, 推奨)</h3>
+    <pre><code># Qwen3-VL 8B をダウンロード (約 6.1GB, デフォルトで Q4_K_M 量子化)
+ollama pull qwen3-vl:8b
+
+# ダウンロード確認
+ollama list
+# NAME           ID              SIZE      MODIFIED
+# qwen3-vl:8b    901cae732162    6.1 GB    Just now</code></pre>
+
+    <h3>テスト実行</h3>
+    <pre><code># テキストクエリでテスト
+curl -s http://localhost:11434/v1/chat/completions \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "model": "qwen3-vl:8b",
+    "messages": [{"role":"user","content":"こんにちは。日本語で返答してください。"}],
+    "max_tokens": 100
+  }'</code></pre>
+
+    <div class="note">
+      <strong>Qwen3 の thinking モード:</strong>
+      Qwen3 はデフォルトで reasoning (思考) モードが有効です。
+      Ollama の OpenAI 互換 API では <code>reasoning</code> フィールドに思考内容、
+      <code>content</code> に最終回答が入ります。
+      PaprikaEngine はこの形式を自動的に処理します。
+    </div>
+
+    <!-- ============================================================ -->
+    <h2 id="network">3. ネットワーク公開</h2>
+    <p>
+      Ollama はデフォルトで <code>127.0.0.1:11434</code> (localhost のみ) で listen します。
+      Hub や Worker からアクセスするには、全インターフェイスで listen するよう設定を変更します。
+    </p>
+
+    <pre><code># systemd サービスに環境変数を追加
+sudo vi /etc/systemd/system/ollama.service</code></pre>
+
+    <p><code>[Service]</code> セクションに以下を追加:</p>
+    <pre><code>[Service]
+ExecStart=/usr/local/bin/ollama serve
+User=ollama
+Group=ollama
+Restart=always
+RestartSec=3
+<strong>Environment="OLLAMA_HOST=0.0.0.0"</strong>       ← この行を追加
+Environment="PATH=..."</code></pre>
+
+    <pre><code># 設定を反映して再起動
+sudo systemctl daemon-reload
+sudo systemctl restart ollama
+
+# 確認: 0.0.0.0:11434 で listen していること
+ss -tlnp | grep 11434
+# LISTEN  0  4096  *:11434  *:*  users:(("ollama",...))    ← OK</code></pre>
+
+    <h3>Hub からの接続テスト</h3>
+    <pre><code># Hub マシンから実行 (&lt;ollama-host&gt; は Ollama のホスト IP)
+curl -s http://&lt;ollama-host&gt;:11434/v1/models
+# {"object":"list","data":[{"id":"qwen3-vl:8b",...}]}</code></pre>
+
+    <div class="note">
+      <strong>ファイアウォール:</strong>
+      ポート 11434 が LAN 内で開放されていることを確認してください。
+      <code>ufw</code> を使っている場合: <code>sudo ufw allow 11434/tcp</code>
+    </div>
+
+    <!-- ============================================================ -->
+    <h2 id="register">4. エンジン登録</h2>
+    <p>Hub の API でエンジンを登録します。</p>
+
+    <h3>API で登録 (推奨)</h3>
+    <pre><code>curl -X PUT http://&lt;HUB_HOST&gt;:8000/engines/qwen3-vl-8b \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "slug": "qwen3-vl-8b",
+    "name": "Qwen3-VL 8B (Ollama)",
+    "kind": "vision-chat",
+    "protocol": "openai",
+    "endpoint": "http://&lt;OLLAMA_HOST&gt;:11434",
+    "model": "qwen3-vl:8b",
+    "timeout_s": 120,
+    "supports_tools": false,
+    "use_for_codegen": true,
+    "notes": "Qwen3-VL 8B on Ollama"
+  }'</code></pre>
+
+    <h3>パラメータ解説</h3>
+    <table>
+      <thead><tr><th>フィールド</th><th>説明</th></tr></thead>
+      <tbody>
+        <tr><td><code>slug</code></td><td>一意な識別子。スクリプトで <code>engine="qwen3-vl-8b"</code> と指定する名前</td></tr>
+        <tr><td><code>name</code></td><td>管理画面に表示される人間向け名称</td></tr>
+        <tr><td><code>kind</code></td><td><code>chat</code> / <code>vision-chat</code> / <code>gui-agent</code></td></tr>
+        <tr><td><code>protocol</code></td><td><code>openai</code> (Ollama / vLLM / OpenAI 互換すべて)</td></tr>
+        <tr><td><code>endpoint</code></td><td>ベース URL。<code>/v1/chat/completions</code> は自動付加される</td></tr>
+        <tr><td><code>model</code></td><td>API に渡す model 名 (Ollama のモデル名そのまま)</td></tr>
+        <tr><td><code>timeout_s</code></td><td>リクエストタイムアウト (秒)。CPU 推論なら長めに設定</td></tr>
+        <tr><td><code>supports_tools</code></td><td>Function calling 対応なら <code>true</code></td></tr>
+        <tr><td><code>use_for_codegen</code></td><td>Submit 画面の「コード生成 LLM」セレクタに表示するか</td></tr>
+        <tr><td><code>api_key_env</code></td><td>API キーの環境変数名 (Ollama では不要)</td></tr>
+      </tbody>
+    </table>
+
+    <h3>管理画面から登録</h3>
+    <p>
+      Admin UI (<code>http://&lt;HUB&gt;:8000/</code>) → Engines タブ → 「＋ 追加」からも登録できます。
+    </p>
+
+    <!-- ============================================================ -->
+    <h2 id="verify">5. 動作確認</h2>
+
+    <h3>API で確認</h3>
+    <pre><code># 登録済みエンジン一覧
+curl -s http://&lt;HUB_HOST&gt;:8000/engines | python3 -m json.tool
+
+# 特定エンジンの詳細
+curl -s http://&lt;HUB_HOST&gt;:8000/engines/qwen3-vl-8b</code></pre>
+
+    <h3>スクリプトから確認</h3>
+    <pre><code>import asyncio
+from paprika_client import async_paprika
+
+async def main():
+    async with async_paprika.connect() as cli:
+        async with cli.session("https://example.com") as page:
+            # テキスト質問
+            answer = await page.ask(
+                "このページのタイトルを教えて",
+                engine="qwen3-vl-8b"
+            )
+            print(answer)
+
+asyncio.run(main())</code></pre>
+
+    <!-- ============================================================ -->
+    <h2 id="usage">使い方</h2>
+
+    <h3>page.ask() — テキスト質問</h3>
+    <pre><code>answer = await page.ask("このページの要約を日本語で", engine="qwen3-vl-8b")</code></pre>
+
+    <h3>page.agent() — 画像 + テキストで判断</h3>
+    <pre><code>result = await page.agent(
+    "ログインボタンをクリックして",
+    engine="qwen3-vl-8b"
+)</code></pre>
+
+    <h3>codegen-loop (AI 調査)</h3>
+    <p>
+      Admin UI の Submit 画面 → 「コード生成 LLM」で登録したエンジンを選択できます
+      (<code>use_for_codegen: true</code> の場合)。
+    </p>
+
+    <h3>promoted (デフォルトエンジン)</h3>
+    <pre><code># engine="auto" 時にこのエンジンを優先使用
+curl -X POST http://&lt;HUB&gt;:8000/engines/qwen3-vl-8b/promote</code></pre>
+
+    <!-- ============================================================ -->
+    <h2 id="models">推奨モデル一覧</h2>
+
+    <table>
+      <thead><tr><th>モデル</th><th>Ollama タグ</th><th>サイズ</th><th>kind</th><th>最低 RAM/VRAM</th><th>用途</th></tr></thead>
+      <tbody>
+        <tr><td>Qwen3-VL 8B</td><td><code>qwen3-vl:8b</code></td><td>6.1 GB</td><td>vision-chat</td><td>8 GB</td><td>汎用 VLM。画像理解 + テキスト生成</td></tr>
+        <tr><td>Qwen3 8B</td><td><code>qwen3:8b</code></td><td>5.2 GB</td><td>chat</td><td>8 GB</td><td>テキスト専用。codegen / 翻訳</td></tr>
+        <tr><td>Gemma 3 12B</td><td><code>gemma3:12b</code></td><td>8.1 GB</td><td>chat</td><td>12 GB</td><td>高品質テキスト生成</td></tr>
+        <tr><td>Gemma 4 31B</td><td><code>gemma4:31b</code></td><td>19 GB</td><td>chat</td><td>24 GB</td><td>大規模テキスト (GPU 推奨)</td></tr>
+      </tbody>
+    </table>
+
+    <!-- ============================================================ -->
+    <h2 id="vllm">vLLM で構築する場合</h2>
+    <p>GPU サーバで高スループットが必要な場合は vLLM を使います。</p>
+
+    <pre><code># vLLM インストール
+pip install vllm
+
+# Qwen3-VL 8B を起動
+python -m vllm.entrypoints.openai.api_server \
+  --model Qwen/Qwen3-VL-8B-Instruct \
+  --port 8001 \
+  --host 0.0.0.0 \
+  --trust-remote-code</code></pre>
+
+    <pre><code># PaprikaEngine に登録
+curl -X PUT http://&lt;HUB&gt;:8000/engines/qwen3-vl-vllm \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "slug": "qwen3-vl-vllm",
+    "name": "Qwen3-VL 8B (vLLM, GPU)",
+    "kind": "vision-chat",
+    "protocol": "openai",
+    "endpoint": "http://&lt;GPU_HOST&gt;:8001",
+    "model": "Qwen/Qwen3-VL-8B-Instruct",
+    "timeout_s": 60
+  }'</code></pre>
+
+    <!-- ============================================================ -->
+    <h2 id="openai">外部 API を登録 (OpenAI / Anthropic 等)</h2>
+
+    <h3>OpenAI GPT-4o</h3>
+    <pre><code>curl -X PUT http://&lt;HUB&gt;:8000/engines/gpt-4o \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "slug": "gpt-4o",
+    "name": "GPT-4o (OpenAI)",
+    "kind": "vision-chat",
+    "protocol": "openai",
+    "endpoint": "https://api.openai.com",
+    "model": "gpt-4o",
+    "api_key_env": "OPENAI_API_KEY",
+    "timeout_s": 60,
+    "supports_tools": true,
+    "use_for_codegen": true
+  }'</code></pre>
+    <p>
+      <code>api_key_env</code> には環境変数名を指定します (値ではない)。
+      Hub コンテナの <code>.env</code> に <code>OPENAI_API_KEY=sk-...</code> を設定してください。
+    </p>
+
+    <h3>Anthropic Claude (LiteLLM 経由)</h3>
+    <pre><code># LiteLLM プロキシを起動
+litellm --model claude-sonnet-4-20250514 --port 4000
+
+# 登録
+curl -X PUT http://&lt;HUB&gt;:8000/engines/claude-sonnet \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "slug": "claude-sonnet",
+    "name": "Claude Sonnet (LiteLLM)",
+    "kind": "vision-chat",
+    "protocol": "openai",
+    "endpoint": "http://&lt;LITELLM_HOST&gt;:4000",
+    "model": "claude-sonnet-4-20250514",
+    "timeout_s": 60,
+    "supports_tools": true,
+    "use_for_codegen": true
+  }'</code></pre>
+
+    <!-- ============================================================ -->
+    <h2 id="troubleshoot">トラブルシューティング</h2>
+
+    <h3>Connection refused</h3>
+    <pre><code># Ollama が起動しているか確認
+sudo systemctl status ollama
+
+# listen アドレスの確認 (0.0.0.0 であること)
+ss -tlnp | grep 11434
+
+# OLLAMA_HOST が設定されているか
+grep OLLAMA_HOST /etc/systemd/system/ollama.service</code></pre>
+
+    <h3>Hub からモデル一覧が見えない</h3>
+    <pre><code># Hub マシンから直接テスト
+curl http://&lt;OLLAMA_HOST&gt;:11434/v1/models
+
+# ファイアウォール確認
+sudo ufw status
+sudo ufw allow 11434/tcp</code></pre>
+
+    <h3>推論が遅い</h3>
+    <ul>
+      <li>CPU のみの場合: 8B Q4_K_M で 1 トークン ≈ 100-150ms が目安</li>
+      <li><code>timeout_s</code> を長めに設定 (120-180s)</li>
+      <li>GPU がある場合: <code>nvidia-smi</code> で Ollama が GPU を使っているか確認</li>
+      <li>メモリ不足: <code>free -h</code> でスワップが発生していないか確認</li>
+    </ul>
+
+    <h3>Qwen3 の回答が空 (content が空文字)</h3>
+    <p>
+      Qwen3 の thinking モードが有効だと、OpenAI 互換 API で <code>content</code> が空、
+      <code>reasoning</code> に全文が入ることがあります。
+      <code>max_tokens</code> を増やすか、Ollama native API (<code>/api/chat</code>) で確認してください。
+    </p>
+
+    <h3>エンジンの削除・更新</h3>
+    <pre><code># 更新 (同じ slug で PUT)
+curl -X PUT http://&lt;HUB&gt;:8000/engines/qwen3-vl-8b -d '{...}'
+
+# 削除
+curl -X DELETE http://&lt;HUB&gt;:8000/engines/qwen3-vl-8b</code></pre>
+
+  </main>
+</div>
+
+<footer>
+  <p>&copy; 2025-2026 NPO PAPS &mdash; <a href="https://github.com/paps-jp/paprika">GitHub</a></p>
+</footer>
+
+</body>
+</html>

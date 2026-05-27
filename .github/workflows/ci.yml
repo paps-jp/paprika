@@ -1,0 +1,85 @@
+# Minimum-viable CI. Two goals:
+#   1. Catch the dumb stuff (broken syntax, unused imports, undefined names,
+#      style drift) before it ships. The hub is a 12k-line FastAPI app
+#      that the maintainer-of-one was editing without any linting or
+#      tests; this stops the bleeding without demanding a coverage push.
+#   2. Run the small but growing pytest suite, which exists primarily to
+#      regression-test bugs that already cost a debugging session
+#      (asset URL #-encoding, soft-404 helper, web_search tool loop).
+#
+# Deliberately NOT in scope here:
+#   * Integration tests requiring Redis / worker / browser. Those need
+#     a docker-compose harness; track separately when there's a real
+#     payoff (the integration bugs we hit so far were all visible to
+#     pure-function tests once the helpers were extracted to importable
+#     modules).
+#   * Type checking. Add mypy in a follow-up once the ruff bulk-fix lands.
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  lint-and-test:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+          cache: pip
+          cache-dependency-path: |
+            requirements.txt
+            client/python/pyproject.toml
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install ruff pytest pytest-asyncio
+          # Hub deps so py_compile + import-time checks pass. Some of
+          # these (arq, redis) only matter at runtime; install them
+          # anyway to keep CI deterministic.
+          pip install -r requirements.txt
+          # Editable install of the client SDK so tests can ``import
+          # paprika_client``.
+          pip install -e client/python
+
+      - name: py_compile (catches syntax errors anywhere)
+        run: python -m compileall -q server core client agent_service
+
+      - name: Ruff lint
+        # Non-blocking until the bulk auto-fix pass lands -- the baseline
+        # is 685 issues, intentionally not fixed in the config-only commit.
+        # GitHub annotations still surface on PRs so reviewers see the
+        # warnings inline. Flip continue-on-error to false in the same PR
+        # that runs ``ruff check --fix`` across the tree.
+        run: ruff check --output-format=github .
+        continue-on-error: true
+
+      - name: Ruff format check
+        run: ruff format --check .
+        continue-on-error: true
+
+      - name: Dependency versions (for diagnosing test failures)
+        run: |
+          python -V
+          pip list
+
+      - name: pytest
+        # ``--tb=long -ra`` makes the failing assertion's full traceback
+        # AND a per-test summary visible in the step log -- the public
+        # GitHub Actions log endpoint requires auth, so the inline view
+        # is what reviewers actually read.
+        # Exit code 5 = "no tests collected". Tolerate that so CI
+        # stays green while the test suite is being rebuilt.
+        run: pytest -v --tb=long -ra || [ $? -eq 5 ]
+        env:
+          # Keep the test's monkeypatch path predictable in CI.
+          PYTHONIOENCODING: utf-8

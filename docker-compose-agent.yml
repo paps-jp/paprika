@@ -1,0 +1,68 @@
+# Stand-alone agent stack: Ollama (gpt-oss-20b) + paprika-agent service.
+#
+# Run on a GPU host (16GB+ VRAM is enough for gpt-oss-20b). paprika
+# worker containers call agent:8001/act over HTTP.
+#
+# Prerequisites on the host:
+#   - NVIDIA driver + nvidia-container-toolkit installed
+#   - docker compose v2
+#
+# Usage:
+#   docker compose -f docker-compose-agent.yml up -d --build
+#
+#   # First boot: pull the model into the ollama volume (one-time ~13GB).
+#   docker compose -f docker-compose-agent.yml exec ollama ollama pull gpt-oss:20b
+#
+#   # Verify both services are healthy.
+#   curl http://localhost:8001/health
+#
+# Customize via .env or shell env:
+#   MODEL_NAME=gpt-oss:20b       (or gpt-oss:120b on an H100)
+#   AGENT_PORT=8001              (host port for paprika -> agent)
+#   OLLAMA_PORT=11434            (host port for direct ollama access)
+
+services:
+  ollama:
+    image: ollama/ollama:latest
+    restart: unless-stopped
+    ports:
+      - "${OLLAMA_PORT:-11434}:11434"
+    volumes:
+      - ollama-models:/root/.ollama
+    environment:
+      # Keep the model resident in VRAM until the container is explicitly
+      # stopped, so back-to-back agent calls don't pay the 20-30s cold
+      # reload that hits on a fresh load. "-1" = forever; replace with
+      # e.g. "30m" if you'd rather free VRAM during idle stretches.
+      - OLLAMA_KEEP_ALIVE=${OLLAMA_KEEP_ALIVE:--1}
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: 1
+              capabilities: [gpu]
+    healthcheck:
+      test: ["CMD-SHELL", "ollama list >/dev/null 2>&1 || exit 1"]
+      interval: 10s
+      timeout: 3s
+      retries: 30
+
+  agent:
+    build:
+      context: ./agent_service
+      dockerfile: Dockerfile
+    image: paprika-agent:latest
+    restart: unless-stopped
+    depends_on:
+      ollama:
+        condition: service_healthy
+    ports:
+      - "${AGENT_PORT:-8001}:8001"
+    environment:
+      - OLLAMA_URL=http://ollama:11434
+      - MODEL_NAME=${MODEL_NAME:-gpt-oss:20b}
+      - REQUEST_TIMEOUT_S=${REQUEST_TIMEOUT_S:-120}
+
+volumes:
+  ollama-models:

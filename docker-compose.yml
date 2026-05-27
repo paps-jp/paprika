@@ -1,0 +1,278 @@
+# paprika docker-compose (Phase 4: per-job browser lanes)
+#
+# Stack:
+#   redis        : job state + Pub/Sub
+#   hub          : FastAPI hub (client API + worker WS endpoint + admin UI)
+#   worker       : worker agent + N browser lanes (Xvfb+Chrome+noVNC per lane)
+#
+# Each "lane" is a dedicated browser environment:
+#   - Lane 0 → Chrome :9223 + noVNC :6080
+#   - Lane 1 → Chrome :9224 + noVNC :6081
+#   - ...
+#
+# Concurrent jobs are distributed across lanes; each in-flight job has its
+# own dedicated browser and live noVNC URL (returned in JobInfo.novnc_url).
+#
+# Usage:
+#   docker compose up -d --build
+#   open http://localhost:8000        (admin UI)
+#   open http://localhost:6080/vnc.html?autoconnect=1  (lane 0)
+#   open http://localhost:6081/vnc.html?autoconnect=1  (lane 1)
+#
+# Tuning concurrency:
+#   - LANE_POOL=N controls how many lanes are spawned (legacy SLOT_POOL accepted)
+#   - Each lane ~ 500MB-1GB RAM under load
+#   - Ports 6080..(6080+N-1) must be in the host-mapped range
+#
+# Viewing from another machine (e.g. running this stack on a remote host):
+#   - Set NOVNC_PUBLIC_HOST to a LAN address/DNS name reachable from the
+#     browser, otherwise the noVNC links in the admin UI will point at
+#     "localhost" (only useful when browsing from the same machine).
+#       NOVNC_PUBLIC_HOST=paprika.lan docker compose up -d
+
+services:
+  redis:
+    image: redis:7-alpine
+    restart: unless-stopped
+    ports: ["6379:6379"]
+    volumes: ["redis-data:/data"]
+    command: ["redis-server", "--appendonly", "yes"]
+
+  hub:
+    build:
+      context: .
+      dockerfile: docker/hub/Dockerfile
+    restart: unless-stopped
+    depends_on: [redis]
+    # Privileged mode: mount.cifs needs full capability set + unconfined
+    # seccomp to mount SMB shares from the Settings UI. SYS_ADMIN alone
+    # is insufficient (mount.cifs's capng_apply fails without
+    # DAC_READ_SEARCH and several other caps). The hub already owns the
+    # Docker socket — effectively host-root — so privileged doesn't
+    # widen the trust boundary.
+    privileged: true
+    ports: ["8000:8000"]
+    environment:
+      - PYTHONUNBUFFERED=1
+      # POST /codegen forwards to this OpenAI-compatible /v1/chat/completions
+      # endpoint and asks the model to write a paprika-client Python
+      # script. Defaults to whatever the agent service is using, so a
+      # single AGENT_LLM_URL / AGENT_MODEL_NAME pair drives both modes.
+      - CODEGEN_LLM_URL=${CODEGEN_LLM_URL:-${AGENT_LLM_URL:-http://<gpu-host>:15082}}
+      - CODEGEN_MODEL_NAME=${CODEGEN_MODEL_NAME:-${AGENT_MODEL_NAME:-qwen2.5-vl-72b}}
+      - CODEGEN_REQUEST_TIMEOUT_S=${CODEGEN_REQUEST_TIMEOUT_S:-180}
+      # Codegen Coder LLM web_search tool. When this is set the hub
+      # attaches a SearXNG-backed ``web_search`` tool to the Coder's
+      # OpenAI tool-calls array; the model can look up external facts
+      # (third-party API shapes, unfamiliar site selectors) that aren't
+      # covered by paprika's built-in skills. Empty / unset = feature
+      # off (codegen falls back to the legacy single-POST shape). See
+      # server/hub/web_search.py.
+      - SEARXNG_URL=${SEARXNG_URL:-}
+      - SEARXNG_TIMEOUT_S=${SEARXNG_TIMEOUT_S:-15}
+      # Iterative codegen-loop (PR-14): hub spawns ephemeral
+      # paprika-runner containers to execute LLM-generated scripts.
+      # Knobs default to safe values; bump in .env for heavier crawls.
+      - PAPRIKA_RUNNER_IMAGE=${PAPRIKA_RUNNER_IMAGE:-paprika-runner:latest}
+      - PAPRIKA_RUNNER_NETWORK=${PAPRIKA_RUNNER_NETWORK:-paprika_default}
+      - PAPRIKA_RUNNER_HUB_URL=${PAPRIKA_RUNNER_HUB_URL:-http://hub:8000}
+      - PAPRIKA_RUNNER_MAX_CONCURRENT=${PAPRIKA_RUNNER_MAX_CONCURRENT:-3}
+      # v2 Phase 3: R1 judge mode -- off | shadow | primary.
+      #   shadow  -- runs the R1 judge alongside the legacy judge for
+      #              comparison; legacy verdict still drives the loop.
+      #   primary -- uses the R1 verdict; falls back to legacy when R1
+      #              is unreachable/unparseable.
+      # See internal/v2-architecture.html § Phase 3 for rationale.
+      - PAPRIKA_R1_JUDGE_MODE=${PAPRIKA_R1_JUDGE_MODE:-off}
+      # v2 Phase 6: R1 Distiller (deep HostKnowledge updates).
+      #   off  -- never run R1 Distiller (default).
+      #   new  -- run when new barrier observed OR job failed (recommended steady-state).
+      #   on   -- run on every completed job (expensive).
+      - PAPRIKA_R1_DISTILLER_MODE=${PAPRIKA_R1_DISTILLER_MODE:-off}
+      - PAPRIKA_R1_DISTILLER_ENGINE=${PAPRIKA_R1_DISTILLER_ENGINE:-deepseek-r1}
+      # DeepSeek API key fallback (the EngineRecord's direct api_key wins
+      # when set; this env is only consulted via api_key_env="DEEPSEEK_API_KEY").
+      - DEEPSEEK_API_KEY=${DEEPSEEK_API_KEY:-}
+    # Docker socket: the hub spawns ephemeral runner containers per
+    # codegen attempt. LAN-trusted deployment; the hub already executes
+    # arbitrary CDP commands and writes to disk, so a privileged
+    # socket adds limited marginal risk. If concerned, run the hub
+    # behind a separate docker-proxy and point PAPRIKA_RUNNER_DOCKER_HOST
+    # at it.
+    # PUBLIC_BASE_URL is what the hub tells workers to POST asset / log /
+    # page.html uploads to. Defaults to the in-compose hostname, which
+    # only works for workers running in the same compose network. Set
+    # this to the host's LAN address whenever a worker on another
+    # machine connects in over WebSocket -- otherwise its uploads
+    # resolve `hub` to nothing and 404 out.
+    #   PUBLIC_BASE_URL=http://paprika.lan docker compose up -d
+    command: >
+      python -m server --mode hub
+      --host 0.0.0.0 --port 8000
+      --redis-url redis://redis:6379
+      --data-dir /data/jobs
+      --public-base-url ${PUBLIC_BASE_URL:-http://hub:8000}
+    volumes:
+      - paprika-data:/data/jobs
+      # Same bind-mount trick as the worker: edit server/hub/app.py +
+      # `docker compose restart hub` is enough to ship a change.
+      - ./server:/app/server
+      - ./core:/app/core
+      - ./VERSION:/app/VERSION:ro
+      # v2 Phase 7: plugin registry directory. Hub is the master copy
+      # (operator-managed); the same path is rsynced to every worker
+      # host by scripts/deploy-workers-from-api.sh and mounted into
+      # the worker container at the same /data/tools path.
+      - ./data/tools:/data/tools
+      # Docker socket for spawning paprika-runner containers
+      # (codegen-loop sandbox). RO mount is enough -- the hub only
+      # needs to `docker run` + observe; not modify socket state.
+      - /var/run/docker.sock:/var/run/docker.sock:rw
+
+  # Build-only image -- not started as a long-running service. The hub
+  # spawns one paprika-runner container per codegen-loop attempt via
+  # the docker socket and tears it down afterwards.
+  # Build:    docker compose build runner
+  # Pre-pull: docker pull paprika-runner:latest  (after build)
+  runner:
+    build:
+      context: .
+      dockerfile: docker/runner/Dockerfile
+    image: paprika-runner:latest
+    profiles: ["build-only"]
+    # `command` ignored at runtime; the hub overrides it per spawn.
+    command: ["--version"]
+
+  # NOTE: A FlareSolverr service used to live here during Phase 7 plugin
+  # bake-off (cloudscraper / curl-cffi / flaresolverr / paprika-flare).
+  # paprika-flare won -- it matches FlareSolverr's success rate while
+  # giving us Worker-IP-matched cookies and a vision-agent fallback for
+  # Turnstile, with zero extra containers. The other three plugins are
+  # removed; only data/tools/installed/paprika-flare remains.
+
+  # LLM-driven agent proxy. GPU-less -- it just forwards prompts to an
+  # OpenAI-compatible LLM endpoint (Ollama, vLLM, llama-server, ...).
+  # Default points at the gpt-oss-120b vLLM on the LAN; override via
+  # AGENT_LLM_URL + AGENT_MODEL_NAME in .env when the brain moves.
+  agent:
+    build:
+      context: ./agent_service
+      dockerfile: Dockerfile
+    image: paprika-agent:latest
+    restart: unless-stopped
+    ports:
+      - "8001:8001"
+    environment:
+      - OLLAMA_URL=${AGENT_LLM_URL:-http://<gpu-host>:15080}
+      - MODEL_NAME=${AGENT_MODEL_NAME:-gpt-oss-120b}
+      - REQUEST_TIMEOUT_S=${AGENT_REQUEST_TIMEOUT_S:-180}
+      - PYTHONUNBUFFERED=1
+
+  worker:
+    build:
+      context: .
+      dockerfile: docker/worker/Dockerfile
+    restart: unless-stopped
+    depends_on: [hub, agent]
+    shm_size: "2gb"
+    # NET_ADMIN lets entrypoint-egress-firewall.sh install iptables
+    # OUTPUT rules. The script is a no-op unless
+    # PAPRIKA_WORKER_EGRESS_FIREWALL=1, so adding the capability is
+    # harmless for deployments that don't use the feature.
+    cap_add:
+      - NET_ADMIN
+    # Expose enough noVNC ports for LANE_POOL lanes (default 2 = 6080-6081).
+    # Bump the range and LANE_POOL together for more parallelism.
+    ports:
+      - "6080-6081:6080-6081"
+    environment:
+      - HUB_URL=ws://hub:8000
+      # Worker egress firewall (SSRF deep defence). Opt-in.
+      # When 1: iptables OUTPUT drops every private IP destination
+      # except hub / agent / DNS / operator-listed allows. See
+      # docker/worker/egress-firewall.sh for the full ruleset and
+      # the PAPRIKA_FIREWALL_ALLOW_{HOSTS,IPS} env vars for adding
+      # extra ACCEPT rules.
+      - PAPRIKA_WORKER_EGRESS_FIREWALL=${PAPRIKA_WORKER_EGRESS_FIREWALL:-0}
+      - PAPRIKA_FIREWALL_ALLOW_HOSTS=${PAPRIKA_FIREWALL_ALLOW_HOSTS:-}
+      - PAPRIKA_FIREWALL_ALLOW_IPS=${PAPRIKA_FIREWALL_ALLOW_IPS:-}
+      # LANE_POOL is the new name; SLOT_POOL is kept as a fallback so old
+      # .env files keep working. Entrypoint resolves them.
+      - LANE_POOL=${LANE_POOL:-}
+      - SLOT_POOL=${SLOT_POOL:-2}
+      - MAX_CONCURRENT=${MAX_CONCURRENT:-2}
+      # noVNC URL the worker advertises to clients. Override to the host's
+      # LAN address (or DNS name) when the browser viewing the admin UI is
+      # not on the same machine, e.g.:
+      #   NOVNC_PUBLIC_HOST=paprika.lan docker compose up -d
+      - NOVNC_PUBLIC_HOST=${NOVNC_PUBLIC_HOST:-localhost}
+      - NOVNC_BASE_PORT=6080
+      - LABELS=${LABELS:-region=local}
+      # URL of the paprika-agent service. The agent runs in the same
+      # compose stack so the in-compose worker reaches it by service
+      # name. External workers (docker-compose-worker.yml) point at the
+      # hub host's LAN address instead.
+      - AGENT_URL=${AGENT_URL:-http://agent:8001}
+      # Tab/popup containment hooks (target=_blank rewrite +
+      # window.open override). On by default. Set AGENT_TAB_HOOKS=0
+      # when these interfere with a site's own click handlers.
+      - AGENT_TAB_HOOKS=${AGENT_TAB_HOOKS:-1}
+      # Physical (CDP-level) tab suppression. Catches popups the
+      # in-page hook misses (cross-origin window.open, programmatic
+      # targets). Default on.
+      - AGENT_TAB_KILL=${AGENT_TAB_KILL:-1}
+      - AGENT_TAB_KILL_REDIRECT=${AGENT_TAB_KILL_REDIRECT:-1}
+      - AGENT_TAB_KILL_URL_SETTLE_S=${AGENT_TAB_KILL_URL_SETTLE_S:-0.5}
+      # End-of-loop safety net. Default 0 (disabled). Set to a
+      # positive value if a flaky model regresses into "click forever"
+      # loops without ever calling capture.
+      - AGENT_MAX_NO_CAPTURE_STREAK=${AGENT_MAX_NO_CAPTURE_STREAK:-0}
+      # Physical no-new-tab mode (--block-new-web-contents). Off by
+      # default; breaks some sites' click navigation. See AGENT_TAB_KILL
+      # for a softer alternative.
+      - CHROME_BLOCK_NEW_TABS=${CHROME_BLOCK_NEW_TABS:-0}
+      # PAGE TEXT section (body innerText excerpt) in the outline.
+      # Set AGENT_INCLUDE_BODY_TEXT=0 on sites whose prose triggers
+      # safety-trained model refusals (gpt-oss-* on adult content etc).
+      - AGENT_INCLUDE_BODY_TEXT=${AGENT_INCLUDE_BODY_TEXT:-1}
+      # Per-step PNG screenshot sent to agent_service for vision LLMs
+      # (Qwen2.5-VL, Pixtral, ...). Off by default to save bandwidth
+      # when the configured model is text-only.
+      - AGENT_SEND_SCREENSHOTS=${AGENT_SEND_SCREENSHOTS:-0}
+      # NOTE: COGAGENT_URL / COGAGENT_REQUEST_TIMEOUT_S env vars were
+      # removed in the v2 cleanup along with the vision-agent mode
+      # and cogagent_service. The VISION_WHEEL_STEP_PX knob still
+      # exists for Qwen-VL's SCROLL emissions (vision-chat path).
+      # Direct vLLM OpenAI-compat URL of the chat LLM (Qwen2.5-VL by
+      # default). Worker uses this for goal translation (JP->EN) in
+      # page.agent() so the agent engine gets English even when the
+      # user writes Japanese. AGENT_URL (agent_service) is for the
+      # /act endpoint; this is the raw chat completion side.
+      - AGENT_LLM_URL=${AGENT_LLM_URL:-http://<gpu-host>:15082}
+      - AGENT_MODEL_NAME=${AGENT_MODEL_NAME:-qwen2.5-vl-72b}
+      - VISION_WHEEL_STEP_PX=${VISION_WHEEL_STEP_PX:-100}
+      # yt-dlp timeout per HLS/DASH playlist that vision-agent
+      # follows. Default 30 min covers a full feature-length video
+      # at slow CDN speeds; lower for crawls that prefer to give up
+      # on stragglers.
+      - VISION_YTDLP_TIMEOUT_S=${VISION_YTDLP_TIMEOUT_S:-1800}
+      # Diagnostic: when set to 1, the passive asset capture logs
+      # every Network.ResponseReceived it sees (not just the ones
+      # matching the MIME filter). Useful for "why isn't this URL
+      # being saved" investigations. Off by default.
+      - SESSION_ASSETS_DEBUG=${SESSION_ASSETS_DEBUG:-0}
+      - PYTHONUNBUFFERED=1
+    volumes:
+      # Persists auto-generated WORKER_ID so the same worker keeps the same
+      # worker_id across `docker compose down/up`.
+      - paprika-worker-state:/root/.paprika
+      # Bind-mount source from the host so code iteration is
+      # `docker compose restart worker`, not a full image rebuild.
+      - ./server:/app/server
+      - ./core:/app/core
+      - ./VERSION:/app/VERSION:ro
+
+volumes:
+  redis-data:
+  paprika-data:
+  paprika-worker-state:

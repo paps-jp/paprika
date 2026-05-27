@@ -1,0 +1,24 @@
+{
+    "name": "paprika/client",
+    "description": "Playwright-shape PHP client for the paprika browser fleet. Synchronous, ext-curl only, no Composer dependencies.",
+    "type": "library",
+    "license": "PolyForm-Noncommercial-1.0.0",
+    "keywords": ["paprika", "browser-automation", "playwright", "scraping", "headless-chrome"],
+    "authors": [
+        { "name": "paps", "email": "paps@paps.jp" }
+    ],
+    "homepage": "https://github.com/paps/paprika",
+    "require": {
+        "php": ">=8.1",
+        "ext-curl": "*",
+        "ext-json": "*"
+    },
+    "autoload": {
+        "psr-4": {
+            "Paprika\\Client\\": "src/"
+        }
+    },
+    "scripts": {
+        "example:fetch": "php examples/fetch.php"
+    }
+}

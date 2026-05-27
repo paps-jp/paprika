@@ -1,0 +1,987 @@
+  /* Icon sizing + alignment defaults so we never need per-call
+     inline styles. font-size inheritance keeps icons matching the
+     surrounding text size. */
+  iconify-icon {
+    display: inline-block; vertical-align: -0.18em;
+    width: 1.15em; height: 1.15em;
+  }
+  /* Tab + button icons get a touch more breathing room. */
+  .tab iconify-icon, .pill iconify-icon, button iconify-icon {
+    margin-right: 2px;
+  }
+  * { box-sizing: border-box; }
+  body { font: 14px/1.5 -apple-system,"Segoe UI",system-ui,sans-serif; margin: 0; background: #f5f3ef; color: #222; }
+  header { background: #c0392b; color: #fff; padding: .8rem 1.5rem; display: flex; align-items: center; gap: 1rem; position: sticky; top: 0; z-index: 20; box-shadow: 0 1px 4px rgba(0,0,0,.15); }
+  header h1 { margin: 0; font-size: 1.3rem; display: inline-flex; align-items: center; gap: 0.5rem; }
+  header h1 .logo { width: 1.5em; height: 1.5em; vertical-align: middle; flex-shrink: 0; }
+  header .status { margin-left: auto; font-size: .85rem; opacity: .9; }
+  /* The two right-side controls (Manual link + locale switch) share
+     the same box geometry so they look like one toolbar. Setting
+     ``height`` + ``box-sizing: border-box`` is the only reliable way
+     to align an <a> against a <select>: native form controls have
+     browser-specific intrinsic heights and ignore line-height in
+     places, so without an explicit height the <select> ends up 1-3 px
+     taller (Chrome) or shorter (Firefox) than its plain-anchor
+     sibling. ``vertical-align: middle`` then keeps both glued to the
+     same baseline inside the header flex row. */
+  header .manual-link,
+  header .locale-switch {
+    height: 26px;
+    box-sizing: border-box;
+    padding: 0 10px;
+    font: inherit;
+    font-size: .85rem;
+    line-height: 24px;             /* 26 - 2*1px border */
+    vertical-align: middle;
+    background: rgba(255,255,255,.15);
+    color: #fff;
+    border: 1px solid rgba(255,255,255,.4);
+    border-radius: 4px;
+  }
+  header .locale-switch {
+    margin-left: 12px;
+    cursor: pointer;
+    /* Drop the default Chrome dropdown padding-right by using a
+       slim appearance-none form. Keep just enough room for the
+       arrow that the browser still draws. */
+    padding-right: 4px;
+  }
+  header .locale-switch option { color: #222; background: #fff; }
+  /* Manual link in the header -- visually matches the locale-switch
+     so the right-side controls cluster reads as one toolbar. Opens
+     the GitHub Pages-hosted manual in a new tab; no in-app router so
+     operators don't accidentally lose the live admin session. */
+  header .manual-link {
+    margin-left: 8px;
+    text-decoration: none;
+    display: inline-flex;
+    align-items: center;
+    gap: 4px;
+  }
+  header .manual-link:hover { background: rgba(255,255,255,.28); text-decoration: none; }
+  main { max-width: 1400px; margin: 0 auto; padding: 1.2rem; }
+
+  /* --- tabs --- */
+  nav.tabs {
+    display: flex; gap: 4px;
+    background: #fff; border-radius: 10px; padding: 5px;
+    margin-bottom: 1rem; box-shadow: 0 1px 3px rgba(0,0,0,.07);
+    flex-wrap: wrap;
+  }
+  .tab {
+    flex: 1 1 auto; min-width: 110px;
+    padding: .6rem .9rem; border: 0; background: none;
+    color: #888; cursor: pointer;
+    font: 600 .92rem/1 inherit; border-radius: 6px;
+    display: inline-flex; align-items: center; justify-content: center; gap: 8px;
+    transition: background .15s, color .15s;
+  }
+  .tab:hover:not(.active) { background: #f7f3ee; color: #444; }
+  .tab.active { background: #c0392b; color: #fff; box-shadow: 0 2px 6px rgba(192,57,43,.25); }
+  .tab .count { font-size: .7rem; padding: 1px 8px; border-radius: 999px; background: rgba(0,0,0,.08); }
+  .tab.active .count { background: rgba(255,255,255,.25); }
+  .panel { display: none; }
+  .panel.active { display: block; }
+
+  /* "More" dropdown -- collapses Hosts / Skills / Conventions into one
+     tab so the nav bar doesn't overflow. The trigger looks like a
+     normal tab; the menu is absolutely positioned right below it. */
+  .tab-dropdown { position: relative; display: inline-flex; flex: 1 1 auto; min-width: 110px; }
+  .tab-dropdown .tab-dropdown-trigger { flex: 1 1 auto; width: 100%; }
+  .tab-dropdown .caret-down { font-size: .75em; margin-left: 2px; opacity: .8; transition: transform .15s; }
+  .tab-dropdown.open .caret-down { transform: rotate(180deg); }
+  /* Treat the trigger as "active" when one of its children is the
+     active panel; setTab() flips the .has-active class via JS. */
+  .tab-dropdown.has-active .tab-dropdown-trigger {
+    background: #c0392b; color: #fff;
+    box-shadow: 0 2px 6px rgba(192,57,43,.25);
+  }
+  .tab-dropdown-menu {
+    /* Anchor to the trigger's right edge so the menu opens to the
+       LEFT -- the trigger now sits at the right end of the nav bar
+       and a left-anchored menu would overflow the viewport on
+       narrow screens. */
+    display: none; position: absolute; top: calc(100% + 4px); right: 0;
+    min-width: 220px; background: #fff; border-radius: 8px;
+    box-shadow: 0 6px 20px rgba(0,0,0,.18); padding: 4px;
+    z-index: 50; flex-direction: column; gap: 2px;
+  }
+  .tab-dropdown.open .tab-dropdown-menu { display: flex; }
+  .tab-dropdown-menu .tab {
+    flex: 0 0 auto; justify-content: flex-start;
+    width: 100%; padding: .5rem .8rem;
+  }
+
+  section { background: #fff; margin-bottom: 1.2rem; padding: 1rem 1.2rem; border-radius: 8px; box-shadow: 0 1px 3px rgba(0,0,0,.07); }
+  h2 { margin: 0 0 .8rem; font-size: 1rem; color: #444; border-bottom: 1px solid #eee; padding-bottom: .4rem; display: flex; align-items: center; gap: .6rem; flex-wrap: wrap; }
+  h2 .hctrl { margin-left: auto; font-weight: normal; font-size: .85rem; color: #555; display: inline-flex; align-items: center; gap: .6rem; flex-wrap: wrap; }
+  table { width: 100%; border-collapse: collapse; font-size: .9rem; }
+  th, td { padding: .4rem .6rem; text-align: left; border-bottom: 1px solid #f0f0f0; vertical-align: middle; }
+  th { background: #fafafa; font-weight: 600; color: #555; }
+  tr:hover td { background: #fafaf5; }
+
+  .badge { display: inline-block; padding: 2px 8px; border-radius: 3px; font-size: .78rem; font-weight: 600; }
+  .badge.completed { background: #d4f5d8; color: #185c2c; }
+  .badge.failed    { background: #fbe0e0; color: #8a1f1f; }
+  .badge.running   { background: #fff2cc; color: #7a5a14; }
+  .badge.queued    { background: #e6e6e6; color: #555; }
+  .badge.cancelled { background: #e0e0e0; color: #777; }
+  /* worker status */
+  .badge.active   { background: #d4f5d8; color: #185c2c; }
+  .badge.drain    { background: #ffe2b8; color: #7a4a14; }
+  .badge.standby  { background: #e0e0e0; color: #555; }
+  .wstat { display: inline-flex; align-items: center; gap: 6px; }
+  .wstat select { font-size: .78rem; padding: 1px 4px; border: 1px solid #ccc; border-radius: 3px; background: #fff; }
+
+  form input[type=text], form input[type=number] { padding: .45rem .6rem; border: 1px solid #ccc; border-radius: 4px; font: inherit; }
+  form input[type=text] { width: 60%; }
+  form button { padding: .5rem 1.2rem; background: #c0392b; color: #fff; border: none; border-radius: 4px; font: inherit; cursor: pointer; }
+  form button:hover { background: #a52e23; }
+  /* agent goal block */
+  .agent-box { margin: .9rem 0 .6rem; padding: .7rem .9rem; background: #fdfaf4; border: 1px solid #ece4d3; border-radius: 6px; }
+  .agent-row { display: flex; align-items: center; gap: 1rem; margin-bottom: .4rem; }
+  .agent-label { font-size: .9rem; color: #555; flex: 1 1 auto; }
+  .agent-label .agent-hint { color: #999; font-size: .82rem; font-weight: normal; margin-left: .3rem; }
+  .agent-steps { font-size: .85rem; color: #555; white-space: nowrap; }
+  .agent-steps input { width: 56px; padding: 2px 6px; }
+  .agent-box textarea { width: 100%; padding: .45rem .6rem; border: 1px solid #ccc; border-radius: 4px; font: inherit; resize: vertical; min-height: 2.4rem; }
+  details { margin-top: .5rem; font-size: .9rem; }
+  details summary { cursor: pointer; color: #c0392b; }
+  details > * { margin-right: 1rem; }
+  .url { font-family: ui-monospace, Consolas, monospace; font-size: .82rem; color: #555; max-width: 360px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; display: inline-block; vertical-align: middle; }
+
+  /* --- pill button + dropdown menu --- */
+  .pill {
+    display: inline-flex; align-items: center; gap: 4px;
+    padding: 3px 9px;
+    background: #f1ece4; color: #5a514a;
+    border: 1px solid #e2dacd; border-radius: 999px;
+    font: 600 .78rem/1.4 -apple-system,"Segoe UI",sans-serif;
+    text-decoration: none; cursor: pointer;
+    transition: background .15s, color .15s, border-color .15s, box-shadow .15s, transform .12s;
+  }
+  .pill:hover { background: #c0392b; color: #fff; border-color: #c0392b; transform: translateY(-1px); box-shadow: 0 2px 6px rgba(192,57,43,.25); }
+  .pill.primary { background: #c0392b; color: #fff; border-color: #c0392b; }
+  .pill.primary:hover { background: #a52e23; border-color: #a52e23; box-shadow: 0 2px 8px rgba(192,57,43,.45); }
+  .pill .ico, .pill .caret { display: inline-flex; align-items: center; }
+  .pill .ico svg { width: 14px; height: 14px; }
+  .pill .caret svg { width: 12px; height: 12px; opacity: .8; }
+
+  /* Flat action row -- same vibe as the Live Job Panel toolbar: pills
+     read flat (no fill, no border, muted ink) and only reveal their
+     per-button accent (--la-bg / --la-bd / --la-fg) plus a soft lift on
+     hover. Used for modal footers. More specific than the global .pill
+     rules so it wins without !important. */
+  .flat-actions { align-items: center; }
+  .flat-actions .pill {
+    background: transparent;
+    border: 1px solid transparent;
+    color: #5a5a68;
+    border-radius: 7px;
+    padding: 6px 12px;
+    box-shadow: none;
+    transition: background .14s ease, border-color .14s ease,
+                color .14s ease, transform .1s ease, box-shadow .14s ease;
+  }
+  .flat-actions .pill:not(:disabled):hover {
+    background: var(--la-bg, #f0f0f6);
+    border-color: var(--la-bd, #d8d8e2);
+    color: var(--la-fg, #2a2a35);
+    transform: translateY(-1px);
+    box-shadow: 0 3px 9px rgba(0,0,0,.10);
+  }
+  .flat-actions .pill:not(:disabled):active {
+    transform: translateY(0);
+    box-shadow: 0 1px 2px rgba(0,0,0,.06);
+  }
+  .flat-actions .pill:disabled {
+    cursor: not-allowed; opacity: .4;
+    box-shadow: none; transform: none;
+  }
+
+  /* Icon-only action trigger for table rows. Replaces the bulky
+     pill+text combo that broke across lines in narrow columns. */
+  .action-btn {
+    display: inline-flex; align-items: center; justify-content: center;
+    width: 30px; height: 30px;
+    background: transparent; border: 1px solid transparent;
+    border-radius: 7px; cursor: pointer; color: #999;
+    transition: background .15s, color .15s, border-color .15s, box-shadow .15s;
+  }
+  .action-btn:hover {
+    background: #f1ece4; color: #c0392b; border-color: #e2dacd;
+    box-shadow: 0 2px 6px rgba(192,57,43,.12);
+  }
+  .action-btn.open {
+    background: #c0392b; color: #fff; border-color: #c0392b;
+  }
+  .action-btn svg { width: 18px; height: 18px; }
+
+  .menu-wrap { position: relative; display: inline-block; }
+  .menu {
+    position: absolute; top: calc(100% + 5px); right: 0;
+    background: #fff; border: 1px solid #e2dacd;
+    border-radius: 8px; box-shadow: 0 8px 28px rgba(0,0,0,.18);
+    min-width: 180px; padding: 4px; z-index: 30;
+    display: none;
+  }
+  .menu.open { display: block; }
+  .menu a, .menu button {
+    display: flex; align-items: center; gap: 10px; width: 100%;
+    padding: 7px 12px; border: 0; background: none; cursor: pointer;
+    text-align: left; color: #444; font: inherit; font-size: .88rem;
+    border-radius: 4px; text-decoration: none;
+  }
+  .menu a:hover, .menu button:hover { background: #f1ece4; color: #c0392b; }
+  .menu .danger:hover { background: #fbe0e0; color: #8a1f1f; }
+  .menu .ico { width: 18px; display: inline-flex; align-items: center; justify-content: center; flex: 0 0 auto; }
+  .menu .ico svg { width: 16px; height: 16px; }
+  .menu .divider { height: 1px; background: #f0eae0; margin: 4px 0; }
+
+  code { font-family: ui-monospace, Consolas, monospace; font-size: .82rem; background: #f4f4f4; padding: 1px 4px; border-radius: 3px; }
+  .empty { color: #999; font-style: italic; padding: .5rem; }
+  .help { font-size: .85rem; color: #777; margin-top: .4rem; }
+  .help code { background: #efe7df; }
+
+  /* --- live preview grid --- */
+  .hctrl input[type=number] { width: 50px; padding: 1px 4px; font: inherit; border: 1px solid #ccc; border-radius: 3px; }
+  .hctrl select { padding: 1px 6px; font: inherit; border: 1px solid #ccc; border-radius: 3px; background: #fff; }
+  .hctrl a { color: #c0392b; text-decoration: none; font-weight: 600; }
+  .hctrl a:hover { text-decoration: underline; }
+  .ssgrid {
+    display: grid;
+    grid-template-columns: var(--ss-cols, repeat(auto-fill, minmax(260px, 1fr)));
+    gap: .6rem;
+  }
+  .ssitem {
+    background: #222; border-radius: 6px; overflow: hidden;
+    position: relative; aspect-ratio: 16/9;
+    display: block; text-decoration: none; color: inherit;
+    transition: transform .15s, box-shadow .15s, outline-color .15s;
+    outline: 2px solid transparent;
+  }
+  /* Lane is running a job -- highlight border in red, animate the
+     LIVE badge so it's obvious at a glance which tiles are busy. */
+  .ssitem.busy {
+    outline-color: #c0392b;
+    box-shadow: 0 0 0 1px rgba(192,57,43,.4), 0 0 12px rgba(192,57,43,.35);
+  }
+  /* Idle lanes get a quieter look so the eye lands on the busy ones. */
+  .ssitem.idle { opacity: .78; }
+  .ssitem.idle .ssimg-wrap { filter: grayscale(40%); }
+  a.ssitem { cursor: pointer; }
+  a.ssitem:hover { transform: translateY(-2px); box-shadow: 0 4px 14px rgba(0,0,0,.35); outline-color: #c0392b; }
+  a.ssitem:hover .ssopen { opacity: 1; }
+  .ssitem img { display: block; width: 100%; height: 100%; object-fit: contain; background: #000; }
+  .sslabel { position: absolute; top: 4px; left: 6px; font-size: .72rem; color: #fff; padding: 1px 6px; background: rgba(0,0,0,.55); border-radius: 3px; pointer-events: none; }
+  .ssopen { position: absolute; top: 4px; right: 6px; font-size: .7rem; color: #fff; padding: 1px 6px; background: rgba(192,57,43,.85); border-radius: 3px; opacity: 0; transition: opacity .15s; pointer-events: none; }
+  .sserr { position: absolute; bottom: 4px; left: 6px; right: 6px; font-size: .7rem; color: #ffb4b4; padding: 2px 6px; background: rgba(120,0,0,.7); border-radius: 3px; pointer-events: none; }
+  /* Status badge: RUNNING (red pulsing dot) or IDLE (grey).
+     Sits on the bottom-right so it doesn't fight with .sslabel /
+     .ssopen up top, or the .sserr error stripe on the bottom-left.  */
+  .ssbadge {
+    position: absolute; bottom: 4px; right: 6px;
+    font-size: .7rem; font-weight: 600;
+    padding: 2px 8px; border-radius: 10px;
+    color: #fff; pointer-events: none;
+    display: flex; align-items: center; gap: 4px;
+  }
+  .ssbadge.running   { background: rgba(192,57,43,.85); }
+  /* KEEPALIVE: crawl finished but session is alive for the operator
+     to drive via noVNC. Distinct (orange) so it doesn't look like
+     either active work (red) or a free lane (grey). */
+  .ssbadge.keepalive { background: rgba(217,127,38,.9); }
+  .ssbadge.idle      { background: rgba(80,80,90,.7); }
+  .ssbadge .dot {
+    width: 7px; height: 7px; border-radius: 50%;
+    background: currentColor; display: inline-block;
+  }
+  .ssbadge.running .dot   { animation: paprikaSsPulse 1.2s infinite; }
+  /* Slow steady pulse for keepalive -- "still here, but waiting". */
+  .ssbadge.keepalive .dot { animation: paprikaSsPulse 2.4s infinite; }
+  @keyframes paprikaSsPulse {
+    0%, 100% { opacity: 1; }
+    50%      { opacity: 0.3; }
+  }
+  /* Loading overlay -- shown on FIRST image load only (we add the
+     .loading class at tile-build time and remove it on the first
+     img 'load' / 'error' event). Polling refreshes silently swap
+     the painted pixels without flashing the spinner, since the
+     class is no longer there. */
+  .ssitem.loading::before {
+    content: '';
+    position: absolute; inset: 0;
+    background: linear-gradient(135deg, #1a1a22 25%, #222 25%, #222 50%, #1a1a22 50%, #1a1a22 75%, #222 75%);
+    background-size: 16px 16px;
+    z-index: 1;
+  }
+  .ssitem.loading::after {
+    content: '';
+    position: absolute;
+    top: 50%; left: 50%;
+    width: 28px; height: 28px;
+    margin: -14px 0 0 -14px;
+    border: 3px solid rgba(255,255,255,.15);
+    border-top-color: #c0392b;
+    border-radius: 50%;
+    animation: paprikaSsLoad 0.8s linear infinite;
+    z-index: 2;
+    pointer-events: none;
+  }
+  @keyframes paprikaSsLoad { to { transform: rotate(360deg); } }
+  /* Hide the noisy "↗ noVNC" hint while loading -- it'd otherwise
+     poke through over the spinner during the first frame fetch. */
+  .ssitem.loading .ssopen { display: none; }
+  /* Sub-label under the worker/lane label: the URL of the running
+     job, truncated. Hidden when idle so the screenshot stays clean. */
+  .sssub {
+    position: absolute; top: 24px; left: 6px; right: 6px;
+    font-size: .68rem; color: #fff;
+    padding: 1px 6px; background: rgba(0,0,0,.55);
+    border-radius: 3px; pointer-events: none;
+    text-overflow: ellipsis; overflow: hidden; white-space: nowrap;
+  }
+
+  /* ------- Submit form: mode cards (Fetch / LLM / Macro / Code) ------
+     These cards used to look like navigation tabs and operators mistook
+     "click to view options" for "click to set the run mode". The
+     stronger selected-state visuals below (filled background, accent
+     bar on the left, ⚫ indicator instead of ✓) plus the "選択中: …"
+     header above the grid push the cards into a clearly-stateful
+     picker, not a tab bar. */
+  .mode-cards {
+    display: grid;
+    grid-template-columns: repeat(4, 1fr);
+    gap: 10px;
+    margin: 6px 0 12px 0;
+  }
+  .mode-card {
+    position: relative;
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    padding: 16px 12px 14px 18px;
+    border: 1.5px solid #d0d0d8;
+    border-radius: 10px;
+    cursor: pointer;
+    background: #fafafd;
+    transition: transform .12s, box-shadow .12s, border-color .12s, background .12s;
+    text-align: center;
+    user-select: none;
+    overflow: hidden;
+  }
+  /* Faint left-edge bar so even un-selected cards hint at the
+     "row of choices" pattern; bumps to accent color when selected. */
+  .mode-card::before {
+    content: "";
+    position: absolute;
+    left: 0; top: 0; bottom: 0;
+    width: 4px;
+    background: transparent;
+    transition: background .12s;
+  }
+  .mode-card:hover {
+    transform: translateY(-1px);
+    border-color: #aab;
+    background: #fff;
+    box-shadow: 0 2px 8px rgba(0,0,0,.05);
+  }
+  .mode-card.selected {
+    border-color: #c0392b;
+    background: #fff5f3;
+    box-shadow: 0 2px 14px rgba(192,57,43,.18);
+  }
+  .mode-card.selected::before {
+    background: #c0392b;
+  }
+  .mode-card.selected::after {
+    content: "● 選択中";
+    position: absolute;
+    top: 6px; right: 8px;
+    padding: 1px 7px;
+    background: #c0392b; color: #fff;
+    border-radius: 10px;
+    font-size: 10.5px; font-weight: 700;
+    letter-spacing: .02em;
+  }
+  .mode-card .mode-icon {
+    font-size: 1.7em;
+    line-height: 1;
+    margin-bottom: 6px;
+    color: #888;
+    transition: color .12s;
+  }
+  .mode-card.selected .mode-icon { color: #c0392b; }
+  .mode-card .mode-title {
+    font-weight: 600;
+    font-size: 0.95em;
+    color: #222;
+  }
+  .mode-card.selected .mode-title { color: #c0392b; }
+  .mode-card .mode-desc {
+    font-size: 0.76em;
+    color: #777;
+    margin-top: 4px;
+    line-height: 1.35;
+  }
+
+  /* Script card sub-tabs (Code | Macro). Pill-shaped row that sits
+     under the mode-cards strip and is shown only when Script is the
+     active mode. */
+  .script-subtabs {
+    display: flex;
+    gap: 6px;
+    margin: -4px 0 12px;
+    padding: 4px 6px;
+    background: #f7f7fc;
+    border-radius: 8px;
+    width: max-content;
+  }
+  .script-subtabs .script-tab {
+    display: inline-flex;
+    align-items: center;
+    gap: 5px;
+    background: transparent;
+    border: 1px solid transparent;
+    color: #555;
+    padding: 5px 12px;
+    border-radius: 6px;
+    cursor: pointer;
+    font: 600 0.85em -apple-system, "Segoe UI", sans-serif;
+    transition: background 0.14s, color 0.14s, border-color 0.14s, box-shadow 0.14s;
+  }
+  .script-subtabs .script-tab:hover {
+    background: #ebebf2;
+    color: #2a2a35;
+  }
+  .script-subtabs .script-tab.selected {
+    background: #c0392b;
+    color: #fff;
+    border-color: #c0392b;
+    box-shadow: 0 1px 3px rgba(192, 57, 43, 0.25);
+  }
+  .script-subtabs .script-tab iconify-icon { font-size: 1em; }
+  /* Tighter card layout on narrow viewports (≤ 720px wraps to 2 cols) */
+  @media (max-width: 720px) {
+    .mode-cards { grid-template-columns: repeat(2, 1fr); }
+  }
+
+  /* ------- Live panel: tighter, more polished look ------------------- */
+  #liveJobPanel {
+    margin-top: 22px;
+    padding: 14px 16px 16px;
+    background: linear-gradient(180deg, #fbfbfd 0%, #f3f3f8 100%);
+    border: 1px solid #d6d6e0;
+    border-radius: 10px;
+    box-shadow: 0 4px 16px rgba(40, 40, 80, .05);
+  }
+  /* Live header: a two-group flex row.
+       Left  = status info (LIVE badge + job id + state pill + asset count)
+       Right = action buttons (pause / resume / gallery / result / log / close)
+     The two halves are visually distinct so operators don't mistake
+     a status badge for a button (or vice versa). */
+  #liveJobPanel h2 {
+    margin: 0 0 10px 0;
+    font-size: 1.0rem;
+    line-height: 1.4;
+    color: #222;
+    font-weight: 600;
+    display: flex; align-items: center; gap: 10px;
+    flex-wrap: wrap;
+  }
+  #liveJobPanel h2 .ljp-status-group {
+    display: inline-flex; align-items: center; gap: 8px;
+    flex-wrap: wrap;
+  }
+  #liveJobPanel h2 .ljp-actions-group {
+    margin-left: auto;
+    display: inline-flex; align-items: center; gap: 6px;
+    flex-wrap: wrap;
+    padding-left: 12px;
+    border-left: 1px solid #d8d8e2;   /* subtle visual divider */
+  }
+  /* "LIVE" badge -- bold red chip, separate from interactive controls.
+     The pulsing dot lives inside it. */
+  #liveJobPanel .ljp-live-badge {
+    display: inline-flex; align-items: center; gap: 6px;
+    background: #c0392b; color: #fff;
+    padding: 4px 9px; border-radius: 5px;
+    font-size: .68em; font-weight: 700;
+    letter-spacing: .12em;
+    box-shadow: 0 1px 3px rgba(192, 57, 43, .35);
+    text-transform: uppercase;
+  }
+  .ljp-livedot {
+    display: inline-block; width: 8px; height: 8px;
+    border-radius: 50%; background: #fff;
+    box-shadow: 0 0 0 0 rgba(255,255,255,.85);
+  }
+  #liveJobPanel h2.running .ljp-livedot {
+    animation: ljp-pulse 1.4s ease-out infinite;
+  }
+  @keyframes ljp-pulse {
+    0%   { box-shadow: 0 0 0 0 rgba(255,255,255,.85); }
+    70%  { box-shadow: 0 0 0 6px rgba(255,255,255,0); }
+    100% { box-shadow: 0 0 0 0 rgba(255,255,255,0); }
+  }
+  /* Job ID -- code chip, clearly read-only. */
+  #liveJobPanel h2 #ljpJobId {
+    font-size: .82em;
+    font-family: ui-monospace, Consolas, monospace;
+    background: #ebebf2;
+    color: #444;
+    padding: 2px 8px;
+    border-radius: 4px;
+    border: 1px solid #dcdce6;
+  }
+  /* Status pill -- colour-coded by job state via JS-set class.
+     Pure visual marker; cursor stays default so it doesn't look
+     clickable. */
+  #liveJobPanel .ljp-status-pill {
+    display: inline-flex; align-items: center; gap: 5px;
+    font-size: .72em; line-height: 1; font-weight: 600;
+    padding: 4px 9px; border-radius: 4px;
+    border: 1px solid; cursor: default;
+    text-transform: lowercase;
+  }
+  .ljp-status-pill.status-running   { background:#fff7e0; border-color:#e0b95c; color:#8a5b1d; }
+  .ljp-status-pill.status-completed { background:#e6f7ea; border-color:#7ab68a; color:#196b2c; }
+  .ljp-status-pill.status-failed    { background:#fdeaea; border-color:#d68080; color:#8a1d1d; }
+  .ljp-status-pill.status-cancelled { background:#eee; border-color:#bbb; color:#666; }
+  .ljp-status-pill.status-queued    { background:#eef; border-color:#88c; color:#33a; }
+  /* Asset-count pill: pure neutral, no interaction. */
+  #liveJobPanel .ljp-asset-pill {
+    display: inline-flex; align-items: center; gap: 5px;
+    font-size: .72em; line-height: 1; font-weight: 600;
+    padding: 4px 9px; border-radius: 999px;
+    background: #efe; border: 1px solid #8c8; color: #1d6a26;
+  }
+  /* Action buttons -- FLAT by default: no fill, no border, just
+     icon+label in a muted ink. They read as plain text until you
+     hover, at which point each reveals its own accent (carried via
+     the --la-bg / --la-bd / --la-fg custom properties set inline)
+     plus a soft lift, making the "this is a button" affordance pop.
+     Keeps the toolbar calm when you're just watching a job run. */
+  #liveJobPanel .ljp-actions-group .pill,
+  #liveJobPanel .ljp-actions-group a.pill,
+  #liveJobPanel .ljp-more-menu .pill,
+  #liveJobPanel .ljp-more-menu a.pill {
+    display: inline-flex; align-items: center; gap: 6px;
+    font-size: .78em; line-height: 1; font-weight: 600;
+    padding: 6px 10px; border-radius: 7px;
+    border: 1px solid transparent;
+    background: transparent;
+    color: #5a5a68;
+    cursor: pointer;
+    text-decoration: none;
+    transition: background .14s ease, border-color .14s ease,
+                color .14s ease, transform .1s ease, box-shadow .14s ease;
+  }
+  #liveJobPanel .ljp-actions-group .pill:not(:disabled):hover,
+  #liveJobPanel .ljp-actions-group a.pill:hover {
+    background: var(--la-bg, #f0f0f6);
+    border-color: var(--la-bd, #d8d8e2);
+    color: var(--la-fg, #2a2a35);
+    transform: translateY(-1px);
+    box-shadow: 0 3px 9px rgba(0,0,0,.10);
+  }
+  #liveJobPanel .ljp-actions-group .pill:not(:disabled):active {
+    transform: translateY(0);
+    box-shadow: 0 1px 2px rgba(0,0,0,.06);
+  }
+  #liveJobPanel .ljp-actions-group .pill:disabled {
+    cursor: not-allowed; opacity: .4;
+    box-shadow: none; transform: none;
+  }
+  /* iconify icons inherit the (muted) text colour, brightening to the
+     accent on hover along with the label. */
+  #liveJobPanel .ljp-actions-group .pill iconify-icon { font-size: 1.05em; }
+
+  /* ----- "more" overflow menu ----- */
+  #liveJobPanel .ljp-more-wrap { position: relative; display: inline-flex; }
+  #liveJobPanel #ljpMore .ljp-more-caret {
+    transition: transform .16s ease; font-size: .9em; opacity: .7;
+  }
+  #liveJobPanel .ljp-more-wrap.open #ljpMore {
+    background: #eceaf6; border-color: #cfcbe6; color: #38306a;
+  }
+  #liveJobPanel .ljp-more-wrap.open #ljpMore .ljp-more-caret {
+    transform: rotate(180deg);
+  }
+  #liveJobPanel .ljp-more-menu {
+    position: absolute; top: calc(100% + 6px); right: 0;
+    min-width: 188px; z-index: 50;
+    display: none; flex-direction: column; gap: 2px;
+    padding: 6px; border-radius: 10px;
+    background: #fff; border: 1px solid #e2e2ec;
+    box-shadow: 0 10px 30px rgba(40,40,70,.16), 0 2px 6px rgba(0,0,0,.06);
+    animation: ljp-menu-in .13s ease-out;
+  }
+  #liveJobPanel .ljp-more-wrap.open .ljp-more-menu { display: flex; }
+  @keyframes ljp-menu-in {
+    from { opacity: 0; transform: translateY(-4px); }
+    to   { opacity: 1; transform: translateY(0); }
+  }
+  /* Menu rows: full-width flat rows, accent on hover (left-aligned,
+     unlike the inline pills which centre). */
+  #liveJobPanel .ljp-more-menu .pill,
+  #liveJobPanel .ljp-more-menu a.pill {
+    width: 100%; justify-content: flex-start;
+    padding: 7px 10px; border-radius: 6px; gap: 9px;
+  }
+  #liveJobPanel .ljp-more-menu .pill:not(:disabled):hover,
+  #liveJobPanel .ljp-more-menu a.pill:hover {
+    background: var(--la-bg, #f0f0f6);
+    color: var(--la-fg, #2a2a35);
+  }
+  #liveJobPanel .ljp-more-menu .pill:disabled {
+    cursor: not-allowed; opacity: .4;
+  }
+  #liveJobPanel .ljp-more-menu hr {
+    border: none; border-top: 1px solid #eee; margin: 4px 2px;
+  }
+  /* Back-compat: the old generic .pill rule (status/asset count) --
+     kept for anything that still uses it directly. */
+  #liveJobPanel .pill {
+    display: inline-flex; align-items: center; gap: 5px;
+    font-size: .72em; line-height: 1;
+    padding: 4px 9px; border-radius: 999px;
+    border: 1px solid; cursor: default;
+  }
+
+  /* Tab bar: clean active-state with bottom accent. */
+  .ljp-tabbar {
+    display: flex; gap: 2px;
+    margin-top: 12px;
+    border-bottom: 1px solid #ccd;
+  }
+  .ljp-tab {
+    border: 1px solid #ccd;
+    border-bottom: none;
+    background: #ecedf3;
+    color: #555;
+    padding: 7px 16px;
+    cursor: pointer;
+    border-radius: 7px 7px 0 0;
+    font-size: .9em;
+    font-weight: 400;
+    transition: background .12s, color .12s, transform .12s;
+    position: relative; top: 1px;
+  }
+  .ljp-tab:hover {
+    background: #f5f5fa; color: #222;
+  }
+  .ljp-tab.active {
+    background: #fff;
+    color: #111;
+    font-weight: 600;
+    z-index: 1;
+    box-shadow: 0 -2px 0 0 #c0392b inset;  /* accent line */
+  }
+  .ljp-tab .count {
+    display: inline-block; min-width: 18px;
+    padding: 1px 5px; margin-left: 3px;
+    background: rgba(0,0,0,.08); color: #555;
+    border-radius: 8px; font-size: .85em;
+    font-family: ui-monospace, Consolas, monospace;
+  }
+  .ljp-tab.active .count { background: #fce6e3; color: #c0392b; }
+
+  /* Pane base styling shared across the four tabs. */
+  .ljp-pane > .ljp-pane-toolbar {
+    display: flex; align-items: center; gap: 10px;
+    padding: 7px 12px;
+    background: #f5f5fa; border: 1px solid #ccd; border-top: none;
+    color: #555; font-size: .85em;
+  }
+  .ljp-pane > .ljp-pane-body {
+    border: 1px solid #ccd; border-top: none;
+    border-radius: 0 0 8px 8px; box-sizing: border-box;
+  }
+  /* Log: terminal-like, with classes for stderr/meta lines. */
+  #ljpLog {
+    background: #14141a; color: #d6d6de;
+    font-family: ui-monospace, "JetBrains Mono", Consolas, monospace;
+  }
+  #ljpLog div.stderr  { color: #ffb4a8; }
+  #ljpLog div.stdout  { color: #aef0c7; }
+  #ljpLog div.meta    { color: #7af; font-style: italic; }
+
+  /* Code: editor-feel. */
+  #ljpCodeBody {
+    background: #181828; color: #eaeaf2;
+    font-family: ui-monospace, "JetBrains Mono", Consolas, monospace;
+  }
+  /* Attempt buttons in the Code tab: rounded pill chips. */
+  .ljp-attempt-btn {
+    border: 1px solid #ccc; padding: 4px 11px;
+    cursor: pointer; border-radius: 999px;
+    font-size: .82em; font-weight: 500;
+    transition: transform .12s, box-shadow .12s;
+  }
+  .ljp-attempt-btn:hover { transform: translateY(-1px); box-shadow: 0 2px 5px rgba(0,0,0,.08); }
+  .ljp-attempt-btn.ok      { background: #e6f7e9; border-color: #7ab68a; color: #196b2c; }
+  .ljp-attempt-btn.timeout { background: #fff4e0; border-color: #d7ad57; color: #885d04; }
+  .ljp-attempt-btn.err     { background: #fde6e6; border-color: #d68080; color: #8a1d1d; }
+  .ljp-attempt-btn.selected {
+    outline: 2px solid #c0392b; outline-offset: 1px;
+    box-shadow: 0 2px 8px rgba(192,57,43,.25);
+  }
+  #ljpCodeRerun:not(:disabled):hover { background:#dff5df; transform: translateY(-1px); }
+  #ljpCodeRerun:disabled { opacity: .5; cursor: not-allowed; }
+
+  /* Gallery: hover lift on tiles. */
+  #ljpGalleryGrid > a {
+    transition: transform .12s, box-shadow .12s, border-color .12s;
+  }
+  #ljpGalleryGrid > a:hover {
+    transform: translateY(-2px);
+    box-shadow: 0 4px 14px rgba(40,40,80,.18);
+    border-color: #c0392b !important;
+  }
+
+  /* Asset modal animations. */
+  #ljpAssetModal { animation: ljp-fadein .12s ease-out; }
+  #ljpAssetModal > div { animation: ljp-popin .18s ease-out; }
+  @keyframes ljp-fadein { from { opacity: 0; } to { opacity: 1; } }
+  @keyframes ljp-popin  { from { transform: scale(.96); opacity: 0; } to { transform: scale(1); opacity: 1; } }
+
+  /* noVNC reload button hover. */
+  .ljp-vnc-reload { transition: background .12s; }
+  .ljp-vnc-reload:hover { background: #555 !important; }
+
+  /* Tiny inline spinner -- used in the Recent Jobs "delete all" button
+     and other long-running operations. */
+  .ljp-spinner {
+    display: inline-block;
+    width: 10px; height: 10px;
+    border: 2px solid #ccc;
+    border-top-color: #c0392b;
+    border-radius: 50%;
+    animation: ljp-spin 0.8s linear infinite;
+    vertical-align: -2px;
+    margin-right: 4px;
+  }
+  @keyframes ljp-spin { to { transform: rotate(360deg); } }
+  /* Generic "spin this iconify-icon" attribute, used by the
+     refresh button while a POST /jobs/{id}/refresh is in flight. */
+  iconify-icon.spin { display: inline-block; animation: ljp-spin 1s linear infinite; }
+
+  /* ---- Simple macro builder: custom action picker ------------------ */
+  /* Native <select> can't render icons inside <option>, so each row's
+     action picker is a button + popover combo. Group headers come from
+     the SIMPLE_ACTIONS[i].category field; clicking an item sets the
+     row's action and closes the popover. */
+  .simple-action-picker { position: relative; min-width: 200px; }
+  .ap-button {
+    display: flex; align-items: center; gap: 6px;
+    width: 100%; padding: 4px 8px;
+    background: #fff; border: 1px solid #ccc; border-radius: 4px;
+    cursor: pointer; font: inherit; text-align: left;
+    color: #222;
+  }
+  .ap-button:hover, .ap-button:focus { background: #f7f7fa; border-color: #99a; outline: none; }
+  .ap-button .ap-current-label { flex: 1; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+  .ap-button .ap-caret { color: #888; font-size: 0.85em; margin-left: 4px; }
+  .ap-popover {
+    position: absolute;
+    top: calc(100% + 2px); left: 0;
+    min-width: 240px;
+    max-height: 60vh; overflow-y: auto;
+    background: #fff;
+    border: 1px solid #ccc; border-radius: 6px;
+    box-shadow: 0 4px 14px rgba(0,0,0,.15);
+    z-index: 200;
+    padding: 4px 0;
+  }
+  .ap-popover[hidden] { display: none; }
+  .ap-group-header {
+    padding: 4px 12px;
+    font-size: 0.72em; font-weight: 700; color: #777;
+    background: #f3f3f6; border-top: 1px solid #e6e6ea;
+    text-transform: none; letter-spacing: 0.02em;
+    user-select: none;
+  }
+  .ap-group-header:first-child { border-top: none; }
+  .ap-item {
+    display: flex; align-items: center; gap: 8px;
+    width: 100%; padding: 5px 12px;
+    background: none; border: none; cursor: pointer;
+    font: inherit; text-align: left; white-space: nowrap;
+    color: #222;
+  }
+  .ap-item:hover { background: #eaf4ff; }
+  .ap-item[data-selected] { background: #d6e9ff; font-weight: 600; }
+  .ap-item iconify-icon { font-size: 1.15em; min-width: 1.4em; color: #555; }
+  .ap-item[data-selected] iconify-icon { color: #1a5a8a; }
+
+/* ============================================================================
+ * Fetch options panel (Submit tab > Fetch mode)
+ * ----------------------------------------------------------------------------
+ * Replaces the old all-inline `display:flex; flex-wrap:wrap;` soup with
+ * section cards + CSS grid so:
+ *   * input widths are uniform (= columns line up between rows),
+ *   * label / input / unit each get their own grid column (= units line up),
+ *   * sub-groups (動作 / タイミング / ヘッダー) are visually separated,
+ *   * the prominent "動画をダウンロード" stays styled but no longer
+ *     feels visually disconnected from the rest of the panel.
+ * ========================================================================== */
+.fetch-options {
+  padding: 12px 14px;
+  background: linear-gradient(180deg, #fafafd 0%, #f3f3fa 100%);
+  border: 1px solid #dfe1ea;
+  border-radius: 8px;
+  margin-bottom: 10px;
+}
+.fetch-options .fo-header {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  font-weight: 600;
+  color: #4a4a5e;
+  font-size: .92em;
+  margin: 2px 0 10px;
+}
+.fetch-options .fo-header iconify-icon { color: #6a6a80; }
+
+/* 実行モード row (sub-mode picker). Sits ABOVE the collapsible
+   options because it's a primary execution choice, not a knob. */
+.fetch-submode {
+  display: flex;
+  align-items: center;
+  gap: 14px;
+  flex-wrap: wrap;
+  padding: 8px 12px;
+  background: #ffffff;
+  border: 1px solid #d8dae5;
+  border-radius: 6px;
+  margin-bottom: 10px;
+}
+.fetch-submode .fo-submode-title {
+  font-weight: 600;
+  color: #4a4a5e;
+  font-size: .92em;
+}
+.fetch-submode label {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  cursor: pointer;
+  user-select: none;
+}
+
+/* AI調査 inline goal area (only visible when AI調査 radio is on). */
+.fetch-investigate-area {
+  padding: 10px 12px;
+  background: #fff8e7;
+  border: 1px solid #f0d68b;
+  border-radius: 6px;
+  margin-bottom: 10px;
+}
+
+/* Each sub-group (動作 / タイミング / ヘッダー) is a "card". */
+.fetch-section {
+  background: #ffffff;
+  border: 1px solid #e6e8ef;
+  border-radius: 6px;
+  padding: 10px 12px;
+  margin-bottom: 8px;
+}
+.fetch-section.video {
+  background: #fffaf3;
+  border-color: #f0d0a0;
+}
+.fetch-section.video .fs-title { color: #8a5a00; }
+.fetch-section .fs-title {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  font-size: .76em;
+  font-weight: 700;
+  color: #6a6a80;
+  text-transform: uppercase;
+  letter-spacing: .05em;
+  margin-bottom: 8px;
+}
+.fetch-section .fs-help {
+  display: block;
+  color: #8a7a4a;
+  font-size: .82em;
+  margin-top: 6px;
+}
+
+/* "動画をダウンロード" big toggle. */
+.fetch-toggle-big {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  font-weight: 600;
+  cursor: pointer;
+  user-select: none;
+}
+.fetch-toggle-big iconify-icon { color: #8a5a00; }
+
+/* Grid of small toggles (動作 セクション). 2 columns wide, 1 narrow. */
+.fetch-toggles {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(170px, 1fr));
+  gap: 6px 16px;
+}
+.fetch-toggles label {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  cursor: pointer;
+  user-select: none;
+}
+
+/* Grid of "label | input | unit" rows. Two columns of rows on wide
+   screens, one column when the container is narrow. */
+.fetch-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(240px, 1fr));
+  gap: 6px 16px;
+}
+.fetch-grid .fetch-row {
+  display: grid;
+  grid-template-columns: 1fr 95px max-content;
+  gap: 6px 10px;
+  align-items: center;
+}
+.fetch-grid .fetch-row > label {
+  color: #555;
+  font-size: .9em;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+.fetch-grid .fetch-row input[type=number],
+.fetch-grid .fetch-row input[type=text] {
+  width: 100%;
+  padding: 3px 6px;
+  box-sizing: border-box;
+  font-variant-numeric: tabular-nums;
+  text-align: right;
+}
+.fetch-grid .fetch-row .fg-unit {
+  color: #888;
+  font-size: .85em;
+}
+
+/* "Wide" single-input rows (リファラー / ジョブに接続). Both share
+   one grid so the label column lines up. */
+.fetch-grid-wide {
+  display: grid;
+  grid-template-columns: max-content 1fr;
+  gap: 8px 12px;
+  align-items: center;
+}
+.fetch-grid-wide > label {
+  color: #555;
+  font-size: .9em;
+}
+.fetch-grid-wide > input[type=text] {
+  width: 100%;
+  padding: 4px 8px;
+  box-sizing: border-box;
+}

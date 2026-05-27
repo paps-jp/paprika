@@ -1,0 +1,43 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "paprika-client"
+version = "0.1.0"
+description = "Playwright-shape Python client for the paprika browser fleet"
+readme = "README.md"
+requires-python = ">=3.9"
+license = "PolyForm-Noncommercial-1.0.0"
+license-files = ["LICENSE"]
+authors = [{ name = "paps", email = "paps@paps.jp" }]
+keywords = ["browser", "automation", "playwright", "cdp", "scraping"]
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "Intended Audience :: Developers",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.9",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Topic :: Internet :: WWW/HTTP :: Browsers",
+    "Topic :: Software Development :: Testing",
+    "Typing :: Typed",
+]
+dependencies = [
+    "httpx>=0.24",
+    "cryptography>=41",
+]
+
+[project.scripts]
+paprika-client = "paprika_client._cli:main"
+
+[project.urls]
+Homepage = "https://github.com/paps-jp/paprika"
+Source = "https://github.com/paps-jp/paprika/tree/main/client/python"
+Documentation = "https://github.com/paps-jp/paprika/blob/main/client/python/README.md"
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["paprika_client*"]
