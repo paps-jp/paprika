@@ -15,7 +15,7 @@ WORKDIR /app
 ARG DOCKER_CLI_VERSION=27.5.1
 RUN set -eux \
  && apt-get update \
- && apt-get install -y --no-install-recommends ca-certificates curl cifs-utils \
+ && apt-get install -y --no-install-recommends ca-certificates curl cifs-utils ffmpeg \
  && curl -fsSL "https://download.docker.com/linux/static/stable/x86_64/docker-${DOCKER_CLI_VERSION}.tgz" \
       -o /tmp/docker.tgz \
  && tar -xz -C /tmp -f /tmp/docker.tgz docker/docker \
