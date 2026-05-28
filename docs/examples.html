@@ -1,0 +1,487 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+<meta charset="utf-8">
+<title>サンプルコード集 — paprika-client Python で動画 DL・ログイン・ DOM 操作</title>
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<link rel="stylesheet" href="style.css">
+<meta name="description" content="paprika-client Python のサンプルコード集。セッション操作、goto / click / fill / scroll、画像・動画ダウンロード、ログイン突破、LLM agent、Simple Macro、同期版など、実際に動くスニペットを用途別に掲載。">
+<link rel="canonical" href="https://paps-jp.github.io/paprika/examples.html">
+<meta property="og:type" content="website">
+<meta property="og:site_name" content="Paprika">
+<meta property="og:title" content="サンプルコード集 — paprika-client Python で動画 DL・ログイン・ DOM 操作">
+<meta property="og:description" content="paprika-client Python のサンプルコード集。セッション操作、goto / click / fill / scroll、画像・動画ダウンロード、ログイン突破、LLM agent、Simple Macro、同期版など、実際に動くスニペットを用途別に掲載。">
+<meta property="og:url" content="https://paps-jp.github.io/paprika/examples.html">
+<meta property="og:image" content="https://paps-jp.github.io/paprika/img/admin-submit.png">
+<meta property="og:locale" content="ja_JP">
+<meta name="twitter:card" content="summary_large_image">
+<meta name="twitter:title" content="サンプルコード集 — paprika-client Python で動画 DL・ログイン・ DOM 操作">
+<meta name="twitter:description" content="paprika-client Python のサンプルコード集。セッション操作、goto / click / fill / scroll、画像・動画ダウンロード、ログイン突破、LLM agent、Simple Macro、同期版など、実際に動くスニペットを用途別に掲載。">
+<meta name="twitter:image" content="https://paps-jp.github.io/paprika/img/admin-submit.png">
+<script type="application/ld+json">{
+  "@context": "https://schema.org",
+  "@type": "Organization",
+  "name": "特定非営利活動法人ぱっぷす",
+  "alternateName": ["paps", "PAPS", "ぱっぷす"],
+  "url": "https://www.paps.jp",
+  "logo": "https://paps-jp.github.io/paprika/icon.svg",
+  "sameAs": [
+    "https://github.com/paps-jp",
+    "https://paps-jp.github.io/paprika/"
+  ]
+}</script>
+</head>
+<body>
+
+<nav class="topnav">
+  <a class="brand" href="index.html"><span class="logo"><img src="icon.svg" alt=""></span> Paprika</a>
+  <span class="links">
+    <a href="index.html">Home</a>
+    <a href="intro.html">はじめに</a>
+    <a href="guides.html">ガイド</a>
+    <a href="examples.html" class="active">サンプル</a>
+    <a href="admin.html">管理画面</a>
+    <a href="api.html">API</a>
+    <a href="operations.html">サーバー</a>
+  </span>
+  <a class="gh" href="https://github.com/paps-jp/paprika">GitHub ↗</a>
+</nav>
+
+<div class="layout">
+  <aside class="sidebar">
+    <h4>サンプル</h4>
+    <ul>
+      <li><a href="#setup">準備・接続</a></li>
+      <li><a href="#session-basics">セッションを開く / 閉じる</a></li>
+      <li><a href="#navigation">goto / state / 戻る</a></li>
+      <li><a href="#interact">クリック・入力・キー操作</a></li>
+      <li><a href="#scroll-wait">スクロール・待機</a></li>
+      <li><a href="#dom-query">DOM を見る (outline / links)</a></li>
+      <li><a href="#screenshot">スクリーンショット</a></li>
+      <li><a href="#assets">アセット (画像・動画) を取る</a></li>
+      <li><a href="#video">動画をダウンロード</a></li>
+      <li><a href="#login">ログイン必須サイト</a></li>
+      <li><a href="#login-flow">ログイン → 操作 → 動画 (フル)</a></li>
+      <li><a href="#llm">LLM (ask / observe / agent)</a></li>
+      <li><a href="#errors">エラー処理</a></li>
+      <li><a href="#sync">同期版で書く</a></li>
+      <li><a href="#runner">paprika-runner 環境</a></li>
+    </ul>
+  </aside>
+
+  <main class="content">
+    <h1>サンプルコード集</h1>
+    <p class="lead">用途別に「コピペで動く」スニペットを集めました。API の網羅的な仕様は <a href="api.html">API リファレンス</a>、概念面の解説は <a href="guides.html">ガイド</a> をご覧ください。</p>
+
+    <div class="callout info">
+      <strong>前提</strong>
+      hub が <code>http://paprika.lan:8000</code> (LAN) もしくは <code>http://localhost:8000</code> (ローカル Docker) で起動済みであること。<code>paprika-client</code> は <code>pip install paprika-client</code> でインストールできます。
+    </div>
+
+    <!-- ==================================================================== -->
+    <h2 id="setup">準備・接続</h2>
+    <p>SDK は async と sync の両方を提供します。基本は <code>async_paprika.connect()</code>:</p>
+<pre><code>import asyncio
+from paprika_client import async_paprika
+
+async def main():
+    # 引数を省略すると環境変数 PAPRIKA_HUB を見る
+    # → paprika-runner 内なら何も書かなくて OK
+    async with async_paprika.connect("http://paprika.lan:8000") as cli:
+        info = await cli.health()
+        print(info)         # {'ok': True, 'store': 'redis', 'workers': 25}
+
+asyncio.run(main())</code></pre>
+
+    <p>以降の例では <code>cli</code> は connect 済みの client、<code>page</code> はセッションを開いた状態を想定します。</p>
+
+    <!-- ==================================================================== -->
+    <h2 id="session-basics">セッションを開く / 閉じる</h2>
+
+    <h3>パターン 1: <code>async with</code> (推奨)</h3>
+    <p>ブロック抜けで <code>close()</code> が自動で走る。スクリプトの 9 割はこの形で OK。</p>
+<pre><code>async with cli.session("https://example.com") as page:
+    await page.click("a.login")
+    # ブロック終端で lane が解放される</code></pre>
+
+    <h3>パターン 2: 明示 open / close</h3>
+    <p>例外を握って自分でリトライしたい場合や、複数のスクリプトをまたいでセッションを使い回したい時。</p>
+<pre><code>page = await cli.open_session(
+    initial_url="https://example.com",
+    use_profile="default",      # 事前 upload した Chrome profile
+    idle_ttl_s=300,             # 無操作 TTL (秒)
+    absolute_ttl_s=3600,        # 絶対 TTL (秒)
+    parent_job_id=None,         # 親 job を持たせると assets がそこに紐づく
+    worker_id=None,             # 特定 worker を狙うなら "host-xxxx"
+    lane_hint=None,             # 特定 lane を狙うなら 0/1
+)
+try:
+    await page.click(...)
+finally:
+    await page.close()</code></pre>
+
+    <h3>パターン 3: 初期 URL 無しで開いて goto</h3>
+<pre><code>async with cli.session() as page:
+    await page.goto("https://example.com/")
+    await page.goto("https://example.com/page2")</code></pre>
+
+    <!-- ==================================================================== -->
+    <h2 id="navigation">goto / state / 戻る</h2>
+<pre><code>async with cli.session() as page:
+    # 移動
+    reply = await page.goto("https://example.com/article")
+    # reply["status"] == "OK" → CDP は届いた
+    # reply["result"]["response"]["status"] == 200 → HTTP ステータス
+
+    # 現在の URL / title / lane
+    st = await page.state()
+    # {'url': 'https://example.com/article',
+    #  'title': '記事タイトル',
+    #  'lane_idx': 0,
+    #  'visited_count': 1}
+
+    title = await page.title()
+    print(title)</code></pre>
+
+    <p>戻る / 進む は CDP の history API を直接呼べる JS evaluate で実現できますが、サイトの普通の操作系 (リンククリック / goto) で十分なケースがほとんどです。</p>
+
+    <!-- ==================================================================== -->
+    <h2 id="interact">クリック・入力・キー操作</h2>
+<pre><code>async with cli.session("https://example.com/login") as page:
+    # ----- クリック -----
+    await page.click("button.submit")              # CSS セレクタ
+    await page.click("#login-link")
+    await page.click('[data-paprika-id="42"]')     # outline の @42 番号
+
+    # ----- 入力 -----
+    await page.fill("input#email", "me@example.com")
+
+    # ${PW} はワーカー側で置換されるのでログにも LLM 履歴にも値が出ない
+    import os
+    await page.fill("input#password", "${PW}",
+                    variables={"PW": os.environ["PASSWORD"]})
+
+    # 既にフォーカス済みの要素に直接タイプ
+    await page.type("hello world")
+
+    # ----- キー -----
+    await page.press("Enter")
+    await page.press("Backspace", count=3)
+    await page.press("Ctrl+A")
+    await page.press("ArrowDown", count=5)         # メニューの選択肢移動
+    await page.press("Ctrl+Shift+T")               # 複合修飾子</code></pre>
+
+    <div class="callout tip">
+      <strong>セレクタが脆い時は outline の @N</strong>
+      <code>page.outline()</code> が返すテキストには各要素に <code>[@N]</code> が振られています。<code>[data-paprika-id="N"]</code> で参照すると、レイアウト変更に強く、LLM 生成スクリプトと同じ識別子で操作できます。
+    </div>
+
+    <!-- ==================================================================== -->
+    <h2 id="scroll-wait">スクロール・待機</h2>
+<pre><code>await page.scroll("down", pixels=800)
+await page.scroll("up", pixels=400)
+await page.scroll("bottom")                        # ページ末尾まで
+
+await page.wait_for(seconds=2)                     # 単純な sleep (client 側)
+await page.wait_for(ms=500)                        # ms 指定も可
+
+# 要素が出るまで待つ (タイムアウト 30 秒、ms 単位指定も可)
+await page.wait_for_selector(".result")
+await page.wait_for_selector("#chart", timeout=10)</code></pre>
+
+    <!-- ==================================================================== -->
+    <h2 id="dom-query">DOM を見る (outline / links)</h2>
+<pre><code># LLM agent が読むのと同じテキスト outline
+out = await page.outline()
+# 例:
+#   [@1] <button> 'ログイン'
+#   [@2] <a href="https://..."> '記事を読む'
+#   [@3] <input placeholder="search">
+#   ...
+
+# ページ内のリンクを全部
+links = await page.links()
+# [{"href": "https://...", "text": "..."}, ...]
+
+urls = await page.links(urls_only=True)
+# ["https://...", "https://...", ...]
+
+# クロール済み URL (このセッション内)
+visited = await page.visited_urls()</code></pre>
+
+    <!-- ==================================================================== -->
+    <h2 id="screenshot">スクリーンショット</h2>
+<pre><code># 現在の viewport を PNG bytes で返す (Playwright と同じ形)
+png = await page.screenshot()
+
+# ローカルファイルに保存
+png = await page.screenshot(path="step1.png")
+
+# parent_job_id を持ったセッションなら gallery に流す
+# (admin UI の Live > Screenshot タブに即時反映)
+png = await page.screenshot(label="after-login")</code></pre>
+
+    <p>「HTML + screenshot + outline」をまとめて記録するなら <code>capture()</code>:</p>
+<pre><code>snap = await page.capture("step1")
+# snap = {"label": "step1", "step": 0, "html_path": "...", "png_path": "...", ...}</code></pre>
+
+    <!-- ==================================================================== -->
+    <h2 id="assets">アセット (画像・動画) を取る</h2>
+    <p>paprika は worker 側で「ページが読み込んだ画像・動画・音声」を <em>受動的に</em> キャプチャしています。<code>page.assets()</code> で取り出せます。</p>
+<pre><code>async with cli.session("https://example.com/gallery", parent_job_id="abc123") as page:
+    await page.scroll("bottom")                # 遅延読み込みを発火させる
+    await page.wait_for(seconds=2)
+
+    # 画像 URL を全件 (既定: kind="image")
+    images = await page.assets()
+
+    # 動画だけ
+    videos = await page.assets(kind="video")
+
+    # 全種類 + メタデータ付き
+    everything = await page.assets(kind=None, details=True)
+    # [
+    #   {"name": "foo.jpg", "url": "http://hub/.../foo.jpg",
+    #    "size": 12345, "mime": "image/jpeg", "kind": "image",
+    #    "source_url": "...", "page_url": "..."},
+    #   ...
+    # ]</code></pre>
+
+    <div class="callout info">
+      <strong>job バインドが必要</strong>
+      <code>assets()</code> は parent job のディレクトリにファイルを保存します。<code>cli.session(..., parent_job_id="...")</code> または paprika-runner 環境で実行してください。普通のフェッチが目的なら次の <a href="#video">cli.fetch()</a> 経由が簡単です。
+    </div>
+
+    <!-- ==================================================================== -->
+    <h2 id="video">動画をダウンロード</h2>
+
+    <h3>パターン A: ワンショット Fetch (管理画面の「動画をダウンロード」と等価)</h3>
+<pre><code>async with async_paprika.connect() as cli:
+    job = await cli.fetch(
+        "https://example.com/video-page",
+        download_video=True,            # ← 管理画面のチェック相当
+        scroll=True,
+    )
+    print("job_id:", job["job_id"])
+
+    videos = await cli.job_assets(job["job_id"], kind="video")
+    for v in videos:
+        print(v["url"], v.get("name"))</code></pre>
+
+    <p><code>download_video=True</code> で worker は:</p>
+    <ul>
+      <li>セッション開始時から iframe / ネスト iframe の network deep-trace を ON</li>
+      <li>HLS/DASH の <code>.m3u8</code> / <code>.mpd</code> 由来 URL を収集</li>
+      <li>Auto yt-dlp 経路を有効化（<code>.ts</code> / <code>.m4s</code> 断片を結合して <code>.mp4</code> に）</li>
+      <li><code>capture_assets</code> を自動で True に矯正</li>
+    </ul>
+
+    <h3>パターン B: セッション内で明示的に <code>page.download_video()</code></h3>
+<pre><code>async with cli.session("https://example.com/video-page",
+                       parent_job_id="abc123") as page:
+    # 現在ページの URL に対して yt-dlp を実行
+    result = await page.download_video()
+
+    # または特定 URL を referer 付きで
+    result = await page.download_video(
+        url="https://cdn.example.com/clip.m3u8",
+        referer="https://example.com/",
+        timeout_s=1800,
+    )
+    # result = {"ok": True, "files": ["clip.mp4"], "file_count": 1,
+    #           "message": "...", "url": "..."}
+
+    from urllib.parse import quote
+    for name in result["files"]:
+        print(f"http://paprika.lan:8000/jobs/abc123/assets/{quote(name, safe='')}")</code></pre>
+
+    <h3>パターン C: ハイブリッド (deep-trace ON + 明示呼び出し)</h3>
+<pre><code>job = await cli.create_job(
+    "https://example.com/video-page",
+    mode="fetch",
+    scroll=True,
+    download_video=True,
+    keep_session=True,        # 終了後もセッションを残す
+)</code></pre>
+
+    <!-- ==================================================================== -->
+    <h2 id="login">ログイン必須サイト</h2>
+
+    <h3>方法 1: Chrome プロファイルを使う (推奨)</h3>
+    <p>事前にあなたのブラウザの <em>User Data</em> ディレクトリを <code>paprika-client upload-profile</code> でアップロードしておくと、そのセッションは既にログイン済みの状態で開きます。</p>
+<pre><code>async with cli.session(
+    "https://example.com/dashboard",
+    use_profile="default",          # アップロード時に付けた名前
+) as page:
+    # クッキー・localStorage・拡張機能・ログインセッション全部
+    # 引き継いだ状態で開く
+    await page.click("a.my-profile")</code></pre>
+
+    <h3>方法 2: 都度ログイン</h3>
+<pre><code>import os
+
+async with cli.session("https://example.com/login") as page:
+    await page.fill("input[name=email]", os.environ["EMAIL"])
+    await page.fill("input[name=password]", "${PW}",
+                    variables={"PW": os.environ["PASSWORD"]})
+    await page.click("button[type=submit]")
+    await page.wait_for_selector(".dashboard", timeout=30)
+    # ここから先はログイン済み</code></pre>
+
+    <!-- ==================================================================== -->
+    <h2 id="login-flow">ログイン → 操作 → 動画 (フルフロー)</h2>
+<pre><code>import asyncio, os
+from paprika_client import async_paprika
+
+async def main():
+    async with async_paprika.connect("http://paprika.lan:8000") as cli:
+        # 親 job を作っておく (assets を集約させる)
+        job = await cli.create_job(
+            "about:blank",
+            mode="fetch",
+            download_video=True,
+            keep_session=True,
+            wait=False,           # 投げっぱなしで session を直接操作
+        )
+
+        async with cli.session(
+            initial_url="https://example.com/login",
+            use_profile="default",
+            parent_job_id=job["job_id"],
+        ) as page:
+            # 1. ログイン
+            await page.fill("input[name=email]", os.environ["EMAIL"])
+            await page.fill("input[name=password]", "${PW}",
+                            variables={"PW": os.environ["PASSWORD"]})
+            await page.click("button[type=submit]")
+            await page.wait_for_selector(".dashboard", timeout=30)
+
+            # 2. 目的のページへ
+            await page.goto("https://example.com/movies/1234")
+            await page.scroll("down", pixels=600)
+            await page.wait_for(seconds=2)
+
+            # 3. 再生開始 (agent に任せる)
+            await page.agent("プレイヤーの再生ボタンを押して再生開始", max_steps=3)
+            await page.wait_for(seconds=5)        # m3u8 が動き出すまで
+
+            # 4. 動画 DL
+            res = await page.download_video()
+            print("saved:", res["files"])
+
+            # 5. ついでに画像も
+            imgs = await page.assets(kind="image")
+            print(f"{len(imgs)} images")
+
+asyncio.run(main())</code></pre>
+
+    <!-- ==================================================================== -->
+    <h2 id="llm">LLM (ask / observe / agent)</h2>
+    <p>ローカルの状態は <code>outline()</code> で読めますが、自然言語で問いたいときは LLM 系プリミティブが便利です。</p>
+
+    <h3><code>page.ask()</code> — 真偽値を問う</h3>
+<pre><code>has_form = await page.ask("ログインフォームが見えていますか？")
+if not has_form:
+    await page.click("a.login")</code></pre>
+
+    <h3><code>page.observe()</code> — 要素を探す</h3>
+<pre><code>cands = await page.observe("'いいね' ボタン")
+# cands = [Candidate(selector="...", text="...", confidence=0.9), ...]
+if cands:
+    await page.click(cands[0])         # Candidate をそのまま click に渡せる</code></pre>
+
+    <h3><code>page.agent()</code> — 観察 + 実行を委任</h3>
+<pre><code># 最大 5 ステップまで observe → act のループを LLM に任せる
+result = await page.agent(
+    "クッキー同意ダイアログを閉じて、トップの '記事を読む' を押す",
+    max_steps=5,
+    engine="auto",      # CogAgent → Qwen-VL の順にフォールバック
+)
+# result["status"] == "OK" / "FAIL"
+# result["steps"] = [{"action": "click", "selector": "...", ...}, ...]</code></pre>
+
+    <div class="callout warn">
+      <strong>料金注意</strong>
+      <code>agent()</code> / <code>ask()</code> / <code>observe()</code> は LLM API を呼びます。決定論的に書ける箇所は <code>click(selector)</code> 等の primitive のみで構成し、LLM 系は「サイト固有の解析が要る所」だけに局所適用してください。
+    </div>
+
+    <!-- ==================================================================== -->
+    <h2 id="errors">エラー処理</h2>
+<pre><code>from paprika_client import PaprikaError, PaprikaActionError
+
+async with cli.session("https://example.com") as page:
+    try:
+        await page.click("button.does-not-exist")
+    except PaprikaActionError as e:
+        # 要素が見つからない / クリック不可能 / タイムアウト
+        print("click failed:", e)
+
+    try:
+        await page.wait_for_selector(".never-appears", timeout=5)
+    except PaprikaActionError:
+        # 5 秒以内に出ない → 代替フローへ
+        await page.goto("https://example.com/fallback")
+
+# 接続エラー / 502 / HTTP レベルの失敗は PaprikaError
+try:
+    async with async_paprika.connect("http://nope:8000") as cli:
+        await cli.health()
+except PaprikaError as e:
+    print("hub unreachable:", e)</code></pre>
+
+    <!-- ==================================================================== -->
+    <h2 id="sync">同期版で書く</h2>
+    <p>ノートブックや既存の同期コードと混ぜる場合は <code>sync_paprika</code>。<code>await</code> を全部外した同じ API です。</p>
+<pre><code>from paprika_client import sync_paprika
+
+with sync_paprika.connect("http://paprika.lan:8000") as cli:
+    job = cli.fetch("https://example.com/article", download_video=True)
+
+    for url in cli.job_images(job.job_id):
+        print(url)
+
+    with cli.session("https://example.com") as page:
+        page.click("text=ログイン")
+        page.fill("input#email", "me@example.com")
+        page.click("button[type=submit]")
+        print(page.title())
+
+        res = page.download_video()
+        print(res["files"])</code></pre>
+
+    <!-- ==================================================================== -->
+    <h2 id="runner">paprika-runner 環境</h2>
+    <p>管理画面の Submit で <strong>code モード</strong> を選んでスクリプトを投げると、worker 内の <code>paprika-runner</code> が以下を自動で設定してから <code>python script.py</code> を実行します:</p>
+    <ul>
+      <li><code>PAPRIKA_HUB</code> = <code>http://hub:8000</code> (in-compose)</li>
+      <li><code>PAPRIKA_JOB_ID</code> = 親 job ID (= <code>session()</code> が自動で <code>parent_job_id</code> をセット)</li>
+    </ul>
+<pre><code>import asyncio
+from paprika_client import async_paprika
+
+async def main():
+    # 引数 0 で OK -- runner 環境変数から HUB と JOB_ID を読む
+    async with async_paprika.connect() as cli:
+        async with cli.session("https://example.com") as page:
+            # 自動で parent_job_id がバインドされる
+            await page.goto("https://example.com/article")
+            await page.scroll("bottom")
+            # 画像は管理画面の Gallery に出る
+            imgs = await page.assets(kind="image")
+            print(f"{len(imgs)} images captured")
+
+asyncio.run(main())</code></pre>
+
+    <p>ローカル開発で同じスクリプトを動かしたい時は、環境変数だけセットすれば OK:</p>
+<pre><code>import os
+os.environ["PAPRIKA_HUB"] = "http://paprika.lan:8000"
+# PAPRIKA_JOB_ID をセットしない → assets() は使えないが click / goto は動く</code></pre>
+
+    <div class="pager">
+      <a href="guides.html"><div class="dir">← 戻る</div><div class="ttl">ガイド</div></a>
+      <a class="next" href="api.html"><div class="dir">次へ →</div><div class="ttl">API リファレンス</div></a>
+    </div>
+  </main>
+</div>
+</body>
+</html>
