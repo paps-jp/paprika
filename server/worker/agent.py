@@ -3038,13 +3038,27 @@ class WorkerAgent:
                 # HLS/DASH streams are merged into a playable mp4
                 # without an explicit SDK call. Idempotent on URL.
                 on_stream_detected=maybe_download_video_session,
-                # iframe + nested-iframe deep network trace. ON only
-                # when the operator opted into the video-download
-                # flow (JobOptions.download_video / /sessions body
-                # download_video). For non-video sessions we save the
-                # CDP attach overhead; page.download_video() can
-                # late-enable via the hook stashed on the tab.
-                enable_iframe_deep_trace=bool(getattr(msg, "download_video", False)),
+                # iframe + nested-iframe deep network trace. ALWAYS on
+                # for a capturing session: the asset dir is always
+                # present here, and many video sites (supjav, DMM
+                # litevideo, embedded players) stream HLS *inside a
+                # cross-origin iframe*. Without deep-trace the parent
+                # CDP target never sees those .m3u8 requests, so
+                # on_stream_detected never fires and a video that
+                # visibly plays during the session is captured as
+                # zero bytes (job 8a10c9289262: video played, nothing
+                # downloaded, because it was submitted download_video=
+                # False so deep-trace stayed deferred and the script's
+                # goal never called page.download_video()).
+                #
+                # Mirrors the same always-on decision in core/fetcher
+                # (fetch path). The old download_video gate + the
+                # page.download_video() late-enable hook left a hole:
+                # a session that merely *plays* a video (rather than
+                # explicitly downloading it) was invisible. The CDP
+                # attach overhead is acceptable for a video-archiving
+                # tool where any played stream should be preserved.
+                enable_iframe_deep_trace=True,
             )
             # Per-host cookies auto-injected by the hub. Install them via
             # CDP Network.setCookies BEFORE the initial navigation so the
@@ -7151,13 +7165,15 @@ class WorkerAgent:
                     # MSE/DASH fragment flood under control.
                     extra_mime_prefixes=("video/",),
                     network_log=fetch_network_log,
-                    # Vision-agent / Fetch jobs use download_video as an
-                    # opt-in for the iframe deep-trace machinery. ON
-                    # only when the operator checked '動画をダウンロード'
-                    # at submit time.
-                    enable_iframe_deep_trace=bool(
-                        getattr(assign.options, "download_video", False)
-                    ),
+                    # ALWAYS on (see the matching session_start call and
+                    # core/fetcher): vision-agent flows frequently land
+                    # on cross-origin iframe players whose HLS stream is
+                    # invisible to the parent CDP target without deep-
+                    # trace. Gating this on download_video meant a video
+                    # the agent visibly opened could be captured as zero
+                    # bytes. The attach overhead is acceptable for a
+                    # video-archiving tool.
+                    enable_iframe_deep_trace=True,
                 )
                 log(f"  ... asset capture armed (min_size={min_asset} bytes, +video/*)")
             except Exception as e:
