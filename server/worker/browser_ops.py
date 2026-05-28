@@ -1436,6 +1436,107 @@ async def _capture_nav_response(
     return status_str, (captured if captured else None)
 
 
+async def install_last_response_tracker(
+    tab,
+    on_response_captured,
+    log: LogFn | None = None,
+) -> None:
+    """Passive tracker that keeps ``state.last_response`` current.
+
+    Hooks Network.requestWillBeSent + Network.responseReceived for the
+    LIFETIME of the session (vs the per-call _capture_nav_response
+    which runs only across a single goto/back/forward). Updates the
+    session's ``last_response`` field whenever a main-document response
+    arrives, no matter what triggered the navigation: page.goto, a
+    click on a link, a form submit, window.location.href = ..., or a
+    JS redirect.
+
+    The session action ``kind: "last_response"`` reads back whatever
+    this tracker stored most recently. SDK exposes it as
+    ``page.last_response()``.
+
+    Args:
+      tab: nodriver Tab handle for the session's main page.
+      on_response_captured: sync callable invoked with the response
+        dict each time a new top-level document response is observed.
+        The agent wires this to ``state.last_response = info``.
+      log: optional logger for diagnostics.
+    """
+    # Mirrors _capture_nav_response's logic but runs unconditionally
+    # for the session's lifetime. The first request after install
+    # might not be a navigation -- a page already has resources in
+    # flight at install time -- so we don't seed an initial value.
+    pending_docs: dict[str, str] = {}   # request_id -> request url
+
+    def _request_url(event) -> str:
+        req = getattr(event, "request", None)
+        if req is not None:
+            return str(getattr(req, "url", "") or "")
+        return str(getattr(event, "request_url", "") or "")
+
+    def _is_doc(event) -> bool:
+        for attr in ("type", "type_", "resource_type"):
+            rt = getattr(event, attr, None)
+            if rt is None:
+                continue
+            if str(rt).rsplit(".", 1)[-1].lower() == "document":
+                return True
+        return False
+
+    async def _on_request(event):
+        try:
+            if not _is_doc(event):
+                return
+            pending_docs[str(event.request_id)] = _request_url(event)
+        except Exception:
+            pass
+
+    async def _on_response(event):
+        try:
+            rid = str(event.request_id)
+            if rid not in pending_docs:
+                return
+            pending_docs.pop(rid, None)
+            resp = event.response
+            try:
+                status_code = int(getattr(resp, "status", 0) or 0)
+            except Exception:
+                status_code = 0
+            hdrs_raw = getattr(resp, "headers", None) or {}
+            try:
+                hdrs = {str(k).lower(): str(v) for k, v in hdrs_raw.items()}
+            except Exception:
+                hdrs = {}
+            info = {
+                "url":         getattr(resp, "url", "") or "",
+                "status":      status_code,
+                "status_text": getattr(resp, "status_text", "") or "",
+                "ok":          200 <= status_code < 300,
+                "headers":     hdrs,
+                "mime":        getattr(resp, "mime_type", "") or "",
+            }
+            try:
+                on_response_captured(info)
+            except Exception:
+                if log:
+                    log(
+                        f"  [last-response] on_captured raised "
+                        f"(ignored): {info.get('url','')[:120]}"
+                    )
+        except Exception:
+            pass
+
+    handlers = getattr(tab, "handlers", None)
+    if handlers is None:
+        if log:
+            log("  [last-response] tab has no .handlers; tracker disabled")
+        return
+    handlers.setdefault(cdp.network.RequestWillBeSent, []).append(_on_request)
+    handlers.setdefault(cdp.network.ResponseReceived, []).append(_on_response)
+    if log:
+        log("  [last-response] tracker installed")
+
+
 async def execute_nav_with_response(
     tab, action: dict, log: LogFn,
 ) -> tuple[str, Optional[dict]]:

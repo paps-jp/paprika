@@ -1142,6 +1142,45 @@ class Page:
         )
 
     @_action_log
+    async def last_response(self) -> dict:
+        """Return the most recent main-document HTTP response observed
+        on this session.
+
+        A passive listener on the worker tracks every top-level
+        navigation -- whether triggered by ``page.goto`` / ``back`` /
+        ``forward`` / ``reload`` / ``history_first`` OR by a click
+        that incidentally navigated (link, form submit, JS
+        ``location.href = ...``). The most recent one is always
+        available here::
+
+            page.locator("a.title-link").first.click()
+            r = await page.last_response()
+            if r["status"] == 404:
+                return None
+            if not r["ok"]:
+                raise RuntimeError(f"HTTP {r['status']}")
+
+        Always returns the standard response dict (see :func:`response_of`).
+        Fields are filled with defaults (``status: 0``, ``ok: False``,
+        empty headers) when no document response has been observed yet
+        on this session.
+
+        Use this for click-induced navigations -- ``page.goto()`` and
+        the explicit nav methods already return the response inline as
+        ``reply["result"]["response"]``.
+        """
+        out = await self._client._json(
+            "GET", f"/sessions/{self._sid}/last_response",
+        )
+        # Bake out into the response_of() shape directly so the caller
+        # doesn't need an extra unwrap step.
+        resp = (out or {}).get("response")
+        result = _EMPTY_RESPONSE.copy()
+        if isinstance(resp, dict):
+            result.update(resp)
+        return result
+
+    @_action_log
     async def network(self, *, since: float = 0.0) -> dict:
         """Media network traffic observed in this session (images / audio
         / video responses the browser loaded).

@@ -1225,6 +1225,37 @@ async def session_links(
     }
 
 
+@router.get("/sessions/{session_id}/last_response")
+async def session_last_response(session_id: str) -> dict:
+    """Return the most recent main-document HTTP response observed
+    on this session.
+
+    A passive Network CDP listener (installed at session_start) keeps
+    the worker's ``state.last_response`` in sync with whatever the
+    last top-level navigation returned -- whether that was
+    ``page.goto`` / ``back`` / ``forward`` / ``reload`` /
+    ``history_first`` OR a click that incidentally navigated
+    (a link, a form submit, an in-page ``location.href = ...``).
+
+    Used by ``page.last_response()`` in the SDK -- the click-induced
+    nav case in particular has no per-call capture (the click action
+    doesn't know whether it will navigate), so this stateful endpoint
+    is the only way to read the response status after such a click.
+
+    Returns ``{"response": {...} | None}``. The inner dict has the
+    same shape as ``page.goto()``'s ``result["response"]``::
+
+        {"url", "status", "status_text", "ok", "headers", "mime"}
+
+    ``response`` is ``None`` when no document response has been
+    observed yet on this session (fresh ``initial_url=about:blank``
+    sessions, or sessions opened just moments before the call).
+    """
+    action = {"kind": "last_response"}
+    out = await _send_session_action(session_id, action, timeout=10.0)
+    return {"session_id": session_id, "response": out.get("result")}
+
+
 @router.get("/sessions/{session_id}/network")
 async def session_network(
     session_id: str,

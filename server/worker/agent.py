@@ -2997,6 +2997,25 @@ class WorkerAgent:
             state.video_downloader = maybe_download_video_session
             state.video_drainer = drain_video_session
 
+            # Passive "last main-document response" tracker so
+            # page.last_response() always reflects whatever the most
+            # recent top-level navigation returned -- including
+            # click-induced ones where _capture_nav_response can't
+            # bracket the call.
+            def _set_last_response(info: dict) -> None:
+                state.last_response = info
+            try:
+                await browser_ops.install_last_response_tracker(
+                    state.tab,
+                    on_response_captured=_set_last_response,
+                    log=lambda s: _logger.info(f"[session {sid}] {s}"),
+                )
+            except Exception as e:
+                _logger.info(
+                    f"[session {sid}] last_response tracker install failed "
+                    f"(non-fatal): {type(e).__name__}: {e}"
+                )
+
             await browser_ops.install_session_asset_capture(
                 state.tab,
                 state.assets_dir,
@@ -3167,6 +3186,9 @@ class WorkerAgent:
             # Network log: read-only list populated by the fetcher's
             # own CDP handlers. Safe to read mid-fetch.
             "network",
+            # Last main-document HTTP response. Updated by a passive
+            # listener so reading it never races the fetch loop.
+            "last_response",
             # Tab management is read-only-safe: listing / switching
             # default doesn't drive the fetch loop's tab. Creating /
             # closing tabs is still disallowed during fetch (the
@@ -3297,6 +3319,18 @@ class WorkerAgent:
                             _slog(f"screenshot gallery upload failed: {e}")
                 elif kind == "visited":
                     reply.result = list(state.visited_urls_ordered)
+                elif kind == "last_response":
+                    # Return the most recent main-document HTTP response
+                    # observed on this session, regardless of whether
+                    # the navigation was triggered by goto / back / forward
+                    # / reload / history_first or a click that happened
+                    # to navigate (form submit, anchor click, JS
+                    # location.href = ...). state.last_response is
+                    # updated by the passive tracker installed at
+                    # session_start (browser_ops.install_last_response_tracker).
+                    # None when no document response has been observed yet
+                    # (session opened with initial_url=about:blank etc.).
+                    reply.result = state.last_response
                 elif kind == "network":
                     # Return the session's network traffic log for the
                     # Live panel "Network" tab. Each entry:

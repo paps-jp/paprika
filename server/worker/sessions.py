@@ -88,6 +88,16 @@ class SessionState:
     # session action so the operator can inspect traffic and selectively
     # add items to the job's asset gallery.
     network_log: list[dict] = field(default_factory=list)
+    # The most recent HTTP response for a top-level document load on
+    # this session. Updated by a passive Network.responseReceived
+    # listener (see browser_ops.install_last_response_tracker) whether
+    # the navigation was triggered by page.goto / back / forward /
+    # reload / history_first OR a click that happened to navigate
+    # (e.g. clicking a link). Read by the ``last_response`` session
+    # action -> page.last_response() on the SDK side.
+    # Shape: same as the goto reply's result["response"], OR None when
+    # nothing has been captured yet on this session.
+    last_response: dict | None = None
     # Canonicalised URLs the session has been on, in arrival order.
     # Powers the visited=true marker in outline().
     visited_urls: set[str] = field(default_factory=set)
