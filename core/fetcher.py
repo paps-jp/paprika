@@ -1333,6 +1333,12 @@ async def fetch(opts: FetchOptions) -> FetchResult:
             nonlocal in_flight, last_activity
             server_mime = (event.response.mime_type or "").lower()
             evt_url = event.response.url or ""
+            # Skip non-HTTP(S) URLs entirely. data: and blob: URIs surface
+            # via iframe deep-trace (Chrome fires ResponseReceived for them
+            # too) but they can't be fetched separately and their base64
+            # payloads would bloat _net_log and the metadata dict.
+            if not evt_url.startswith(("http://", "https://")):
+                return
             # _effective_mime falls back to URL extension when the
             # server returns no / generic Content-Type -- Cloudflare-
             # fronted WordPress is the canonical AVIF case.
