@@ -823,91 +823,56 @@ def _sniff_stream_urls_from_log(network_log) -> list[str]:
 
 
 async def _paprika_agent_run(
-    chrome_port: int,
+    tab,
     cmd: str,
     args: dict | None = None,
     *,
-    timeout: float = 10.0,
+    timeout: float = 8.0,
     log=None,
 ) -> dict | None:
-    """Run a Paprika Agent extension command on its service-worker
-    target via raw CDP, and return the parsed ``{ok, result|error}``
-    dict -- or ``None`` if the agent SW couldn't be found/reached
-    (caller should then fall back).
+    """Run a Paprika Agent extension command and return the parsed
+    ``{ok, result|error}`` dict -- or ``None`` if the agent couldn't be
+    reached (caller should then fall back).
 
     The Paprika Agent extension (server/web/extensions/paprika-agent,
-    loaded into every lane's Chrome) exposes one command bus,
-    ``globalThis.__paprikaAgent.run(cmd, args)``, for capabilities CDP
-    can't drive directly (genuine chrome.tabs page zoom, ...). We reach
-    it by listing the lane's debug targets, finding the extension's
-    service-worker target, opening a raw CDP websocket to it, and
-    Runtime.evaluate-ing the command. Self-contained (doesn't touch the
-    nodriver connection) so it can't perturb the main tab.
+    loaded into every lane's Chrome) exposes capabilities CDP can't
+    drive directly (genuine chrome.tabs page zoom, ...). MV3 service
+    workers are dormant and hard to attach to over CDP, so instead we
+    evaluate a snippet in the PAGE that postMessages the command;
+    content.js relays it to the service worker (waking it) and posts the
+    response back, which our evaluated promise resolves with. Uses the
+    page's own evaluate -- no SW target hunting, robust to dormancy.
     """
     import json as _json
 
     args = args or {}
+    # Build a page snippet: post the command on window, wait for the
+    # matching response (relayed by content.js), resolve with it.
+    expr = (
+        "(function(){return new Promise(function(resolve){"
+        "var id='pa_'+Date.now()+'_'+Math.random().toString(36).slice(2);"
+        "var done=false;"
+        "function onMsg(ev){var d=ev.data;"
+        "if(ev.source!==window||!d||d.__paprikaAgentResp!==id)return;"
+        "done=true;window.removeEventListener('message',onMsg);resolve(d);}"
+        "window.addEventListener('message',onMsg);"
+        "window.postMessage({__paprikaAgentReq:id,cmd:" + _json.dumps(cmd)
+        + ",args:" + _json.dumps(args) + "},'*');"
+        "setTimeout(function(){if(!done){window.removeEventListener('message',onMsg);"
+        "resolve({ok:false,error:'agent-timeout'});}}," + str(int(timeout * 1000))
+        + ");});})()"
+    )
     try:
-        import websockets as _ws  # nodriver dependency; always present
-    except Exception:
-        return None
-    base = f"http://127.0.0.1:{int(chrome_port)}"
-    # Enumerate targets; extension service workers show up as type
-    # "service_worker" with a chrome-extension://<id>/background.js url.
-    try:
-        async with httpx.AsyncClient(timeout=5.0) as _c:
-            resp = await _c.get(base + "/json/list")
-            targets = resp.json()
+        res = await asyncio.wait_for(
+            tab.evaluate(expr, await_promise=True),
+            timeout=timeout + 3.0,
+        )
     except Exception as e:
         if log:
-            log(f"[agent] target list failed: {type(e).__name__}: {e}")
+            log(f"[agent] page relay evaluate failed: {type(e).__name__}: {e}")
         return None
-    sw_targets = [
-        t for t in (targets or [])
-        if t.get("type") == "service_worker"
-        and t.get("webSocketDebuggerUrl")
-        and "background.js" in (t.get("url") or "")
-    ]
-    if not sw_targets:
-        return None
-    expr = (
-        "(globalThis.__paprikaAgent ? __paprikaAgent.run("
-        + _json.dumps(cmd) + "," + _json.dumps(args)
-        + ") : ({ok:false,error:'no-agent'}))"
-    )
-    loop = asyncio.get_event_loop()
-    for t in sw_targets:
-        try:
-            async with _ws.connect(t["webSocketDebuggerUrl"], max_size=None) as ws:
-                await ws.send(_json.dumps({
-                    "id": 1,
-                    "method": "Runtime.evaluate",
-                    "params": {
-                        "expression": expr,
-                        "awaitPromise": True,
-                        "returnByValue": True,
-                    },
-                }))
-                deadline = loop.time() + timeout
-                while True:
-                    remaining = deadline - loop.time()
-                    if remaining <= 0:
-                        break
-                    raw = await asyncio.wait_for(ws.recv(), timeout=remaining)
-                    msg = _json.loads(raw)
-                    if msg.get("id") != 1:
-                        continue
-                    res = (msg.get("result") or {}).get("result") or {}
-                    val = res.get("value")
-                    if isinstance(val, dict):
-                        if val.get("error") == "no-agent":
-                            break  # this SW isn't ours; try the next
-                        return val
-                    break
-        except Exception as e:
-            if log:
-                log(f"[agent] SW call failed: {type(e).__name__}: {e}")
-            continue
+    if isinstance(res, dict):
+        return res
     return None
 
 
@@ -5147,14 +5112,10 @@ class WorkerAgent:
                         z = 5.0
                     agent_out = None
                     try:
-                        _port = getattr(
-                            getattr(state, "lane", None), "chrome_port", None,
+                        agent_out = await _paprika_agent_run(
+                            tab, "setZoom", {"factor": z},
+                            timeout=8.0, log=_slog,
                         )
-                        if _port:
-                            agent_out = await _paprika_agent_run(
-                                _port, "setZoom", {"factor": z},
-                                timeout=8.0, log=_slog,
-                            )
                     except Exception as e:
                         _slog(f"[zoom] agent path errored: {type(e).__name__}: {e}")
                         agent_out = None
@@ -6422,7 +6383,15 @@ class WorkerAgent:
                 f"list fetch failed ({type(e).__name__}: {e})",
             )
             return
-        items = [it for it in (payload.get("extensions") or []) if it.get("enabled", True)]
+        # Skip built-in extensions (e.g. paprika-agent): they ship in
+        # the repo and are loaded straight from the code tree by the
+        # lane -- there's no tarball to download (the /extensions list
+        # only surfaces them for operator visibility), so trying to
+        # fetch one just logs a spurious 404.
+        items = [
+            it for it in (payload.get("extensions") or [])
+            if it.get("enabled", True) and not it.get("builtin")
+        ]
         wanted: dict[str, dict] = {it["slug"]: it for it in items if it.get("slug")}
         self._extension_cache_root.mkdir(parents=True, exist_ok=True)
         # Evict cache entries for extensions removed on the hub.
