@@ -380,6 +380,20 @@ class Lane:
         import json
 
         paths: list[str] = []
+        # Built-in Paprika Agent extension (fixed; shipped in the repo,
+        # not operator-uploaded). Always loaded first so the worker can
+        # reach Chrome capabilities CDP can't (genuine page zoom, ...).
+        # Path is relative to this module: server/worker/lanes.py ->
+        # server/web/extensions/paprika-agent.
+        try:
+            agent_dir = (
+                Path(__file__).resolve().parents[1]
+                / "web" / "extensions" / "paprika-agent"
+            )
+            if (agent_dir / "manifest.json").exists():
+                paths.append(str(agent_dir))
+        except Exception:
+            pass
         ext_root = Path(f"/tmp/chrome-lane-{self.lane_idx}/Default/Extensions")
         if ext_root.exists():
             for ext_id_dir in sorted(ext_root.iterdir()):

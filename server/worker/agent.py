@@ -822,6 +822,95 @@ def _sniff_stream_urls_from_log(network_log) -> list[str]:
     return out
 
 
+async def _paprika_agent_run(
+    chrome_port: int,
+    cmd: str,
+    args: dict | None = None,
+    *,
+    timeout: float = 10.0,
+    log=None,
+) -> dict | None:
+    """Run a Paprika Agent extension command on its service-worker
+    target via raw CDP, and return the parsed ``{ok, result|error}``
+    dict -- or ``None`` if the agent SW couldn't be found/reached
+    (caller should then fall back).
+
+    The Paprika Agent extension (server/web/extensions/paprika-agent,
+    loaded into every lane's Chrome) exposes one command bus,
+    ``globalThis.__paprikaAgent.run(cmd, args)``, for capabilities CDP
+    can't drive directly (genuine chrome.tabs page zoom, ...). We reach
+    it by listing the lane's debug targets, finding the extension's
+    service-worker target, opening a raw CDP websocket to it, and
+    Runtime.evaluate-ing the command. Self-contained (doesn't touch the
+    nodriver connection) so it can't perturb the main tab.
+    """
+    import json as _json
+
+    args = args or {}
+    try:
+        import websockets as _ws  # nodriver dependency; always present
+    except Exception:
+        return None
+    base = f"http://127.0.0.1:{int(chrome_port)}"
+    # Enumerate targets; extension service workers show up as type
+    # "service_worker" with a chrome-extension://<id>/background.js url.
+    try:
+        async with httpx.AsyncClient(timeout=5.0) as _c:
+            resp = await _c.get(base + "/json/list")
+            targets = resp.json()
+    except Exception as e:
+        if log:
+            log(f"[agent] target list failed: {type(e).__name__}: {e}")
+        return None
+    sw_targets = [
+        t for t in (targets or [])
+        if t.get("type") == "service_worker"
+        and t.get("webSocketDebuggerUrl")
+        and "background.js" in (t.get("url") or "")
+    ]
+    if not sw_targets:
+        return None
+    expr = (
+        "(globalThis.__paprikaAgent ? __paprikaAgent.run("
+        + _json.dumps(cmd) + "," + _json.dumps(args)
+        + ") : ({ok:false,error:'no-agent'}))"
+    )
+    loop = asyncio.get_event_loop()
+    for t in sw_targets:
+        try:
+            async with _ws.connect(t["webSocketDebuggerUrl"], max_size=None) as ws:
+                await ws.send(_json.dumps({
+                    "id": 1,
+                    "method": "Runtime.evaluate",
+                    "params": {
+                        "expression": expr,
+                        "awaitPromise": True,
+                        "returnByValue": True,
+                    },
+                }))
+                deadline = loop.time() + timeout
+                while True:
+                    remaining = deadline - loop.time()
+                    if remaining <= 0:
+                        break
+                    raw = await asyncio.wait_for(ws.recv(), timeout=remaining)
+                    msg = _json.loads(raw)
+                    if msg.get("id") != 1:
+                        continue
+                    res = (msg.get("result") or {}).get("result") or {}
+                    val = res.get("value")
+                    if isinstance(val, dict):
+                        if val.get("error") == "no-agent":
+                            break  # this SW isn't ours; try the next
+                        return val
+                    break
+        except Exception as e:
+            if log:
+                log(f"[agent] SW call failed: {type(e).__name__}: {e}")
+            continue
+    return None
+
+
 def _make_video_downloader(
     *,
     assets_dir: Path,
@@ -5040,13 +5129,14 @@ class WorkerAgent:
                                 f"ERR: resize_window CDP call failed: {type(e).__name__}: {e}"
                             )
                 elif kind == "zoom":
-                    # In-browser PAGE zoom: visually magnify the rendered
-                    # page via CDP Emulation.setPageScaleFactor. Unlike
-                    # CSS `zoom` on the document root, this scales the
-                    # actual paint output -- so it ALSO zooms full-
-                    # viewport (100vw/100vh) cross-origin iframe players
-                    # like supjav's supremejav embed, which CSS zoom
-                    # can't touch. 1.0 = 100%. Reset by sending 1.0.
+                    # In-browser PAGE zoom. Preferred path: the Paprika
+                    # Agent extension's chrome.tabs.setZoom -- the GENUINE
+                    # browser zoom (reflows, == the Ctrl+/Ctrl- menu
+                    # zoom), which also works on full-viewport
+                    # cross-origin iframe players. Fallback when the
+                    # agent SW isn't reachable: CDP
+                    # Emulation.setPageScaleFactor (pinch-magnify; no
+                    # reflow but still visibly zooms). 1.0 = 100%.
                     try:
                         z = float(action.get("factor") or 1.0)
                     except Exception:
@@ -5055,20 +5145,48 @@ class WorkerAgent:
                         z = 0.25
                     elif z > 5.0:
                         z = 5.0
+                    agent_out = None
                     try:
-                        from nodriver import cdp
-
-                        await tab.send(
-                            cdp.emulation.set_page_scale_factor(
-                                page_scale_factor=z,
-                            ),
+                        _port = getattr(
+                            getattr(state, "lane", None), "chrome_port", None,
                         )
-                        reply.result = {"factor": z}
-                        _slog(f"[zoom] page scale factor = {z}")
+                        if _port:
+                            agent_out = await _paprika_agent_run(
+                                _port, "setZoom", {"factor": z},
+                                timeout=8.0, log=_slog,
+                            )
                     except Exception as e:
-                        reply.status = (
-                            f"ERR: zoom CDP call failed: {type(e).__name__}: {e}"
-                        )
+                        _slog(f"[zoom] agent path errored: {type(e).__name__}: {e}")
+                        agent_out = None
+                    if agent_out and agent_out.get("ok"):
+                        reply.result = {
+                            "factor": z,
+                            "method": "chrome.tabs.setZoom",
+                        }
+                        _slog(f"[zoom] genuine zoom via agent = {z}")
+                    else:
+                        # Fallback: CDP pinch-zoom.
+                        try:
+                            from nodriver import cdp
+
+                            await tab.send(
+                                cdp.emulation.set_page_scale_factor(
+                                    page_scale_factor=z,
+                                ),
+                            )
+                            reply.result = {
+                                "factor": z,
+                                "method": "setPageScaleFactor(fallback)",
+                            }
+                            _slog(
+                                f"[zoom] fallback setPageScaleFactor = {z} "
+                                f"(agent unavailable)"
+                            )
+                        except Exception as e:
+                            reply.status = (
+                                f"ERR: zoom failed (agent + CDP): "
+                                f"{type(e).__name__}: {e}"
+                            )
                 # ---- tab management (session-level) ---------------------
                 elif kind == "pages":
                     # List all tabs in this session.

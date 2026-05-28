@@ -45,7 +45,42 @@ def _extension_meta_to_dict(m) -> dict:
     tag = reg.etag(m.slug)
     if tag:
         d["etag"] = tag
+    d["builtin"] = False
     return d
+
+
+def _builtin_extensions() -> list[dict]:
+    """Synthetic entries for repo-shipped, always-loaded extensions
+    (the Paprika Agent command-bus). These aren't in the upload
+    registry -- every lane loads them from the code tree -- but we
+    surface them in the admin list as fixed (``builtin: true``,
+    non-deletable, always enabled) so operators can see what's running.
+    """
+    import json as _json
+    from pathlib import Path
+
+    out: list[dict] = []
+    ext_root = Path(__file__).resolve().parents[2] / "web" / "extensions"
+    for slug in ("paprika-agent",):
+        mpath = ext_root / slug / "manifest.json"
+        if not mpath.exists():
+            continue
+        try:
+            man = _json.loads(mpath.read_text("utf-8", errors="replace"))
+        except Exception:
+            man = {}
+        out.append({
+            "slug": slug,
+            "name": man.get("name") or slug,
+            "description": man.get("description") or "",
+            "version": man.get("version") or "",
+            "extension_id": "",
+            "size_bytes": 0,
+            "enabled": True,
+            "builtin": True,
+            "note": "Built-in Paprika extension (always loaded, fixed).",
+        })
+    return out
 
 
 @router.get("/extensions")
@@ -65,7 +100,7 @@ async def list_extensions() -> dict:
         }
     """
     reg = _require_extensions()
-    rows = [_extension_meta_to_dict(m) for m in reg.list()]
+    rows = _builtin_extensions() + [_extension_meta_to_dict(m) for m in reg.list()]
     return {"count": len(rows), "extensions": rows}
 
 
@@ -167,6 +202,8 @@ async def set_extension_enabled(slug: str, body: dict) -> dict:
     """
     if not _extension_slug_valid(slug):
         raise HTTPException(400, "invalid extension slug")
+    if any(b["slug"] == slug for b in _builtin_extensions()):
+        raise HTTPException(409, f"'{slug}' is a built-in extension and is always enabled")
     body = body or {}
     if "enabled" not in body:
         raise HTTPException(400, "missing 'enabled' in body")
@@ -183,6 +220,8 @@ async def delete_extension(slug: str) -> dict:
     """Remove the tarball + metadata for one extension."""
     if not _extension_slug_valid(slug):
         raise HTTPException(400, "invalid extension slug")
+    if any(b["slug"] == slug for b in _builtin_extensions()):
+        raise HTTPException(409, f"'{slug}' is a built-in extension and can't be deleted")
     reg = _require_extensions()
     lock = state.extensions_lock
     assert lock is not None
