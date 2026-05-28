@@ -1260,6 +1260,208 @@ def _apply_variables(text: str, vars_map: Optional[dict]) -> str:
     return _VAR_PLACEHOLDER_RE.sub(_repl, text)
 
 
+# ---------------------------------------------------------------------------
+# Playwright-compatible HTTP Response capture for navigation actions.
+#
+# Plain CDP page.navigate(...) doesn't return the document's HTTP status,
+# so page.goto("https://example.com/missing") would happily report ``OK``
+# even when the server replied 404. We bridge the gap by hooking
+# Network.requestWillBeSent + Network.responseReceived around the
+# navigation, picking out the first main-document request, and reading
+# its response.status / response.headers off the CDP event.
+#
+# Best-effort: if no main-frame Document response arrives within
+# ``timeout_s`` (cached navigation, immediate aborts, ...), we return
+# ``response=None`` and the caller treats it as "status unknown" rather
+# than failing the action.
+# ---------------------------------------------------------------------------
+
+
+def _resource_type_is_document(event) -> bool:
+    """Whether a Network.requestWillBeSent event is for a Document.
+
+    Tries multiple attribute spellings because nodriver's CDP wrapper
+    has varied over releases (`type`, `type_`, plain dict). Returns
+    False conservatively when nothing matches -- callers fall back to
+    URL-match heuristics.
+    """
+    for attr in ("type", "type_", "resource_type"):
+        rt = getattr(event, attr, None)
+        if rt is None:
+            continue
+        s = str(rt).rsplit(".", 1)[-1].lower()
+        if s == "document":
+            return True
+    return False
+
+
+def _request_event_url(event) -> str:
+    """Best-effort extraction of the URL from a Network.requestWillBeSent."""
+    req = getattr(event, "request", None)
+    if req is not None:
+        url = getattr(req, "url", None)
+        if url:
+            return str(url)
+    # Some CDP wrappers expose .request_url at the top level too.
+    return str(getattr(event, "request_url", "") or "")
+
+
+async def _capture_nav_response(
+    tab,
+    nav_coro,
+    *,
+    timeout_s: float = 5.0,
+    expected_url: str = "",
+) -> tuple[str, Optional[dict]]:
+    """Execute ``nav_coro`` (an awaitable returning ``"OK"`` / ``"ERR: …"``)
+    and concurrently capture the main document's HTTP response.
+
+    Returns ``(status_str, response_dict)`` where ``response_dict`` is::
+
+        {
+          "url":         "https://example.com/path",   # final URL after redirects
+          "status":      404,                          # HTTP status code
+          "status_text": "Not Found",
+          "ok":          False,                        # 200 <= status < 300
+          "headers":     {"content-type": "text/html; charset=UTF-8", ...},
+          "mime":        "text/html",
+        }
+
+    ``response_dict`` is ``None`` when the navigation produced no
+    Document-type response we could correlate (cached pages, naked
+    media URLs that bypass the navigation pipeline, race conditions,
+    timeouts).
+    """
+    import sys as _sys
+    captured: dict[str, Any] = {}
+    doc_request_ids: set[str] = set()
+    armed = {"value": False}  # toggled True right before nav_coro starts
+    response_event = asyncio.Event()
+    _dbg = os.environ.get("PAPRIKA_NAV_RESPONSE_DEBUG", "") in ("1", "true", "yes")
+    _expected_norm = (expected_url or "").rstrip("/").lower()
+
+    def _d(msg: str) -> None:
+        if _dbg:
+            print(f"[nav-resp DEBUG] {msg}", file=_sys.stderr, flush=True)
+
+    def _url_matches_expected(url: str) -> bool:
+        if not _expected_norm or not url:
+            return False
+        return (url or "").rstrip("/").lower() == _expected_norm
+
+    async def _on_request(event):
+        try:
+            if not armed["value"]:
+                # Pre-nav noise (lingering loads from before goto). Ignore.
+                return
+            url = _request_event_url(event)
+            is_doc = _resource_type_is_document(event)
+            # Three signals that this is the document we care about:
+            #   1) CDP reported ResourceType=Document (preferred, when available)
+            #   2) Request URL equals the URL we are navigating to
+            #   3) We haven't picked a candidate yet AND this is the first
+            #      request after we armed -- fallback for cached navs that
+            #      skip resource-type metadata
+            first_unknown = not doc_request_ids and not is_doc
+            url_match = _url_matches_expected(url)
+            if is_doc or url_match or first_unknown:
+                doc_request_ids.add(str(event.request_id))
+                _d(
+                    f"REQ-MATCH is_doc={is_doc} url_match={url_match} "
+                    f"first={first_unknown} url={url[:120]}"
+                )
+        except Exception as e:
+            _d(f"_on_request raised: {e!r}")
+
+    async def _on_response(event):
+        try:
+            if str(event.request_id) not in doc_request_ids:
+                return
+            resp = event.response
+            try:
+                status_code = int(getattr(resp, "status", 0) or 0)
+            except Exception:
+                status_code = 0
+            # Headers come back as a CDP "Headers" object that behaves
+            # like a dict. Normalise keys to lowercase so callers can
+            # do response["headers"]["content-type"] portably.
+            hdrs_raw = getattr(resp, "headers", None) or {}
+            try:
+                hdrs = {str(k).lower(): str(v) for k, v in hdrs_raw.items()}
+            except Exception:
+                hdrs = {}
+            captured.update({
+                "url":         getattr(resp, "url", "") or "",
+                "status":      status_code,
+                "status_text": getattr(resp, "status_text", "") or "",
+                "ok":          200 <= status_code < 300,
+                "headers":     hdrs,
+                "mime":        getattr(resp, "mime_type", "") or "",
+            })
+            response_event.set()
+        except Exception:
+            pass
+
+    handlers = getattr(tab, "handlers", None)
+    if handlers is None:
+        # No CDP listener surface -- run the nav anyway, just no
+        # response info.
+        _d("tab has no .handlers attr; falling back to no-capture")
+        return await nav_coro, None
+    handlers.setdefault(cdp.network.RequestWillBeSent, []).append(_on_request)
+    handlers.setdefault(cdp.network.ResponseReceived, []).append(_on_response)
+    _d(
+        f"installed handlers; req-listeners="
+        f"{len(handlers.get(cdp.network.RequestWillBeSent, []))} "
+        f"resp-listeners={len(handlers.get(cdp.network.ResponseReceived, []))} "
+        f"expected_url={_expected_norm!r}"
+    )
+    armed["value"] = True
+    try:
+        status_str = await nav_coro
+        _d(f"nav_coro returned {status_str!r}; waiting for response event")
+        try:
+            await asyncio.wait_for(response_event.wait(), timeout=timeout_s)
+        except asyncio.TimeoutError:
+            _d(f"timeout after {timeout_s}s; captured={captured}")
+    finally:
+        try:
+            handlers.get(cdp.network.RequestWillBeSent, []).remove(_on_request)
+        except (ValueError, AttributeError):
+            pass
+        try:
+            handlers.get(cdp.network.ResponseReceived, []).remove(_on_response)
+        except (ValueError, AttributeError):
+            pass
+    return status_str, (captured if captured else None)
+
+
+async def execute_nav_with_response(
+    tab, action: dict, log: LogFn,
+) -> tuple[str, Optional[dict]]:
+    """Variant of :func:`execute` that returns the captured HTTP response
+    info for nav-kind actions (navigate / back / forward / history_first).
+
+    For non-nav kinds the second element is always None -- callers can
+    use this uniformly without branching on kind.
+    """
+    kind = action.get("kind")
+    vars_map = action.get("variables") or None
+    if kind == "navigate":
+        url = _apply_variables(action.get("url") or "", vars_map)
+        return await _capture_nav_response(
+            tab, navigate(tab, url, log), expected_url=url,
+        )
+    if kind == "back":
+        return await _capture_nav_response(tab, back(tab, log))
+    if kind == "forward":
+        return await _capture_nav_response(tab, forward(tab, log))
+    if kind == "history_first":
+        return await _capture_nav_response(tab, history_first(tab, log))
+    # Non-nav: delegate to the existing dispatcher; no response info.
+    return await execute(tab, action, log), None
+
+
 async def execute(tab, action: dict, log: LogFn) -> str:
     """Translate one ParsedAction dict into a single primitive call.
 

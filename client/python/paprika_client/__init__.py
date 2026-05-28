@@ -45,7 +45,15 @@ labels in the meantime.
 from __future__ import annotations
 
 from ._client import PaprikaClient, PaprikaError, async_paprika
-from ._page import Candidate, HandoffInfo, Locator, Page, PaprikaActionError, Session
+from ._page import (
+    Candidate,
+    HandoffInfo,
+    Locator,
+    Page,
+    PaprikaActionError,
+    Session,
+    response_of,
+)
 from ._oneshot import outline, run, snapshot, state
 from ._walker import DEFAULT_DENY_PATTERNS, Visit, Walker, walk
 from ._sync import SyncClient, sync_paprika
@@ -67,6 +75,11 @@ __all__ = [
     # LLM-proposed action object returned by Page.observe(). Passed
     # back to Page.click() / Page.fill() to execute the proposal.
     "Candidate",
+    # Playwright-compatible HTTP Response accessor for nav-action
+    # replies (page.goto / back / forward / reload / history_first).
+    # Always returns a dict with {url, status, status_text, ok, headers,
+    # mime}; status == 0 means "response not captured".
+    "response_of",
     # Exception types -- exported here so LLM-generated scripts can
     # write `except pap.PaprikaActionError` / `except pap.PaprikaError`
     # without reaching into the private `_page` / `_client` submodules.

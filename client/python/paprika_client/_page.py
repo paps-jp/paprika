@@ -15,6 +15,55 @@ if TYPE_CHECKING:
     from ._client import PaprikaClient
 
 
+def response_of(reply: dict | None) -> dict:
+    """Extract the Playwright-compatible HTTP Response from a nav reply.
+
+    Nav-kind actions (``page.goto`` / ``back`` / ``forward`` / ``reload``
+    / ``history_first``) return a reply whose ``result["response"]``
+    carries the captured HTTP response. This helper smooths over the
+    "result might be None / not-a-dict / missing the key" edge cases
+    and always returns a dict with the standard fields::
+
+        {"url": "", "status": 0, "status_text": "", "ok": False,
+         "headers": {}, "mime": ""}
+
+    Usage::
+
+        reply = await page.goto(url)
+        r = response_of(reply)
+        if r["status"] == 404:
+            return None
+        if not r["ok"]:
+            raise RuntimeError(f"fetch failed: HTTP {r['status']}")
+
+    Always returns a dict (never None), so direct subscript access
+    is safe. ``status == 0`` means "no Document response captured"
+    (cache hit, naked-media URL, capture timeout, etc.).
+    """
+    if not isinstance(reply, dict):
+        return _EMPTY_RESPONSE.copy()
+    result = reply.get("result")
+    if not isinstance(result, dict):
+        return _EMPTY_RESPONSE.copy()
+    resp = result.get("response")
+    if not isinstance(resp, dict):
+        return _EMPTY_RESPONSE.copy()
+    # Fill in any missing keys so callers can subscript freely.
+    out = _EMPTY_RESPONSE.copy()
+    out.update(resp)
+    return out
+
+
+_EMPTY_RESPONSE: dict = {
+    "url": "",
+    "status": 0,
+    "status_text": "",
+    "ok": False,
+    "headers": {},
+    "mime": "",
+}
+
+
 @dataclass(frozen=True)
 class HandoffInfo:
     """Returned by ``Page.detach()`` / ``Session.detach()``. Carries
@@ -443,8 +492,30 @@ class Page:
 
     @_action_log
     async def goto(self, url: str) -> dict:
-        """Playwright-style ``page.goto(url)``. Returns the action reply
-        (``{status, elapsed_ms, result}``)."""
+        """Playwright-style ``page.goto(url)``.
+
+        Returns the action reply with a Playwright-compatible HTTP
+        ``response`` object embedded::
+
+            reply = await page.goto("https://example.com/missing")
+            # reply["status"]             == "OK"       # CDP nav succeeded
+            # reply["elapsed_ms"]         == 1234
+            # reply["result"]["response"] == {
+            #     "url":         "https://example.com/missing",  # final URL
+            #     "status":      404,                            # HTTP code
+            #     "status_text": "Not Found",
+            #     "ok":          False,                          # 200-299
+            #     "headers":     {"content-type": "text/html", ...},
+            #     "mime":        "text/html",
+            # }
+            if not response_of(reply)["ok"]:
+                raise RuntimeError("page missing")
+
+        ``reply["result"]["response"]`` is ``None`` when the navigation
+        produced no Document-type response we could correlate (cached
+        page, redirect-to-non-HTTP target, response arrived after the 5s
+        capture window, ...). Use :func:`response_of` for safe lookup.
+        """
         reply = await self._client._json(
             "POST", f"/sessions/{self._sid}/navigate",
             json=self._pid_json({"url": url}),
@@ -456,7 +527,13 @@ class Page:
     @_action_log
     async def back(self) -> dict:
         """``window.history.back()`` -- equivalent to the browser's Back
-        button. Updates :attr:`url` on success."""
+        button. Updates :attr:`url` on success.
+
+        Returns the same reply shape as :meth:`goto` -- including
+        ``result["response"]`` with the HTTP response info for the
+        page navigated back to. Use :func:`response_of` to access it
+        safely.
+        """
         reply = await self._client._json(
             "POST", f"/sessions/{self._sid}/back",
             json=self._pid_json(),
@@ -478,7 +555,12 @@ class Page:
     async def forward(self) -> dict:
         """``window.history.forward()`` -- equivalent to the browser's
         Forward button. Symmetric counterpart to :meth:`back`. No-op
-        when there's no forward entry (returns OK)."""
+        when there's no forward entry (returns OK).
+
+        Reply shape matches :meth:`goto` -- ``result["response"]`` carries
+        the HTTP status of the page navigated forward to. Access via
+        :func:`response_of`.
+        """
         reply = await self._client._json(
             "POST", f"/sessions/{self._sid}/forward",
             json=self._pid_json(),

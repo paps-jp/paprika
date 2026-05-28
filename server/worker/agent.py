@@ -5256,11 +5256,31 @@ class WorkerAgent:
                     # click / fill / press_key / scroll / navigate /
                     # back / wait -- delegate to browser_ops.execute
                     # which understands these kinds.
-                    reply.status = await browser_ops.execute(
-                        tab,
-                        action,
-                        _slog,
-                    )
+                    #
+                    # For nav-kind actions (navigate / back / forward /
+                    # history_first) we also capture the main document's
+                    # HTTP response (status, headers, final URL) so the
+                    # SDK can surface a Playwright-compatible Response
+                    # object to the caller. Non-nav kinds return resp=None.
+                    nav_kinds = ("navigate", "back", "forward", "history_first")
+                    if action.get("kind") in nav_kinds:
+                        status_str, resp_info = await browser_ops.execute_nav_with_response(
+                            tab, action, _slog,
+                        )
+                        reply.status = status_str
+                        if resp_info:
+                            # Put the HTTP response info under reply.result
+                            # as a dict; existing nav callers expect
+                            # result=None so we use {"response": {...}}
+                            # to keep the new key namespaced and easy to
+                            # spot.
+                            reply.result = {"response": resp_info}
+                    else:
+                        reply.status = await browser_ops.execute(
+                            tab,
+                            action,
+                            _slog,
+                        )
             except Exception as e:
                 reply.status = f"ERR: {type(e).__name__}: {e}"
                 _slog(f"action {msg.action.get('kind')!r} crashed: {e}")
