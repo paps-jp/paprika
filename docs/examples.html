@@ -194,9 +194,9 @@ await page.wait_for_selector("#chart", timeout=10)</code></pre>
 <pre><code># LLM agent が読むのと同じテキスト outline
 out = await page.outline()
 # 例:
-#   [@1] <button> 'ログイン'
-#   [@2] <a href="https://..."> '記事を読む'
-#   [@3] <input placeholder="search">
+#   [@1] &lt;button&gt; 'ログイン'
+#   [@2] &lt;a href="https://..."&gt; '記事を読む'
+#   [@3] &lt;input placeholder="search"&gt;
 #   ...
 
 # ページ内のリンクを全部

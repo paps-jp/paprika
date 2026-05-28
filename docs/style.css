@@ -95,6 +95,20 @@ li { margin: .3em 0; }
 .callout.tip  { background: #dafbe1; border-color: #aceebb; }
 .callout strong { display: block; margin-bottom: 3px; }
 
+/* "詳細はこちら" 系の section-end リンク行 (guides.html の各セクション末尾)。
+   ガイドからサンプル集の該当章へ飛ばすためのサブな導線で、コードブロック
+   や callout の直後に配置しても主張しすぎない見え方にする。 */
+.see-also {
+  margin: 8px 0 24px;
+  font-size: 0.9rem;
+  text-align: right;
+  color: var(--fg-muted);
+}
+.see-also a {
+  color: var(--accent);
+  font-weight: 500;
+}
+
 .cards { display: grid; grid-template-columns: repeat(auto-fit, minmax(220px, 1fr));
   gap: 14px; margin: 22px 0; }
 .card { border: 1px solid var(--border); border-radius: 12px; padding: 16px 18px;

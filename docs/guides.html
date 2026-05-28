@@ -69,11 +69,6 @@
     <h1>ガイド</h1>
     <p class="lead">よくあるタスクを動くコードで紹介します。全関数の仕様は <a href="api.html">API リファレンス</a>、用途別の動くスニペット集は <a href="examples.html">サンプルコード集</a> をご覧ください。</p>
 
-    <div class="callout tip">
-      <strong>具体的なサンプルはこちら</strong>
-      セッション操作、<code>goto</code> / <code>click</code> / <code>fill</code> / <code>scroll</code>、画像・動画ダウンロード、ログイン突破、LLM agent、同期版などを用途別にまとめた <a href="examples.html">サンプルコード集</a> を別ページに用意しました。
-    </div>
-
     <h2 id="images">画像を一括で取得</h2>
     <p>URL を 1 つ渡すだけです。<code>cli.fetch()</code> が実行から完了まで行います。</p>
     <pre><code>import asyncio
@@ -89,6 +84,7 @@ async def main():
 asyncio.run(main())</code></pre>
     <div class="callout tip"><strong>遅延ロード対策</strong>
     多くのサイトは画面に入った画像だけ読み込みます。<code>scroll=True</code>（既定）でスクロールさせ、長いページは <code>scroll_max=12000</code> など大きめに設定してください。</div>
+    <p class="see-also">→ <a href="examples.html#assets">詳細はこちら（サンプル集: アセット取得）</a></p>
 
     <h2 id="from-jobs">既存ジョブから取得</h2>
     <p>管理 UI や別スクリプトで実行済みのジョブから、あとで回収します:</p>
@@ -97,6 +93,7 @@ job_id = jobs[0].job_id
 images = await cli.job_images(job_id)          # 画像URL一覧
 rows   = await cli.job_assets(job_id, details=True)  # メタ付き(size/source_url/mime)
 await cli.download_job_assets(job_id, f"out/{job_id}")</code></pre>
+    <p class="see-also">→ <a href="examples.html#assets">詳細はこちら（サンプル集: アセット取得）</a></p>
 
     <h2 id="list-assets">画像一覧を 1 件ずつ表示（for で出力）</h2>
     <p>収集した画像をまとめて確認したいときの基本パターンです。<code>cli.job_assets(..., details=True)</code> で
@@ -147,6 +144,7 @@ asyncio.run(main())</code></pre>
       <li>同期版なら <code>from paprika_client import sync_paprika</code> で <code>await</code> を外すだけ（<a href="api.html#sync">API → 同期版</a>）</li>
     </ul>
     </div>
+    <p class="see-also">→ <a href="examples.html#assets">詳細はこちら（サンプル集: アセット取得）</a></p>
 
     <h2 id="videos">動画を取得</h2>
     <p>ページ上の動画ファイルをまとめて取得するなら fetch + <code>play_videos</code> を使います:</p>
@@ -158,6 +156,7 @@ await cli.download_job_assets(job.job_id, "out/videos", kind="video")</code></pr
                        parent_job_id="video-grab") as page:
     await page.download_video()                # 現ページを yt-dlp
     await page.save_assets("out/videos", kind="video")</code></pre>
+    <p class="see-also">→ <a href="examples.html#video">詳細はこちら（サンプル集: 動画をダウンロード）</a></p>
 
     <h2 id="login">ログイン必須サイト</h2>
     <p>一度ログインして Cookie を Host レジストリに保存すれば、以後は自動で再利用されます。</p>
@@ -173,6 +172,7 @@ async with cli.session("https://market.example.com/login",
 job = await cli.fetch("https://market.example.com/item/xxx",
                       cookies_from="market.example.com")
 await cli.download_job_assets(job.job_id, "out/item")</code></pre>
+    <p class="see-also">→ <a href="examples.html#login">詳細はこちら（サンプル集: ログイン必須サイト）</a></p>
 
     <h2 id="session">セッションで操作</h2>
     <p>クリックや入力を挟んでから取得したいとき。Playwright と同じ書き方です。</p>
@@ -185,6 +185,7 @@ await cli.download_job_assets(job.job_id, "out/item")</code></pre>
     <code>page.assets()</code> / <code>save_assets()</code> は画像の保存先となる親ジョブが要ります。
     手元実行なら <code>cli.session(url, parent_job_id="任意のID")</code> を渡してください
     （runner 上では <code>PAPRIKA_JOB_ID</code> で自動）。</div>
+    <p class="see-also">→ <a href="examples.html#session-basics">詳細はこちら（サンプル集: セッションを開く / 閉じる）</a></p>
 
     <h2 id="dom">DOM 取得・待機・入力</h2>
     <p><code>page.evaluate()</code> を土台に、Playwright スタイルの取得・待機・入力デバイスが使えます。</p>
@@ -217,6 +218,7 @@ await page.get_by_text("ログイン").click()</code></pre>
     ほとんどのサイトはこれで反応しますが、まれに「<em>人間が本当にクリックしたか</em>」を厳しくチェックする画面（広告ゲート・一部の動画再生ボタン等）には効きません。
     そのときは <code>page.agent()</code>（LLM が画面を見て操作）か、noVNC で人手操作してください。
     <code>set_input_files</code>（ファイルアップロード）だけは別ルート（CDP）で実際にファイルを渡すので確実です。</div>
+    <p class="see-also">→ <a href="examples.html#interact">詳細はこちら（サンプル集: クリック・入力・キー操作 / スクロール・待機 / DOM を見る）</a></p>
 
     <h2 id="crawl">サイトを巡回（walk）</h2>
     <p>「このサイトを N 件たどって各ページの画像を保存」のようなクロールは、<code>walk()</code> に任せると
@@ -307,6 +309,7 @@ async with cli.session("https://example.com") as page:
     if await page.ask("年齢確認ダイアログが出ている?"):
         await page.agent("年齢確認の「はい」を押す", max_steps=3)
     await page.capture("after-gate")</code></pre>
+    <p class="see-also">→ <a href="examples.html#llm">詳細はこちら（サンプル集: LLM (ask / observe / agent)）</a></p>
 
     <h2 id="macro">Simple Macro</h2>
     <p>コードを書かずに、管理 UI 上で「開く → クリック → 入力 → 保存」を行のように積んで実行できます
@@ -327,6 +330,7 @@ with sync_paprika.connect() as cli:
         page.click("text=ログイン")
         print(page.title())</code></pre>
     <p>メソッドは async 版と同一です。詳細は <a href="api.html#sync">API → 同期版</a> をご覧ください。</p>
+    <p class="see-also">→ <a href="examples.html#sync">詳細はこちら（サンプル集: 同期版で書く）</a></p>
 
     <div class="pager">
       <a href="intro.html"><div class="dir">← 戻る</div><div class="ttl">はじめに</div></a>
