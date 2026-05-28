@@ -446,7 +446,7 @@ async def _run_codegen_loop_job(request: Request, info: JobInfo) -> None:
                         AssetInfo(
                             name=_af.name,
                             size=_af.stat().st_size,
-                            url=f"/jobs/{_url_quote(job_id, safe='')}/assets/{_url_quote(_af.name, safe='')}",
+                            href=f"/jobs/{_url_quote(job_id, safe='')}/assets/{_url_quote(_af.name, safe='')}",
                         )
                     )
             if _codegen_assets:
@@ -1032,7 +1032,7 @@ async def _run_rerun_loop_job(
                         AssetInfo(
                             name=_af.name,
                             size=_af.stat().st_size,
-                            url=f"/jobs/{_url_quote(job_id, safe='')}/assets/{_url_quote(_af.name, safe='')}",
+                            href=f"/jobs/{_url_quote(job_id, safe='')}/assets/{_url_quote(_af.name, safe='')}",
                         )
                     )
             if _rerun_assets:
