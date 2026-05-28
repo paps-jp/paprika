@@ -9566,9 +9566,20 @@ async function _refreshSmbDiskUsage() {
     if (!r.ok) { el.textContent = ''; return; }
     const d = await r.json();
     if (d.mounted && d.usage) {
+      // Prefer the server's unit-scaled strings (TB / GB / ...) so a
+      // multi-TB NAS isn't shown as a huge GB number. Fall back to the
+      // legacy *_gb fields for older hubs.
+      const u = d.usage;
+      const used  = u.used_h  || (u.used_gb  + ' GB');
+      const total = u.total_h || (u.total_gb + ' GB');
+      const free  = u.free_h  || (u.free_gb  + ' GB');
+      // Surface that the watchdog will auto-reconnect a dropped mount.
+      const auto = d.auto_mount
+        ? ' <span style="color:#888; font-weight:normal;">· 自動再接続 ON</span>'
+        : ' <span style="color:#c0792a; font-weight:normal;">· 自動再接続 OFF</span>';
       el.innerHTML = '<iconify-icon icon="lucide:database"></iconify-icon> '
-        + '使用量: ' + d.usage.used_gb + ' GB / ' + d.usage.total_gb + ' GB'
-        + ' (空き ' + d.usage.free_gb + ' GB)';
+        + '使用量: ' + used + ' / ' + total
+        + ' (空き ' + free + ')' + auto;
       el.style.color = '#196b2c';
     } else if (d.mounted) {
       el.textContent = 'マウント済み (使用量取得不可)';

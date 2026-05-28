@@ -106,6 +106,33 @@ async def lifespan(app: FastAPI):
     # Otherwise a client that forgets to DELETE leaks a Lane forever.
     reaper_task = asyncio.create_task(_session_reaper_loop())
 
+    # SMB storage: a cifs mount does not survive a restart, so re-mount
+    # the configured share NOW (before the first job needs storage_dir)
+    # and spawn a watchdog that re-mounts it if it ever drops (NAS
+    # reboot / network blip). No-op when SMB isn't configured or
+    # smb_auto_mount is off. Needs CAP_SYS_ADMIN (same as the manual
+    # /settings/smb/mount endpoint).
+    smb_watchdog_task = None
+    try:
+        from server.hub.smb_mount import (
+            ensure_smb_mounted,
+            smb_is_configured,
+            smb_watchdog_loop,
+        )
+
+        if state.settings is not None and smb_is_configured(state.settings):
+            ok, msg = await asyncio.to_thread(ensure_smb_mounted, state.settings)
+            if ok:
+                log.info("SMB: share mounted at startup (%s)", msg)
+            else:
+                log.warning(
+                    "SMB: startup mount skipped/failed (%s); watchdog will retry",
+                    msg,
+                )
+        smb_watchdog_task = asyncio.create_task(smb_watchdog_loop())
+    except Exception:
+        log.exception("SMB startup mount / watchdog launch failed")
+
     # Recover from previous hub crash / deploy: any job persisted as
     # `status=running` but no longer driven by a local task is an
     # orphan from a killed orchestrator. Mark it failed so it doesn't
@@ -150,6 +177,8 @@ async def lifespan(app: FastAPI):
     yield
 
     reaper_task.cancel()
+    if smb_watchdog_task is not None:
+        smb_watchdog_task.cancel()
     for t in list(state.local_tasks.values()):
         if not t.done():
             t.cancel()

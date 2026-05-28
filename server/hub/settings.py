@@ -90,6 +90,14 @@ _SCHEMA: dict[str, tuple[Any, str]] = {
     "smb_password": ("", "str"),         # SMB password (stored in settings.json)
     "smb_mount_point": ("/mnt/paprika", "str"),  # local mount path
     "smb_mount_options": ("", "str"),    # extra mount -o options (e.g. "vers=3.0")
+    # When True (default) the hub mounts the configured SMB share at
+    # startup and a background watchdog re-mounts it within ~30s if the
+    # mount drops (host/container restart, NAS reboot, network blip).
+    # Set False to manage the mount entirely by hand -- the manual
+    # /settings/smb/unmount endpoint flips this off so the watchdog
+    # doesn't fight a deliberate unmount; /settings/smb/mount flips it
+    # back on. See server/hub/smb_mount.py.
+    "smb_auto_mount": (True, "bool"),
     # ---- Windows portable: Chrome headless ------------------------------
     # When True, the bundled Chromium starts with ``--headless=new`` so
     # the operator's physical desktop isn't taken over by paprika's job

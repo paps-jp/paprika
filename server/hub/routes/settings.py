@@ -12,16 +12,24 @@ accordingly.
 from __future__ import annotations
 
 import logging
-import os
 import shutil
-import subprocess
-from pathlib import Path
 
 from fastapi import APIRouter, HTTPException
 
 from server.hub._state import config, get_storage_dir, state
 from server.hub.codegen import CODEGEN_LLM_URL, CODEGEN_MODEL_NAME
 from server.hub.settings import SettingsRegistry
+
+# SMB mount logic lives in server.hub.smb_mount so the startup
+# auto-mount + watchdog (app.py lifespan) and these endpoints share a
+# single implementation. ``ensure_smb_mounted`` is the idempotent
+# "mount if configured & not already healthily mounted" entrypoint.
+from server.hub.smb_mount import (
+    _smb_is_mounted,
+    _smb_mount,
+    _smb_unmount,
+    ensure_smb_mounted,
+)
 
 log = logging.getLogger(__name__)
 
@@ -32,68 +40,6 @@ def _require_settings() -> SettingsRegistry:
     if state.settings is None:
         raise HTTPException(503, "settings registry not initialised")
     return state.settings
-
-
-# -------------------------------------------------------------------
-# SMB mount helpers
-# -------------------------------------------------------------------
-
-def _smb_is_mounted(mount_point: str) -> bool:
-    """Check if *mount_point* is currently a mount point."""
-    if not mount_point:
-        return False
-    try:
-        return os.path.ismount(mount_point)
-    except Exception:
-        return False
-
-
-def _smb_mount(server: str, share: str, username: str, password: str,
-               mount_point: str, extra_opts: str) -> str:
-    """Mount an SMB share.  Returns "" on success, error string on failure."""
-    mp = Path(mount_point)
-    mp.mkdir(parents=True, exist_ok=True)
-
-    # Build the mount command
-    opts_parts = [f"username={username}"] if username else ["guest"]
-    if password:
-        opts_parts.append(f"password={password}")
-    else:
-        if not username:
-            opts_parts.append("password=")
-    # iocharset + file_mode so job files are world-readable
-    opts_parts.extend(["iocharset=utf8", "file_mode=0666", "dir_mode=0777"])
-    if extra_opts:
-        opts_parts.append(extra_opts)
-    opts_str = ",".join(opts_parts)
-
-    unc = f"//{server}/{share}"
-    cmd = ["mount", "-t", "cifs", unc, str(mp), "-o", opts_str]
-    log.info("SMB mount: %s", " ".join(cmd).replace(password, "***") if password else " ".join(cmd))
-
-    try:
-        r = subprocess.run(cmd, capture_output=True, text=True, timeout=30)
-        if r.returncode != 0:
-            err = (r.stderr or r.stdout or "unknown error").strip()
-            log.error("SMB mount failed: %s", err)
-            return err
-        return ""
-    except subprocess.TimeoutExpired:
-        return "mount timed out (30s)"
-    except Exception as e:
-        return str(e)
-
-
-def _smb_unmount(mount_point: str) -> str:
-    """Unmount.  Returns "" on success, error string on failure."""
-    try:
-        r = subprocess.run(["umount", mount_point],
-                           capture_output=True, text=True, timeout=15)
-        if r.returncode != 0:
-            return (r.stderr or r.stdout or "unknown error").strip()
-        return ""
-    except Exception as e:
-        return str(e)
 
 
 # -------------------------------------------------------------------
@@ -161,38 +107,47 @@ async def put_settings(body: dict) -> dict:
 @router.post("/settings/smb/mount")
 async def smb_mount() -> dict:
     """Mount the SMB share using the saved connection settings.
-    On success, ``storage_dir`` is automatically set to the mount point."""
-    reg = _require_settings()
-    server = reg.get("smb_server", "")
-    share = reg.get("smb_share", "")
-    username = reg.get("smb_username", "")
-    password = reg.get("smb_password", "")
-    mount_point = reg.get("smb_mount_point", "/mnt/paprika")
-    extra_opts = reg.get("smb_mount_options", "")
+    On success, ``storage_dir`` is automatically set to the mount point.
 
-    if not server or not share:
+    Also (re-)enables ``smb_auto_mount`` so the startup auto-mount +
+    watchdog keep the share mounted across restarts / network blips.
+    A manual mount is the operator saying "I want this share up", which
+    is exactly what auto-mount should track.
+    """
+    reg = _require_settings()
+    if not reg.get("smb_server", "") or not reg.get("smb_share", ""):
         raise HTTPException(400, "smb_server and smb_share are required")
 
-    # Already mounted?
-    if _smb_is_mounted(mount_point):
-        # Still set storage_dir in case it drifted
-        reg.update({"storage_dir": mount_point})
-        return {"ok": True, "message": "already mounted", "mount_point": mount_point}
+    # Re-enable auto-mount: a manual mount means the operator wants the
+    # share kept up. (A prior manual unmount sets it False; mounting
+    # again flips it back on.)
+    reg.update({"smb_auto_mount": True})
 
-    err = _smb_mount(server, share, username, password, mount_point, extra_opts)
-    if err:
-        raise HTTPException(500, f"mount failed: {err}")
+    # ensure_smb_mounted is idempotent: mounts if needed, remounts a
+    # stale mount, sets storage_dir on success. Run it off the event
+    # loop since it shells out to `mount`.
+    import asyncio
 
-    # Point storage_dir at the mount
-    reg.update({"storage_dir": mount_point})
-    return {"ok": True, "message": "mounted", "mount_point": mount_point}
+    ok, msg = await asyncio.to_thread(ensure_smb_mounted, reg)
+    if not ok:
+        raise HTTPException(500, f"mount failed: {msg}")
+    mount_point = reg.get("smb_mount_point", "/mnt/paprika")
+    return {"ok": True, "message": msg, "mount_point": mount_point}
 
 
 @router.post("/settings/smb/unmount")
 async def smb_unmount() -> dict:
-    """Unmount the SMB share and revert ``storage_dir`` to default."""
+    """Unmount the SMB share and revert ``storage_dir`` to default.
+
+    Also disables ``smb_auto_mount`` so the watchdog respects the manual
+    unmount and doesn't immediately re-mount the share on its next tick.
+    Re-mounting via the Mount button flips auto-mount back on.
+    """
     reg = _require_settings()
     mount_point = reg.get("smb_mount_point", "/mnt/paprika")
+
+    # Stop the watchdog from fighting a deliberate unmount.
+    reg.update({"smb_auto_mount": False})
 
     if not _smb_is_mounted(mount_point):
         # Clear storage_dir anyway
@@ -205,6 +160,27 @@ async def smb_unmount() -> dict:
 
     reg.update({"storage_dir": ""})
     return {"ok": True, "message": "unmounted", "mount_point": mount_point}
+
+
+def _fmt_size(num_bytes: int) -> str:
+    """Human-readable size that scales the unit to the magnitude.
+
+    Operators with multi-TB NAS arrays complained that everything was
+    reported in GB (e.g. "12345.6 GB"); pick the largest unit that keeps
+    the number readable so a 12 TB array shows "12.1 TB", a 500 GB share
+    "500.0 GB", and a tiny tmpfs "812.0 MB".
+    """
+    n = float(num_bytes)
+    for unit, factor in (
+        ("PB", 1024**5),
+        ("TB", 1024**4),
+        ("GB", 1024**3),
+        ("MB", 1024**2),
+        ("KB", 1024),
+    ):
+        if n >= factor:
+            return f"{n / factor:.1f} {unit}"
+    return f"{int(n)} B"
 
 
 @router.get("/settings/smb/status")
@@ -220,9 +196,15 @@ async def smb_status() -> dict:
         try:
             st = shutil.disk_usage(mp)
             usage = {
+                # Raw GB kept for backwards-compat / programmatic use.
                 "total_gb": round(st.total / (1024**3), 1),
                 "used_gb": round(st.used / (1024**3), 1),
                 "free_gb": round(st.free / (1024**3), 1),
+                # Pre-formatted, unit-scaled strings (GB / TB / PB ...)
+                # the admin UI renders directly.
+                "total_h": _fmt_size(st.total),
+                "used_h": _fmt_size(st.used),
+                "free_h": _fmt_size(st.free),
             }
         except Exception:
             pass
@@ -232,5 +214,6 @@ async def smb_status() -> dict:
         "mount_point": mp,
         "server": reg.get("smb_server", ""),
         "share": reg.get("smb_share", ""),
+        "auto_mount": bool(reg.get("smb_auto_mount", True)),
         "usage": usage,
     }
