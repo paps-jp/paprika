@@ -1822,6 +1822,22 @@ async def install_iframe_deep_trace(tab, log: LogFn | None = None) -> bool:
     # >1M is safely beyond collision.
     _subsession_msg_id = [10_000_000]
 
+    # Auto-attach filter, defined ONCE here so both the main-tab
+    # set_auto_attach (below) and the per-sub-session recursive
+    # re-attach (inside _hook_subtarget) share the exact same shape.
+    # nodriver's default filter MISSES OOPIF on Chrome 140+ (it doesn't
+    # explicitly include "iframe" and Chrome treats absence as exclude).
+    explicit_filter = cdp.target.TargetFilter([
+        {"exclude": True, "type": "browser"},
+        {"exclude": True, "type": "tab"},
+        {"exclude": False, "type": "iframe"},
+        {"exclude": False, "type": "page"},
+        {"exclude": False, "type": "worker"},
+        {"exclude": False, "type": "service_worker"},
+        {"exclude": False, "type": "shared_worker"},
+        {},  # catch-all for any unknown sub-target types
+    ])
+
     async def _hook_subtarget(event):
         try:
             if not isinstance(event, cdp.target.AttachedToTarget):
@@ -1881,6 +1897,45 @@ async def install_iframe_deep_trace(tab, log: LogFn | None = None) -> bool:
                         f"  [iframe-trace] hooked sub-target "
                         f"{ti.type_}: {(ti.url or '')[:120]}"
                     )
+                # RECURSE: tell THIS sub-session to auto-attach to its
+                # OWN children too. Without this, only direct children
+                # of the top tab are traced -- a nested player (e.g.
+                # supjav -> sptvp/supremejav iframe -> inner video
+                # iframe whose HLS/MP4 stream is the real content) stays
+                # invisible because its AttachedToTarget never fires.
+                # flatten=True keeps the grandchildren's events on the
+                # SAME parent socket, so _hook_subtarget fires again for
+                # them and the trace recurses to arbitrary depth.
+                # _attached_target_ids dedups, so re-attaches are cheap.
+                try:
+                    gen2 = cdp.target.set_auto_attach(
+                        auto_attach=True,
+                        wait_for_debugger_on_start=False,
+                        flatten=True,
+                        filter_=explicit_filter,
+                    )
+                    method2, *raw_params2 = next(gen2).values()
+                    params2 = raw_params2.pop() if raw_params2 else {}
+                    _subsession_msg_id[0] += 1
+                    msg2 = {
+                        "id": _subsession_msg_id[0],
+                        "method": method2,
+                        "params": params2,
+                        "sessionId": session_id,
+                    }
+                    await ws.send(_json.dumps(msg2))
+                    if log:
+                        log(
+                            f"  [iframe-trace] recursed setAutoAttach "
+                            f"into {ti.type_} {ti.target_id[:12]}"
+                        )
+                except Exception as e:
+                    if log:
+                        log(
+                            f"  [iframe-trace] recursive setAutoAttach "
+                            f"on sub-target {ti.type_} failed "
+                            f"(non-fatal): {type(e).__name__}: {e}"
+                        )
             except Exception as e:
                 if log:
                     log(
@@ -1910,16 +1965,8 @@ async def install_iframe_deep_trace(tab, log: LogFn | None = None) -> bool:
     # Network.enable through the parent socket with explicit
     # sessionId rather than spinning up a new websocket per iframe.
     try:
-        explicit_filter = cdp.target.TargetFilter([
-            {"exclude": True, "type": "browser"},
-            {"exclude": True, "type": "tab"},
-            {"exclude": False, "type": "iframe"},
-            {"exclude": False, "type": "page"},
-            {"exclude": False, "type": "worker"},
-            {"exclude": False, "type": "service_worker"},
-            {"exclude": False, "type": "shared_worker"},
-            {},  # catch-all for any unknown sub-target types
-        ])
+        # explicit_filter defined above (shared with the recursive
+        # per-sub-session re-attach in _hook_subtarget).
         await tab.send(
             cdp.target.set_auto_attach(
                 auto_attach=True,
