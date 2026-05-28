@@ -242,8 +242,9 @@ $cli-&gt;session('https://example.com', function (Session $sess) use ($cli) {
     <table>
       <thead><tr><th>メソッド</th><th>説明</th></tr></thead>
       <tbody>
-        <tr><td><code>page.goto(url)</code> → dict</td><td>ページ遷移</td></tr>
-        <tr><td><code>page.back()</code> / <code>forward()</code> / <code>history_first()</code> / <code>reload()</code></td><td>履歴移動・再読み込み（境界で安全）</td></tr>
+        <tr><td><code>page.goto(url)</code> → dict</td><td>ページ遷移。返り値 <code>reply["result"]["response"]</code> に Playwright 互換 HTTP レスポンス（<code>status</code> / <code>ok</code> / <code>headers</code> / <code>mime</code> / <code>url</code>）。<code>pap.response_of(reply)</code> で安全に取り出せる</td></tr>
+        <tr><td><code>page.back()</code> / <code>forward()</code> / <code>history_first()</code> / <code>reload()</code></td><td>履歴移動・再読み込み（境界で安全）。<code>goto()</code> と同じく <code>result["response"]</code> を持つ</td></tr>
+        <tr><td><code>page.last_response()</code> → dict</td><td>直近のメインドキュメント HTTP レスポンス。<strong>クリック起因のナビゲーション</strong>（リンク・フォーム送信・<code>location.href=</code>）後の status 取得に使う。常に <code>{url,status,status_text,ok,headers,mime}</code> を返す（status=0 は「未取得」）</td></tr>
         <tr><td><code>page.click(selector)</code> → dict</td><td>クリック。<code>[@N]</code> は <code>[data-paprika-id="N"]</code> に展開</td></tr>
         <tr><td><code>page.fill(selector, value)</code> → dict</td><td>input/textarea に値セット（input/change 発火）</td></tr>
         <tr><td><code>page.press(key, *, count=1, modifiers=None)</code> → dict</td><td>キー押下（<code>"Enter"</code> / <code>modifiers=["Ctrl"]</code>）</td></tr>
@@ -255,11 +256,38 @@ $cli-&gt;session('https://example.com', function (Session $sess) use ($cli) {
         <tr><td><code>page.set_input_files(selector, files)</code> → dict</td><td>ファイルアップロード（CDP）。<code>files</code> はパス or リスト</td></tr>
       </tbody>
     </table>
-    <div class="ex-async"><pre><code>await page.goto("https://example.com")
+    <div class="ex-async"><pre><code>import paprika_client as pap
+
+# HTTP ステータスの取得（Playwright 互換 Response）
+reply = await page.goto("https://example.com/missing")
+r = pap.response_of(reply)          # {url,status,status_text,ok,headers,mime}
+if r["status"] == 404:
+    return None
+if not r["ok"]:
+    raise RuntimeError(f"HTTP {r['status']}")
+
+# クリック起因のナビゲーション後は last_response() を使う
+await page.locator(".titleline > a").first.click()
+r = await page.last_response()
+if r["status"] == 404:
+    return None
+
 await page.fill("#email", "user@example.com")
 await page.press("Enter")
 await page.set_input_files("input[type=file]", ["a.jpg", "b.jpg"])</code></pre></div>
-    <div class="ex-sync"><pre><code>page.goto("https://example.com")
+    <div class="ex-sync"><pre><code>import paprika_client as pap
+
+reply = page.goto("https://example.com/missing")
+r = pap.response_of(reply)
+if r["status"] == 404:
+    return None
+
+# クリック起因のナビゲーション（sync でも await 不要）
+page.locator(".titleline > a").first.click()
+r = page.last_response()
+if r["status"] == 404:
+    return None
+
 page.fill("#email", "user@example.com")
 page.press("Enter")
 page.set_input_files("input[type=file]", ["a.jpg", "b.jpg"])</code></pre></div>

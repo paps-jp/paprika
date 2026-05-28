@@ -130,7 +130,7 @@ docker compose up -d --build</code></pre>
       <li>Swagger（HTTP API）→ <code>http://localhost:8000/docs</code></li>
     </ul>
     <p>前提: Docker + Docker Compose v2、Linux ホスト推奨。1 レーンあたり ~500MB–1GB RAM（既定 2 レーン）。
-    LLM 機能（codegen / vision-agent / <code>page.agent</code>）を使うときだけ OpenAI 互換の LLM エンドポイントが必要、Fetch だけなら不要。</p>
+    LLM 機能（codegen-loop / <code>page.agent</code> / R1 judge・distiller）を使うときだけ OpenAI 互換の LLM エンドポイントが必要、Fetch だけなら不要。</p>
 
     <h3 id="install-b">B. ハブ + リモート worker（分散）</h3>
     <p><strong>① ハブホスト</strong>：A と同じ手順で立ち上げる。ただし他マシンからアクセスするので <code>.env</code> で公開アドレスを設定：</p>

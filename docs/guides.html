@@ -5,18 +5,18 @@
 <title>ガイド — Paprika で画像・動画取得・ログイン・ブラウザ操作・サイト巡回</title>
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <link rel="stylesheet" href="style.css">
-<meta name="description" content="Paprika 実践ガイド。1 URL の画像一括取得・動画ダウンロード（yt-dlp 連携）・ログイン必須サイトの自動再ログイン・DOM 操作・サイト巡回 (walk)・LLM (codegen-loop / vision-agent) の使い分けまでレシピで解説。">
+<meta name="description" content="Paprika 実践ガイド。1 URL の画像一括取得・動画ダウンロード（yt-dlp 連携）・ログイン必須サイトの自動再ログイン・DOM 操作・サイト巡回 (walk)・LLM (codegen-loop / page.agent) の使い分けまでレシピで解説。">
 <link rel="canonical" href="https://paps-jp.github.io/paprika/guides.html">
 <meta property="og:type" content="website">
 <meta property="og:site_name" content="Paprika">
 <meta property="og:title" content="ガイド — Paprika で画像・動画取得・ログイン・ブラウザ操作・サイト巡回">
-<meta property="og:description" content="Paprika 実践ガイド。1 URL の画像一括取得・動画ダウンロード（yt-dlp 連携）・ログイン必須サイトの自動再ログイン・DOM 操作・サイト巡回 (walk)・LLM (codegen-loop / vision-agent) の使い分けまでレシピで解説。">
+<meta property="og:description" content="Paprika 実践ガイド。1 URL の画像一括取得・動画ダウンロード（yt-dlp 連携）・ログイン必須サイトの自動再ログイン・DOM 操作・サイト巡回 (walk)・LLM (codegen-loop / page.agent) の使い分けまでレシピで解説。">
 <meta property="og:url" content="https://paps-jp.github.io/paprika/guides.html">
 <meta property="og:image" content="https://paps-jp.github.io/paprika/img/admin-submit.png">
 <meta property="og:locale" content="ja_JP">
 <meta name="twitter:card" content="summary_large_image">
 <meta name="twitter:title" content="ガイド — Paprika で画像・動画取得・ログイン・ブラウザ操作・サイト巡回">
-<meta name="twitter:description" content="Paprika 実践ガイド。1 URL の画像一括取得・動画ダウンロード（yt-dlp 連携）・ログイン必須サイトの自動再ログイン・DOM 操作・サイト巡回 (walk)・LLM (codegen-loop / vision-agent) の使い分けまでレシピで解説。">
+<meta name="twitter:description" content="Paprika 実践ガイド。1 URL の画像一括取得・動画ダウンロード（yt-dlp 連携）・ログイン必須サイトの自動再ログイン・DOM 操作・サイト巡回 (walk)・LLM (codegen-loop / page.agent) の使い分けまでレシピで解説。">
 <meta name="twitter:image" content="https://paps-jp.github.io/paprika/img/admin-submit.png">
 <script type="application/ld+json">{
   "@context": "https://schema.org",
@@ -299,9 +299,8 @@ asyncio.run(main())</code></pre>
     <table>
       <thead><tr><th>使い方</th><th>向いてるタスク</th></tr></thead>
       <tbody>
-        <tr><td><code>page.agent(goal)</code></td><td>スクリプト内の局所的な不確実部分（年齢ゲート突破、再生ボタン探し、ログイン）</td></tr>
+        <tr><td><code>page.agent(goal)</code></td><td>スクリプト内の局所的な不確実部分（年齢ゲート突破、再生ボタン探し、ログイン）。CSS が効かない画面も Qwen-VL が「見て」操作</td></tr>
         <tr><td><code>mode="codegen-loop"</code></td><td>「このサイトを巡回」のような大きめタスクを抽象的な言葉で操作</td></tr>
-        <tr><td><code>mode="vision-agent"</code></td><td>CSS セレクタが効かない / 動的レンダリング / 視覚情報必須のサイト</td></tr>
       </tbody>
     </table>
     <pre><code># スクリプト内で 1 ステップだけ LLM に任せる

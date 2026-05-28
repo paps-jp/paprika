@@ -395,7 +395,7 @@ if cands:
 result = await page.agent(
     "クッキー同意ダイアログを閉じて、トップの '記事を読む' を押す",
     max_steps=5,
-    engine="auto",      # CogAgent → Qwen-VL の順にフォールバック
+    engine="auto",      # = "qwen"（Qwen-VL ビジョンエンジン）
 )
 # result["status"] == "OK" / "FAIL"
 # result["steps"] = [{"action": "click", "selector": "...", ...}, ...]</code></pre>

@@ -124,7 +124,7 @@
         <tr><td><strong>Code</strong></td><td><code>rerun</code></td><td>paprika-client の Python を直接貼り付けて 1 回実行（過去ジョブの再実行も）</td></tr>
       </tbody>
     </table>
-    <p>CSS セレクタが効かない画面を「見て」操作させたいときは、Fetch オプションや LLM の設定から <code>vision-agent</code> を選べます。</p>
+    <p>CSS セレクタが効かない画面を「見て」操作させたいときは、<code>codegen-loop</code> で生成したスクリプト内から <code>page.agent("…を探してクリック")</code>（Qwen-VL ビジョンエンジン）を呼べます。</p>
     <div class="callout tip"><strong>最小ファイルサイズ</strong>
     小さなアイコン等を除外したいときは Fetch オプション（または Settings の既定値）でバイト数を指定。<code>0</code> = フィルタ無効。</div>
 

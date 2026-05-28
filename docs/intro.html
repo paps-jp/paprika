@@ -205,8 +205,7 @@ foreach ($cli-&gt;jobImages($job['job_id']) as $url) {
       <thead><tr><th>mode</th><th>用途</th></tr></thead>
       <tbody>
         <tr><td><code>fetch</code></td><td><strong>既定。</strong>URL を開いて画像/動画/HTML を取得。LLM 不要・最速</td></tr>
-        <tr><td><code>codegen-loop</code></td><td>自然言語のゴール → LLM がスクリプト生成 → 実行 → 失敗時リトライ</td></tr>
-        <tr><td><code>vision-agent</code></td><td>スクリーンショットを見て LLM がクリック。CSS が効かない画面に強い</td></tr>
+        <tr><td><code>codegen-loop</code></td><td>自然言語のゴール → LLM がスクリプト生成 → 実行 → 失敗時リトライ。CSS が効かない画面は <code>page.agent()</code>（Qwen-VL）をスクリプト内で呼べる</td></tr>
         <tr><td><code>rerun</code></td><td>既存スクリプトをそのまま実行（Simple Macro が compile した Python もこれ）</td></tr>
       </tbody>
     </table>
