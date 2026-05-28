@@ -833,6 +833,13 @@ def _make_video_downloader(
     #              Live panel via WorkerJobLog if the session is tied
     #              to a parent job. None when the downloader runs in
     #              a context without a job (rare; mostly tests).
+    page_url_provider=None,  # optional sync callable () -> str|None
+    #              returning the session's current TOP-LEVEL page URL.
+    #              Used as a referer fallback for HLS/DASH streams that
+    #              were loaded inside a cross-origin iframe player: the
+    #              CDP-observed document URL (passed as ``referer``) is
+    #              then the IFRAME url, which the CDN often rejects --
+    #              the top page url is the referer it actually expects.
 ):
     """Return ``(maybe_download, drain)`` closures.
 
@@ -1128,22 +1135,68 @@ def _make_video_downloader(
             except RuntimeError:
                 pass  # loop already stopped (job was cancelled)
 
+        # Referer fallback chain. A stream loaded inside a cross-origin
+        # iframe player (supjav -> lk1.supremejav.com -> saawsedge HLS)
+        # carries the IFRAME's document URL as ``referer``; the CDN
+        # 403s it and yt-dlp writes no file. The top-level page URL is
+        # the referer the CDN actually expects -- proven on supjav: a
+        # saawsedge main-content m3u8 that yields 0 bytes with the
+        # iframe referer downloads in full with the supjav.com page
+        # referer. So: try the frame referer first (correct for normal
+        # / same-origin players, and the sidebar-preview streams that
+        # already work), then fall back to the top page URL, then to no
+        # referer. Stop the instant yt-dlp writes a file.
+        page_url = None
         try:
-            ok, msg = await asyncio.to_thread(
-                run_ytdlp,
-                target_url,
-                assets_dir,
-                referer,
-                None,
-                ytdlp_timeout,
-                _ytdlp_log,
-            )
+            if page_url_provider is not None:
+                page_url = page_url_provider()
+        except Exception:
+            page_url = None
+        referer_candidates: list = []
+        for _r in (referer, page_url, ""):
+            if _r is None:
+                continue
+            if _r not in referer_candidates:
+                referer_candidates.append(_r)
+
+        ok = False
+        msg = ""
+        new_files = []
+        try:
+            for _idx, _cand_ref in enumerate(referer_candidates):
+                if _idx > 0:
+                    _kind = (
+                        "page-url" if _cand_ref == page_url
+                        else "no-referer" if not _cand_ref
+                        else "frame"
+                    )
+                    log(
+                        f"  🔁 yt-dlp retry with {_kind} referer: "
+                        f"{(_cand_ref or '(none)')[:80]}"
+                    )
+                last_progress[target_url] = time.time()
+                ok, msg = await asyncio.to_thread(
+                    run_ytdlp,
+                    target_url,
+                    assets_dir,
+                    _cand_ref or None,
+                    None,
+                    ytdlp_timeout,
+                    _ytdlp_log,
+                )
+                after = {p.name for p in assets_dir.iterdir() if p.is_file()}
+                new_files = sorted(after - before)
+                if ok and new_files:
+                    break  # got a file -- don't burn the other referers
         finally:
             last_progress.pop(target_url, None)
         after = {p.name for p in assets_dir.iterdir() if p.is_file()}
         new_files = sorted(after - before)
-        if not ok:
-            log(f"  !! yt-dlp failed: {msg}")
+        if not ok and not new_files:
+            log(
+                f"  !! yt-dlp failed (tried {len(referer_candidates)} "
+                f"referer(s)): {msg}"
+            )
         else:
             log(f"  ✅ yt-dlp completed: {msg} ({len(new_files)} new file(s))")
         for name in new_files:
@@ -2993,6 +3046,16 @@ class WorkerAgent:
                 log=lambda s: _logger.info(f"[session {sid}] {s}"),
                 job_id_for_logs=f"session-{sid}",
                 job_log=_maybe_send_job_log,
+                # Top-level page URL referer fallback for cross-origin
+                # iframe player streams (e.g. supjav's supremejav iframe).
+                # state.last_response tracks the most recent top-level
+                # document load, so its url is the page the operator is
+                # actually on -- the referer the CDN expects.
+                page_url_provider=lambda: (
+                    (state.last_response or {}).get("url")
+                    if isinstance(getattr(state, "last_response", None), dict)
+                    else None
+                ),
             )
             state.video_downloader = maybe_download_video_session
             state.video_drainer = drain_video_session
@@ -5779,6 +5842,11 @@ class WorkerAgent:
                 on_saved=_on_session_video_saved,
                 log=lambda s: _slog(s),
                 job_id_for_logs=f"session-{sid}",
+                page_url_provider=lambda: (
+                    (state.last_response or {}).get("url")
+                    if isinstance(getattr(state, "last_response", None), dict)
+                    else None
+                ),
             )
 
         async def _viewport(tab) -> tuple[int, int]:
@@ -7225,6 +7293,9 @@ class WorkerAgent:
                 on_saved=_on_asset_saved,
                 log=log,
                 job_id_for_logs=assign.job_id,
+                # Top-level page URL referer fallback for cross-origin
+                # iframe player streams (see _make_video_downloader).
+                page_url_provider=lambda: getattr(assign, "url", None),
             )
 
             # ---- main loop --------------------------------------------
