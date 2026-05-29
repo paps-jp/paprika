@@ -9826,8 +9826,9 @@ async function _populateReasoningJudgeEngines(currentSlug) {
   sel.innerHTML = '<option value="">(未設定 — env fallback)</option>';
   try {
     const r = await fetch('/engines');
-    const engines = await r.json();
-    (engines || []).forEach(e => {
+    const data = await r.json();
+    const engines = Array.isArray(data) ? data : (data.engines || []);
+    engines.forEach(e => {
       const opt = document.createElement('option');
       opt.value = e.slug;
       opt.textContent = `${e.slug} (${e.model || e.name})`;
