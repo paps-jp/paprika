@@ -1,0 +1,322 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+<meta charset="utf-8">
+<title>Vision AI とマウス操作 — 人間的な軌跡でボット検知を回避</title>
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<link rel="stylesheet" href="style.css">
+<meta name="description" content="Paprika の Vision AI エージェントがスクリーンショットから座標を特定し、Bézier 曲線による人間的なマウス軌跡でクリックを実行する仕組み。CDP Input API、加減速、ジッター、ボット検知回避の技術解説。">
+<link rel="canonical" href="https://paps-jp.github.io/paprika/vision-mouse.html">
+</head>
+<body>
+
+<nav class="topnav">
+  <a class="brand" href="index.html"><span class="logo"><img src="icon.svg" alt=""></span> Paprika</a>
+  <span class="links">
+    <a href="index.html">Home</a>
+    <span class="dropdown">
+      <a class="dropdown-toggle" href="intro.html">学ぶ ▾</a>
+      <span class="dropdown-menu">
+        <a href="intro.html">はじめに</a>
+        <a href="guides.html">ガイド</a>
+        <a href="examples.html">サンプル</a>
+      </span>
+    </span>
+    <span class="dropdown">
+      <a class="dropdown-toggle" href="api.html">リファレンス ▾</a>
+      <span class="dropdown-menu">
+        <a href="api.html">API</a>
+        <a href="admin.html">管理画面</a>
+      </span>
+    </span>
+    <span class="dropdown">
+      <a class="dropdown-toggle active" href="operations.html">運用・設計 ▾</a>
+      <span class="dropdown-menu">
+        <a href="operations.html">サーバー構成</a>
+        <a href="engine-setup.html">エンジン設定</a>
+        <a href="scaling.html">Hub スケーリング</a>
+        <a href="vision-mouse.html" class="active">Vision AI とマウス</a>
+        <a href="worker-autodeploy.html">ワーカー自動デプロイ</a>
+        <a href="vnc-embed.html">VNC 埋め込み</a>
+      </span>
+    </span>
+  </span>
+  <a class="gh" href="https://github.com/paps-jp/paprika">GitHub ↗</a>
+</nav>
+
+<div class="layout">
+  <aside class="sidebar">
+    <h4>Vision AI とマウス</h4>
+    <ul>
+      <li><a href="#overview">概要</a></li>
+      <li><a href="#vision-pipeline">Vision AI パイプライン</a></li>
+      <li><a href="#cdp-input">CDP Input API</a></li>
+      <li><a href="#problem">瞬間移動の問題</a></li>
+      <li><a href="#bezier">Bezier 曲線軌跡</a></li>
+      <li><a href="#easing">加減速とジッター</a></li>
+      <li><a href="#actions">対応アクション一覧</a></li>
+      <li><a href="#config">設定</a></li>
+      <li><a href="#detection">ボット検知との関係</a></li>
+    </ul>
+  </aside>
+
+  <main class="content">
+    <h1>Vision AI とマウス操作</h1>
+    <p class="lead">Vision AI エージェントがスクリーンショットから座標を読み取り、
+    人間のようにカーソルを動かしてクリックする仕組みを解説します。</p>
+
+    <h2 id="overview">概要</h2>
+    <p>Paprika には 2 つのブラウザ操作方式があります：</p>
+    <table>
+      <thead><tr><th>方式</th><th>ターゲット指定</th><th>使用場面</th></tr></thead>
+      <tbody>
+        <tr>
+          <td><strong>CSS セレクタ方式</strong></td>
+          <td><code>page.click("button#submit")</code></td>
+          <td>SDK / codegen-loop。DOM にアクセスできるとき</td>
+        </tr>
+        <tr>
+          <td><strong>Vision AI 方式（座標指定）</strong></td>
+          <td><code>click_at(x=432, y=218)</code></td>
+          <td>Vision エージェント。スクリーンショットから座標を特定</td>
+        </tr>
+      </tbody>
+    </table>
+    <p>CSS セレクタ方式は DOM の <code>element.click()</code> を呼ぶため、マウスの物理的な移動は発生しません。
+    一方 Vision AI 方式は、人間と同じように <strong>画面上のピクセル座標にマウスを動かしてクリック</strong> します。
+    このマウス移動の「動かし方」がボット検知の判定に影響します。</p>
+
+    <h2 id="vision-pipeline">Vision AI パイプライン</h2>
+    <p>Vision エージェント（CogAgent / Qwen-VL 等）の 1 ステップ：</p>
+    <pre><code>1. スクリーンショットを撮影
+2. VLM に送信：「ログインボタンをクリックして」
+3. VLM が応答：CLICK(box=[400, 200, 464, 236])
+4. box の中心座標を計算：(432, 218)
+5. CDP でマウスを (432, 218) に移動してクリック  ← ここが本題</code></pre>
+
+    <h2 id="cdp-input">CDP Input API</h2>
+    <p>Paprika は Chrome DevTools Protocol (CDP) の
+    <code>Input.dispatchMouseEvent</code> でマウスを制御します。
+    3 種類のイベントを順番に発行します：</p>
+
+    <pre><code># 1. カーソルを移動（:hover やマウスリスナーが発火）
+Input.dispatchMouseEvent(type="mouseMoved", x=432, y=218)
+
+# 2. ボタンを押下
+Input.dispatchMouseEvent(type="mousePressed", x=432, y=218, button="left")
+
+# 3. ボタンを離す
+Input.dispatchMouseEvent(type="mouseReleased", x=432, y=218, button="left")</code></pre>
+
+    <p>これは実際の OS レベルのマウスイベントと同等のものが Chrome 内部で生成されるため、
+    JavaScript の <code>mousedown</code> / <code>mouseup</code> / <code>click</code> イベントが正しく発火します。</p>
+
+    <h2 id="problem">瞬間移動の問題</h2>
+
+    <div class="callout warn">
+    <strong>「瞬間移動」はボットの指紋</strong>
+    従来の実装では <code>mouseMoved</code> を 1 回だけ発行してターゲットに瞬間移動していました。
+    人間のマウスは必ず曲線を描いて移動するため、ボット検知システムはこのパターンを見分けます。
+    </div>
+
+    <p>ボット検知システム（Cloudflare Turnstile、reCAPTCHA v3 等）は、
+    マウスの移動軌跡を分析してスコアリングします：</p>
+    <table>
+      <thead><tr><th>特徴</th><th>人間</th><th>ボット（瞬間移動）</th></tr></thead>
+      <tbody>
+        <tr><td>移動軌跡</td><td>曲線（微妙な S 字カーブ）</td><td>直線 or 瞬間移動</td></tr>
+        <tr><td>速度変化</td><td>加速 → 巡航 → 減速</td><td>一定速度 or 0ms</td></tr>
+        <tr><td>座標のブレ</td><td>±1-2px の微小な揺れ</td><td>完全に正確</td></tr>
+        <tr><td>mouseMoved 数</td><td>数十〜数百イベント</td><td>0〜1 イベント</td></tr>
+      </tbody>
+    </table>
+
+    <h2 id="bezier">Bezier 曲線による軌跡生成</h2>
+    <p>Paprika は <strong>3 次 Bezier 曲線</strong>（cubic Bezier）でマウスの軌跡を生成します。</p>
+
+    <h3>アルゴリズム</h3>
+    <pre><code>始点 P0 = 前回のマウス位置
+終点 P3 = クリック先の座標
+
+制御点:
+  P1 = P0 から 1/3 の位置 + ランダムな横方向オフセット
+  P2 = P0 から 2/3 の位置 + ランダムな横方向オフセット
+
+   P0
+    \          P1（ランダムにずれる）
+     \       /
+      ●───●
+           \
+            ●───●
+           /       \
+  P2（ランダム）    P3（クリック先）</code></pre>
+
+    <p>この曲線上に <strong>30 個の中間点（waypoint）</strong> を等間隔に生成し、
+    各点で <code>mouseMoved</code> イベントを発行します。</p>
+
+    <h3>カーブの大きさ</h3>
+    <p>制御点の横方向オフセット（曲がり具合）は移動距離に比例します：</p>
+    <pre><code>spread = min(120px, 移動距離 × 0.3)
+
+短い移動（50px）  → spread = 15px  → ほぼ直線
+中程度（300px）   → spread = 90px  → 自然な S 字
+長い移動（500px+）→ spread = 120px → 大きなカーブ（上限）</code></pre>
+
+    <h2 id="easing">加減速とジッター</h2>
+
+    <h3>sinusoidal ease-in-out</h3>
+    <p>人間のマウス操作はターゲットに向かって加速し、到達直前で減速します。
+    Paprika はこれを正弦波ベースのイージング関数で再現します：</p>
+    <pre><code>def ease_in_out(t):
+    return 0.5 × (1 - cos(π × t))
+
+t=0.0 → 0.00  （静止）
+t=0.1 → 0.02  （ゆっくり加速）
+t=0.3 → 0.21  （加速中）
+t=0.5 → 0.50  （最高速）
+t=0.7 → 0.79  （減速中）
+t=0.9 → 0.98  （ゆっくり減速）
+t=1.0 → 1.00  （到着）</code></pre>
+
+    <h3>マイクロジッター</h3>
+    <p>各中間点に <strong>±1.5 px のランダムノイズ</strong> を加えます。
+    始点と終点はブレません（正確に元の位置から出発し、正確にターゲットに到着する）。</p>
+    <pre><code># 中間点のみ（始点・終点はブレなし）
+if 0 &lt; i &lt; steps:
+    x += random.uniform(-1.5, 1.5)
+    y += random.uniform(-1.5, 1.5)</code></pre>
+
+    <h2 id="actions">対応アクション一覧</h2>
+    <p>人間的マウス移動が適用されるアクション：</p>
+    <table>
+      <thead><tr><th>アクション</th><th>関数</th><th>マウス移動</th><th>説明</th></tr></thead>
+      <tbody>
+        <tr>
+          <td><strong>click</strong></td>
+          <td><code>click_at()</code></td>
+          <td>Bezier 軌跡 → press → release</td>
+          <td>左クリック</td>
+        </tr>
+        <tr>
+          <td><strong>double_click</strong></td>
+          <td><code>click_at(click_count=2)</code></td>
+          <td>Bezier 軌跡 → press×2 → release×2</td>
+          <td>ダブルクリック</td>
+        </tr>
+        <tr>
+          <td><strong>right_click</strong></td>
+          <td><code>click_at(button="right")</code></td>
+          <td>Bezier 軌跡 → press → release</td>
+          <td>右クリック</td>
+        </tr>
+        <tr>
+          <td><strong>hover</strong></td>
+          <td><code>hover_at()</code></td>
+          <td>Bezier 軌跡のみ（クリックなし）</td>
+          <td>ホバーメニュー展開等</td>
+        </tr>
+        <tr>
+          <td><strong>type</strong></td>
+          <td><code>type_at()</code></td>
+          <td>Bezier 軌跡 → click → insertText</td>
+          <td>フィールドをクリックして入力</td>
+        </tr>
+        <tr>
+          <td><strong>scroll</strong></td>
+          <td><code>wheel_at()</code></td>
+          <td>なし（ホイールイベントのみ）</td>
+          <td>ページスクロール</td>
+        </tr>
+      </tbody>
+    </table>
+
+    <h2 id="config">設定</h2>
+    <table>
+      <thead><tr><th>環境変数</th><th>デフォルト</th><th>説明</th></tr></thead>
+      <tbody>
+        <tr>
+          <td><code>PAPRIKA_HUMAN_MOUSE</code></td>
+          <td><code>1</code></td>
+          <td><code>0</code> で無効化（瞬間移動に戻す）。デバッグ・速度優先時に</td>
+        </tr>
+        <tr>
+          <td><code>PAPRIKA_MOUSE_STEPS</code></td>
+          <td><code>30</code></td>
+          <td>1 回の移動で生成する waypoint 数。多い = より滑らか</td>
+        </tr>
+        <tr>
+          <td><code>PAPRIKA_MOUSE_DURATION_MS</code></td>
+          <td><code>250</code></td>
+          <td>移動にかかる時間 (ms)。30 steps ÷ 250ms ≈ 8ms/step</td>
+        </tr>
+        <tr>
+          <td><code>VISION_WHEEL_STEP_PX</code></td>
+          <td><code>100</code></td>
+          <td>スクロール 1 ステップのピクセル数</td>
+        </tr>
+      </tbody>
+    </table>
+
+    <div class="callout tip">
+    <strong>速度と自然さのトレードオフ</strong>
+    steps を減らすか duration を短くすると速くなりますが、軌跡が荒くなりボット検知に引っかかりやすくなります。
+    デフォルト値（30 steps / 250ms）は人間のマウス移動速度の研究に基づいた妥当な値です。
+    </div>
+
+    <h2 id="detection">ボット検知との関係</h2>
+
+    <h3>検知システムが見ているもの</h3>
+    <p>主要なボット検知システムがマウスイベントから判定する特徴：</p>
+    <table>
+      <thead><tr><th>検知手法</th><th>判定内容</th><th>Paprika の対応</th></tr></thead>
+      <tbody>
+        <tr>
+          <td><strong>軌跡分析</strong></td>
+          <td>mouseMoved イベントの座標列が直線的すぎないか</td>
+          <td>Bezier 曲線で自然なカーブを生成</td>
+        </tr>
+        <tr>
+          <td><strong>速度プロファイル</strong></td>
+          <td>移動速度が一定すぎないか、加減速があるか</td>
+          <td>sinusoidal ease-in-out で加減速</td>
+        </tr>
+        <tr>
+          <td><strong>ジッター検出</strong></td>
+          <td>完全に滑らかな軌跡は人間ではない</td>
+          <td>±1.5px のマイクロノイズを付加</td>
+        </tr>
+        <tr>
+          <td><strong>イベント頻度</strong></td>
+          <td>mouseMoved が 0 回 or 1 回は自動化の証拠</td>
+          <td>30 回の mouseMoved を発行</td>
+        </tr>
+        <tr>
+          <td><strong>タイミング</strong></td>
+          <td>イベント間隔が完全に等間隔すぎないか</td>
+          <td>ease-in-out で間隔に自然な変動</td>
+        </tr>
+      </tbody>
+    </table>
+
+    <h3>限界</h3>
+    <p>マウス軌跡だけでは回避できない検知手法もあります：</p>
+    <ul>
+      <li><strong>ブラウザフィンガープリント</strong> — WebGL / Canvas / AudioContext のハッシュ値。
+      Paprika は実際の Chrome を使うため、これは自然にパスします。</li>
+      <li><strong>navigator.webdriver</strong> — CDP 接続時にセットされるフラグ。
+      nodriver（undetected-chromedriver の後継）がパッチ済み。</li>
+      <li><strong>IP レピュテーション</strong> — 同一 IP からの大量アクセス。
+      プロキシローテーションで対応（<code>paprika-proxy-fetch</code> プラグイン参照）。</li>
+    </ul>
+
+    <div class="footer">
+      Paprika &copy; 2026 <a href="https://www.paps.jp">paps-jp</a>
+    </div>
+    <div class="pager">
+      <a class="prev" href="scaling.html"><div class="dir">&larr; 前へ</div><div class="ttl">Hub スケーリング</div></a>
+      <a class="next" href="worker-autodeploy.html"><div class="dir">次へ &rarr;</div><div class="ttl">ワーカー自動デプロイ</div></a>
+    </div>
+  </main>
+</div>
+</body>
+</html>
