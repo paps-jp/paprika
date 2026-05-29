@@ -6904,8 +6904,39 @@ document.getElementById('submit').addEventListener('submit', async e => {
     _restoreSubmitBtn();
   }
 });
+// Polling loop with Page Visibility gating. The admin UI is routinely
+// left open in a background browser tab; without this guard each open
+// tab keeps hammering /health + /workers + /jobs + /sessions every 2s
+// forever (≈2 req/s/tab) even when nobody is looking. We pause the
+// loop while document.hidden is true and resume — with an immediate
+// catch-up refresh — the moment the tab becomes visible again.
+const REFRESH_INTERVAL_MS = 2000;
+let _refreshTimer = null;
+function _startRefreshLoop() {
+  if (_refreshTimer !== null) return;   // already running
+  _refreshTimer = setInterval(refresh, REFRESH_INTERVAL_MS);
+}
+function _stopRefreshLoop() {
+  if (_refreshTimer === null) return;
+  clearInterval(_refreshTimer);
+  _refreshTimer = null;
+}
+document.addEventListener('visibilitychange', () => {
+  if (document.hidden) {
+    _stopRefreshLoop();
+  } else {
+    // Tab came back to the foreground: refresh once immediately so the
+    // operator sees current state without waiting a full interval, then
+    // resume the periodic loop.
+    refresh();
+    _startRefreshLoop();
+  }
+});
+// Initial paint + loop. If the page somehow loads already-hidden
+// (prerender / background open), start polling only when it first
+// becomes visible -- the visibilitychange handler covers that.
 refresh();
-setInterval(refresh, 2000);
+if (!document.hidden) _startRefreshLoop();
 
 // ---- hosts (per-host cookie registry) ------------------------------------
 // State: cookies are stored server-side; the UI fetches a list of host
