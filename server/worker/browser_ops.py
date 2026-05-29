@@ -29,7 +29,9 @@ from __future__ import annotations
 import asyncio
 import base64
 import json
+import math
 import os
+import random
 import re
 import time
 from dataclasses import dataclass
@@ -707,6 +709,116 @@ async def scroll(tab, direction: str, pixels: int, log: LogFn) -> str:
 # ---------------------------------------------------------------------------
 
 
+# ---------------------------------------------------------------------------
+# Human-like mouse movement
+#
+# Instead of teleporting the cursor to the target, we trace a Bézier curve
+# with randomised control points, apply ease-in-out timing, and add ±1-2 px
+# jitter along the path. The result is a trajectory that passes the mouse-
+# movement heuristics in Cloudflare Turnstile, reCAPTCHA v3, and similar
+# bot-detection systems.
+#
+# Env knobs:
+#   PAPRIKA_HUMAN_MOUSE=0        → disable (teleport, legacy behaviour)
+#   PAPRIKA_MOUSE_STEPS=30       → waypoints per move (more = smoother)
+#   PAPRIKA_MOUSE_DURATION_MS=250 → total travel time in ms
+# ---------------------------------------------------------------------------
+
+_HUMAN_MOUSE_ENABLED = os.environ.get("PAPRIKA_HUMAN_MOUSE", "1") != "0"
+_MOUSE_STEPS = int(os.environ.get("PAPRIKA_MOUSE_STEPS", "30"))
+_MOUSE_DURATION_MS = int(os.environ.get("PAPRIKA_MOUSE_DURATION_MS", "250"))
+
+# Module-level "last known" cursor position. Reset per tab is unnecessary
+# because we only use this to calculate the starting point of the next
+# move; the worst case is a single wrong starting point on the very first
+# action of a fresh tab, which looks fine (the first move always starts
+# from somewhere "off-screen" in practice).
+_last_mouse: dict[str, tuple[int, int]] = {}  # tab_id -> (x, y)
+
+
+def _bezier_curve(
+    start: tuple[int, int],
+    end: tuple[int, int],
+    steps: int,
+) -> list[tuple[int, int]]:
+    """Generate waypoints along a cubic Bézier curve from *start* to *end*.
+
+    Two randomised control points are placed at roughly 1/3 and 2/3 of the
+    way between start and end, with lateral jitter proportional to the
+    distance — this produces the slight S-curve that real hand movements
+    exhibit.
+    """
+    sx, sy = start
+    ex, ey = end
+    dist = math.hypot(ex - sx, ey - sy)
+    # Lateral jitter: bigger moves get bigger curves (capped at 120 px).
+    spread = min(120.0, dist * 0.3)
+
+    # Control points at ~1/3 and ~2/3 along the direct line, offset
+    # perpendicularly by a random amount.
+    dx, dy = ex - sx, ey - sy
+    # Perpendicular unit vector (rotate 90°).
+    if dist < 1:
+        return [end]
+    px, py = -dy / dist, dx / dist
+
+    off1 = random.uniform(-spread, spread)
+    off2 = random.uniform(-spread, spread)
+    c1x = sx + dx * 0.33 + px * off1
+    c1y = sy + dy * 0.33 + py * off1
+    c2x = sx + dx * 0.67 + px * off2
+    c2y = sy + dy * 0.67 + py * off2
+
+    points: list[tuple[int, int]] = []
+    for i in range(steps + 1):
+        t = i / steps
+        # ease-in-out: slow at start/end, fast in the middle.
+        t = _ease_in_out(t)
+        # De Casteljau (cubic Bézier).
+        u = 1 - t
+        bx = u**3 * sx + 3 * u**2 * t * c1x + 3 * u * t**2 * c2x + t**3 * ex
+        by = u**3 * sy + 3 * u**2 * t * c1y + 3 * u * t**2 * c2y + t**3 * ey
+        # Micro-jitter: ±1-2 px random noise (skip the endpoints).
+        if 0 < i < steps:
+            bx += random.uniform(-1.5, 1.5)
+            by += random.uniform(-1.5, 1.5)
+        points.append((int(round(bx)), int(round(by))))
+    return points
+
+
+def _ease_in_out(t: float) -> float:
+    """Sinusoidal ease-in-out: ``0→0``, ``0.5→0.5``, ``1→1``."""
+    return 0.5 * (1 - math.cos(math.pi * t))
+
+
+async def _human_move_to(tab, x: int, y: int) -> None:
+    """Trace a human-like Bézier path from the last known position to (x, y).
+
+    Each waypoint fires a CDP ``Input.dispatchMouseEvent("mouseMoved")``.
+    The total travel time is ``_MOUSE_DURATION_MS`` with the inter-step
+    delay spread across the waypoints (typically 6-10 ms each for 30 steps).
+    """
+    tab_id = str(id(tab))
+    start = _last_mouse.get(tab_id, (x // 2, y + 80))  # default: below-centre
+    _last_mouse[tab_id] = (x, y)
+
+    none_enum = _mouse_button("none")
+    points = _bezier_curve(start, (x, y), _MOUSE_STEPS)
+    delay = _MOUSE_DURATION_MS / 1000.0 / max(len(points), 1)
+
+    for px, py in points:
+        await tab.send(
+            cdp.input_.dispatch_mouse_event(
+                type_="mouseMoved",
+                x=px,
+                y=py,
+                button=none_enum,
+            )
+        )
+        if delay > 0:
+            await asyncio.sleep(delay)
+
+
 def _mouse_button(name: str):
     """Resolve a ``"left"`` / ``"right"`` / ``"middle"`` string to the
     matching ``cdp.input_.MouseButton`` enum member.
@@ -745,20 +857,21 @@ async def click_at(
     btn_enum = _mouse_button(button)
     none_enum = _mouse_button("none")
     try:
-        # mouseMoved first so :hover styles update and any
-        # mouseenter/leave listeners fire before the press. Chrome's
-        # input pipeline is forgiving without it but some sites
-        # gate clicks on a preceding move (lazy-loaded button libs).
-        # mouseMoved uses MouseButton.NONE (no button pressed during
-        # the move itself).
-        await tab.send(
-            cdp.input_.dispatch_mouse_event(
-                type_="mouseMoved",
-                x=x,
-                y=y,
-                button=none_enum,
+        # Trace a human-like Bézier path to the target so bot-detection
+        # systems (Turnstile, reCAPTCHA v3) see a realistic mousemove
+        # trajectory. Falls back to a single teleport-style mouseMoved
+        # when PAPRIKA_HUMAN_MOUSE=0 or on very short distances.
+        if _HUMAN_MOUSE_ENABLED:
+            await _human_move_to(tab, x, y)
+        else:
+            await tab.send(
+                cdp.input_.dispatch_mouse_event(
+                    type_="mouseMoved",
+                    x=x,
+                    y=y,
+                    button=none_enum,
+                )
             )
-        )
         await tab.send(
             cdp.input_.dispatch_mouse_event(
                 type_="mousePressed",
@@ -789,16 +902,19 @@ async def hover_at(tab, x: int, y: int, log: LogFn) -> str:
 
     Useful for menus that expand on hover before they can be clicked.
     """
-    none_enum = _mouse_button("none")
     try:
-        await tab.send(
-            cdp.input_.dispatch_mouse_event(
-                type_="mouseMoved",
-                x=x,
-                y=y,
-                button=none_enum,
+        if _HUMAN_MOUSE_ENABLED:
+            await _human_move_to(tab, x, y)
+        else:
+            none_enum = _mouse_button("none")
+            await tab.send(
+                cdp.input_.dispatch_mouse_event(
+                    type_="mouseMoved",
+                    x=x,
+                    y=y,
+                    button=none_enum,
+                )
             )
-        )
     except Exception as e:
         log(f"  [vagent] hover_at ({x},{y}): {short_error(e)}")
         return f"ERR: {short_error(e)}"
