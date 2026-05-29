@@ -8,3 +8,4 @@ arq>=0.26
 python-multipart>=0.0.9
 websockets>=12
 httpx>=0.27
+aiomysql>=0.2

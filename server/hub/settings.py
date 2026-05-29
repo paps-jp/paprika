@@ -112,6 +112,16 @@ _SCHEMA: dict[str, tuple[Any, str]] = {
     # Engine slug registered in the Engines tab.  When empty, falls back
     # to env PAPRIKA_R1_DISTILLER_ENGINE (legacy compat) → "deepseek-r1".
     "reasoning_judge_engine": ("", "str"),
+    # ---- Database: MariaDB -----------------------------------------------
+    # External MariaDB / MySQL connection for persistent structured data.
+    # When configured and reachable, the hub can migrate job state,
+    # worker registry, and eventually file-backed registries into tables.
+    # Empty host (default) = feature off, keep using Redis / file storage.
+    "mariadb_host": ("", "str"),
+    "mariadb_port": (3306, "int"),
+    "mariadb_database": ("paprika", "str"),
+    "mariadb_username": ("", "str"),
+    "mariadb_password": ("", "str"),
     # ---- Windows portable: Chrome headless ------------------------------
     # When True, the bundled Chromium starts with ``--headless=new`` so
     # the operator's physical desktop isn't taken over by paprika's job
@@ -156,6 +166,12 @@ def _env_default(key: str, fallback: Any) -> Any:
         # Reasoning judge: settings.json -> env vars -> static default.
         "reasoning_judge_mode": ("PAPRIKA_R1_JUDGE_MODE", "str"),
         "reasoning_judge_engine": ("PAPRIKA_R1_DISTILLER_ENGINE", "str"),
+        # MariaDB: settings.json -> env vars -> static default.
+        "mariadb_host": ("PAPRIKA_MARIADB_HOST", "str"),
+        "mariadb_port": ("PAPRIKA_MARIADB_PORT", "int"),
+        "mariadb_database": ("PAPRIKA_MARIADB_DATABASE", "str"),
+        "mariadb_username": ("PAPRIKA_MARIADB_USERNAME", "str"),
+        "mariadb_password": ("PAPRIKA_MARIADB_PASSWORD", "str"),
     }
     info = env_map.get(key)
     if not info:

@@ -217,3 +217,72 @@ async def smb_status() -> dict:
         "auto_mount": bool(reg.get("smb_auto_mount", True)),
         "usage": usage,
     }
+
+
+# -------------------------------------------------------------------
+# MariaDB connection test
+# -------------------------------------------------------------------
+
+@router.post("/settings/mariadb/test")
+async def mariadb_test(body: dict | None = None) -> dict:
+    """Test MariaDB connectivity.
+
+    If *body* contains host/port/database/username/password, those are
+    used directly (for testing before saving).  Otherwise the saved
+    settings are read.
+    """
+    import asyncio
+
+    reg = _require_settings()
+    b = body or {}
+    host = b.get("host") or reg.get("mariadb_host", "")
+    port = int(b.get("port") or reg.get("mariadb_port", 3306))
+    database = b.get("database") or reg.get("mariadb_database", "paprika")
+    username = b.get("username") or reg.get("mariadb_username", "")
+    password = b.get("password") or reg.get("mariadb_password", "")
+
+    if not host:
+        return {"ok": False, "message": "ホストが未設定です"}
+    if not username:
+        return {"ok": False, "message": "ユーザー名が未設定です"}
+
+    async def _test():
+        try:
+            import aiomysql  # type: ignore[import-untyped]
+        except ImportError:
+            # Fallback: try synchronous pymysql
+            try:
+                import pymysql  # type: ignore[import-untyped]
+            except ImportError:
+                return {"ok": False, "message": "aiomysql / pymysql がインストールされていません"}
+            try:
+                conn = pymysql.connect(
+                    host=host, port=port, user=username,
+                    password=password, database=database,
+                    connect_timeout=5,
+                )
+                cur = conn.cursor()
+                cur.execute("SELECT VERSION()")
+                version = cur.fetchone()[0]
+                cur.close()
+                conn.close()
+                return {"ok": True, "message": f"接続成功", "version": version}
+            except Exception as e:
+                return {"ok": False, "message": str(e)}
+
+        try:
+            conn = await aiomysql.connect(
+                host=host, port=port, user=username,
+                password=password, db=database,
+                connect_timeout=5,
+            )
+            async with conn.cursor() as cur:
+                await cur.execute("SELECT VERSION()")
+                row = await cur.fetchone()
+                version = row[0] if row else "unknown"
+            conn.close()
+            return {"ok": True, "message": "接続成功", "version": version}
+        except Exception as e:
+            return {"ok": False, "message": str(e)}
+
+    return await _test()

@@ -2852,6 +2852,52 @@ curl 'http://paprika.lan/extensions/ublock-lite/download' --output ublock-lite.t
       </div>
     </div>
 
+    <!-- B7. Database: MariaDB -->
+    <h3 style="margin-top:1.2rem; font-size:.95rem; color:#444; border-bottom:1px solid #eee; padding-bottom:.3rem;"><iconify-icon icon="lucide:database"></iconify-icon> Database (MariaDB)
+      <small style="font-weight:normal; color:#888;">— 外部 MariaDB / MySQL への接続</small>
+    </h3>
+    <p style="margin:4px 0 8px; color:#666; font-size:.88em;">
+      ジョブ・ワーカー・ホスト等の永続データを MariaDB に保管。未設定なら従来通り Redis + ファイルを使用。
+    </p>
+
+    <div id="mariadbStatusBanner" style="display:none; padding:8px 14px; border-radius:6px; margin-bottom:10px; font-size:.9em; align-items:center; gap:8px;">
+    </div>
+
+    <div style="display:grid; grid-template-columns: 200px 1fr; gap:8px 12px; align-items:center; padding:8px 4px;">
+      <label for="setMariadbHost" title="MariaDB サーバーの IP またはホスト名">ホスト:</label>
+      <div>
+        <input type="text" id="setMariadbHost" placeholder="例: 10.10.50.16" style="width:240px; padding:4px 8px;">
+      </div>
+
+      <label for="setMariadbPort" title="MariaDB ポート番号">ポート:</label>
+      <div>
+        <input type="number" id="setMariadbPort" value="3306" min="1" max="65535" style="width:100px; padding:4px 8px;">
+      </div>
+
+      <label for="setMariadbDatabase" title="データベース名">データベース:</label>
+      <div>
+        <input type="text" id="setMariadbDatabase" placeholder="paprika" style="width:240px; padding:4px 8px;">
+      </div>
+
+      <label for="setMariadbUsername" title="MariaDB ユーザー名">ユーザー名:</label>
+      <div>
+        <input type="text" id="setMariadbUsername" placeholder="" style="width:240px; padding:4px 8px;" autocomplete="off">
+      </div>
+
+      <label for="setMariadbPassword" title="MariaDB パスワード">パスワード:</label>
+      <div>
+        <input type="password" id="setMariadbPassword" placeholder="" style="width:240px; padding:4px 8px;" autocomplete="off">
+        <button type="button" id="setMariadbPasswordToggle" class="pill" style="padding:2px 8px; font-size:.8em; margin-left:4px; background:#f5f5fa; border-color:#ccd; color:#555;" title="パスワード表示/非表示">👁</button>
+      </div>
+
+      <div></div>
+      <div style="display:flex; gap:8px; align-items:center; flex-wrap:wrap; margin-top:4px;">
+        <button id="setSaveMariadbBtn" class="pill" style="background:#eef8ee; border-color:#7ab68a; color:#196b2c;"><iconify-icon icon="lucide:save"></iconify-icon> 接続設定を保存</button>
+        <button id="setMariadbTestBtn" class="pill" style="background:#e8f0ff; border-color:#6a8ec7; color:#2a4a8a;"><iconify-icon icon="lucide:plug"></iconify-icon> 接続テスト</button>
+        <span id="setMariadbStatus" style="font-size:.9em; margin-left:4px;"></span>
+      </div>
+    </div>
+
     <!-- C. System info (read-only) -->
     <h3 style="margin-top:1.2rem; font-size:.95rem; color:#444; border-bottom:1px solid #eee; padding-bottom:.3rem;">ℹ System info
       <small style="font-weight:normal; color:#888;">— 環境変数依存、再デプロイで変更</small>
