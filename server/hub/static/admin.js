@@ -6789,9 +6789,16 @@ document.getElementById('submit').addEventListener('submit', async e => {
       }
       const _max = parseInt(document.getElementById('fetchInvestigateMaxAttempts').value, 10) || 3;
       const _tmo = parseInt(document.getElementById('fetchInvestigateTimeoutSec').value, 10) || 600;
+      // Start from the full Fetch options (download_video, cookies_from,
+      // referer, min_asset_size_bytes, etc.) so the operator's toggles
+      // are honoured. Then overlay the codegen-loop-specific fields.
+      const _fetchOpts = (typeof buildFetchOptionsFromForm === 'function')
+        ? buildFetchOptionsFromForm()
+        : {};
       body = {
         url,
         options: {
+          ..._fetchOpts,
           mode: 'codegen-loop',
           goal: _goal,
           max_codegen_attempts: _max,
