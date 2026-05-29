@@ -1057,6 +1057,47 @@ _FORCE_LAZY_LOAD_JS = r"""
   document.querySelectorAll('[style*="content-visibility"]').forEach(el => {
     el.style.contentVisibility = 'visible';
   });
+  // 4) Force-fetch images the browser won't auto-request on a passive
+  //    fetch: CSS background-image on offscreen / unpainted elements
+  //    (e.g. a jwplayer ".jw-preview" poster set via inline style),
+  //    <meta og:image/twitter:image> (metadata -- never fetched), and
+  //    poster / data-poster attrs. new Image() fires a real GET so the
+  //    network listener captures + saves it; the asset idle-wait below
+  //    keeps the capture window open until these land. Same-origin GETs
+  //    carry the page as referer (what cover CDNs expect).
+  const _abs = (u) => { try { return new URL(u, location.href).href; } catch (_) { return null; } };
+  const _urls = new Set();
+  const _add = (u) => { const a = _abs(u); if (a && /^https?:/i.test(a)) _urls.add(a); };
+  // 4a) computed background-image on every element (inline jw-preview
+  //     poster + any CSS-class background-image). Capped so a giant DOM
+  //     can't stall the fetch.
+  try {
+    let _n = 0;
+    for (const el of document.querySelectorAll('*')) {
+      if (++_n > 8000) break;
+      let bg = '';
+      try { bg = getComputedStyle(el).backgroundImage || ''; } catch (_) { continue; }
+      if (!bg || bg === 'none') continue;
+      const re = /url\((["']?)([^"')]+)\1\)/gi;
+      let m;
+      while ((m = re.exec(bg)) !== null) { if (m[2]) _add(m[2]); }
+    }
+  } catch (_) {}
+  // 4b) og:image / twitter:image meta (cover poster; metadata-only).
+  document.querySelectorAll(
+    'meta[property="og:image"], meta[property="og:image:url"], ' +
+    'meta[name="twitter:image"], meta[name="twitter:image:src"]'
+  ).forEach(m => _add(m.getAttribute('content') || ''));
+  // 4c) poster / data-poster attributes (<video poster>, lazy posters).
+  document.querySelectorAll('[poster], [data-poster]').forEach(el => {
+    _add(el.getAttribute('poster') || '');
+    _add(el.getAttribute('data-poster') || '');
+  });
+  let forcedBg = 0;
+  for (const u of _urls) {
+    try { const im = new Image(); im.src = u; forcedBg++; } catch (_) {}
+  }
+  promoted.forcedBg = forcedBg;
   return JSON.stringify(promoted);
 })()
 """
@@ -1795,7 +1836,8 @@ async def fetch(opts: FetchOptions) -> FetchResult:
                         f"  ... lazy-load force: img.src={stats.get('imgSrc',0)} "
                         f"img.srcset={stats.get('imgSrcset',0)} "
                         f"source.srcset={stats.get('sourceSrcset',0)} "
-                        f"bg={stats.get('bg',0)}"
+                        f"bg={stats.get('bg',0)} "
+                        f"forced-bg/og/poster={stats.get('forcedBg',0)}"
                     )
             except Exception as e:
                 log(f"  ... lazy-load force skipped ({type(e).__name__}: {e})")
