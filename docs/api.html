@@ -41,6 +41,25 @@
   table.apiref td:nth-child(1) code, table.apiref td:nth-child(2) code,
   table.apiref td:nth-child(3) code { font-size: 0.88em; }
   table.apiref .ret { color: var(--stem); font-weight: 600; }
+
+  /* Playwright-style per-method blocks: 見出し → 説明 → Usage → Arguments → Returns */
+  .pw { margin: 0 0 26px; }
+  .pw > h3 { font-family: ui-monospace, Consolas, monospace; font-size: 1.02rem;
+    font-weight: 600; margin: 1.5em 0 .35em; padding-bottom: .25em;
+    border-bottom: 1px solid var(--border-soft); }
+  .pw > h3 .pw-ret { color: var(--stem); }
+  .pw > p { margin: .4em 0 .2em; }
+  .pw-label { font-size: .68rem; text-transform: uppercase; letter-spacing: .07em;
+    color: var(--fg-muted); font-weight: 700; margin: 12px 0 5px; }
+  .pw-args { list-style: none; margin: 0 0 6px; padding: 0; }
+  .pw-args > li { padding: 3px 0 3px 13px; border-left: 2px solid var(--border-soft);
+    margin: 5px 0; line-height: 1.6; }
+  .pw-args code.arg { font-weight: 600; }
+  .pw-type { font-family: ui-monospace, Consolas, monospace; font-size: .8em;
+    background: var(--bg-soft); border: 1px solid var(--border-soft);
+    border-radius: 5px; padding: 1px 6px; color: var(--accent); white-space: nowrap; }
+  .pw-opt { font-style: italic; color: var(--fg-muted); font-size: .85em; }
+  .pw pre { margin: 4px 0 8px; }
 </style>
 </head>
 <body>
@@ -579,155 +598,305 @@ page.block_hosts(["ads.example.net"])
 reply = page.ext("setContentSetting", {"type": "images", "setting": "block"})</code></pre></div>
     <div class="ex-php"><div class="callout info"><strong>PHP は Phase 2 で対応予定</strong>です（拡張コマンドは <a href="#php">Page サーフェス</a>の一部として Phase 2 に含まれます）。</div></div>
 
-    <h3><code>page.ext(cmd, args=None, *, timeout=20.0)</code> <span class="ret">→ dict</span></h3>
-    <p>
-      拡張機能の任意コマンドを実行する汎用パススルー。<code>cmd</code> は拡張側ハンドラ名、
-      <code>args</code> はその引数 dict。下の全ラッパーはこれの別名です。新しい能力を足すときも
-      「拡張にハンドラ＋ここにラッパー」だけで増やせます。
-    </p>
-    <table class="apiref">
-      <thead><tr><th>メソッド</th><th>引数</th><th>戻り値</th><th>説明</th></tr></thead>
-      <tbody>
-        <tr>
-          <td><code>page.ext()</code></td>
-          <td><code>cmd</code> (str) — ハンドラ名, <code>args</code> (dict=None), <code>timeout</code> (秒=20.0)</td>
-          <td><span class="ret">dict</span></td>
-          <td>汎用コマンド実行。ペイロードは <code>result</code></td>
-        </tr>
-        <tr>
-          <td><code>page.zoom()</code> / <code>set_zoom()</code></td>
-          <td><code>factor</code> (float) — 1.0=100%、0.25〜5.0</td>
-          <td><span class="ret">dict</span></td>
-          <td>本物のページズーム（リフロー・全画面 iframe にも有効、縮小可）。<code>result["method"]</code> が <code>chrome.tabs.setZoom</code> なら成功</td>
-        </tr>
-        <tr>
-          <td><code>page.set_referer()</code></td>
-          <td><code>value</code> (str) — Referer 値, <code>url_filter</code> (str="*")</td>
-          <td><span class="ret">dict</span></td>
-          <td>マッチ URL に <code>Referer</code> ヘッダを強制。CDN/HLS の referer 弾き対策（<code>result["id"]</code>=ルール ID）</td>
-        </tr>
-        <tr>
-          <td><code>page.set_request_header()</code></td>
-          <td><code>header</code> (str), <code>value</code> (str), <code>url_filter</code> (str="*"), <code>rule_id</code> (int=2000) — 同 ID で置換</td>
-          <td><span class="ret">dict</span></td>
-          <td>任意リクエストヘッダを強制（declarativeNetRequest modifyHeaders）</td>
-        </tr>
-        <tr>
-          <td><code>page.block_hosts()</code></td>
-          <td><code>hosts</code> (list[str]) — ドメイン列</td>
-          <td><span class="ret">dict</span></td>
-          <td>指定ドメインへの全リクエストを遮断（<code>result["added"]</code>=件数）</td>
-        </tr>
-        <tr>
-          <td><code>page.net_rules()</code></td>
-          <td>なし</td>
-          <td><span class="ret">list[dict]</span></td>
-          <td>現在の動的ネットワークルール一覧</td>
-        </tr>
-        <tr>
-          <td><code>page.clear_net_rules()</code></td>
-          <td>なし</td>
-          <td><span class="ret">dict</span></td>
-          <td>全動的ルールを削除（<code>result["removed"]</code>=件数）</td>
-        </tr>
-        <tr>
-          <td><code>page.set_content_setting()</code></td>
-          <td><code>type</code> (str: <code>popups</code>/<code>images</code>/<code>javascript</code>/<code>automaticDownloads</code> 等), <code>setting</code> (str: <code>allow</code>/<code>block</code>/<code>session_only</code>/<code>ask</code>), <code>pattern</code> (str="*://*/*")</td>
-          <td><span class="ret">dict</span></td>
-          <td>サイト別コンテンツ設定</td>
-        </tr>
-        <tr>
-          <td><code>page.allow_popups()</code></td>
-          <td><code>pattern</code> (str="*://*/*")</td>
-          <td><span class="ret">dict</span></td>
-          <td>popup を許可（リダイレクト連鎖のプレーヤー対策）</td>
-        </tr>
-        <tr>
-          <td><code>page.allow_auto_downloads()</code></td>
-          <td><code>pattern</code> (str="*://*/*")</td>
-          <td><span class="ret">dict</span></td>
-          <td>複数の自動ダウンロードを無確認で許可</td>
-        </tr>
-        <tr>
-          <td><code>page.set_privacy()</code></td>
-          <td><code>path</code> (str, 例 <code>network.webRTCIPHandlingPolicy</code>), <code>value</code></td>
-          <td><span class="ret">dict</span></td>
-          <td><code>chrome.privacy</code> の ChromeSetting を設定</td>
-        </tr>
-        <tr>
-          <td><code>page.prevent_webrtc_leak()</code></td>
-          <td>なし</td>
-          <td><span class="ret">dict</span></td>
-          <td>WebRTC による実 IP 漏洩を防止（プロキシ併用時に重要）</td>
-        </tr>
-        <tr>
-          <td><code>page.navigation_events()</code></td>
-          <td><code>since</code> (float=0.0) — この epoch(ms) 以降</td>
-          <td><span class="ret">list[dict]</span></td>
-          <td>バッファ済み遷移イベント（<code>type</code>/<code>url</code>/<code>tabId</code>/<code>sourceFrameId</code> 等。popup・新規タブの出自を含む）</td>
-        </tr>
-        <tr>
-          <td><code>page.download()</code></td>
-          <td><code>url</code> (str), <code>filename</code> (str=None), <code>conflict</code> (str="uniquify"/"overwrite"/"prompt"), <code>headers</code> (list[{name,value}]=None)</td>
-          <td><span class="ret">dict</span></td>
-          <td>制御付きダウンロードを開始（<code>result["download_id"]</code>）</td>
-        </tr>
-        <tr>
-          <td><code>page.download_status()</code></td>
-          <td><code>download_id</code> (int=None) — 省略で全件</td>
-          <td><span class="ret">list[dict]</span></td>
-          <td>DL 状態を検索（<code>state</code>/<code>bytesReceived</code>/<code>totalBytes</code> 等）</td>
-        </tr>
-        <tr>
-          <td><code>page.cancel_download()</code></td>
-          <td><code>download_id</code> (int)</td>
-          <td><span class="ret">dict</span></td>
-          <td>ダウンロードを中止</td>
-        </tr>
-        <tr>
-          <td><code>page.set_proxy()</code></td>
-          <td><code>host</code> (str), <code>port</code> (int), <code>scheme</code> (str="http"/"https"/"socks5"), <code>bypass</code> (list=None)</td>
-          <td><span class="ret">dict</span></td>
-          <td>レーン（プロファイル）単位の固定プロキシ。認証付きプロキシは不可</td>
-        </tr>
-        <tr>
-          <td><code>page.clear_proxy()</code></td>
-          <td>なし</td>
-          <td><span class="ret">dict</span></td>
-          <td>プロキシ設定を解除</td>
-        </tr>
-        <tr>
-          <td><code>page.proxy_info()</code></td>
-          <td>なし</td>
-          <td><span class="ret">dict</span></td>
-          <td>現在のプロキシ設定（<code>result["value"]</code> / <code>levelOfControl</code>）</td>
-        </tr>
-        <tr>
-          <td><code>page.register_user_script()</code></td>
-          <td><code>id</code> (str), <code>code</code> (str, JS), <code>matches</code> (list=["&lt;all_urls&gt;"]), <code>world</code> (str="MAIN"/"USER_SCRIPT"), <code>run_at</code> (str="document_idle")</td>
-          <td><span class="ret">dict</span></td>
-          <td>MAIN ワールドへ常駐スクリプトを登録（プレーヤー API フック等）</td>
-        </tr>
-        <tr>
-          <td><code>page.unregister_user_script()</code></td>
-          <td><code>id</code> (str)</td>
-          <td><span class="ret">dict</span></td>
-          <td>登録済みユーザースクリプトを解除</td>
-        </tr>
-        <tr>
-          <td><code>page.installed_extensions()</code></td>
-          <td>なし</td>
-          <td><span class="ret">list[dict]</span></td>
-          <td>レーンにインストール済みの拡張一覧（<code>id</code>/<code>name</code>/<code>enabled</code>/<code>version</code>）</td>
-        </tr>
-        <tr>
-          <td><code>page.set_extension_enabled()</code></td>
-          <td><code>ext_id</code> (str), <code>enabled</code> (bool)</td>
-          <td><span class="ret">dict</span></td>
-          <td>他の拡張を有効/無効に切り替え</td>
-        </tr>
-      </tbody>
-    </table>
+    <div class="pw">
+      <h3><code>page.ext(cmd, args=None, *, timeout=20.0)</code> <span class="pw-ret">&rarr; dict</span></h3>
+      <p>拡張機能の任意コマンドを実行する汎用パススルー。下の全ラッパーはこれの薄い別名で、新しい能力も「拡張にハンドラ＋ここにラッパー」だけで増やせます。</p>
+      <div class="pw-label">Usage</div>
+      <pre><code>reply = await page.ext("setContentSetting", {"type": "images", "setting": "block"})
+print(reply["result"])</code></pre>
+      <div class="pw-label">Arguments</div>
+      <ul class="pw-args">
+        <li><code class="arg">cmd</code> <span class="pw-type">str</span> &mdash; 拡張側ハンドラ名（例 <code>"netSetHeader"</code>）</li>
+        <li><code class="arg">args</code> <span class="pw-type">dict</span> <span class="pw-opt">(optional, None)</span> &mdash; ハンドラへ渡す引数</li>
+        <li><code class="arg">timeout</code> <span class="pw-type">float</span> <span class="pw-opt">(optional, 20.0)</span> &mdash; 応答待ちの秒数</li>
+      </ul>
+      <div class="pw-label">Returns</div>
+      <ul class="pw-args"><li><span class="pw-type">dict</span> &mdash; reply 全体 <code>{status, result, elapsed_ms}</code>。ペイロードは <code>result</code></li></ul>
+    </div>
+
+    <div class="pw">
+      <h3><code>page.zoom(factor)</code> / <code>page.set_zoom(factor)</code> <span class="pw-ret">&rarr; dict</span></h3>
+      <p>本物のページズーム。リフローを伴い全画面クロスオリジン iframe プレーヤーにも効きます。CDP の <code>setPageScaleFactor</code> と違い 1.0 未満（縮小）も有効。</p>
+      <div class="pw-label">Usage</div>
+      <pre><code>await page.zoom(0.5)   # 50% に縮小
+await page.zoom(1.0)   # 等倍に戻す</code></pre>
+      <div class="pw-label">Arguments</div>
+      <ul class="pw-args">
+        <li><code class="arg">factor</code> <span class="pw-type">float</span> &mdash; 倍率。1.0 = 100%、範囲 0.25&ndash;5.0</li>
+      </ul>
+      <div class="pw-label">Returns</div>
+      <ul class="pw-args"><li><span class="pw-type">dict</span> &mdash; <code>result["factor"]</code> と <code>result["method"]</code>（<code>"chrome.tabs.setZoom"</code> なら本物のズーム成功）</li></ul>
+    </div>
+
+    <div class="pw">
+      <h3><code>page.set_referer(value, *, url_filter="*")</code> <span class="pw-ret">&rarr; dict</span></h3>
+      <p>マッチする URL に <code>Referer</code> リクエストヘッダを強制します。CDN/HLS が iframe の URL を Referer に取って 403 を返すプレーヤーの救済に使います。</p>
+      <div class="pw-label">Usage</div>
+      <pre><code>await page.set_referer("https://supjav.com/")</code></pre>
+      <div class="pw-label">Arguments</div>
+      <ul class="pw-args">
+        <li><code class="arg">value</code> <span class="pw-type">str</span> &mdash; 設定する Referer の値</li>
+        <li><code class="arg">url_filter</code> <span class="pw-type">str</span> <span class="pw-opt">(optional, "*")</span> &mdash; 適用先 URL パターン</li>
+      </ul>
+      <div class="pw-label">Returns</div>
+      <ul class="pw-args"><li><span class="pw-type">dict</span> &mdash; <code>result["id"]</code> にルール ID</li></ul>
+    </div>
+
+    <div class="pw">
+      <h3><code>page.set_request_header(header, value, *, url_filter="*", rule_id=2000)</code> <span class="pw-ret">&rarr; dict</span></h3>
+      <p>任意のリクエストヘッダを強制します（declarativeNetRequest の modifyHeaders）。同じ <code>rule_id</code> で呼ぶとルールを置き換えます。</p>
+      <div class="pw-label">Usage</div>
+      <pre><code>await page.set_request_header("X-Requested-With", "XMLHttpRequest")</code></pre>
+      <div class="pw-label">Arguments</div>
+      <ul class="pw-args">
+        <li><code class="arg">header</code> <span class="pw-type">str</span> &mdash; ヘッダ名</li>
+        <li><code class="arg">value</code> <span class="pw-type">str</span> &mdash; ヘッダ値</li>
+        <li><code class="arg">url_filter</code> <span class="pw-type">str</span> <span class="pw-opt">(optional, "*")</span> &mdash; 適用先 URL パターン</li>
+        <li><code class="arg">rule_id</code> <span class="pw-type">int</span> <span class="pw-opt">(optional, 2000)</span> &mdash; 同 ID で上書き</li>
+      </ul>
+      <div class="pw-label">Returns</div>
+      <ul class="pw-args"><li><span class="pw-type">dict</span> &mdash; <code>result["id"]</code></li></ul>
+    </div>
+
+    <div class="pw">
+      <h3><code>page.block_hosts(hosts)</code> <span class="pw-ret">&rarr; dict</span></h3>
+      <p>指定したドメインへの全リクエストを遮断します（広告・トラッカー除去）。</p>
+      <div class="pw-label">Usage</div>
+      <pre><code>await page.block_hosts(["ads.example.net", "track.example.com"])</code></pre>
+      <div class="pw-label">Arguments</div>
+      <ul class="pw-args">
+        <li><code class="arg">hosts</code> <span class="pw-type">list[str]</span> &mdash; 遮断するドメインの列</li>
+      </ul>
+      <div class="pw-label">Returns</div>
+      <ul class="pw-args"><li><span class="pw-type">dict</span> &mdash; <code>result["added"]</code> に追加ルール件数</li></ul>
+    </div>
+
+    <div class="pw">
+      <h3><code>page.net_rules()</code> <span class="pw-ret">&rarr; list[dict]</span></h3>
+      <p>現在有効な動的ネットワークルール（ブロック・ヘッダ書き換え）の一覧を返します。</p>
+      <div class="pw-label">Usage</div>
+      <pre><code>rules = await page.net_rules()</code></pre>
+      <div class="pw-label">Returns</div>
+      <ul class="pw-args"><li><span class="pw-type">list[dict]</span> &mdash; 動的 declarativeNetRequest ルール</li></ul>
+    </div>
+
+    <div class="pw">
+      <h3><code>page.clear_net_rules()</code> <span class="pw-ret">&rarr; dict</span></h3>
+      <p>すべての動的ネットワークルールを削除します。</p>
+      <div class="pw-label">Usage</div>
+      <pre><code>await page.clear_net_rules()</code></pre>
+      <div class="pw-label">Returns</div>
+      <ul class="pw-args"><li><span class="pw-type">dict</span> &mdash; <code>result["removed"]</code> に削除件数</li></ul>
+    </div>
+
+    <div class="pw">
+      <h3><code>page.set_content_setting(type, setting, *, pattern="*://*/*")</code> <span class="pw-ret">&rarr; dict</span></h3>
+      <p>サイト別のコンテンツ設定を変更します。</p>
+      <div class="pw-label">Usage</div>
+      <pre><code>await page.set_content_setting("images", "block")</code></pre>
+      <div class="pw-label">Arguments</div>
+      <ul class="pw-args">
+        <li><code class="arg">type</code> <span class="pw-type">str</span> &mdash; <code>popups</code> / <code>images</code> / <code>javascript</code> / <code>automaticDownloads</code> 等</li>
+        <li><code class="arg">setting</code> <span class="pw-type">str</span> &mdash; <code>allow</code> / <code>block</code> / <code>session_only</code> / <code>ask</code></li>
+        <li><code class="arg">pattern</code> <span class="pw-type">str</span> <span class="pw-opt">(optional, "*://*/*")</span> &mdash; 適用先パターン</li>
+      </ul>
+      <div class="pw-label">Returns</div>
+      <ul class="pw-args"><li><span class="pw-type">dict</span></li></ul>
+    </div>
+
+    <div class="pw">
+      <h3><code>page.allow_popups(*, pattern="*://*/*")</code> <span class="pw-ret">&rarr; dict</span></h3>
+      <p>popup を許可します（リダイレクト連鎖で別窓を開くプレーヤー対策）。<code>set_content_setting("popups", "allow")</code> の別名。</p>
+      <div class="pw-label">Usage</div>
+      <pre><code>await page.allow_popups()</code></pre>
+      <div class="pw-label">Arguments</div>
+      <ul class="pw-args">
+        <li><code class="arg">pattern</code> <span class="pw-type">str</span> <span class="pw-opt">(optional, "*://*/*")</span> &mdash; 適用先パターン</li>
+      </ul>
+      <div class="pw-label">Returns</div>
+      <ul class="pw-args"><li><span class="pw-type">dict</span></li></ul>
+    </div>
+
+    <div class="pw">
+      <h3><code>page.allow_auto_downloads(*, pattern="*://*/*")</code> <span class="pw-ret">&rarr; dict</span></h3>
+      <p>複数の自動ダウンロードを確認ダイアログ無しで許可します。</p>
+      <div class="pw-label">Usage</div>
+      <pre><code>await page.allow_auto_downloads()</code></pre>
+      <div class="pw-label">Arguments</div>
+      <ul class="pw-args">
+        <li><code class="arg">pattern</code> <span class="pw-type">str</span> <span class="pw-opt">(optional, "*://*/*")</span> &mdash; 適用先パターン</li>
+      </ul>
+      <div class="pw-label">Returns</div>
+      <ul class="pw-args"><li><span class="pw-type">dict</span></li></ul>
+    </div>
+
+    <div class="pw">
+      <h3><code>page.set_privacy(path, value)</code> <span class="pw-ret">&rarr; dict</span></h3>
+      <p><code>chrome.privacy</code> の ChromeSetting をドット区切りパスで設定します。</p>
+      <div class="pw-label">Usage</div>
+      <pre><code>await page.set_privacy("network.webRTCIPHandlingPolicy", "disable_non_proxied_udp")</code></pre>
+      <div class="pw-label">Arguments</div>
+      <ul class="pw-args">
+        <li><code class="arg">path</code> <span class="pw-type">str</span> &mdash; 設定パス（例 <code>network.webRTCIPHandlingPolicy</code>）</li>
+        <li><code class="arg">value</code> <span class="pw-type">any</span> &mdash; 設定値</li>
+      </ul>
+      <div class="pw-label">Returns</div>
+      <ul class="pw-args"><li><span class="pw-type">dict</span></li></ul>
+    </div>
+
+    <div class="pw">
+      <h3><code>page.prevent_webrtc_leak()</code> <span class="pw-ret">&rarr; dict</span></h3>
+      <p>WebRTC による実 IP 漏洩を防ぎます（プロキシ併用時に重要）。<code>set_privacy</code> のショートカット。</p>
+      <div class="pw-label">Usage</div>
+      <pre><code>await page.prevent_webrtc_leak()</code></pre>
+      <div class="pw-label">Returns</div>
+      <ul class="pw-args"><li><span class="pw-type">dict</span></li></ul>
+    </div>
+
+    <div class="pw">
+      <h3><code>page.navigation_events(*, since=0.0)</code> <span class="pw-ret">&rarr; list[dict]</span></h3>
+      <p>バッファされた遷移イベント（committed / completed / newtarget / error）を取り出します。<code>newtarget</code> は popup・新規タブの出自（ソースフレーム＋URL）を含みます。</p>
+      <div class="pw-label">Usage</div>
+      <pre><code>events = await page.navigation_events()
+for e in events:
+    print(e["type"], e["url"])</code></pre>
+      <div class="pw-label">Arguments</div>
+      <ul class="pw-args">
+        <li><code class="arg">since</code> <span class="pw-type">float</span> <span class="pw-opt">(optional, 0.0)</span> &mdash; この epoch(ms) 以降のイベントのみ</li>
+      </ul>
+      <div class="pw-label">Returns</div>
+      <ul class="pw-args"><li><span class="pw-type">list[dict]</span> &mdash; 各イベント <code>{type, url, tabId, frameId, sourceFrameId, ...}</code></li></ul>
+    </div>
+
+    <div class="pw">
+      <h3><code>page.download(url, *, filename=None, conflict="uniquify", headers=None)</code> <span class="pw-ret">&rarr; dict</span></h3>
+      <p>制御付きのダウンロードを開始します（chrome.downloads）。保存先・ファイル名・追加ヘッダを指定でき、セッションの Cookie を引き継ぎます。</p>
+      <div class="pw-label">Usage</div>
+      <pre><code>dl = await page.download("https://cdn.example.com/v.mp4", filename="evidence.mp4")</code></pre>
+      <div class="pw-label">Arguments</div>
+      <ul class="pw-args">
+        <li><code class="arg">url</code> <span class="pw-type">str</span> &mdash; ダウンロード URL</li>
+        <li><code class="arg">filename</code> <span class="pw-type">str</span> <span class="pw-opt">(optional, None)</span> &mdash; 保存ファイル名</li>
+        <li><code class="arg">conflict</code> <span class="pw-type">str</span> <span class="pw-opt">(optional, "uniquify")</span> &mdash; <code>uniquify</code> / <code>overwrite</code> / <code>prompt</code></li>
+        <li><code class="arg">headers</code> <span class="pw-type">list</span> <span class="pw-opt">(optional, None)</span> &mdash; <code>[{name, value}]</code> の追加リクエストヘッダ</li>
+      </ul>
+      <div class="pw-label">Returns</div>
+      <ul class="pw-args"><li><span class="pw-type">dict</span> &mdash; <code>result["download_id"]</code></li></ul>
+    </div>
+
+    <div class="pw">
+      <h3><code>page.download_status(*, download_id=None)</code> <span class="pw-ret">&rarr; list[dict]</span></h3>
+      <p>ダウンロードの状態を検索します。</p>
+      <div class="pw-label">Usage</div>
+      <pre><code>items = await page.download_status(download_id=dl["result"]["download_id"])
+print(items[0]["state"], items[0]["bytesReceived"])</code></pre>
+      <div class="pw-label">Arguments</div>
+      <ul class="pw-args">
+        <li><code class="arg">download_id</code> <span class="pw-type">int</span> <span class="pw-opt">(optional, None)</span> &mdash; 省略で全件</li>
+      </ul>
+      <div class="pw-label">Returns</div>
+      <ul class="pw-args"><li><span class="pw-type">list[dict]</span> &mdash; <code>{state, bytesReceived, totalBytes, filename, ...}</code></li></ul>
+    </div>
+
+    <div class="pw">
+      <h3><code>page.cancel_download(download_id)</code> <span class="pw-ret">&rarr; dict</span></h3>
+      <p>進行中のダウンロードを中止します。</p>
+      <div class="pw-label">Usage</div>
+      <pre><code>await page.cancel_download(1)</code></pre>
+      <div class="pw-label">Arguments</div>
+      <ul class="pw-args">
+        <li><code class="arg">download_id</code> <span class="pw-type">int</span> &mdash; ダウンロード ID</li>
+      </ul>
+      <div class="pw-label">Returns</div>
+      <ul class="pw-args"><li><span class="pw-type">dict</span></li></ul>
+    </div>
+
+    <div class="pw">
+      <h3><code>page.set_proxy(host, port, *, scheme="http", bypass=None)</code> <span class="pw-ret">&rarr; dict</span></h3>
+      <p>このレーン（Chrome プロファイル）単位の固定プロキシを設定します。タブ単位ではなくプロファイル全体に効きます。認証付きプロキシは非対応。</p>
+      <div class="pw-label">Usage</div>
+      <pre><code>await page.set_proxy("10.0.0.2", 1080, scheme="socks5")</code></pre>
+      <div class="pw-label">Arguments</div>
+      <ul class="pw-args">
+        <li><code class="arg">host</code> <span class="pw-type">str</span> &mdash; プロキシホスト</li>
+        <li><code class="arg">port</code> <span class="pw-type">int</span> &mdash; プロキシポート</li>
+        <li><code class="arg">scheme</code> <span class="pw-type">str</span> <span class="pw-opt">(optional, "http")</span> &mdash; <code>http</code> / <code>https</code> / <code>socks5</code></li>
+        <li><code class="arg">bypass</code> <span class="pw-type">list</span> <span class="pw-opt">(optional, None)</span> &mdash; 直結するドメイン列</li>
+      </ul>
+      <div class="pw-label">Returns</div>
+      <ul class="pw-args"><li><span class="pw-type">dict</span> &mdash; <code>result["mode"]</code></li></ul>
+    </div>
+
+    <div class="pw">
+      <h3><code>page.clear_proxy()</code> <span class="pw-ret">&rarr; dict</span></h3>
+      <p>プロキシ設定を解除します。</p>
+      <div class="pw-label">Usage</div>
+      <pre><code>await page.clear_proxy()</code></pre>
+      <div class="pw-label">Returns</div>
+      <ul class="pw-args"><li><span class="pw-type">dict</span></li></ul>
+    </div>
+
+    <div class="pw">
+      <h3><code>page.proxy_info()</code> <span class="pw-ret">&rarr; dict</span></h3>
+      <p>現在のプロキシ設定を取得します。</p>
+      <div class="pw-label">Usage</div>
+      <pre><code>info = await page.proxy_info()</code></pre>
+      <div class="pw-label">Returns</div>
+      <ul class="pw-args"><li><span class="pw-type">dict</span> &mdash; <code>result["value"]</code> / <code>result["levelOfControl"]</code></li></ul>
+    </div>
+
+    <div class="pw">
+      <h3><code>page.register_user_script(id, code, *, matches=None, world="MAIN", run_at="document_idle")</code> <span class="pw-ret">&rarr; dict</span></h3>
+      <p>MAIN ワールドへ常駐スクリプトを登録します（プレーヤー API をフックして実ソース URL を露出させる等）。同じ <code>id</code> で更新。</p>
+      <div class="pw-label">Usage</div>
+      <pre><code>await page.register_user_script("hook", "window.__paprika = jwplayer;")</code></pre>
+      <div class="pw-label">Arguments</div>
+      <ul class="pw-args">
+        <li><code class="arg">id</code> <span class="pw-type">str</span> &mdash; スクリプト ID</li>
+        <li><code class="arg">code</code> <span class="pw-type">str</span> &mdash; JavaScript ソース</li>
+        <li><code class="arg">matches</code> <span class="pw-type">list</span> <span class="pw-opt">(optional, ["&lt;all_urls&gt;"])</span> &mdash; 適用先 match パターン</li>
+        <li><code class="arg">world</code> <span class="pw-type">str</span> <span class="pw-opt">(optional, "MAIN")</span> &mdash; <code>MAIN</code> / <code>USER_SCRIPT</code></li>
+        <li><code class="arg">run_at</code> <span class="pw-type">str</span> <span class="pw-opt">(optional, "document_idle")</span> &mdash; 実行タイミング</li>
+      </ul>
+      <div class="pw-label">Returns</div>
+      <ul class="pw-args"><li><span class="pw-type">dict</span> &mdash; <code>result["id"]</code></li></ul>
+    </div>
+
+    <div class="pw">
+      <h3><code>page.unregister_user_script(id)</code> <span class="pw-ret">&rarr; dict</span></h3>
+      <p>登録済みのユーザースクリプトを解除します。</p>
+      <div class="pw-label">Usage</div>
+      <pre><code>await page.unregister_user_script("hook")</code></pre>
+      <div class="pw-label">Arguments</div>
+      <ul class="pw-args">
+        <li><code class="arg">id</code> <span class="pw-type">str</span> &mdash; スクリプト ID</li>
+      </ul>
+      <div class="pw-label">Returns</div>
+      <ul class="pw-args"><li><span class="pw-type">dict</span></li></ul>
+    </div>
+
+    <div class="pw">
+      <h3><code>page.installed_extensions()</code> <span class="pw-ret">&rarr; list[dict]</span></h3>
+      <p>このレーンの Chrome にインストール済みの拡張一覧を返します（uBlock 等が有効か検証する用途）。</p>
+      <div class="pw-label">Usage</div>
+      <pre><code>exts = await page.installed_extensions()</code></pre>
+      <div class="pw-label">Returns</div>
+      <ul class="pw-args"><li><span class="pw-type">list[dict]</span> &mdash; <code>{id, name, enabled, version}</code></li></ul>
+    </div>
+
+    <div class="pw">
+      <h3><code>page.set_extension_enabled(ext_id, enabled)</code> <span class="pw-ret">&rarr; dict</span></h3>
+      <p>他の拡張を有効/無効に切り替えます。</p>
+      <div class="pw-label">Usage</div>
+      <pre><code>await page.set_extension_enabled("cjpalhdlnbpafiamejdnhcphjbkeiagm", True)</code></pre>
+      <div class="pw-label">Arguments</div>
+      <ul class="pw-args">
+        <li><code class="arg">ext_id</code> <span class="pw-type">str</span> &mdash; 対象拡張の ID</li>
+        <li><code class="arg">enabled</code> <span class="pw-type">bool</span> &mdash; 有効化するなら True</li>
+      </ul>
+      <div class="pw-label">Returns</div>
+      <ul class="pw-args"><li><span class="pw-type">dict</span></li></ul>
+    </div>
 
     <h2 id="tabs">Page — タブ・ライフサイクル</h2>
     <table class="apiref">
