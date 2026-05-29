@@ -38,7 +38,7 @@ router = APIRouter(tags=["Extensions"])
 # update manifest below; workers force-install it via an enterprise
 # policy (Chrome 148 ignores --load-extension for unpacked extensions).
 PAPRIKA_AGENT_ID = "gmhfgiloilioklcofcinlemifjjaeppe"
-_AGENT_EXT_ROOT = Path(__file__).resolve().parents[1] / "web" / "extensions"
+_AGENT_EXT_ROOT = Path(__file__).resolve().parents[2] / "web" / "extensions"
 
 
 @router.get("/agent-ext/paprika-agent.crx", include_in_schema=False)
