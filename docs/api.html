@@ -31,6 +31,17 @@
     "https://paps-jp.github.io/paprika/"
   ]
 }</script>
+<style>
+  /* 4-column method reference: メソッド / 引数 / 戻り値 / 説明 */
+  table.apiref { table-layout: fixed; }
+  table.apiref th:nth-child(1), table.apiref td:nth-child(1) { width: 23%; }
+  table.apiref th:nth-child(2), table.apiref td:nth-child(2) { width: 27%; }
+  table.apiref th:nth-child(3), table.apiref td:nth-child(3) { width: 15%; }
+  table.apiref td { vertical-align: top; word-break: break-word; }
+  table.apiref td:nth-child(1) code, table.apiref td:nth-child(2) code,
+  table.apiref td:nth-child(3) code { font-size: 0.88em; }
+  table.apiref .ret { color: var(--stem); font-weight: 600; }
+</style>
 </head>
 <body>
 
@@ -60,6 +71,7 @@
       <li><a href="#getters">Page: 取得・待機</a></li>
       <li><a href="#evaluate">Page: JS・DOM</a></li>
       <li><a href="#assets">Page: 収集・状態</a></li>
+      <li><a href="#agent-ext">Page: 拡張機能コマンド</a></li>
       <li><a href="#tabs">Page: タブ・寿命</a></li>
       <li><a href="#session">Session 固有</a></li>
       <li><a href="#locator">Locator</a></li>
@@ -239,21 +251,81 @@ $cli-&gt;session('https://example.com', function (Session $sess) use ($cli) {
 
     <h2 id="nav">Page — ナビゲーション・操作</h2>
     <p>プロパティ（I/O なし）: <code>page.url</code> / <code>session_id</code> / <code>worker_id</code> / <code>lane_idx</code> / <code>novnc_url</code> / <code>page_id</code>。</p>
-    <table>
-      <thead><tr><th>メソッド</th><th>説明</th></tr></thead>
+    <table class="apiref">
+      <thead><tr><th>メソッド</th><th>引数</th><th>戻り値</th><th>説明</th></tr></thead>
       <tbody>
-        <tr><td><code>page.goto(url)</code> → dict</td><td>ページ遷移。返り値 <code>reply["result"]["response"]</code> に Playwright 互換 HTTP レスポンス（<code>status</code> / <code>ok</code> / <code>headers</code> / <code>mime</code> / <code>url</code>）。<code>pap.response_of(reply)</code> で安全に取り出せる</td></tr>
-        <tr><td><code>page.back()</code> / <code>forward()</code> / <code>history_first()</code> / <code>reload()</code></td><td>履歴移動・再読み込み（境界で安全）。<code>goto()</code> と同じく <code>result["response"]</code> を持つ</td></tr>
-        <tr><td><code>page.last_response()</code> → dict</td><td>直近のメインドキュメント HTTP レスポンス。<strong>クリック起因のナビゲーション</strong>（リンク・フォーム送信・<code>location.href=</code>）後の status 取得に使う。常に <code>{url,status,status_text,ok,headers,mime}</code> を返す（status=0 は「未取得」）</td></tr>
-        <tr><td><code>page.click(selector)</code> → dict</td><td>クリック。<code>[@N]</code> は <code>[data-paprika-id="N"]</code> に展開</td></tr>
-        <tr><td><code>page.fill(selector, value)</code> → dict</td><td>input/textarea に値セット（input/change 発火）</td></tr>
-        <tr><td><code>page.press(key, *, count=1, modifiers=None)</code> → dict</td><td>キー押下（<code>"Enter"</code> / <code>modifiers=["Ctrl"]</code>）</td></tr>
-        <tr><td><code>page.type(text)</code> → dict</td><td>フォーカス要素に文字挿入</td></tr>
-        <tr><td><code>page.scroll(direction="down", pixels=800)</code> → dict</td><td>スクロール</td></tr>
-        <tr><td><code>page.hover / dblclick / focus / scroll_into_view_if_needed (selector, *, index=0)</code> → bool</td><td>入力デバイス（合成イベント）</td></tr>
-        <tr><td><code>page.select_option(selector, value, *, index=0)</code> → bool</td><td><code>&lt;select&gt;</code> を選択</td></tr>
-        <tr><td><code>page.check / uncheck (selector, *, index=0)</code> → bool</td><td>チェック ON/OFF</td></tr>
-        <tr><td><code>page.set_input_files(selector, files)</code> → dict</td><td>ファイルアップロード（CDP）。<code>files</code> はパス or リスト</td></tr>
+        <tr>
+          <td><code>page.goto()</code></td>
+          <td><code>url</code> (str) — 遷移先 URL</td>
+          <td><span class="ret">dict</span></td>
+          <td>ページ遷移。<code>result["response"]</code> に Playwright 互換 HTTP レスポンス（<code>status</code>/<code>ok</code>/<code>headers</code>/<code>mime</code>/<code>url</code>）。<code>pap.response_of(reply)</code> で安全に取り出せる</td>
+        </tr>
+        <tr>
+          <td><code>page.back()</code> / <code>forward()</code> / <code>history_first()</code> / <code>reload()</code></td>
+          <td>なし</td>
+          <td><span class="ret">dict</span></td>
+          <td>履歴移動・再読み込み（境界で安全）。<code>goto()</code> と同じく <code>result["response"]</code> を持つ</td>
+        </tr>
+        <tr>
+          <td><code>page.last_response()</code></td>
+          <td>なし</td>
+          <td><span class="ret">dict</span></td>
+          <td>直近のメインドキュメント HTTP レスポンス。<strong>クリック起因のナビゲーション</strong>（リンク・フォーム送信・<code>location.href=</code>）後の status 取得に使う。常に <code>{url,status,status_text,ok,headers,mime}</code>（status=0 は「未取得」）</td>
+        </tr>
+        <tr>
+          <td><code>page.click()</code></td>
+          <td><code>selector</code> (str) — CSS。<code>[@N]</code> は <code>[data-paprika-id="N"]</code> に展開</td>
+          <td><span class="ret">dict</span></td>
+          <td>要素をクリック</td>
+        </tr>
+        <tr>
+          <td><code>page.fill()</code></td>
+          <td><code>selector</code> (str), <code>value</code> (str)</td>
+          <td><span class="ret">dict</span></td>
+          <td>input/textarea に値をセット（input/change を発火）</td>
+        </tr>
+        <tr>
+          <td><code>page.press()</code></td>
+          <td><code>key</code> (str, 例 <code>"Enter"</code>), <code>count</code> (int=1), <code>modifiers</code> (list, 例 <code>["Ctrl"]</code>)</td>
+          <td><span class="ret">dict</span></td>
+          <td>キー押下</td>
+        </tr>
+        <tr>
+          <td><code>page.type()</code></td>
+          <td><code>text</code> (str)</td>
+          <td><span class="ret">dict</span></td>
+          <td>フォーカス要素に文字を挿入</td>
+        </tr>
+        <tr>
+          <td><code>page.scroll()</code></td>
+          <td><code>direction</code> (str="down"), <code>pixels</code> (int=800)</td>
+          <td><span class="ret">dict</span></td>
+          <td>ページをスクロール</td>
+        </tr>
+        <tr>
+          <td><code>page.hover()</code> / <code>dblclick()</code> / <code>focus()</code> / <code>scroll_into_view_if_needed()</code></td>
+          <td><code>selector</code> (str), <code>index</code> (int=0)</td>
+          <td><span class="ret">bool</span></td>
+          <td>合成入力イベント。複数一致時は <code>index</code> 番目</td>
+        </tr>
+        <tr>
+          <td><code>page.select_option()</code></td>
+          <td><code>selector</code> (str), <code>value</code> (str), <code>index</code> (int=0)</td>
+          <td><span class="ret">bool</span></td>
+          <td><code>&lt;select&gt;</code> の選択肢を選ぶ</td>
+        </tr>
+        <tr>
+          <td><code>page.check()</code> / <code>uncheck()</code></td>
+          <td><code>selector</code> (str), <code>index</code> (int=0)</td>
+          <td><span class="ret">bool</span></td>
+          <td>チェックボックスを ON/OFF</td>
+        </tr>
+        <tr>
+          <td><code>page.set_input_files()</code></td>
+          <td><code>selector</code> (str), <code>files</code> (str | list[str]) — ファイルパス</td>
+          <td><span class="ret">dict</span></td>
+          <td>ファイルアップロード（CDP）</td>
+        </tr>
       </tbody>
     </table>
     <div class="ex-async"><pre><code>import paprika_client as pap
@@ -294,21 +366,81 @@ page.set_input_files("input[type=file]", ["a.jpg", "b.jpg"])</code></pre></div>
     <div class="ex-php"><div class="callout info"><strong>PHP は Phase 2 で対応予定</strong>です（現在の Phase 1 は <a href="#php">Job API + Session ライフサイクル</a>のみ）。</div></div>
 
     <h2 id="getters">Page — 取得・待機・状態</h2>
-    <table>
-      <thead><tr><th>メソッド</th><th>説明</th></tr></thead>
+    <table class="apiref">
+      <thead><tr><th>メソッド</th><th>引数</th><th>戻り値</th><th>説明</th></tr></thead>
       <tbody>
-        <tr><td><code>page.text_content / inner_text / inner_html / input_value (selector, *, index=0)</code></td><td>テキスト・HTML・値</td></tr>
-        <tr><td><code>page.get_attribute(selector, name, *, index=0)</code></td><td>属性値</td></tr>
-        <tr><td><code>page.count(selector)</code> → int</td><td>一致要素数</td></tr>
-        <tr><td><code>page.is_visible / is_checked / is_enabled / is_disabled / is_editable (selector, *, index=0)</code> → bool</td><td>状態判定</td></tr>
-        <tr><td><code>page.exists(selector)</code> → bool</td><td>存在チェック（確定的・LLM不要）</td></tr>
-        <tr><td><code>page.wait_for_selector(selector, *, state="visible", timeout=30.0)</code> → bool</td><td>出現/消失待ち。state=attached/detached/visible/hidden</td></tr>
-        <tr><td><code>page.wait_for(*, seconds=None, ms=None)</code> → None</td><td>単純待機</td></tr>
-        <tr><td><code>page.state()</code> → dict</td><td>{url, title, lane_idx, visited_count}</td></tr>
-        <tr><td><code>page.title()</code> → str / <code>page.outline()</code> → str</td><td>タイトル / 要素一覧（[@N] 付き）</td></tr>
-        <tr><td><code>page.links(*, urls_only=False)</code> → list</td><td>全 <code>&lt;a href&gt;</code> 絶対URL</td></tr>
-        <tr><td><code>page.visited_urls()</code> → list[str]</td><td>踏んだURL</td></tr>
-        <tr><td><code>page.screenshot(*, path=None)</code> → bytes</td><td>ビューポート PNG</td></tr>
+        <tr>
+          <td><code>page.text_content()</code> / <code>inner_text()</code> / <code>inner_html()</code> / <code>input_value()</code></td>
+          <td><code>selector</code> (str), <code>index</code> (int=0)</td>
+          <td><span class="ret">str | None</span></td>
+          <td>要素のテキスト / 表示テキスト / 内部 HTML / 入力値。一致なしは <code>None</code></td>
+        </tr>
+        <tr>
+          <td><code>page.get_attribute()</code></td>
+          <td><code>selector</code> (str), <code>name</code> (str), <code>index</code> (int=0)</td>
+          <td><span class="ret">str | None</span></td>
+          <td>指定属性の値</td>
+        </tr>
+        <tr>
+          <td><code>page.count()</code></td>
+          <td><code>selector</code> (str)</td>
+          <td><span class="ret">int</span></td>
+          <td>一致要素数</td>
+        </tr>
+        <tr>
+          <td><code>page.is_visible()</code> / <code>is_checked()</code> / <code>is_enabled()</code> / <code>is_disabled()</code> / <code>is_editable()</code></td>
+          <td><code>selector</code> (str), <code>index</code> (int=0)</td>
+          <td><span class="ret">bool</span></td>
+          <td>要素の状態判定</td>
+        </tr>
+        <tr>
+          <td><code>page.exists()</code></td>
+          <td><code>selector</code> (str)</td>
+          <td><span class="ret">bool</span></td>
+          <td>存在チェック（確定的・LLM 不要）</td>
+        </tr>
+        <tr>
+          <td><code>page.wait_for_selector()</code></td>
+          <td><code>selector</code> (str), <code>state</code> (str="visible": <code>attached</code>/<code>detached</code>/<code>visible</code>/<code>hidden</code>), <code>timeout</code> (秒=30.0)</td>
+          <td><span class="ret">bool</span></td>
+          <td>要素の出現/消失を待つ。タイムアウトで <code>False</code></td>
+        </tr>
+        <tr>
+          <td><code>page.wait_for()</code></td>
+          <td><code>seconds</code> (float) または <code>ms</code> (int)</td>
+          <td><span class="ret">None</span></td>
+          <td>単純待機</td>
+        </tr>
+        <tr>
+          <td><code>page.state()</code></td>
+          <td>なし</td>
+          <td><span class="ret">dict</span></td>
+          <td>ライブ状態 <code>{url, title, lane_idx, visited_count}</code></td>
+        </tr>
+        <tr>
+          <td><code>page.title()</code> / <code>page.outline()</code></td>
+          <td>なし</td>
+          <td><span class="ret">str</span></td>
+          <td>ページタイトル / 操作可能要素の一覧（<code>[@N]</code> 付き）</td>
+        </tr>
+        <tr>
+          <td><code>page.links()</code></td>
+          <td><code>urls_only</code> (bool=False)</td>
+          <td><span class="ret">list</span></td>
+          <td>全 <code>&lt;a href&gt;</code> の絶対 URL（<code>urls_only=False</code> なら text 付き dict）</td>
+        </tr>
+        <tr>
+          <td><code>page.visited_urls()</code></td>
+          <td>なし</td>
+          <td><span class="ret">list[str]</span></td>
+          <td>このセッションで踏んだ URL</td>
+        </tr>
+        <tr>
+          <td><code>page.screenshot()</code></td>
+          <td><code>path</code> (str=None) — 指定でファイル保存も</td>
+          <td><span class="ret">bytes</span></td>
+          <td>ビューポートの PNG バイト列</td>
+        </tr>
       </tbody>
     </table>
 
@@ -331,33 +463,306 @@ data  = page.evaluate("fetch('/api').then(r=>r.json())", await_promise=True)</co
     </table>
 
     <h2 id="assets">Page — 収集・Cookie・LLM・永続状態</h2>
-    <table>
-      <thead><tr><th>メソッド</th><th>説明</th></tr></thead>
+    <table class="apiref">
+      <thead><tr><th>メソッド</th><th>引数</th><th>戻り値</th><th>説明</th></tr></thead>
       <tbody>
-        <tr><td><code>page.capture(label="capture")</code> → dict</td><td>HTML + スクショ + outline を保存</td></tr>
-        <tr><td><code>page.assets(*, kind="image", absolute=True, refresh=True, details=False)</code> → list</td><td>このセッションでキャプチャ済みの asset（<strong>要 parent_job_id</strong>）</td></tr>
-        <tr><td><code>page.save_assets(dest_dir, *, kind="image", refresh=True)</code> → list[str]</td><td>↑をディスク保存</td></tr>
-        <tr><td><code>page.download_video(url=None, *, referer=None, timeout_s=1800)</code> → dict</td><td>yt-dlp で動画取得</td></tr>
-        <tr><td><code>page.cookies(*, host=None, all_cookies=False)</code> → dict</td><td>現在の Cookie</td></tr>
-        <tr><td><code>page.save_cookies_to_host(*, host=None, notes=None, all_cookies=False)</code> → dict</td><td>Cookie を Host レジストリへ保存</td></tr>
-        <tr><td><code>page.network(*, since=0.0)</code> → dict</td><td>メディアのネットワークログ</td></tr>
-        <tr><td><code>page.ask(question, *, engine="auto")</code> → bool</td><td>LLM に yes/no 質問</td></tr>
-        <tr><td><code>page.agent(goal, *, max_steps=5, engine="auto")</code> → dict</td><td>vision/LLM エージェントに委譲</td></tr>
-        <tr><td><code>page.get_state(key) / set_state(key, value)</code></td><td>親 job に紐づく永続データ（<strong>要 parent_job_id</strong>）</td></tr>
-        <tr><td><code>page.solve_cloudflare(*, timeout_s=25.0)</code> → dict</td><td>Cloudflare チャレンジを待つ/通す</td></tr>
-        <tr><td><code>page.resize_window(width, height)</code> → dict</td><td>ウィンドウサイズ変更</td></tr>
+        <tr>
+          <td><code>page.capture()</code></td>
+          <td><code>label</code> (str="capture")</td>
+          <td><span class="ret">dict</span></td>
+          <td>HTML + スクショ + outline を保存</td>
+        </tr>
+        <tr>
+          <td><code>page.assets()</code></td>
+          <td><code>kind</code> (str="image"), <code>absolute</code> (bool=True), <code>refresh</code> (bool=True), <code>details</code> (bool=False)</td>
+          <td><span class="ret">list</span></td>
+          <td>このセッションでキャプチャ済みの asset（<strong>要 parent_job_id</strong>）</td>
+        </tr>
+        <tr>
+          <td><code>page.save_assets()</code></td>
+          <td><code>dest_dir</code> (str), <code>kind</code> (str="image"), <code>refresh</code> (bool=True)</td>
+          <td><span class="ret">list[str]</span></td>
+          <td>↑をディスクに保存。保存したパス列を返す</td>
+        </tr>
+        <tr>
+          <td><code>page.download_video()</code></td>
+          <td><code>url</code> (str=None: 省略で検出済みストリーム), <code>referer</code> (str=None), <code>timeout_s</code> (int=1800)</td>
+          <td><span class="ret">dict</span></td>
+          <td>yt-dlp / httpx で動画を取得・保存</td>
+        </tr>
+        <tr>
+          <td><code>page.cookies()</code></td>
+          <td><code>host</code> (str=None), <code>all_cookies</code> (bool=False)</td>
+          <td><span class="ret">dict</span></td>
+          <td>現在の Cookie</td>
+        </tr>
+        <tr>
+          <td><code>page.save_cookies_to_host()</code></td>
+          <td><code>host</code> (str=None), <code>notes</code> (str=None), <code>all_cookies</code> (bool=False)</td>
+          <td><span class="ret">dict</span></td>
+          <td>Cookie を Host レジストリへ保存</td>
+        </tr>
+        <tr>
+          <td><code>page.network()</code></td>
+          <td><code>since</code> (float=0.0) — これ以降のエントリ</td>
+          <td><span class="ret">dict</span></td>
+          <td>メディア系のネットワークログ</td>
+        </tr>
+        <tr>
+          <td><code>page.ask()</code></td>
+          <td><code>question</code> (str), <code>engine</code> (str="auto")</td>
+          <td><span class="ret">bool</span></td>
+          <td>LLM に yes/no を問う</td>
+        </tr>
+        <tr>
+          <td><code>page.agent()</code></td>
+          <td><code>goal</code> (str), <code>max_steps</code> (int=5, 1–30), <code>engine</code> (str="auto"/"qwen"/"cogagent")</td>
+          <td><span class="ret">dict</span></td>
+          <td>vision/LLM エージェントにゴールを委譲</td>
+        </tr>
+        <tr>
+          <td><code>page.get_state()</code> / <code>set_state()</code></td>
+          <td><code>key</code> (str), <code>set_state</code> は <code>value</code> も</td>
+          <td><span class="ret">dict | None</span></td>
+          <td>親 job に紐づく永続データ（<strong>要 parent_job_id</strong>）</td>
+        </tr>
+        <tr>
+          <td><code>page.solve_cloudflare()</code></td>
+          <td><code>timeout_s</code> (float=25.0)</td>
+          <td><span class="ret">dict</span></td>
+          <td>Cloudflare チャレンジを待つ/通す</td>
+        </tr>
+        <tr>
+          <td><code>page.resize_window()</code></td>
+          <td><code>width</code> (int), <code>height</code> (int)</td>
+          <td><span class="ret">dict</span></td>
+          <td>Chrome のウィンドウサイズを変更</td>
+        </tr>
+      </tbody>
+    </table>
+
+    <h2 id="agent-ext">Page — 拡張機能コマンド（Agent ext）</h2>
+    <p>
+      CDP / nodriver では直接届かない Chrome 機能を、全レーンに常駐する
+      <strong>Paprika Agent 拡張機能</strong>経由で呼ぶための API 群です（本物の
+      ページズーム、リクエストヘッダ書き換え、コンテンツ設定、プライバシー、
+      ダウンロード、プロキシ、ナビゲーション監視、ユーザースクリプト、拡張管理）。
+      下の型付きメソッドはすべて汎用 <code>page.ext()</code> の薄いラッパーです。
+      fetch 実行中のセッションでも呼べます（ブラウザ設定であってページ書き込みではないため）。
+    </p>
+    <div class="callout info">
+      <strong>戻り値の見かた</strong>
+      ほとんどのメソッドは <em>reply 全体</em>（<code>{status, result, elapsed_ms}</code>）を返し、
+      実際のペイロードは <code>reply["result"]</code> に入ります（例: <code>set_referer()</code> なら
+      <code>result["id"]</code>）。一覧取得系（<code>net_rules</code> / <code>navigation_events</code> /
+      <code>installed_extensions</code> / <code>download_status</code>）だけは <code>list</code> を直接返します。
+    </div>
+    <div class="ex-async"><pre><code># CDN が iframe URL を Referer に取って弾くプレーヤーを救う（HLS の 403 対策）
+await page.set_referer("https://supjav.com/")
+
+# リダイレクト連鎖で開く popup を素通しさせる
+await page.allow_popups()
+
+# 本物のページズーム（縮小もできる。CDP の setPageScaleFactor と違い 1.0 未満も有効）
+await page.zoom(0.5)
+
+# 広告ドメインを遮断
+await page.block_hosts(["ads.example.net", "track.example.com"])
+
+# 型付きラッパーの無い機能は汎用 ext() で（例: 画像読み込みをブロック）
+reply = await page.ext("setContentSetting", {"type": "images", "setting": "block"})
+print(reply["result"])</code></pre></div>
+    <div class="ex-sync"><pre><code>page.set_referer("https://supjav.com/")
+page.allow_popups()
+page.zoom(0.5)
+page.block_hosts(["ads.example.net"])
+reply = page.ext("setContentSetting", {"type": "images", "setting": "block"})</code></pre></div>
+    <div class="ex-php"><div class="callout info"><strong>PHP は Phase 2 で対応予定</strong>です（拡張コマンドは <a href="#php">Page サーフェス</a>の一部として Phase 2 に含まれます）。</div></div>
+
+    <h3><code>page.ext(cmd, args=None, *, timeout=20.0)</code> <span class="ret">→ dict</span></h3>
+    <p>
+      拡張機能の任意コマンドを実行する汎用パススルー。<code>cmd</code> は拡張側ハンドラ名、
+      <code>args</code> はその引数 dict。下の全ラッパーはこれの別名です。新しい能力を足すときも
+      「拡張にハンドラ＋ここにラッパー」だけで増やせます。
+    </p>
+    <table class="apiref">
+      <thead><tr><th>メソッド</th><th>引数</th><th>戻り値</th><th>説明</th></tr></thead>
+      <tbody>
+        <tr>
+          <td><code>page.ext()</code></td>
+          <td><code>cmd</code> (str) — ハンドラ名, <code>args</code> (dict=None), <code>timeout</code> (秒=20.0)</td>
+          <td><span class="ret">dict</span></td>
+          <td>汎用コマンド実行。ペイロードは <code>result</code></td>
+        </tr>
+        <tr>
+          <td><code>page.zoom()</code> / <code>set_zoom()</code></td>
+          <td><code>factor</code> (float) — 1.0=100%、0.25〜5.0</td>
+          <td><span class="ret">dict</span></td>
+          <td>本物のページズーム（リフロー・全画面 iframe にも有効、縮小可）。<code>result["method"]</code> が <code>chrome.tabs.setZoom</code> なら成功</td>
+        </tr>
+        <tr>
+          <td><code>page.set_referer()</code></td>
+          <td><code>value</code> (str) — Referer 値, <code>url_filter</code> (str="*")</td>
+          <td><span class="ret">dict</span></td>
+          <td>マッチ URL に <code>Referer</code> ヘッダを強制。CDN/HLS の referer 弾き対策（<code>result["id"]</code>=ルール ID）</td>
+        </tr>
+        <tr>
+          <td><code>page.set_request_header()</code></td>
+          <td><code>header</code> (str), <code>value</code> (str), <code>url_filter</code> (str="*"), <code>rule_id</code> (int=2000) — 同 ID で置換</td>
+          <td><span class="ret">dict</span></td>
+          <td>任意リクエストヘッダを強制（declarativeNetRequest modifyHeaders）</td>
+        </tr>
+        <tr>
+          <td><code>page.block_hosts()</code></td>
+          <td><code>hosts</code> (list[str]) — ドメイン列</td>
+          <td><span class="ret">dict</span></td>
+          <td>指定ドメインへの全リクエストを遮断（<code>result["added"]</code>=件数）</td>
+        </tr>
+        <tr>
+          <td><code>page.net_rules()</code></td>
+          <td>なし</td>
+          <td><span class="ret">list[dict]</span></td>
+          <td>現在の動的ネットワークルール一覧</td>
+        </tr>
+        <tr>
+          <td><code>page.clear_net_rules()</code></td>
+          <td>なし</td>
+          <td><span class="ret">dict</span></td>
+          <td>全動的ルールを削除（<code>result["removed"]</code>=件数）</td>
+        </tr>
+        <tr>
+          <td><code>page.set_content_setting()</code></td>
+          <td><code>type</code> (str: <code>popups</code>/<code>images</code>/<code>javascript</code>/<code>automaticDownloads</code> 等), <code>setting</code> (str: <code>allow</code>/<code>block</code>/<code>session_only</code>/<code>ask</code>), <code>pattern</code> (str="*://*/*")</td>
+          <td><span class="ret">dict</span></td>
+          <td>サイト別コンテンツ設定</td>
+        </tr>
+        <tr>
+          <td><code>page.allow_popups()</code></td>
+          <td><code>pattern</code> (str="*://*/*")</td>
+          <td><span class="ret">dict</span></td>
+          <td>popup を許可（リダイレクト連鎖のプレーヤー対策）</td>
+        </tr>
+        <tr>
+          <td><code>page.allow_auto_downloads()</code></td>
+          <td><code>pattern</code> (str="*://*/*")</td>
+          <td><span class="ret">dict</span></td>
+          <td>複数の自動ダウンロードを無確認で許可</td>
+        </tr>
+        <tr>
+          <td><code>page.set_privacy()</code></td>
+          <td><code>path</code> (str, 例 <code>network.webRTCIPHandlingPolicy</code>), <code>value</code></td>
+          <td><span class="ret">dict</span></td>
+          <td><code>chrome.privacy</code> の ChromeSetting を設定</td>
+        </tr>
+        <tr>
+          <td><code>page.prevent_webrtc_leak()</code></td>
+          <td>なし</td>
+          <td><span class="ret">dict</span></td>
+          <td>WebRTC による実 IP 漏洩を防止（プロキシ併用時に重要）</td>
+        </tr>
+        <tr>
+          <td><code>page.navigation_events()</code></td>
+          <td><code>since</code> (float=0.0) — この epoch(ms) 以降</td>
+          <td><span class="ret">list[dict]</span></td>
+          <td>バッファ済み遷移イベント（<code>type</code>/<code>url</code>/<code>tabId</code>/<code>sourceFrameId</code> 等。popup・新規タブの出自を含む）</td>
+        </tr>
+        <tr>
+          <td><code>page.download()</code></td>
+          <td><code>url</code> (str), <code>filename</code> (str=None), <code>conflict</code> (str="uniquify"/"overwrite"/"prompt"), <code>headers</code> (list[{name,value}]=None)</td>
+          <td><span class="ret">dict</span></td>
+          <td>制御付きダウンロードを開始（<code>result["download_id"]</code>）</td>
+        </tr>
+        <tr>
+          <td><code>page.download_status()</code></td>
+          <td><code>download_id</code> (int=None) — 省略で全件</td>
+          <td><span class="ret">list[dict]</span></td>
+          <td>DL 状態を検索（<code>state</code>/<code>bytesReceived</code>/<code>totalBytes</code> 等）</td>
+        </tr>
+        <tr>
+          <td><code>page.cancel_download()</code></td>
+          <td><code>download_id</code> (int)</td>
+          <td><span class="ret">dict</span></td>
+          <td>ダウンロードを中止</td>
+        </tr>
+        <tr>
+          <td><code>page.set_proxy()</code></td>
+          <td><code>host</code> (str), <code>port</code> (int), <code>scheme</code> (str="http"/"https"/"socks5"), <code>bypass</code> (list=None)</td>
+          <td><span class="ret">dict</span></td>
+          <td>レーン（プロファイル）単位の固定プロキシ。認証付きプロキシは不可</td>
+        </tr>
+        <tr>
+          <td><code>page.clear_proxy()</code></td>
+          <td>なし</td>
+          <td><span class="ret">dict</span></td>
+          <td>プロキシ設定を解除</td>
+        </tr>
+        <tr>
+          <td><code>page.proxy_info()</code></td>
+          <td>なし</td>
+          <td><span class="ret">dict</span></td>
+          <td>現在のプロキシ設定（<code>result["value"]</code> / <code>levelOfControl</code>）</td>
+        </tr>
+        <tr>
+          <td><code>page.register_user_script()</code></td>
+          <td><code>id</code> (str), <code>code</code> (str, JS), <code>matches</code> (list=["&lt;all_urls&gt;"]), <code>world</code> (str="MAIN"/"USER_SCRIPT"), <code>run_at</code> (str="document_idle")</td>
+          <td><span class="ret">dict</span></td>
+          <td>MAIN ワールドへ常駐スクリプトを登録（プレーヤー API フック等）</td>
+        </tr>
+        <tr>
+          <td><code>page.unregister_user_script()</code></td>
+          <td><code>id</code> (str)</td>
+          <td><span class="ret">dict</span></td>
+          <td>登録済みユーザースクリプトを解除</td>
+        </tr>
+        <tr>
+          <td><code>page.installed_extensions()</code></td>
+          <td>なし</td>
+          <td><span class="ret">list[dict]</span></td>
+          <td>レーンにインストール済みの拡張一覧（<code>id</code>/<code>name</code>/<code>enabled</code>/<code>version</code>）</td>
+        </tr>
+        <tr>
+          <td><code>page.set_extension_enabled()</code></td>
+          <td><code>ext_id</code> (str), <code>enabled</code> (bool)</td>
+          <td><span class="ret">dict</span></td>
+          <td>他の拡張を有効/無効に切り替え</td>
+        </tr>
       </tbody>
     </table>
 
     <h2 id="tabs">Page — タブ・ライフサイクル</h2>
-    <table>
-      <thead><tr><th>メソッド</th><th>説明</th></tr></thead>
+    <table class="apiref">
+      <thead><tr><th>メソッド</th><th>引数</th><th>戻り値</th><th>説明</th></tr></thead>
       <tbody>
-        <tr><td><code>page.new_page(url) / open(url)</code> → Page</td><td>新規タブ（<code>switch=True</code> で既定に）</td></tr>
-        <tr><td><code>page.pages()</code> → list[Page]</td><td>全タブ</td></tr>
-        <tr><td><code>page.switch()</code> → dict</td><td>このタブを前面に</td></tr>
-        <tr><td><code>page.close()</code> → None</td><td>タブを閉じる（最後の1枚ならセッション終了）</td></tr>
-        <tr><td><code>page.keepalive(*, idle_ttl_s=120, absolute_ttl_s=86400)</code> → HandoffInfo</td><td>スクリプト終了後も残し noVNC で人手に引き継ぐ（別名 <code>detach</code>）</td></tr>
+        <tr>
+          <td><code>page.new_page()</code> / <code>open()</code></td>
+          <td><code>url</code> (str), <code>switch</code> (bool=False) — True で既定タブに</td>
+          <td><span class="ret">Page</span></td>
+          <td>新規タブを開く</td>
+        </tr>
+        <tr>
+          <td><code>page.pages()</code></td>
+          <td>なし</td>
+          <td><span class="ret">list[Page]</span></td>
+          <td>セッションの全タブ</td>
+        </tr>
+        <tr>
+          <td><code>page.switch()</code></td>
+          <td>なし</td>
+          <td><span class="ret">dict</span></td>
+          <td>このタブを前面に</td>
+        </tr>
+        <tr>
+          <td><code>page.close()</code></td>
+          <td>なし</td>
+          <td><span class="ret">None</span></td>
+          <td>タブを閉じる（最後の 1 枚ならセッション終了）</td>
+        </tr>
+        <tr>
+          <td><code>page.keepalive()</code></td>
+          <td><code>idle_ttl_s</code> (int=120), <code>absolute_ttl_s</code> (int=86400)</td>
+          <td><span class="ret">HandoffInfo</span></td>
+          <td>スクリプト終了後もセッションを残し noVNC で人手に引き継ぐ（別名 <code>detach</code>）</td>
+        </tr>
       </tbody>
     </table>
 
