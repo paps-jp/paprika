@@ -1099,49 +1099,67 @@ async def run_iterative_codegen(
                 target=llm_target,
             )
 
-            # v2 Phase 3: shadow / primary R1 judge.
-            # PAPRIKA_R1_JUDGE_MODE controls how the R1-backed judge is
-            # used alongside the legacy one:
-            #   off     -- never call R1 (default; matches Phase 1/2 behaviour).
-            #   shadow  -- call R1, log both verdicts, keep using legacy.
-            #   primary -- call R1 first; use legacy as fallback when R1 is
-            #              unreachable / unparseable.
-            # The R1 verdict is always persisted to attempts/{n}/judge_r1.json
-            # so operators can compare offline regardless of mode.
-            _r1_mode = (os.environ.get("PAPRIKA_R1_JUDGE_MODE", "off") or "off").lower().strip()
-            if _r1_mode in ("shadow", "primary"):
+            # Reasoning judge (shadow / primary mode).
+            # Settings → reasoning_judge_mode controls how the reasoning
+            # judge is used alongside the default one:
+            #   off     -- never call it (default).
+            #   shadow  -- call it, log both verdicts, keep using default.
+            #   primary -- use reasoning verdict; fall back to default when
+            #              the engine is unreachable / unparseable.
+            # Persists to attempts/{n}/judge_reasoning.json for offline
+            # comparison regardless of mode.
+            _reasoning_mode = "off"
+            try:
+                from server.hub._state import state as _reasoning_st
+                if _reasoning_st.settings is not None:
+                    _reasoning_mode = (_reasoning_st.settings.get("reasoning_judge_mode", "") or "").lower().strip()
+            except Exception:
+                pass
+            if not _reasoning_mode or _reasoning_mode == "off":
+                _reasoning_mode = (os.environ.get("PAPRIKA_R1_JUDGE_MODE", "off") or "off").lower().strip()
+
+            if _reasoning_mode in ("shadow", "primary"):
                 try:
                     from server.hub.codegen import resolve_engine_target
-                    from server.hub.judge_llm import judge_via_r1
+                    from server.hub.judge_llm import judge_via_reasoning
                     from server.hub.perception_llm import (
                         generate_perception_for_attempt,
                         find_vision_capable_target,
                     )
 
-                    # v2 Phase 4: 2-stage judge.
-                    # Stage A: vision LLM (Qwen-VL or similar) observes
-                    #   the attempt's final screenshot and produces a
-                    #   PerceptionResult -- structured facts about what
-                    #   the page actually shows.
-                    # Stage B: R1 reads PerceptionResult + stdout + stderr
-                    #   + script and decides "satisfied". R1 never sees
-                    #   pixels; it gets the visual signal as structured
-                    #   text fields.
-                    # This is the design originally laid out in
-                    # internal/v2-architecture.html § Phase 4.
-                    r1_target = None
+                    # Resolve the reasoning engine slug from settings,
+                    # falling back to env / "deepseek-r1".
+                    _reasoning_engine_slug = ""
+                    try:
+                        if _reasoning_st.settings is not None:
+                            _reasoning_engine_slug = (
+                                _reasoning_st.settings.get("reasoning_judge_engine", "") or ""
+                            ).strip()
+                    except Exception:
+                        pass
+                    if not _reasoning_engine_slug:
+                        _reasoning_engine_slug = os.environ.get(
+                            "PAPRIKA_R1_DISTILLER_ENGINE", "deepseek-r1"
+                        )
+
+                    # 2-stage judge:
+                    # Stage A: vision LLM observes the attempt's final
+                    #   screenshot → PerceptionResult (structured facts).
+                    # Stage B: reasoning engine reads perception + stdout +
+                    #   stderr + script → verdict. Never sees pixels.
+                    reasoning_target = None
                     vision_target = None
                     try:
                         from server.hub._state import state as _st
                         if _st.engines is not None:
-                            r1_target = resolve_engine_target("deepseek-r1", _st.engines)
+                            reasoning_target = resolve_engine_target(
+                                _reasoning_engine_slug, _st.engines
+                            )
                         vision_target = find_vision_capable_target()
                     except Exception as _re:
-                        _log(f"  !! r1-judge: target resolve failed: {_re}")
+                        _log(f"  !! reasoning-judge: target resolve failed: {_re}")
 
-                    # Generate Stage-A perception (only if we have a vision
-                    # engine -- otherwise R1 falls back to "no perception"
-                    # and still judges from stdout alone).
+                    # Stage A: perception.
                     perception_dict = None
                     if vision_target is not None:
                         try:
@@ -1154,8 +1172,6 @@ async def run_iterative_codegen(
                             )
                             if perception_obj is not None:
                                 perception_dict = perception_obj.model_dump(mode="json")
-                                # Persist the per-attempt perception too --
-                                # it's useful evidence for distillation.
                                 try:
                                     (data_dir / job_id / "attempts" / str(n) / "perception.json").write_text(
                                         perception_obj.model_dump_json(indent=2),
@@ -1164,11 +1180,11 @@ async def run_iterative_codegen(
                                 except Exception:
                                     pass
                         except Exception as _pe:
-                            _log(f"  !! r1-judge: perception failed: {type(_pe).__name__}: {_pe}")
+                            _log(f"  !! reasoning-judge: perception failed: {type(_pe).__name__}: {_pe}")
 
-                    r1_verdict: Verdict | None = None
-                    if r1_target is not None:
-                        # Cheap asset summary by extension.
+                    # Stage B: reasoning verdict.
+                    reasoning_verdict: Verdict | None = None
+                    if reasoning_target is not None:
                         _assets_summary: dict[str, int] = {}
                         try:
                             if judge_assets.is_dir():
@@ -1178,7 +1194,7 @@ async def run_iterative_codegen(
                                         _assets_summary[ext] = _assets_summary.get(ext, 0) + 1
                         except Exception:
                             pass
-                        r1_verdict = await judge_via_r1(
+                        reasoning_verdict = await judge_via_reasoning(
                             goal=judge_goal,
                             exit_code=result.exit_code,
                             perception=perception_dict,
@@ -1187,21 +1203,22 @@ async def run_iterative_codegen(
                             stdout=result.stdout or "",
                             stderr=result.stderr or "",
                             script=code or "",
-                            target=r1_target,
+                            target=reasoning_target,
                         )
 
-                    # 3) Persist R1 verdict for offline comparison.
-                    if r1_verdict is not None:
+                    # Persist reasoning verdict for offline comparison.
+                    if reasoning_verdict is not None:
                         try:
-                            (data_dir / job_id / "attempts" / str(n) / "judge_r1.json").write_text(
+                            (data_dir / job_id / "attempts" / str(n) / "judge_reasoning.json").write_text(
                                 json.dumps(
                                     {
-                                        "satisfied": r1_verdict.satisfied,
-                                        "reason": r1_verdict.reason,
-                                        "hint": r1_verdict.hint,
-                                        "model": r1_verdict.model,
-                                        "elapsed_ms": r1_verdict.elapsed_ms,
-                                        "mode": _r1_mode,
+                                        "satisfied": reasoning_verdict.satisfied,
+                                        "reason": reasoning_verdict.reason,
+                                        "hint": reasoning_verdict.hint,
+                                        "model": reasoning_verdict.model,
+                                        "elapsed_ms": reasoning_verdict.elapsed_ms,
+                                        "mode": _reasoning_mode,
+                                        "engine": _reasoning_engine_slug,
                                     },
                                     ensure_ascii=False,
                                     indent=2,
@@ -1211,35 +1228,34 @@ async def run_iterative_codegen(
                         except Exception:
                             pass
 
-                    # 4) Log + decide which verdict wins.
-                    if r1_verdict is not None:
+                    # Log + decide which verdict wins.
+                    if reasoning_verdict is not None:
                         agree = (
                             verdict is not None
-                            and verdict.satisfied == r1_verdict.satisfied
+                            and verdict.satisfied == reasoning_verdict.satisfied
                         )
                         legacy_str = (
-                            f"legacy={'OK' if (verdict and verdict.satisfied) else 'NG'}"
+                            f"default={'OK' if (verdict and verdict.satisfied) else 'NG'}"
                             if verdict is not None
-                            else "legacy=?"
+                            else "default=?"
                         )
                         _log(
-                            f"  🧠 r1-judge ({_r1_mode}): "
-                            f"R1={'OK' if r1_verdict.satisfied else 'NG'} "
+                            f"  🧠 reasoning-judge ({_reasoning_mode}): "
+                            f"reasoning={'OK' if reasoning_verdict.satisfied else 'NG'} "
                             f"{legacy_str} "
                             f"{'AGREE' if agree else 'DISAGREE'} "
-                            f"-- {r1_verdict.reason[:120]}"
+                            f"[{_reasoning_engine_slug}] "
+                            f"-- {reasoning_verdict.reason[:120]}"
                         )
-                        if _r1_mode == "primary":
-                            # Use R1 verdict (with legacy fallback handled by
-                            # the original verdict==None path elsewhere).
-                            verdict = r1_verdict
-                    elif _r1_mode == "primary":
+                        if _reasoning_mode == "primary":
+                            verdict = reasoning_verdict
+                    elif _reasoning_mode == "primary":
                         _log(
-                            "  🧠 r1-judge (primary): R1 unavailable, "
-                            "falling back to legacy verdict"
+                            "  🧠 reasoning-judge (primary): engine unavailable, "
+                            "falling back to default verdict"
                         )
                 except Exception as _e:
-                    _log(f"  !! r1-judge crashed (non-fatal): {type(_e).__name__}: {_e}")
+                    _log(f"  !! reasoning-judge crashed (non-fatal): {type(_e).__name__}: {_e}")
             if verdict is not None:
                 # Persist the judge's full response next to the
                 # attempt so operators can inspect it later via

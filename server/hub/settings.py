@@ -98,6 +98,20 @@ _SCHEMA: dict[str, tuple[Any, str]] = {
     # doesn't fight a deliberate unmount; /settings/smb/mount flips it
     # back on. See server/hub/smb_mount.py.
     "smb_auto_mount": (True, "bool"),
+    # ---- Reasoning Judge ------------------------------------------------
+    # A second, higher-quality LLM judge that runs alongside (shadow) or
+    # instead of (primary) the default judge. Originally "R1 judge"
+    # because DeepSeek-R1 was the first model used here, but the slot
+    # accepts any engine -- Claude, GPT, Qwen-thinking, etc.
+    #   off     -- never call the reasoning judge (default).
+    #   shadow  -- call it, log both verdicts for comparison, keep using
+    #              the default judge's verdict.
+    #   primary -- use the reasoning judge's verdict; fall back to
+    #              default when it's unreachable / unparseable.
+    "reasoning_judge_mode": ("off", "str"),
+    # Engine slug registered in the Engines tab.  When empty, falls back
+    # to env PAPRIKA_R1_DISTILLER_ENGINE (legacy compat) → "deepseek-r1".
+    "reasoning_judge_engine": ("", "str"),
     # ---- Windows portable: Chrome headless ------------------------------
     # When True, the bundled Chromium starts with ``--headless=new`` so
     # the operator's physical desktop isn't taken over by paprika's job
@@ -139,6 +153,9 @@ def _env_default(key: str, fallback: Any) -> Any:
         "searxng_url": ("SEARXNG_URL", "str"),
         "searxng_timeout_s": ("SEARXNG_TIMEOUT_S", "float"),
         "web_search_max_calls": ("WEB_SEARCH_MAX_CALLS", "int"),
+        # Reasoning judge: settings.json -> env vars -> static default.
+        "reasoning_judge_mode": ("PAPRIKA_R1_JUDGE_MODE", "str"),
+        "reasoning_judge_engine": ("PAPRIKA_R1_DISTILLER_ENGINE", "str"),
     }
     info = env_map.get(key)
     if not info:

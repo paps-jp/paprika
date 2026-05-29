@@ -2818,6 +2818,40 @@ curl 'http://paprika.lan/extensions/ublock-lite/download' --output ublock-lite.t
       <div id="smbDiskUsage" style="font-size:.85em; color:#888; margin-top:4px;"></div>
     </div>
 
+    <!-- B6. Reasoning Judge -->
+    <h3 style="margin-top:1.2rem; font-size:.95rem; color:#444; border-bottom:1px solid #eee; padding-bottom:.3rem;"><iconify-icon icon="lucide:brain-circuit"></iconify-icon> 推論ジャッジ
+      <small style="font-weight:normal; color:#888;">— 高品質な LLM 判定 (DeepSeek R1 / Claude / GPT 等)</small>
+    </h3>
+    <p style="margin:4px 0 8px; color:#666; font-size:.88em;">
+      デフォルトジャッジに加え、推論特化モデルで判定を行う。
+      shadow = 両方実行して比較ログ、primary = 推論ジャッジの判定を採用。
+    </p>
+
+    <div style="display:grid; grid-template-columns: 200px 1fr; gap:8px 12px; align-items:center; padding:8px 4px;">
+      <label for="setReasoningJudgeMode">モード:</label>
+      <div>
+        <select id="setReasoningJudgeMode" style="padding:4px 8px; min-width:200px;">
+          <option value="off">off — 無効</option>
+          <option value="shadow">shadow — 比較ログのみ</option>
+          <option value="primary">primary — 推論ジャッジ優先</option>
+        </select>
+      </div>
+
+      <label for="setReasoningJudgeEngine">エンジン:</label>
+      <div>
+        <select id="setReasoningJudgeEngine" style="padding:4px 8px; min-width:200px;">
+          <option value="">(未設定 — env fallback)</option>
+        </select>
+        <small style="color:#888; display:block; margin-top:2px;">AI エンジンタブで登録済みのエンジンから選択</small>
+      </div>
+
+      <div></div>
+      <div style="display:flex; gap:8px; align-items:center; margin-top:4px;">
+        <button id="setSaveReasoningJudgeBtn" class="pill" style="background:#eef8ee; border-color:#7ab68a; color:#196b2c;"><iconify-icon icon="lucide:save"></iconify-icon> 推論ジャッジを保存</button>
+        <span id="setReasoningJudgeStatus" style="font-size:.9em; margin-left:4px;"></span>
+      </div>
+    </div>
+
     <!-- C. System info (read-only) -->
     <h3 style="margin-top:1.2rem; font-size:.95rem; color:#444; border-bottom:1px solid #eee; padding-bottom:.3rem;">ℹ System info
       <small style="font-weight:normal; color:#888;">— 環境変数依存、再デプロイで変更</small>

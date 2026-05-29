@@ -401,23 +401,24 @@ async def judge_attempt(
 
 
 # ---------------------------------------------------------------------------
-# v2 Phase 3: PerceptionResult + R1 judge
+# Reasoning judge (v2 Phase 3)
 #
-# Drop-in replacement for ``judge_attempt`` that reasons over a
-# structured PerceptionResult (produced by the eye, Phase 1) instead of
-# rummaging through stdout/stderr/screenshot. The brain (DeepSeek-R1)
-# gets a compact factual brief and decides; it never sees raw HTML or
-# pixels. Same Verdict shape so iterative_codegen consumes it without
-# changes.
+# Higher-quality judge that reasons over a structured PerceptionResult
+# (produced by the eye, Phase 1) instead of rummaging through
+# stdout/stderr/screenshot. The reasoning engine (DeepSeek-R1, Claude,
+# GPT, etc.) gets a compact factual brief and decides; it never sees
+# raw HTML or pixels.  Same Verdict shape so iterative_codegen consumes
+# it without changes.
 #
-# Opt-in via PAPRIKA_USE_R1_JUDGE=1. Falls back to legacy ``judge_attempt``
-# when:
-#   * the flag is off,
+# Opt-in via Settings → reasoning_judge_mode (or env
+# PAPRIKA_R1_JUDGE_MODE for legacy compat).  Falls back to legacy
+# ``judge_attempt`` when:
+#   * the mode is off,
 #   * no PerceptionResult could be produced for the attempt,
-#   * the R1 engine is unreachable / returns garbage.
+#   * the reasoning engine is unreachable / returns garbage.
 # ---------------------------------------------------------------------------
 
-_R1_JUDGE_SYSTEM_PROMPT = """You are the JUDGE for paprika browser automation (v2).
+_REASONING_JUDGE_SYSTEM_PROMPT = """You are the JUDGE for paprika browser automation (v2).
 
 You receive:
   * GOAL        -- what the operator wanted to happen
@@ -555,7 +556,7 @@ def _tail(text: str, n_lines: int = 30, max_chars: int = 2000) -> str:
     return tail
 
 
-async def judge_via_r1(
+async def judge_via_reasoning(
     *,
     goal: str,
     exit_code: int,
@@ -567,13 +568,13 @@ async def judge_via_r1(
     script: str = "",
     target: LLMTarget,
 ) -> Verdict | None:
-    """R1-based goal verification using a structured PerceptionResult.
+    """Reasoning-model-based goal verification.
 
-    For codegen-loop attempts, the eye (Qwen-VL) generates a
-    PerceptionResult from the final screenshot, and R1 reasons over
-    THAT plus the script's stdout/stderr/script body. R1 never sees
-    pixels -- the screenshot facts arrive as structured perception
-    fields, the script outcome arrives as text.
+    A higher-quality judge that works with any reasoning-capable LLM
+    (DeepSeek-R1, Claude, GPT, etc.). It receives structured
+    PerceptionResult from the vision LLM plus stdout/stderr/script,
+    and decides whether the goal was achieved. Never sees pixels --
+    the visual signal arrives as structured text fields.
 
     Returns None on any unrecoverable failure (LLM unreachable, parser
     can't extract verdict) so the caller can fall back to the legacy
@@ -621,7 +622,7 @@ async def judge_via_r1(
     body = {
         "model": target.model,
         "messages": [
-            {"role": "system", "content": _R1_JUDGE_SYSTEM_PROMPT},
+            {"role": "system", "content": _REASONING_JUDGE_SYSTEM_PROMPT},
             {"role": "user", "content": user_msg},
         ],
         "temperature": 0.6,
@@ -639,20 +640,20 @@ async def judge_via_r1(
         try:
             check_engine_quota(target)
         except EngineQuotaExceeded as e:
-            log.info(f"[judge:r1] quota gate refused: {e}")
+            log.info(f"[judge:reasoning] quota gate refused: {e}")
             return None
         async with httpx.AsyncClient(timeout=target.timeout) as client:
             r = await client.post(target.url, json=body, headers=target.headers)
             if r.status_code >= 400:
                 log.info(
-                    f"[judge:r1] LLM {r.status_code} from {target.url} "
+                    f"[judge:reasoning] LLM {r.status_code} from {target.url} "
                     f"model={target.model}: {r.text[:400]}"
                 )
                 return None
             payload = r.json()
             record_engine_usage(target, payload.get("usage") or {})
     except Exception as e:
-        log.info(f"[judge:r1] LLM call failed: {type(e).__name__}: {e}")
+        log.info(f"[judge:reasoning] LLM call failed: {type(e).__name__}: {e}")
         return None
     elapsed_ms_call = int((time.time() - t0) * 1000)
 
@@ -669,7 +670,7 @@ async def judge_via_r1(
     verdict = _parse_verdict(stripped)
     if verdict is None:
         log.info(
-            f"[judge:r1] could not parse verdict (model={payload.get('model','?')}, "
+            f"[judge:reasoning] could not parse verdict (model={payload.get('model','?')}, "
             f"raw[:200]={stripped[:200]!r})"
         )
         return None
@@ -677,3 +678,7 @@ async def judge_via_r1(
     verdict.elapsed_ms = elapsed_ms_call
     verdict.raw = raw  # keep the WITH-think version for debugging
     return verdict
+
+
+# Backward-compat alias -- existing imports use the old name.
+judge_via_r1 = judge_via_reasoning

@@ -307,8 +307,8 @@ async def clear_plugin_invocations() -> dict:
     return {"deleted": n}
 
 
-# v2 Phase 3: judge comparison analysis.
-# Aggregates legacy judge.json vs R1 judge_r1.json verdicts across all
+# Judge comparison analysis.
+# Aggregates default judge.json vs reasoning judge verdicts across all
 # codegen-loop attempts so operators can see how often the two agree,
 # and inspect the disagreement cases. Used while running in shadow mode
 # to decide when (or whether) to switch to primary.
@@ -316,10 +316,11 @@ async def clear_plugin_invocations() -> dict:
 
 @router.get("/admin/judge_comparisons")
 async def get_judge_comparisons(limit: int = 50) -> dict:
-    """Aggregate legacy vs R1 judge verdicts across all jobs.
+    """Aggregate default vs reasoning judge verdicts across all jobs.
 
     Walks ``data/jobs/*/attempts/*/`` and pairs up ``judge.json``
-    (legacy / qwen-vl) with ``judge_r1.json`` (deepseek-r1). Returns:
+    (default) with ``judge_reasoning.json`` or ``judge_r1.json``
+    (reasoning judge). Returns:
 
       * counts:       agree / disagree / r1_only / legacy_only / both_missing
       * disagree_rate: float (when both ran)
@@ -356,7 +357,10 @@ async def get_judge_comparisons(limit: int = 50) -> dict:
             if not att_path.is_dir():
                 continue
             legacy_file = att_path / "judge.json"
-            r1_file = att_path / "judge_r1.json"
+            # Support both new and legacy reasoning judge filenames
+            r1_file = att_path / "judge_reasoning.json"
+            if not r1_file.is_file():
+                r1_file = att_path / "judge_r1.json"
             has_legacy = legacy_file.is_file()
             has_r1 = r1_file.is_file()
             if has_legacy and has_r1:

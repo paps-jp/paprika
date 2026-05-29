@@ -1205,15 +1205,15 @@ async def get_attempt_file(job_id: str, n: int, filename: str):
         # actions. Mirror of the top-level /jobs/{id}/actions.json
         # for the winning attempt.
         "actions.json": "application/json",
-        # v2 Phase 4: R1 judge verdict, written next to legacy judge.json
-        # when PAPRIKA_R1_JUDGE_MODE is shadow / primary. Same shape as
-        # judge.json plus a "mode" field. Operators compare both to see
-        # how the new R1-backed judge would have ruled.
+        # Reasoning judge verdict, written next to legacy judge.json
+        # when reasoning_judge_mode is shadow / primary. Same shape as
+        # judge.json plus "mode" and "engine" fields.
+        "judge_reasoning.json": "application/json",
+        # Legacy name (backward compat for existing job data).
         "judge_r1.json": "application/json",
-        # v2 Phase 4: per-attempt PerceptionResult (Qwen-VL observation
-        # of the attempt's final screenshot, structured into the v0
-        # PerceptionResult schema). Used by judge_via_r1 and the R1
-        # Distiller. Read-only artefact.
+        # Per-attempt PerceptionResult (vision LLM observation of the
+        # attempt's final screenshot). Used by reasoning judge and
+        # distiller. Read-only artefact.
         "perception.json": "application/json",
     }
     if filename not in allowed:
