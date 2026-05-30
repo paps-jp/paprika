@@ -3566,6 +3566,152 @@ class WorkerAgent:
             "cookies": out,
         }
 
+    @_session_action("resize_window", read_only=False)
+    async def _act_resize_window(self, ctx: "_ActionCtx") -> None:
+        # Resize the Chrome OS window via CDP Browser.setWindowBounds.
+        # The X display stays its native size; Chrome clamps edge cases.
+        try:
+            width = int(ctx.action.get("width") or 0)
+            height = int(ctx.action.get("height") or 0)
+        except Exception:
+            width = height = 0
+        if width < 200 or height < 200:
+            ctx.reply.status = (
+                f"ERR: resize_window: width / height must "
+                f"be >= 200 (got {width}x{height})"
+            )
+        elif width > 4096 or height > 4096:
+            ctx.reply.status = (
+                f"ERR: resize_window: width / height must "
+                f"be <= 4096 (got {width}x{height})"
+            )
+        else:
+            try:
+                from nodriver import cdp
+
+                wfor = await ctx.tab.send(
+                    cdp.browser.get_window_for_target(),
+                )
+                # nodriver returns (window_id, bounds) tuple.
+                if isinstance(wfor, tuple) and len(wfor) >= 1:
+                    window_id = wfor[0]
+                else:
+                    window_id = getattr(wfor, "window_id", wfor)
+                await ctx.tab.send(
+                    cdp.browser.set_window_bounds(
+                        window_id=window_id,
+                        bounds=cdp.browser.Bounds(
+                            width=width,
+                            height=height,
+                            window_state=cdp.browser.WindowState.NORMAL,
+                        ),
+                    ),
+                )
+                ctx.reply.result = {
+                    "width": width,
+                    "height": height,
+                    "window_id": int(window_id)
+                    if isinstance(window_id, (int, str)) and str(window_id).isdigit()
+                    else None,
+                }
+                ctx.slog(f"[resize_window] {width}x{height}")
+            except Exception as e:
+                ctx.reply.status = (
+                    f"ERR: resize_window CDP call failed: {type(e).__name__}: {e}"
+                )
+
+    @_session_action("zoom", read_only=True)
+    async def _act_zoom(self, ctx: "_ActionCtx") -> None:
+        # In-browser PAGE zoom. Preferred: the Paprika Agent extension's
+        # chrome.tabs.setZoom (genuine reflow zoom, works on cross-origin
+        # iframe players). Fallback: CDP Emulation.setPageScaleFactor.
+        try:
+            z = float(ctx.action.get("factor") or 1.0)
+        except Exception:
+            z = 1.0
+        if z < 0.25:
+            z = 0.25
+        elif z > 5.0:
+            z = 5.0
+        agent_out = None
+        try:
+            agent_out = await _paprika_agent_run(
+                ctx.tab, "setZoom", {"factor": z},
+                timeout=8.0, log=ctx.slog,
+            )
+        except Exception as e:
+            ctx.slog(f"[zoom] agent path errored: {type(e).__name__}: {e}")
+            agent_out = None
+        if agent_out and agent_out.get("ok"):
+            ctx.reply.result = {
+                "factor": z,
+                "method": "chrome.tabs.setZoom",
+            }
+            ctx.slog(f"[zoom] genuine zoom via agent = {z}")
+        else:
+            # Fallback: CDP pinch-zoom.
+            try:
+                from nodriver import cdp
+
+                await ctx.tab.send(
+                    cdp.emulation.set_page_scale_factor(
+                        page_scale_factor=z,
+                    ),
+                )
+                ctx.reply.result = {
+                    "factor": z,
+                    "method": "setPageScaleFactor(fallback)",
+                }
+                ctx.slog(
+                    f"[zoom] fallback setPageScaleFactor = {z} "
+                    f"(agent unavailable)"
+                )
+            except Exception as e:
+                ctx.reply.status = (
+                    f"ERR: zoom failed (agent + CDP): "
+                    f"{type(e).__name__}: {e}"
+                )
+
+    @_session_action("ext", read_only=True)
+    async def _act_ext(self, ctx: "_ActionCtx") -> None:
+        # Generic Paprika Agent extension command bus: relay cmd/args to
+        # the extension service worker, return HANDLERS[cmd]'s result.
+        # Vendor-neutral -- new capabilities never change this branch.
+        cmd = ctx.action.get("cmd")
+        cargs = ctx.action.get("args") or {}
+        if not cmd:
+            ctx.reply.status = "ERR: ext: missing 'cmd'"
+        else:
+            try:
+                _to = float(ctx.action.get("timeout") or 8.0)
+            except Exception:
+                _to = 8.0
+            # NOTE: reply.status defaults to "OK" (truthy), so gate on a
+            # local flag -- not on `not reply.status`.
+            out = None
+            errored = False
+            try:
+                out = await _paprika_agent_run(
+                    ctx.tab, cmd, cargs, timeout=_to, log=ctx.slog,
+                )
+            except Exception as e:
+                errored = True
+                ctx.reply.status = (
+                    f"ERR: ext({cmd}): {type(e).__name__}: {e}"
+                )
+            if not errored:
+                if out is None:
+                    ctx.reply.status = (
+                        f"ERR: ext({cmd}): agent unreachable"
+                    )
+                elif out.get("ok"):
+                    ctx.reply.result = out.get("result")
+                    ctx.slog(f"[ext] {cmd} ok")
+                else:
+                    ctx.reply.status = (
+                        f"ERR: ext({cmd}): {out.get('error')}"
+                    )
+
     async def _handle_session_action(self, msg: HubSessionAction) -> None:
         """Dispatch one action against a bound session via browser_ops."""
         sid = msg.session_id
@@ -5199,163 +5345,6 @@ class WorkerAgent:
                         "added": added,
                         "added_count": len(added),
                     }
-                elif kind == "resize_window":
-                    # Resize the Chrome OS window to (width, height).
-                    # Used by the admin UI's "iframe サイズに合わせる"
-                    # button so the operator can match the browser to
-                    # the noVNC viewport. CDP path:
-                    #   Browser.getWindowForTarget -> windowId
-                    #   Browser.setWindowBounds(windowId, bounds)
-                    # The X display itself stays its native size --
-                    # we only resize Chrome inside it. Edge cases
-                    # (X display smaller than requested window) are
-                    # left to Chrome to clamp.
-                    try:
-                        width = int(action.get("width") or 0)
-                        height = int(action.get("height") or 0)
-                    except Exception:
-                        width = height = 0
-                    if width < 200 or height < 200:
-                        reply.status = (
-                            f"ERR: resize_window: width / height must "
-                            f"be >= 200 (got {width}x{height})"
-                        )
-                    elif width > 4096 or height > 4096:
-                        reply.status = (
-                            f"ERR: resize_window: width / height must "
-                            f"be <= 4096 (got {width}x{height})"
-                        )
-                    else:
-                        try:
-                            from nodriver import cdp
-
-                            wfor = await tab.send(
-                                cdp.browser.get_window_for_target(),
-                            )
-                            # nodriver returns (window_id, bounds) tuple.
-                            if isinstance(wfor, tuple) and len(wfor) >= 1:
-                                window_id = wfor[0]
-                            else:
-                                window_id = getattr(wfor, "window_id", wfor)
-                            await tab.send(
-                                cdp.browser.set_window_bounds(
-                                    window_id=window_id,
-                                    bounds=cdp.browser.Bounds(
-                                        width=width,
-                                        height=height,
-                                        window_state=cdp.browser.WindowState.NORMAL,
-                                    ),
-                                ),
-                            )
-                            reply.result = {
-                                "width": width,
-                                "height": height,
-                                "window_id": int(window_id)
-                                if isinstance(window_id, (int, str)) and str(window_id).isdigit()
-                                else None,
-                            }
-                            _slog(f"[resize_window] {width}x{height}")
-                        except Exception as e:
-                            reply.status = (
-                                f"ERR: resize_window CDP call failed: {type(e).__name__}: {e}"
-                            )
-                elif kind == "zoom":
-                    # In-browser PAGE zoom. Preferred path: the Paprika
-                    # Agent extension's chrome.tabs.setZoom -- the GENUINE
-                    # browser zoom (reflows, == the Ctrl+/Ctrl- menu
-                    # zoom), which also works on full-viewport
-                    # cross-origin iframe players. Fallback when the
-                    # agent SW isn't reachable: CDP
-                    # Emulation.setPageScaleFactor (pinch-magnify; no
-                    # reflow but still visibly zooms). 1.0 = 100%.
-                    try:
-                        z = float(action.get("factor") or 1.0)
-                    except Exception:
-                        z = 1.0
-                    if z < 0.25:
-                        z = 0.25
-                    elif z > 5.0:
-                        z = 5.0
-                    agent_out = None
-                    try:
-                        agent_out = await _paprika_agent_run(
-                            tab, "setZoom", {"factor": z},
-                            timeout=8.0, log=_slog,
-                        )
-                    except Exception as e:
-                        _slog(f"[zoom] agent path errored: {type(e).__name__}: {e}")
-                        agent_out = None
-                    if agent_out and agent_out.get("ok"):
-                        reply.result = {
-                            "factor": z,
-                            "method": "chrome.tabs.setZoom",
-                        }
-                        _slog(f"[zoom] genuine zoom via agent = {z}")
-                    else:
-                        # Fallback: CDP pinch-zoom.
-                        try:
-                            from nodriver import cdp
-
-                            await tab.send(
-                                cdp.emulation.set_page_scale_factor(
-                                    page_scale_factor=z,
-                                ),
-                            )
-                            reply.result = {
-                                "factor": z,
-                                "method": "setPageScaleFactor(fallback)",
-                            }
-                            _slog(
-                                f"[zoom] fallback setPageScaleFactor = {z} "
-                                f"(agent unavailable)"
-                            )
-                        except Exception as e:
-                            reply.status = (
-                                f"ERR: zoom failed (agent + CDP): "
-                                f"{type(e).__name__}: {e}"
-                            )
-                elif kind == "ext":
-                    # Generic Paprika Agent extension command bus. The
-                    # worker stays vendor-neutral: it just relays
-                    # cmd/args to the extension's service worker (via the
-                    # page<->content-script relay) and returns whatever
-                    # the matching HANDLERS[cmd] yields. New capabilities
-                    # are added in the extension + the Python client; this
-                    # dispatch branch never changes.
-                    cmd = action.get("cmd")
-                    cargs = action.get("args") or {}
-                    if not cmd:
-                        reply.status = "ERR: ext: missing 'cmd'"
-                    else:
-                        try:
-                            _to = float(action.get("timeout") or 8.0)
-                        except Exception:
-                            _to = 8.0
-                        # NOTE: reply.status defaults to "OK" (truthy), so
-                        # gate on a local flag -- not on `not reply.status`.
-                        out = None
-                        errored = False
-                        try:
-                            out = await _paprika_agent_run(
-                                tab, cmd, cargs, timeout=_to, log=_slog,
-                            )
-                        except Exception as e:
-                            errored = True
-                            reply.status = (
-                                f"ERR: ext({cmd}): {type(e).__name__}: {e}"
-                            )
-                        if not errored:
-                            if out is None:
-                                reply.status = (
-                                    f"ERR: ext({cmd}): agent unreachable"
-                                )
-                            elif out.get("ok"):
-                                reply.result = out.get("result")
-                                _slog(f"[ext] {cmd} ok")
-                            else:
-                                reply.status = (
-                                    f"ERR: ext({cmd}): {out.get('error')}"
-                                )
                 # ---- tab management (session-level) ---------------------
                 elif kind == "pages":
                     # List all tabs in this session.
