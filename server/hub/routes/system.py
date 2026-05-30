@@ -652,6 +652,20 @@ asyncio.run(main())"
           <input type="number" id="forensicsMaxSteps" value="18" min="1" max="60"
             style="padding:4px 6px; border:1px solid #ccc; border-radius:4px;">
         </label>
+        <fieldset style="border:1px solid #e0dcf0; border-radius:6px; padding:8px 10px; margin:0;">
+          <legend style="font-size:.82em; color:#666; padding:0 4px;">許可する操作（任意・既定は読み取り専用）</legend>
+          <label style="display:flex; align-items:center; gap:6px; font-size:.9em; cursor:pointer;">
+            <input type="checkbox" id="forensicsAllowMedia" value="media">
+            <span>メディア再生 <small style="color:#999;">(video.play / pause / seek — 遅延ロードの動画を起動して通信を観測)</small></span>
+          </label>
+          <label style="display:flex; align-items:center; gap:6px; font-size:.9em; cursor:pointer; margin-top:4px;">
+            <input type="checkbox" id="forensicsAllowClick" value="click">
+            <span>クリック操作 <small style="color:#999;">(再生/表示/展開ボタン等。送信・削除・購入など破壊的ボタンは常にブロック)</small></span>
+          </label>
+          <div style="font-size:.78em; color:#a06; margin-top:6px;">
+            ⚠️ 遷移・送信(POST)・フォーム送信・Cookie/Storage 書込・ダウンロード・データ持ち出し・スクリプト注入は、選択に関わらず常に拒否されます。
+          </div>
+        </fieldset>
         <div id="forensicsError" style="color:#c00; display:none; font-size:.9em;"></div>
       </div>
       <div style="display:flex; gap:8px; align-items:center; margin-top:12px;">

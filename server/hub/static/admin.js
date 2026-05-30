@@ -6700,6 +6700,11 @@ window.openForensicsModal = async function openForensicsModal(sessionId, hintUrl
   runBtn.disabled = false;
   goalEl.value = '';
   stepsEl.value = '18';
+  // Reset interaction permission checkboxes to OFF (read-only default).
+  const cbMedia = document.getElementById('forensicsAllowMedia');
+  const cbClick = document.getElementById('forensicsAllowClick');
+  if (cbMedia) cbMedia.checked = false;
+  if (cbClick) cbClick.checked = false;
 
   // Stash the session ID on the modal so the run handler can read it.
   modal.dataset.sessionId = sessionId || '';
@@ -6731,6 +6736,13 @@ document.getElementById('forensicsRun').addEventListener('click', async () => {
 
   const maxSteps = parseInt(stepsEl.value, 10) || 18;
 
+  // Collect the operator's per-run interaction permissions.
+  const allow = [];
+  const cbMedia = document.getElementById('forensicsAllowMedia');
+  const cbClick = document.getElementById('forensicsAllowClick');
+  if (cbMedia && cbMedia.checked) allow.push('media');
+  if (cbClick && cbClick.checked) allow.push('click');
+
   runBtn.disabled      = true;
   spinner.style.display = '';
   results.style.display = 'none';
@@ -6743,6 +6755,7 @@ document.getElementById('forensicsRun').addEventListener('click', async () => {
         goal,
         max_steps: maxSteps,
         page_url:  modal.dataset.hintUrl || undefined,
+        allow,
       }),
     });
     if (!r.ok) {

@@ -69,6 +69,16 @@ async def session_forensics(session_id: str, body: dict) -> dict:
     if max_steps is not None and max_steps < 1:
         raise HTTPException(400, "max_steps must be >= 1")
 
+    # Per-run interaction permissions chosen by the operator (checkboxes
+    # in the admin modal). Only "media" / "click" are recognised; anything
+    # else is ignored. Empty -> pure read-only run (default). The absolute
+    # no-go set (navigation / submit / POST / writes / exfil / destructive
+    # clicks) stays blocked regardless -- see forensics.safety_check.
+    raw_allow = body.get("allow") or []
+    if isinstance(raw_allow, str):
+        raw_allow = [raw_allow]
+    allow = {str(c).strip().lower() for c in raw_allow if str(c).strip()}
+
     # Confirm the session exists and grab its URL as a hint for the LLM
     # when the operator didn't supply page_url.
     info = _get_session_or_404(session_id)
@@ -108,16 +118,18 @@ async def session_forensics(session_id: str, body: dict) -> dict:
         page_url=page_url,
         evaluate_fn=_evaluate,
         max_steps=max_steps,
+        allow=allow,
     )
 
     log.info(
-        "forensics %s: completed=%s steps=%d/%d elapsed=%dms model=%s",
+        "forensics %s: completed=%s steps=%d/%d elapsed=%dms model=%s allow=%s",
         session_id,
         result.completed,
         result.steps_taken,
         result.max_steps,
         result.elapsed_ms,
         result.model,
+        sorted(allow) or "-",
     )
 
     return {

@@ -72,61 +72,145 @@ FORENSICS_RESULT_MAX_CHARS = int(
 # ---------------------------------------------------------------------------
 # Pre-flight probe safety check.
 # ---------------------------------------------------------------------------
-# The LLM is told (system prompt) that probes are read-only. This regex
-# pass is a defense-in-depth net so a malformed plan doesn't accidentally
-# perturb the session under investigation. It's not adversarial-proof
-# (the LLM could base64-encode a bad call) -- the threat model assumes
-# the LLM is paprika's trusted endpoint, not an attacker.
-_BLOCKED: list[tuple[re.Pattern, str]] = [
+# Two tiers:
+#   * _ALWAYS_BLOCKED -- the "absolute no-go" set. Server-mutating
+#     requests, navigation, form submit, storage/cookie writes, DOM/script
+#     injection, downloads, data exfiltration. NEVER allowed, regardless
+#     of the operator's per-run permission checkboxes. These are
+#     irreversible and/or run with the session's (possibly logged-in)
+#     authority on an adversarial page.
+#   * _GATED -- side-effecting but reversible/local interactions
+#     (media playback, element clicks). Blocked by default; permitted only
+#     when the operator ticks the matching capability for THIS run.
+#
+# Best-effort regex, not adversarial-proof (the LLM could base64 a bad
+# call) -- the threat model assumes the LLM is paprika's trusted endpoint.
+# Capability keys used in the ``allow`` set: "media", "click".
+_ALWAYS_BLOCKED: list[tuple[re.Pattern, str]] = [
+    # --- navigation (loses the page under investigation / derails fetch) -
     (re.compile(r"location\s*\.\s*(?:href|replace|assign)\s*="),
      "location.href / replace / assign"),
+    (re.compile(r"location\s*\.\s*(?:replace|assign)\s*\("),
+     "location.replace( / assign("),
     (re.compile(r"\bwindow\s*\.\s*location\s*="),
      "window.location ="),
     (re.compile(r"history\s*\.\s*(?:pushState|replaceState|go|back|forward)\b"),
      "history.pushState / replaceState / go / back / forward"),
-    (re.compile(r"\.\s*submit\s*\(\s*\)"),
-     "form .submit()"),
-    (re.compile(r"\.\s*click\s*\(\s*\)"),
-     ".click()  (use page.evaluate to INSPECT, not click)"),
+    (re.compile(r"window\s*\.\s*open\s*\("),
+     "window.open("),
+    # --- form submit -----------------------------------------------------
+    (re.compile(r"\.\s*(?:submit|requestSubmit)\s*\("),
+     "form .submit() / .requestSubmit()"),
+    # --- server-mutating requests ---------------------------------------
+    (re.compile(r"method\s*:\s*['\"](?:POST|PUT|PATCH|DELETE)['\"]", re.I),
+     "fetch with mutating method (POST/PUT/PATCH/DELETE)"),
+    (re.compile(r"\.\s*open\s*\(\s*['\"](?:POST|PUT|PATCH|DELETE)['\"]", re.I),
+     "XMLHttpRequest .open(POST/PUT/PATCH/DELETE, ...)"),
+    (re.compile(r"navigator\s*\.\s*sendBeacon\b"),
+     "navigator.sendBeacon"),
+    # --- storage / cookie writes ----------------------------------------
     (re.compile(r"document\s*\.\s*cookie\s*="),
      "document.cookie ="),
     (re.compile(r"\b(?:localStorage|sessionStorage)\s*\.\s*"
                 r"(?:setItem|removeItem|clear)\b"),
      "storage write (setItem / removeItem / clear)"),
-    (re.compile(r"\bindexedDB\s*\.\s*(?:deleteDatabase|open)\b"),
-     "indexedDB write"),
-    (re.compile(r"window\s*\.\s*open\s*\("),
-     "window.open("),
-    (re.compile(r"method\s*:\s*['\"]POST['\"]", re.I),
-     "fetch with method: 'POST' (read-only only)"),
-    (re.compile(r"\.\s*open\s*\(\s*['\"]POST['\"]"),
-     "XMLHttpRequest .open('POST', ...)"),
+    (re.compile(r"\b(?:localStorage|sessionStorage)\s*\[[^\]]+\]\s*="),
+     "storage write (bracket assignment)"),
+    (re.compile(r"\bindexedDB\s*\.\s*deleteDatabase\b"),
+     "indexedDB.deleteDatabase"),
+    # --- DOM / script injection -----------------------------------------
+    (re.compile(r"\.\s*(?:innerHTML|outerHTML)\s*="),
+     ".innerHTML / .outerHTML ="),
     (re.compile(r"document\s*\.\s*write\s*\("),
      "document.write("),
-    (re.compile(r"\.\s*innerHTML\s*="),
-     ".innerHTML ="),
-    (re.compile(r"\.\s*outerHTML\s*="),
-     ".outerHTML ="),
-    (re.compile(r"navigator\s*\.\s*sendBeacon\b"),
-     "navigator.sendBeacon"),
-    (re.compile(r"chrome\s*\.\s*(?:downloads|tabs|runtime)\s*\."),
-     "chrome.downloads / tabs / runtime"),
+    (re.compile(r"\.\s*insertAdjacentHTML\s*\("),
+     ".insertAdjacentHTML("),
+    (re.compile(r"createElement\s*\(\s*['\"]script['\"]", re.I),
+     "createElement('script')  (script injection)"),
+    # --- extension / downloads ------------------------------------------
+    (re.compile(r"\bchrome\s*\.\s*(?:downloads|tabs|runtime|scripting|"
+                r"debugger|webRequest|cookies|management|proxy)\b"),
+     "chrome.* privileged API"),
 ]
 
+# Gated interaction patterns, keyed by the capability the operator must
+# enable to use them.
+_GATED: dict[str, list[tuple[re.Pattern, str]]] = {
+    "media": [
+        (re.compile(r"\.\s*(?:play|pause|load)\s*\(\s*\)"),
+         "media .play() / .pause() / .load()"),
+        (re.compile(r"\.\s*(?:muted|currentTime|volume|playbackRate)\s*="),
+         "media property write (.muted / .currentTime / ...)"),
+        (re.compile(r"\.\s*requestFullscreen\s*\("),
+         ".requestFullscreen()"),
+    ],
+    "click": [
+        (re.compile(r"\.\s*click\s*\(\s*\)"),
+         "element .click()"),
+        (re.compile(r"\.\s*dispatchEvent\s*\("),
+         ".dispatchEvent()"),
+    ],
+}
 
-def safety_check(js: str) -> str | None:
-    """Return a reason string when ``js`` should be rejected, else
-    ``None``. Best-effort; see threat model in module docstring."""
-    for rx, why in _BLOCKED:
+# Verbs that mark a DESTRUCTIVE / irreversible UI action. When an
+# interaction sink (.click / .dispatchEvent / .submit) co-occurs with one
+# of these in the same probe, reject it EVEN IF the operator enabled
+# "click" -- this is the "irreversible UI op" absolute no-go (submit /
+# delete / buy / post / report / logout, on a possibly logged-in session).
+_DESTRUCTIVE_VERB = re.compile(
+    r"(?i)(?:\bsubmit\b|\bsend\b|\bdelete\b|\bremove\b|\bdestroy\b|\bbuy\b|"
+    r"purchase|checkout|payment|\bpay\b|\border\b|publish|\bpost\b|comment|"
+    r"reply|\bshare\b|follow|subscribe|logout|sign\s*out|log\s*out|confirm|"
+    r"削除|消去|通報|報告|送信|投稿|公開|購入|支払|決済|注文|共有|フォロー|"
+    r"登録|退会|ログアウト)"
+)
+_INTERACTION_SINK = re.compile(
+    r"\.\s*(?:click|dispatchEvent|submit|requestSubmit)\s*\("
+)
+# Data-exfiltration: a network sink that carries a sensitive value off the
+# page. Blocked unconditionally.
+_NET_SINK = re.compile(
+    r"(?:\bfetch\s*\(|XMLHttpRequest|\.\s*send\s*\(|new\s+Image|"
+    r"sendBeacon|\.\s*src\s*=)"
+)
+_SENSITIVE_SRC = re.compile(
+    r"document\s*\.\s*cookie|localStorage|sessionStorage"
+)
+
+
+def safety_check(js: str, allow: set[str] | None = None) -> str | None:
+    """Return a reason string when ``js`` should be rejected, else ``None``.
+
+    ``allow`` is the set of operator-enabled capability keys for this run
+    (e.g. ``{"media", "click"}``). Absolute-no-go patterns are rejected
+    regardless; gated patterns are rejected only when their capability is
+    NOT in ``allow``. Best-effort; see threat model in the module docstring.
+    """
+    allow = allow or set()
+    for rx, why in _ALWAYS_BLOCKED:
         if rx.search(js):
             return why
+    # Gated interactions: block unless the matching capability is enabled.
+    for cap, patterns in _GATED.items():
+        if cap in allow:
+            continue
+        for rx, why in patterns:
+            if rx.search(js):
+                return f"{why} -- enable the '{cap}' capability to allow it"
+    # Destructive UI op: never allowed, even with "click" enabled.
+    if _INTERACTION_SINK.search(js) and _DESTRUCTIVE_VERB.search(js):
+        return ("destructive UI action (submit/send/delete/buy/post/"
+                "report/logout ...) is never allowed")
+    # Exfiltration: network sink + sensitive source.
+    if _NET_SINK.search(js) and _SENSITIVE_SRC.search(js):
+        return "data exfiltration (cookie/storage sent over the network)"
     return None
 
 
 # ---------------------------------------------------------------------------
 # LLM system prompt + JSON action protocol.
 # ---------------------------------------------------------------------------
-_SYSTEM = """\
+_SYSTEM_TMPL = """\
 You are a FORENSICS ANALYST. You are inspecting a live web page in a
 real browser to answer a specific question. Work iteratively: each
 turn, either ask for ONE JS probe and read the result, or finish with a
@@ -151,18 +235,11 @@ You CAN:
     to find site-defined functions / vars.
   * Call existing site JS functions (e.g. window.someShowFn()) when you
     suspect a reveal/trigger; this is allowed because it's the site's
-    own JS in the site's own page. Do NOT click DOM elements.
+    own JS in the site's own page.
   * Pattern-match with regex. STRINGIFY before returning (objects come
     back as RemoteObject descriptors otherwise -- always JSON.stringify).
 
-You MUST NOT (probes will be REJECTED automatically):
-  * Navigate or change URL  (location.href=, location.replace, history.*).
-  * Submit forms or call element .click() / .submit().
-  * Mutate cookies, localStorage, sessionStorage, IndexedDB.
-  * Write to the DOM  (.innerHTML=, .outerHTML=, document.write).
-  * POST anything  (fetch with method:'POST', XHR .open('POST', ...)).
-  * Open new windows (window.open).
-
+{permissions}
 PROBE DESIGN
   * Keep `expression` a single self-contained JS expression. IIFEs are
     fine: `(()=>{ ... return JSON.stringify(out); })()`.
@@ -198,6 +275,71 @@ RULES
    counts you observed) so the operator can audit.
 """
 
+# Human labels for the gated capabilities (used in the system prompt).
+_CAP_LABELS: dict[str, str] = {
+    "media": (
+        "MEDIA PLAYBACK: you may start/stop media to trigger lazy video "
+        "loads and observe the resulting requests -- "
+        "document.querySelector('video').play() / .pause() / .load(), and "
+        "set .muted / .currentTime / .volume / .playbackRate. Prefer "
+        "calling .play() directly over clicking a play button."
+    ),
+    "click": (
+        "ELEMENT CLICKS: you may click NON-DESTRUCTIVE controls "
+        "(play / reveal / expand / tab buttons) via element.click() or "
+        "dispatchEvent. NEVER click anything that submits, sends, posts, "
+        "comments, replies, deletes, reports, buys, pays, shares, follows, "
+        "subscribes, or logs out -- those are rejected automatically and "
+        "could act with the session's logged-in authority."
+    ),
+}
+
+
+def _build_system(allow: set[str] | None) -> str:
+    """Render the system prompt with a PERMISSIONS block reflecting the
+    operator's per-run capability choices."""
+    allow = allow or set()
+    lines: list[str] = []
+    enabled = [c for c in ("media", "click") if c in allow]
+    if enabled:
+        lines.append(
+            "ENABLED INTERACTIONS (the operator allowed these for THIS run):"
+        )
+        for c in enabled:
+            lines.append(f"  * {_CAP_LABELS[c]}")
+    else:
+        lines.append(
+            "READ-ONLY RUN: only inspect. Do not click, play, submit, or "
+            "change anything (such probes are rejected automatically)."
+        )
+    lines.append("")
+    lines.append("You MUST NOT (probes are REJECTED automatically), ever:")
+    lines.append(
+        "  * Navigate / change URL (location.href=, location.replace, "
+        "history.*) or open windows (window.open)."
+    )
+    lines.append(
+        "  * Submit forms (.submit()) or click destructive controls "
+        "(send/post/delete/buy/pay/share/report/logout)."
+    )
+    lines.append(
+        "  * Mutate cookies / localStorage / sessionStorage / IndexedDB."
+    )
+    lines.append(
+        "  * Write/inject DOM (.innerHTML=, .outerHTML=, document.write, "
+        "insertAdjacentHTML, createElement('script'))."
+    )
+    lines.append(
+        "  * POST/PUT/PATCH/DELETE (fetch/XHR), sendBeacon, or send "
+        "cookies/storage off-page (exfiltration)."
+    )
+    lines.append("  * Use chrome.* privileged APIs or trigger downloads.")
+    permissions = "\n".join(lines) + "\n"
+    # NB: plain .replace, not .format -- the template is full of literal
+    # JS braces ({"thought":...}, (()=>{...})()) that str.format would
+    # try (and fail) to interpret as fields.
+    return _SYSTEM_TMPL.replace("{permissions}", permissions)
+
 
 # ---------------------------------------------------------------------------
 # Public types
@@ -230,10 +372,12 @@ EvaluateFn = Callable[[str, bool], Awaitable[tuple[bool, Any, int]]]
 # ---------------------------------------------------------------------------
 # LLM call
 # ---------------------------------------------------------------------------
-async def _chat(history: list[dict], *, max_tokens: int = 2400) -> str:
+async def _chat(
+    history: list[dict], system: str, *, max_tokens: int = 2400
+) -> str:
     body: dict = {
         "model": FORENSICS_MODEL_NAME,
-        "messages": [{"role": "system", "content": _SYSTEM}] + history,
+        "messages": [{"role": "system", "content": system}] + history,
         "temperature": 0.2,
         "max_tokens": max_tokens,
         "response_format": {"type": "json_object"},
@@ -295,14 +439,21 @@ async def run_forensics(
     page_url: str | None,
     evaluate_fn: EvaluateFn,
     max_steps: int | None = None,
+    allow: set[str] | None = None,
 ) -> ForensicsResult:
     """Drive the forensics loop. ``evaluate_fn(js, await_promise)``
     returns ``(ok, value_or_err, elapsed_ms)``; the caller wraps the
     existing session evaluate transport, so this module stays
-    decoupled from FastAPI / the worker protocol."""
+    decoupled from FastAPI / the worker protocol.
+
+    ``allow`` is the set of operator-enabled interaction capabilities for
+    this run (subset of {"media", "click"}); it relaxes the pre-flight
+    safety check and is reflected in the system prompt."""
     t0 = time.time()
     cap = int(max_steps or FORENSICS_DEFAULT_MAX_STEPS)
     cap = max(1, min(cap, 60))  # bound the bound
+    allow = {c for c in (allow or set()) if c in _GATED}
+    system = _build_system(allow)
 
     user_msg = (
         f"GOAL: {goal.strip()}\n"
@@ -317,7 +468,7 @@ async def run_forensics(
 
     for n in range(1, cap + 1):
         try:
-            raw = await _chat(history)
+            raw = await _chat(history, system)
         except Exception as e:
             final_report = (
                 f"Investigation aborted at step {n}: LLM call failed "
@@ -344,7 +495,7 @@ async def run_forensics(
         if not expr:
             step.error = "empty expression"
         else:
-            blocked = safety_check(expr)
+            blocked = safety_check(expr, allow)
             if blocked:
                 step.error = f"BLOCKED by safety check: {blocked}"
             else:
@@ -413,7 +564,7 @@ async def run_forensics(
             ),
         })
         try:
-            raw = await _chat(history)
+            raw = await _chat(history, system)
             act = _parse_action(raw)
             rep = str(act.get("report") or "").strip()
             if rep and rep != "(no report)":
