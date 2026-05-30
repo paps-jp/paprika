@@ -628,10 +628,27 @@ Rules
    terminal.
 9b. Use ``page.agent(goal, max_steps=N)`` for short LOCAL unknowns
     that the script can't predict (age gates, cookie/consent dialogs,
-    SPA elements that vary across visits, click-to-play video widgets,
-    login flows where the layout shifts). The script keeps writing
-    the deterministic loops; only the ambiguous spots get delegated
-    to the LLM. Typical ``N`` is 2-5; never above 10.
+    SPA elements that vary across visits, login flows where the layout
+    shifts). The script keeps writing the deterministic loops; only the
+    ambiguous spots get delegated to the LLM. Typical ``N`` is 2-5;
+    never above 10.
+
+    AVOID ``page.agent()`` for simple one-click actions like clicking a
+    play button. The agent spawns a full LLM vision loop (2-3 min per
+    call) and frequently TIMES OUT on video players. Instead, use
+    ``page.evaluate()`` or ``page.click()`` for deterministic clicks::
+
+        # SLOW -- agent loop, 120-180s, often times out:
+        #   await page.agent("Click the play button", max_steps=3)
+        #
+        # FAST -- direct JS, <1s:
+        await page.evaluate(
+            "document.querySelector('video')?.play() "
+            "|| document.querySelector('[class*=play]')?.click()"
+        )
+
+    Reserve ``page.agent()`` for multi-step flows with unpredictable
+    DOM layout (age gates, cookie banners, login forms).
 
     SIGNATURE (read carefully -- frequent mistake):
 
@@ -723,7 +740,7 @@ __VIDEO_SECTION_BEGIN__
         tabs = list(page)
         for p in tabs[1:]:                # tabs[0] is the listing page
             await p.switch()
-            r = await p.download_video(timeout_s=600)
+            r = await p.download_video(timeout_s=1800)
             if r.get("file_count", 0):
                 total += r.file_count
         await page.close_popups()         # tidy up before next click
@@ -772,7 +789,7 @@ __VIDEO_SECTION_BEGIN__
 
         async for visit in pap.walk(page, target_pages=20, ...):
             if "/video." in visit.url:        # site-specific test
-                r = await page.download_video(timeout_s=600)
+                r = await page.download_video(timeout_s=1800)
                 print(f"  -> downloaded {r.file_count} file(s)")
                 # If you need the names:
                 #   for name in r.get("files", []):
@@ -796,7 +813,7 @@ __VIDEO_SECTION_BEGIN__
         downloaded_any = False
         async for visit in pap.walk(page, target_pages=20, ...):
             if looks_like_video_page(visit.url):
-                r = await page.download_video(timeout_s=600)
+                r = await page.download_video(timeout_s=1800)
                 if r.get("file_count", 0) > 0:
                     downloaded_any = True
 
@@ -806,7 +823,7 @@ __VIDEO_SECTION_BEGIN__
         # know how to enumerate them from one URL.
         if not downloaded_any:
             await page.goto(start_url)            # re-anchor if needed
-            r = await page.download_video(timeout_s=600)
+            r = await page.download_video(timeout_s=1800)
             print(f"  -> fallback downloaded {r.file_count} file(s)")
 
     The rule of thumb: an empty result from page.download_video()
@@ -815,6 +832,99 @@ __VIDEO_SECTION_BEGIN__
     ``RuntimeError("no video found")`` wastes the entire attempt
     and forces a retry from scratch. Always try the fallback before
     giving up.
+
+9d-ter. NETWORK-AWARE VIDEO DOWNLOAD -- FOR SITES yt-dlp DOESN'T KNOW.
+
+    Many video sites serve their streams via a 3rd-party CDN (e.g.
+    surrit.com, cdn77, bunnycdn, ...) using HLS .m3u8 playlists that
+    yt-dlp cannot discover from the PAGE URL because the site isn't a
+    recognised yt-dlp extractor. The video player loads the playlist
+    via XHR/Fetch inside the page (or an iframe), and that request IS
+    captured in the session's network log. The script can read it with
+    ``await page.network()`` and pass the URL directly.
+
+    This pattern REPLACES the naive "page.agent('click play') ->
+    page.download_video()" approach that burns 120-180s on the agent
+    call and then fails anyway. The correct approach:
+
+    1. TRIGGER playback cheaply -- use ``page.evaluate()`` or
+       ``page.click()`` on the ``<video>`` or play-button element.
+       DO NOT use ``page.agent()`` for play-button clicks; it spawns
+       a full LLM vision loop that takes 2-3 minutes, far too slow
+       for a single click.  A JS snippet is both faster and more
+       reliable::
+
+           await page.evaluate(
+               "document.querySelector('video')?.play() "
+               "|| document.querySelector('[class*=play]')?.click()"
+           )
+           await asyncio.sleep(5)   # give the player time to fetch m3u8
+
+    2. SNIFF the network log for .m3u8 / .mpd URLs::
+
+           net = await page.network()
+           streams = [
+               e["url"] for e in net.get("entries", [])
+               if ".m3u8" in e.get("url", "") or ".mpd" in e.get("url", "")
+           ]
+
+    3. DOWNLOAD using the sniffed URL with a generous timeout::
+
+           if streams:
+               # prefer the LAST m3u8 (usually highest quality / master)
+               r = await page.download_video(
+                   url=streams[-1], timeout_s=3600
+               )
+           else:
+               # fallback: let yt-dlp try the page URL
+               r = await page.download_video(timeout_s=1800)
+           print(f"downloaded {r.get('file_count', 0)} file(s)")
+
+    Complete recipe for a single-video page with age gate::
+
+        TARGET_URL = "https://example.com/video/12345"
+
+        async def main():
+            async with async_paprika.connect() as cli:
+                async with cli.session(initial_url=TARGET_URL) as page:
+                    # 1) age gate / consent
+                    await page.agent(
+                        "Accept any age verification or consent dialog.",
+                        max_steps=3,
+                    )
+                    # 2) close ad popups
+                    await page.close_popups()
+
+                    # 3) trigger playback via JS (fast, no agent timeout)
+                    await page.evaluate(
+                        "document.querySelector('video')?.play() "
+                        "|| document.querySelector('[class*=play]')?.click()"
+                    )
+                    await asyncio.sleep(5)
+
+                    # 4) sniff m3u8 from network log
+                    net = await page.network()
+                    streams = [
+                        e["url"] for e in net.get("entries", [])
+                        if ".m3u8" in e.get("url", "")
+                           or ".mpd" in e.get("url", "")
+                    ]
+                    print(f"detected {len(streams)} stream URL(s)")
+
+                    # 5) download with sniffed URL (or page URL fallback)
+                    if streams:
+                        r = await page.download_video(
+                            url=streams[-1], timeout_s=3600,
+                        )
+                    else:
+                        r = await page.download_video(timeout_s=1800)
+                    print(f"downloaded {r.get('file_count', 0)} file(s)")
+
+    TIMEOUT GUIDANCE: full-length videos can be 1-10 GB. A 4 GB HLS
+    stream takes ~30-55 minutes on a 10 Mbit connection. Always use
+    ``timeout_s=3600`` (1 hour) for full-video downloads. The default
+    ``timeout_s=1800`` (30 min) is okay for shorter clips. NEVER use
+    ``timeout_s=600`` -- it will time out on anything over ~1 GB.
 __VIDEO_SECTION_END__
 
     Same idea applies more generally: when the "find candidate URL
@@ -935,9 +1045,11 @@ def _filter_video_section(prompt: str, *, download_video: bool) -> str:
     block in :data:`_SYSTEM_PROMPT` based on the job's ``download_video``
     flag.
 
-    The block contains rules 9c-ter (popup-spawned download recipe) and
-    9d-bis (``page.download_video()`` reference) plus their fallbacks --
-    everything that tells the LLM how to use the video-DL machinery.
+    The block contains rules 9c-ter (popup-spawned download recipe),
+    9d-bis (``page.download_video()`` reference), and 9d-ter
+    (network-aware download for sites yt-dlp doesn't know) plus their
+    fallbacks -- everything that tells the LLM how to use the video-DL
+    machinery.
     When ``download_video=False`` (the common cheap-extraction case) we
     remove the whole block AND append a single negative line so the
     model doesn't reach back to its training distribution and emit

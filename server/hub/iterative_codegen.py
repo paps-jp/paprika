@@ -627,6 +627,19 @@ async def run_iterative_codegen(
                 pass
         logger.info("[%s] %s", job_id, line)
 
+    # When download_video is enabled, enforce a minimum timeout so
+    # large HLS streams (4+ GB, ~30-55 min) don't get killed mid-
+    # download. The UI default for AI調査 is 600s which is far too
+    # short. Bump silently; the operator can always raise it further.
+    _VIDEO_MIN_TIMEOUT = 3600.0
+    if download_video and attempt_timeout_s < _VIDEO_MIN_TIMEOUT:
+        _log(
+            f"start: download_video=True, bumping attempt_timeout "
+            f"from {attempt_timeout_s:.0f}s to {_VIDEO_MIN_TIMEOUT:.0f}s "
+            f"(video downloads need ≥30 min)"
+        )
+        attempt_timeout_s = _VIDEO_MIN_TIMEOUT
+
     _log(f"start: max_attempts={max_attempts} timeout={attempt_timeout_s}s")
     attempts: list[Attempt] = []
     t0 = time.time()
