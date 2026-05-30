@@ -4229,6 +4229,17 @@ class WorkerAgent:
                         videos_dir.mkdir(parents=True, exist_ok=True)
                         timeout_s = int(action.get("timeout_s") or 1800)
                         referer = action.get("referer")
+                        # Default referer to the current page URL when
+                        # user-pinned URL points at a different host
+                        # (e.g. m3u8 on a CDN). Many CDNs reject bare
+                        # requests without a plausible Referer.
+                        if not referer:
+                            try:
+                                referer = await tab.evaluate(
+                                    "document.location.href"
+                                )
+                            except Exception:
+                                pass
 
                         # ---- candidate URL list (priority ordered) ----
                         # Tier 1: user-pinned ``url=`` (caller knows best)
