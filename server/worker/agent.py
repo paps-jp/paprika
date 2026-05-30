@@ -18,8 +18,9 @@ import string
 import sys
 import tempfile
 import time
+from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Optional
+from typing import Any, Callable, Optional
 from urllib.parse import urlsplit, urlunsplit
 
 import httpx
@@ -2246,6 +2247,89 @@ def _normalise_extracted_profile(root: Path, *, log=None) -> None:
         msg_log("  ... normalised extracted profile: wrapped flat layout in 'Default/'")
 
 
+# ============================================================================
+# Session-action handler registry (plugin-style dispatch)
+# ----------------------------------------------------------------------------
+# ``_handle_session_action`` used to be a ~2300-line if/elif over every
+# action ``kind``. We're migrating it to a registry: each handler is a
+# small ``async def _act_<kind>(self, ctx)`` method decorated with
+# :func:`_session_action`, which records the kind + its two routing flags
+# (``read_only`` = allowed against a fetch-owned session mid-fetch;
+# ``session_level`` = runs under ``state.lock`` rather than a per-tab lock).
+#
+# This co-locates each kind's routing metadata with its handler, so the
+# two legacy hardcoded sets below stop needing manual upkeep -- the
+# decorator asserts the flag agrees with the legacy set at import time
+# while both coexist during the migration. When every explicit kind has
+# moved into the registry, the if/elif + the two sets get deleted and the
+# router derives everything from ``_SESSION_ACTIONS``.
+#
+# The mutating actions (click / fill / press / scroll / navigate / back /
+# forward / history_first / wait) are intentionally NOT individual
+# handlers: they all delegate uniformly to ``browser_ops.execute`` via the
+# router's ``else`` branch, so they need no per-kind entry.
+
+# Actions that are safe to run against a session a fetch job is actively
+# driving (read-only / non-tab-driving). Module-level constant (was
+# rebuilt per call as a local); referenced by the fetch-owned gate.
+_READ_ONLY_KINDS_FOR_FETCH = {
+    "outline", "state", "screenshot", "visited", "get_cookies", "links",
+    "exists", "ask", "network", "last_response", "pages", "switch_page",
+    "zoom", "ext",
+}
+# Kinds that operate on the session as a whole (not a specific tab); they
+# run under ``state.lock`` rather than the per-page lock.
+_SESSION_LEVEL_KINDS = {"pages", "new_page", "close_page", "switch_page"}
+
+
+@dataclass
+class _ActionCtx:
+    """Everything a session-action handler needs. Built once per action
+    in ``_handle_session_action`` and passed to the matched handler."""
+
+    state: Any                 # SessionState
+    tab: Any                   # target nodriver Tab (None for session-level)
+    action: dict
+    reply: Any                 # WorkerSessionActionResult (handler mutates)
+    cur: str                   # snapshotted current URL of the target tab
+    slog: Callable[[str], None]
+    t0: float
+    msg: Any                   # HubSessionAction
+
+
+@dataclass
+class _ActionSpec:
+    fn: Callable               # unbound: called as fn(self, ctx)
+    read_only: bool
+    session_level: bool
+
+
+# kind -> spec. Populated by the @_session_action decorator at class-def time.
+_SESSION_ACTIONS: dict[str, _ActionSpec] = {}
+
+
+def _session_action(kind: str, *, read_only: bool = False, session_level: bool = False):
+    """Register a WorkerAgent method as the handler for ``kind``.
+
+    Asserts the declared flags match the legacy hardcoded sets so a
+    copy-paste error surfaces at import time (not as a silent mid-fetch
+    permission / locking bug) while the registry and the if/elif coexist.
+    Drop the asserts once the legacy sets are removed.
+    """
+    assert read_only == (kind in _READ_ONLY_KINDS_FOR_FETCH), (
+        f"{kind!r}: read_only={read_only} disagrees with _READ_ONLY_KINDS_FOR_FETCH"
+    )
+    assert session_level == (kind in _SESSION_LEVEL_KINDS), (
+        f"{kind!r}: session_level={session_level} disagrees with _SESSION_LEVEL_KINDS"
+    )
+
+    def deco(fn: Callable) -> Callable:
+        _SESSION_ACTIONS[kind] = _ActionSpec(fn, read_only, session_level)
+        return fn
+
+    return deco
+
+
 class WorkerAgent:
     def __init__(
         self,
@@ -3365,6 +3449,44 @@ class WorkerAgent:
                 f"[worker {self.worker_id}] failed to send session_start_ack: {e}"
             )
 
+    # ----- session-action handlers (registry, plugin-style) ----------------
+    # Each handler reads/writes through the _ActionCtx and is registered
+    # for its ``kind`` by the @_session_action decorator. The router in
+    # _handle_session_action dispatches to these; un-migrated kinds still
+    # live in the if/elif there. Read-only query kinds first (safest).
+
+    @_session_action("outline", read_only=True)
+    async def _act_outline(self, ctx: "_ActionCtx") -> None:
+        ctx.reply.result = await browser_ops.outline(
+            ctx.tab,
+            visited_urls=ctx.state.visited_urls,
+        )
+
+    @_session_action("visited", read_only=True)
+    async def _act_visited(self, ctx: "_ActionCtx") -> None:
+        ctx.reply.result = list(ctx.state.visited_urls_ordered)
+
+    @_session_action("last_response", read_only=True)
+    async def _act_last_response(self, ctx: "_ActionCtx") -> None:
+        # Most recent main-document HTTP response observed on this
+        # session (goto / back / forward / reload / click-navigation),
+        # updated by the passive tracker installed at session_start.
+        # None until a document response has been seen.
+        ctx.reply.result = ctx.state.last_response
+
+    @_session_action("network", read_only=True)
+    async def _act_network(self, ctx: "_ActionCtx") -> None:
+        # Session network traffic log for the Live panel "Network" tab.
+        # ``since`` enables incremental polling (only newer entries).
+        since_ts = float(ctx.action.get("since", 0) or 0)
+        entries = ctx.state.network_log
+        if since_ts:
+            entries = [e for e in entries if e.get("timestamp", 0) > since_ts]
+        ctx.reply.result = {
+            "count": len(ctx.state.network_log),
+            "entries": entries,
+        }
+
     async def _handle_session_action(self, msg: HubSessionAction) -> None:
         """Dispatch one action against a bound session via browser_ops."""
         sid = msg.session_id
@@ -3392,53 +3514,10 @@ class WorkerAgent:
             _logger.info(f"[session {sid}] {line}")
 
         # Fetch-owned sessions are read-only: the fetch loop is driving
-        # the tab and a write action mid-fetch would race (clicks would
-        # collide with the scroll loop, navigates would derail asset
-        # capture). Reject early with a clear error so the UI shows
-        # something sensible instead of a CDP-level explosion.
-        _READ_ONLY_KINDS_FOR_FETCH = {
-            "outline",
-            "state",
-            "screenshot",
-            "visited",
-            "get_cookies",
-            "links",
-            "exists",
-            "ask",
-            # Network log: read-only list populated by the fetcher's
-            # own CDP handlers. Safe to read mid-fetch.
-            "network",
-            # Last main-document HTTP response. Updated by a passive
-            # listener so reading it never races the fetch loop.
-            "last_response",
-            # Tab management is read-only-safe: listing / switching
-            # default doesn't drive the fetch loop's tab. Creating /
-            # closing tabs is still disallowed during fetch (the
-            # passive listener is bound to a specific tab and would
-            # de-sync). Hence only "pages" / "switch_page" included.
-            "pages",
-            "switch_page",
-            # Page zoom is a viewing aid (visual magnification only --
-            # Emulation.setPageScaleFactor). It doesn't navigate or
-            # touch the DOM, so it's safe to apply while a fetch drives
-            # the tab (operator zooms in to watch / inspect).
-            "zoom",
-            # Generic Paprika Agent extension command. Applies browser
-            # config (request header/block rules, content settings,
-            # privacy, proxy, ...) -- it doesn't navigate or drive the
-            # fetch loop's tab. Notably lets an operator set a Referer
-            # header rule to rescue a CDN fetch mid-capture.
-            "ext",
-        }
-        # Session-level kinds (operate on the session as a whole, not
-        # on any specific tab). They run under ``state.lock`` rather
-        # than the per-page lock.
-        _SESSION_LEVEL_KINDS = {
-            "pages",
-            "new_page",
-            "close_page",
-            "switch_page",
-        }
+        # the tab and a write action mid-fetch would race. The set of
+        # allowed kinds (``_READ_ONLY_KINDS_FOR_FETCH``) and the
+        # session-level set (``_SESSION_LEVEL_KINDS``) are module-level
+        # constants now -- see the registry block above ``WorkerAgent``.
         action = msg.action or {}
         kind = action.get("kind") or ""
         # A read-only evaluate (forensics probe) is also permitted
@@ -3498,7 +3577,10 @@ class WorkerAgent:
 
                 # Snapshot the current URL into visited_urls so the
                 # visited=true marker works for the next outline. Only
-                # meaningful for per-tab kinds (tab exists).
+                # meaningful for per-tab kinds (tab exists). ``cur`` is
+                # initialised first so the ctx below always has it (a
+                # session-level kind has tab=None and never assigns it).
+                cur = ""
                 if tab is not None:
                     try:
                         cur = await tab.evaluate("document.location.href")
@@ -3507,12 +3589,18 @@ class WorkerAgent:
                     if cur:
                         state.note_url(browser_ops.canon_url(cur))
 
-                if kind == "outline":
-                    out = await browser_ops.outline(
-                        tab,
-                        visited_urls=state.visited_urls,
-                    )
-                    reply.result = out
+                # Plugin-style dispatch: kinds migrated into the
+                # _SESSION_ACTIONS registry are handled by their
+                # decorated _act_<kind> method. Everything not yet
+                # migrated falls through to the if/elif below (and the
+                # mutating catch-all ``else`` at the end).
+                ctx = _ActionCtx(
+                    state=state, tab=tab, action=action, reply=reply,
+                    cur=cur, slog=_slog, t0=t0, msg=msg,
+                )
+                spec = _SESSION_ACTIONS.get(kind)
+                if spec is not None:
+                    await spec.fn(self, ctx)
                 elif kind == "state":
                     try:
                         title = await tab.evaluate("document.title")
@@ -3563,34 +3651,6 @@ class WorkerAgent:
                             )
                         except Exception as e:
                             _slog(f"screenshot gallery upload failed: {e}")
-                elif kind == "visited":
-                    reply.result = list(state.visited_urls_ordered)
-                elif kind == "last_response":
-                    # Return the most recent main-document HTTP response
-                    # observed on this session, regardless of whether
-                    # the navigation was triggered by goto / back / forward
-                    # / reload / history_first or a click that happened
-                    # to navigate (form submit, anchor click, JS
-                    # location.href = ...). state.last_response is
-                    # updated by the passive tracker installed at
-                    # session_start (browser_ops.install_last_response_tracker).
-                    # None when no document response has been observed yet
-                    # (session opened with initial_url=about:blank etc.).
-                    reply.result = state.last_response
-                elif kind == "network":
-                    # Return the session's network traffic log for the
-                    # Live panel "Network" tab. Each entry:
-                    #   {url, mime, size, saved, document_url, timestamp}
-                    # The ``since`` parameter lets the client do
-                    # incremental polling (only new entries).
-                    since_ts = float(action.get("since", 0) or 0)
-                    entries = state.network_log
-                    if since_ts:
-                        entries = [e for e in entries if e.get("timestamp", 0) > since_ts]
-                    reply.result = {
-                        "count": len(state.network_log),
-                        "entries": entries,
-                    }
                 elif kind == "links":
                     # Return every <a href> on the current page resolved
                     # to absolute URLs, deduped, with the visible text
