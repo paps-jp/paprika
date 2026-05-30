@@ -75,9 +75,32 @@ def _smb_is_healthy(mount_point: str) -> bool:
         return False
 
 
+def _smb_field_is_safe(value: str) -> bool:
+    """Reject values that would break out of the CIFS ``-o`` option list.
+
+    server / share / username / password are interpolated unescaped into
+    the comma-joined ``-o`` string and the ``//server/share`` UNC. A comma
+    injects an arbitrary extra CIFS option (e.g. ``…,credentials=/path``,
+    ``unc=…``); a CR/LF could split the argument. None of these fields
+    legitimately contains a comma or newline, so reject them. (``extra_opts``
+    is intentionally NOT checked here -- it legitimately contains commas,
+    e.g. ``vers=3.0,sec=ntlmssp``, and is operator-set.)
+    """
+    return not any(c in value for c in (",", "\n", "\r"))
+
+
 def _smb_mount(server: str, share: str, username: str, password: str,
                mount_point: str, extra_opts: str) -> str:
     """Mount an SMB share. Returns "" on success, error string on failure."""
+    # Defend the option-list interpolation below against injection via
+    # operator-supplied (and, pre-auth-gate, attacker-supplied) settings.
+    for label, val in (
+        ("smb_server", server), ("smb_share", share),
+        ("smb_username", username), ("smb_password", password),
+    ):
+        if not _smb_field_is_safe(val):
+            return f"{label} contains an illegal character (comma / newline)"
+
     mp = Path(mount_point)
     try:
         mp.mkdir(parents=True, exist_ok=True)

@@ -1244,13 +1244,27 @@ document.addEventListener('click', e => {
 });
 
 // --- main refresh -----------------------------------------------------------
+// Resilient JSON fetch: returns ``fallback`` on a network error OR a
+// non-2xx status (an HTML error page would otherwise blow up r.json()).
+// Used by refresh() so a single flaky endpoint can't reject the whole
+// Promise.all and freeze every table for the rest of the session.
+async function _refreshJson(url, fallback) {
+  try {
+    const r = await fetch(url);
+    if (!r.ok) return fallback;
+    return await r.json();
+  } catch (_) {
+    return fallback;
+  }
+}
+
 async function refresh() {
   try {
     const [h, workers, jobs, sessions] = await Promise.all([
-      fetch('/health').then(r => r.json()),
-      fetch('/workers').then(r => r.json()),
-      fetch('/jobs').then(r => r.json()),
-      fetch('/sessions').then(r => r.json()).catch(() => ({count:0, sessions:[]})),
+      _refreshJson('/health', { store: '?', workers: '?' }),
+      _refreshJson('/workers', { count: 0, workers: [] }),
+      _refreshJson('/jobs', { total: 0, jobs: [] }),
+      _refreshJson('/sessions', { count: 0, sessions: [] }),
     ]);
     const wcount = workers.count || 0;
     const jcount = jobs.total ?? (jobs.jobs || jobs).length;
@@ -9871,7 +9885,18 @@ async function loadSettingsPanel() {
       _setVal('setSmbServer', hub.smb_server);
       _setVal('setSmbShare', hub.smb_share);
       _setVal('setSmbUsername', hub.smb_username);
-      _setVal('setSmbPassword', hub.smb_password);
+      // Password is redacted server-side (GET never returns it). Leave
+      // the field blank and signal whether one is stored via the
+      // placeholder; saveSettingsSmb omits a blank field so "save
+      // without retyping" keeps the existing password.
+      const _setSecretPw = (id, isSet) => {
+        const e = document.getElementById(id);
+        if (!e) return;
+        e.value = '';
+        e.placeholder = isSet ? '(設定済み — 変更時のみ入力)' : '(未設定)';
+      };
+      const _secretsSet = d.secrets_set || {};
+      _setSecretPw('setSmbPassword', !!_secretsSet.smb_password);
       _setVal('setSmbMountPoint', hub.smb_mount_point || '/mnt/paprika');
       _setVal('setSmbMountOptions', hub.smb_mount_options);
       // SMB status banner + disk usage
@@ -9894,7 +9919,7 @@ async function loadSettingsPanel() {
       if (_mdbPort) _mdbPort.value = hub.mariadb_port || 3306;
       _setVal('setMariadbDatabase', hub.mariadb_database || 'paprika');
       _setVal('setMariadbUsername', hub.mariadb_username);
-      _setVal('setMariadbPassword', hub.mariadb_password);
+      _setSecretPw('setMariadbPassword', !!_secretsSet.mariadb_password);
       // MariaDB status banner
       const mdbSt = d.mariadb_status || {};
       _updateMariadbStatusBanner(mdbSt);
@@ -10173,10 +10198,14 @@ async function saveSettingsSmb() {
     smb_server:        (document.getElementById('setSmbServer').value || '').trim(),
     smb_share:         (document.getElementById('setSmbShare').value || '').trim(),
     smb_username:      (document.getElementById('setSmbUsername').value || '').trim(),
-    smb_password:      document.getElementById('setSmbPassword').value || '',
     smb_mount_point:   (document.getElementById('setSmbMountPoint').value || '/mnt/paprika').trim(),
     smb_mount_options: (document.getElementById('setSmbMountOptions').value || '').trim(),
   };
+  // Only send the password when the operator actually typed one — a
+  // blank field means "keep the stored password" (it's never echoed
+  // back to the form, so a blank save must not wipe it).
+  const _smbPw = document.getElementById('setSmbPassword').value || '';
+  if (_smbPw) body.smb_password = _smbPw;
   try {
     const r = await fetch(SETTINGS_URL, {
       method: 'PUT',
@@ -10311,8 +10340,11 @@ async function saveSettingsMariadb() {
     mariadb_port: parseInt(document.getElementById('setMariadbPort')?.value, 10) || 3306,
     mariadb_database: (document.getElementById('setMariadbDatabase')?.value || 'paprika').trim(),
     mariadb_username: (document.getElementById('setMariadbUsername')?.value || '').trim(),
-    mariadb_password: document.getElementById('setMariadbPassword')?.value || '',
   };
+  // Blank password field => keep the stored one (it's redacted from
+  // GET /settings and never re-populated, so omit it from the PUT).
+  const _mdbPw = document.getElementById('setMariadbPassword')?.value || '';
+  if (_mdbPw) body.mariadb_password = _mdbPw;
   try {
     const r = await fetch(SETTINGS_URL, {
       method: 'PUT',

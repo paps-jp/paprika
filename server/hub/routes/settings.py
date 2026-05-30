@@ -35,6 +35,12 @@ log = logging.getLogger(__name__)
 
 router = APIRouter(tags=["Settings"])
 
+# Setting keys whose VALUE must never be returned by GET /settings (the
+# endpoint is unauthenticated on the LAN). Redacted to "" in the GET
+# payload; the UI uses the companion ``secrets_set`` map to show whether
+# one is stored. PUT still accepts the real value to (re)set it.
+_SECRET_KEYS = frozenset({"smb_password", "mariadb_password"})
+
 
 def _require_settings() -> SettingsRegistry:
     if state.settings is None:
@@ -87,8 +93,21 @@ async def get_settings() -> dict:
         except Exception:
             mdb_status = {"connected": False}
 
+    # Never ship secret values to the browser. GET /settings is
+    # unauthenticated on the LAN, so returning smb_password /
+    # mariadb_password in cleartext (as reg.all() does) would leak the
+    # NAS + DB credentials to anyone who can curl the hub. Redact the
+    # values and instead report whether each secret is set, so the UI
+    # can render a "(設定済み — 変更時のみ入力)" placeholder. The PUT
+    # path still accepts the real value when the operator types one.
+    _values = reg.all()
+    _secrets_set = {k: bool(_values.get(k)) for k in _SECRET_KEYS}
+    for k in _SECRET_KEYS:
+        _values[k] = ""
+
     return {
-        "values": reg.all(),
+        "values": _values,
+        "secrets_set": _secrets_set,
         "schema": reg.schema(),
         "system": {
             "codegen_llm_url": CODEGEN_LLM_URL,

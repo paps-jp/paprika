@@ -663,7 +663,6 @@ def run_ytdlp(
         cmd += ["--cookies", str(cookies_file)]
     elif cookies_from_browser:
         cmd += ["--cookies-from-browser", cookies_from_browser]
-    cmd.append(url)
     extras = []
     if referer:
         extras.append(f"referer={referer}")
@@ -687,12 +686,17 @@ def run_ytdlp(
             f"  🔴 live HLS stream detected — recording first "
             f"{_live_record_s}s (PAPRIKA_LIVE_HLS_RECORD_S={_live_record_s})"
         )
-        cmd = cmd[:-1] + [
+        cmd += [
             "--no-live-from-start",
             "--download-sections", f"*0-{_live_record_s}",
             "--hls-use-mpegts",
-            cmd[-1],
         ]
+    # Append the URL LAST, behind a ``--`` option terminator so a URL
+    # beginning with ``-`` can never be misread by yt-dlp as a flag
+    # (e.g. ``--exec`` = arbitrary shell command). url_safety already
+    # requires an http(s) host before dispatch; this is cheap
+    # defense-in-depth at the exact point the URL enters the argv.
+    cmd += ["--", url]
     lines: list[str] = []
     deadline = time.monotonic() + timeout
     returncode = -1

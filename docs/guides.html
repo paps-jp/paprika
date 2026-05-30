@@ -167,8 +167,8 @@ asyncio.run(main())</code></pre>
     <p class="see-also">→ <a href="examples.html#assets">詳細はこちら（サンプル集: アセット取得）</a></p>
 
     <h2 id="videos">動画を取得</h2>
-    <p>ページ上の動画ファイルをまとめて取得するなら fetch + <code>play_videos</code> を使います:</p>
-    <pre><code>job = await cli.fetch("https://example.com/clips", play_videos=True, wait_seconds=30)
+    <p>ページ上の動画をまとめて取得するなら fetch + <code>download_video=True</code> を使います。worker が iframe / ネスト iframe の通信を観測し、HLS/DASH の配信動画を yt-dlp で 1 本の mp4 にまとめます:</p>
+    <pre><code>job = await cli.fetch("https://example.com/clips", download_video=True)
 videos = await cli.job_assets(job.job_id, kind="video")
 await cli.download_job_assets(job.job_id, "out/videos", kind="video")</code></pre>
     <p>HLS/DASH の配信動画を 1 本の mp4 として取得したいときは、セッションで <code>download_video()</code>（yt-dlp）を使います:</p>
