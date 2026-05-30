@@ -659,15 +659,18 @@
   .submit-subtabs {
     display: flex;
     gap: 4px;
-    padding: 0 2px;
+    /* No horizontal padding so the FIRST tab's outer-left edge aligns
+       exactly with .submit-subpane's outer-left edge (operator
+       feedback: a 2px offset looked off). */
+    padding: 0;
     /* No gap below: the active tab merges with the .submit-subpane
        border on the next line. */
     margin: 0;
     border-bottom: 1px solid #d4cfca;
   }
   .submit-subtab {
-    padding: .42rem .9rem .5rem;
-    font: 600 .85rem/1 inherit;
+    padding: .55rem 1.1rem .6rem;
+    font: 600 .9rem/1 inherit;
     border: 1px solid #d4cfca;
     border-bottom: none;
     border-radius: 7px 7px 0 0;
@@ -707,13 +710,21 @@
 
   /* Sub-pane body: subtle card style that visually catches the active
      tab. Side + bottom border close the box; the top is left to the
-     .submit-subtabs border + active tab inset shadow seam. */
+     .submit-subtabs border + active tab inset shadow seam.
+     min-height pushes the bottom border down to the viewport edge so
+     the card always reads as "filling the panel area" -- looks
+     cleaner than a content-sized card ending mid-viewport with empty
+     body background below it. 320px is a rough header/nav/subtabs
+     budget; calc(100vh - 320px) ≈ viewport bottom on a typical
+     laptop. */
   .submit-subpane {
     background: #fff;
     border: 1px solid #d4cfca;
     border-top: none;
     padding: 16px 18px;
     border-radius: 0 0 8px 8px;
+    min-height: calc(100vh - 320px);
+    box-sizing: border-box;
   }
 
   /* Tab bar: clean active-state with bottom accent. */
