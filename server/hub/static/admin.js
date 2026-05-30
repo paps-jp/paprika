@@ -862,6 +862,13 @@ function setTab(name, { updateHash = true } = {}) {
   if (name === 'recipes' && typeof renderRecipes === 'function') {
     renderRecipes();
   }
+  // Settings tab: load hub settings + MariaDB/SMB status on activation
+  // so the panel is populated when deep-linking via #settings or on
+  // browser refresh. loadSettingsPanel is hoisted (function decl), so
+  // it's safe to call from the initial setTab() at parse time.
+  if (name === 'settings' && typeof loadSettingsPanel === 'function') {
+    loadSettingsPanel();
+  }
   // Highlight the "More" dropdown when one of its children is active.
   const moreWrap = document.getElementById('moreTabWrap');
   if (moreWrap) {
