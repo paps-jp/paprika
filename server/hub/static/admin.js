@@ -5178,35 +5178,44 @@ function ljpMountVncFrame(key, s) {
   const wrap = document.createElement('div');
   wrap.style.cssText = 'border:1px solid #ccc; border-radius:6px; overflow:hidden; background:#000;';
   const head = document.createElement('div');
-  // Chrome-style address bar: dark, rounded buttons, nav (◀ ▶ ↻) on the
-  // LEFT in the order an operator instinctively reaches for. Right-side
-  // controls (zoom / fit / open) are secondary, less-used affordances.
-  head.style.cssText = 'background:#2a2a32; color:#eee; padding:6px 10px; font-size:11.5px; display:flex; align-items:center; gap:6px; border-bottom:1px solid #1a1a22;';
+  // Light Chrome-chrome bar: matches the LJP top-header pill aesthetic
+  // (cream/beige .pill + --la-* accent) instead of the previous dark
+  // Chrome-tab bar. Sits above the dark noVNC iframe so the contrast
+  // reads as "window chrome above viewport". The ``ljp-vnc-head`` class
+  // hooks a scoped CSS rule (admin.css) that mirrors the LJP-top pill
+  // behaviour -- per-button --la-bg accent applied at rest, gentle
+  // lift on hover -- so the global .pill red-fill hover doesn't dominate.
+  head.className = 'ljp-vnc-head';
+  head.style.cssText = 'background:#f3f0ec; color:#3a3a45; padding:6px 8px; display:flex; align-items:center; gap:6px; border-bottom:1px solid #d4cfca;';
   // Operator control buttons (learn-from-operator Phase 1). Shown only
   // for real sessions (not the synthetic '__job__' fetch placeholder).
   // Each press is forwarded to /operator_action which executes it AND
   // records it to the per-job trace for later recipe distillation.
   const _opSid = ljpSessionKey(key);
-  // Chrome-feel button styling. Icon-only nav buttons get tighter padding;
-  // labelled "popup" / "URL" buttons slightly wider so the text breathes.
-  const _navBtnCss = 'background:#3a3a44; color:#eee; border:1px solid #555; border-radius:4px; padding:3px 8px; cursor:pointer; font-size:12px; line-height:1; min-width:26px;';
-  const _opBtnCss  = 'background:#2a3550; color:#cfe; border:1px solid #557; border-radius:4px; padding:3px 8px; cursor:pointer; font-size:11px; line-height:1;';
-  const _rightBtnCss = 'background:#333a; color:#ddd; border:1px solid #555; border-radius:4px; padding:3px 8px; cursor:pointer; font-size:11px; line-height:1;';
+  // Per-button accent: blueish for benign nav (戻る/進む/reload), red-ish
+  // for destructive (popup close), green for affirmative (URL go).
+  // Matches the LJP top-header convention (--la-bg / --la-bd / --la-fg
+  // custom props applied by inline style; the .pill class reads them
+  // on hover via the LJP override, with the global .pill as fallback
+  // for visible default fill).
+  const _navAccent = '--la-bg:#eef0ff; --la-bd:#9bf; --la-fg:#0a4a7e;';
+  const _popupAccent = '--la-bg:#fde6e6; --la-bd:#d68080; --la-fg:#8a1d1d;';
+  const _urlAccent = '--la-bg:#e6f7e9; --la-bd:#7ab68a; --la-fg:#196b2c;';
   const navBtns = _opSid ? (
-    `<button class="ljp-op-back" style="${_navBtnCss}" title="戻る (記録)">◀</button>` +
-    `<button class="ljp-op-fwd"  style="${_navBtnCss}" title="進む (記録)">▶</button>` +
-    `<button class="ljp-vnc-reload" style="${_navBtnCss}" title="reload this iframe">↻</button>` +
-    `<button class="ljp-op-popups" style="${_opBtnCss}" title="広告などのポップアップ・別タブを閉じる (記録)">✕ popup</button>` +
-    `<button class="ljp-op-url"   style="${_opBtnCss}" title="URL を入力して移動 (記録)">URL</button>`
+    `<button class="pill ljp-op-back" style="${_navAccent}" title="戻る (記録)"><iconify-icon icon="lucide:chevron-left"></iconify-icon> 戻る</button>` +
+    `<button class="pill ljp-op-fwd"  style="${_navAccent}" title="進む (記録)"><iconify-icon icon="lucide:chevron-right"></iconify-icon> 進む</button>` +
+    `<button class="pill ljp-vnc-reload" style="${_navAccent}" title="reload this iframe"><iconify-icon icon="lucide:rotate-cw"></iconify-icon></button>` +
+    `<button class="pill ljp-op-popups" style="${_popupAccent}" title="広告などのポップアップ・別タブを閉じる (記録)"><iconify-icon icon="lucide:x"></iconify-icon> popup</button>` +
+    `<button class="pill ljp-op-url"  style="${_urlAccent}" title="URL を入力して移動 (記録)"><iconify-icon icon="lucide:link"></iconify-icon> URL</button>`
   ) : (
-    `<button class="ljp-vnc-reload" style="${_navBtnCss}" title="reload this iframe">↻</button>`
+    `<button class="pill ljp-vnc-reload" style="${_navAccent}" title="reload this iframe"><iconify-icon icon="lucide:rotate-cw"></iconify-icon></button>`
   );
   // Per-session zoom selector. Synced globally via the .ljp-vnc-zoom
   // class -- changing any one in a multi-session view applies to all
   // panes and persists to localStorage. Replaces the old single
   // #ljpVncZoom dropdown that lived in a separate toolbar row.
   const zoomSelect =
-    `<select class="ljp-vnc-zoom" title="ページズーム (Ctrl+/Ctrl- 相当)" style="background:#333; color:#eee; border:1px solid #555; border-radius:4px; padding:2px 4px; font-size:11px;">` +
+    `<select class="ljp-vnc-zoom" title="ページズーム (Ctrl+/Ctrl- 相当)" style="background:#fff; color:#3a3a45; border:1px solid #d4cfca; border-radius:6px; padding:3px 6px; font-size:.78rem; font-weight:600;">` +
       `<option value="0.5">50%</option>` +
       `<option value="0.75">75%</option>` +
       `<option value="1.0" selected>100%</option>` +
@@ -5214,16 +5223,17 @@ function ljpMountVncFrame(key, s) {
       `<option value="1.5">150%</option>` +
       `<option value="2.0">200%</option>` +
     `</select>`;
+  const _rightAccent = '--la-bg:#eef0f6; --la-bd:#bbc; --la-fg:#333;';
   head.innerHTML =
-    // LEFT: nav cluster (戻る / 進む / reload / popup / URL)
+    // LEFT: nav cluster (戻る / 進む / reload / popup / URL) -- chrome-like
     navBtns +
-    // CENTER: session label (= placeholder for "URL bar"). flex:1 so
-    // it absorbs all leftover horizontal space.
-    `<code style="flex:1; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; background:#1a1a22; color:#aab; padding:3px 8px; border:1px solid #444; border-radius:4px; font-size:11px;" title="${esc(s.label)}">${esc(s.label)}</code>` +
+    // CENTER: session label dressed as a URL bar -- monospace, neutral
+    // chip, takes leftover space via flex:1.
+    `<code style="flex:1; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; background:#fff; color:#5a5a68; padding:5px 10px; border:1px solid #d4cfca; border-radius:6px; font-size:.78rem; font-family:ui-monospace,Consolas,monospace;" title="${esc(s.label)}">${esc(s.label)}</code>` +
     // RIGHT: zoom / fit / open (less-frequent affordances)
     zoomSelect +
-    `<button class="ljp-vnc-fit" style="${_rightBtnCss}" title="Chrome のウィンドウサイズを現在の zoom 設定に再同期する">↔ fit</button>` +
-    `<a href="${esc(src)}" target="_blank" style="color:#9cf; text-decoration:none; padding:3px 4px; font-size:11px;" title="新しいタブで開く">↗ open</a>`;
+    `<button class="pill ljp-vnc-fit" style="${_rightAccent}" title="Chrome のウィンドウサイズを現在の zoom 設定に再同期する"><iconify-icon icon="lucide:maximize"></iconify-icon> fit</button>` +
+    `<a class="pill" href="${esc(src)}" target="_blank" style="${_rightAccent}" title="新しいタブで開く"><iconify-icon icon="lucide:external-link"></iconify-icon> open</a>`;
   // The iframe lives inside a transform-scale-box so the layout
   // reserves the *visually-scaled* size, not the logical size.
   const scaleBox = document.createElement('div');

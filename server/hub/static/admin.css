@@ -597,6 +597,35 @@
      accent on hover along with the label. */
   #liveJobPanel .ljp-actions-group .pill iconify-icon { font-size: 1.05em; }
 
+  /* noVNC per-session chrome bar (.ljp-vnc-head). Each button uses the
+     same .pill class as the LJP top header + --la-bg / --la-bd / --la-fg
+     inline custom props for accent colour. Unlike the LJP override the
+     accent is applied AT REST (not just on hover) so the buttons look
+     like a Chrome address bar with always-visible tinted chips. */
+  .ljp-vnc-head .pill {
+    display: inline-flex; align-items: center; gap: 4px;
+    padding: 5px 10px; border-radius: 6px;
+    font: 600 .78rem/1 inherit;
+    background: var(--la-bg, #f0f0f6);
+    border: 1px solid var(--la-bd, #d8d8e2);
+    color: var(--la-fg, #2a2a35);
+    cursor: pointer; text-decoration: none;
+    transition: background .14s, color .14s, border-color .14s, transform .1s, box-shadow .14s;
+  }
+  .ljp-vnc-head .pill:not(:disabled):hover {
+    transform: translateY(-1px);
+    box-shadow: 0 2px 6px rgba(0,0,0,.10);
+    /* Slightly darker fill on hover -- inherits the same accent so the
+       button doesn't shift colour, just lifts. Achieved via filter so
+       we don't need to know the exact var(--la-bg) value. */
+    filter: brightness(.95);
+  }
+  .ljp-vnc-head .pill:disabled {
+    cursor: not-allowed; opacity: .45;
+    transform: none; box-shadow: none; filter: none;
+  }
+  .ljp-vnc-head .pill iconify-icon { font-size: 1.05em; }
+
   /* ----- "more" overflow menu ----- */
   #liveJobPanel .ljp-more-wrap { position: relative; display: inline-flex; }
   #liveJobPanel #ljpMore .ljp-more-caret {
