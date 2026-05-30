@@ -877,6 +877,25 @@ __VIDEO_SECTION_BEGIN__
     page.download_video()" approach that burns 120-180s on the agent
     call and then fails anyway. The correct approach:
 
+    0. AGE GATE / CONSENT DIALOGS -- use ``page.evaluate()`` with a
+       JS snippet that clicks matching buttons, NOT ``page.agent()``.
+       ``page.agent()`` spawns a vision agent that takes 180 s to
+       timeout on these simple dialogs.  A JS click finishes in < 1 s::
+
+           await page.evaluate(
+               "(() => {"
+               "  const texts = ['enter','i am 18','18','yes','agree',"
+               "    '入場','18歳以上','同意'];"
+               "  for (const btn of document.querySelectorAll("
+               "    'button, a, [role=button], input[type=submit]')) {"
+               "    const t = (btn.textContent||btn.value||'').toLowerCase();"
+               "    if (texts.some(w => t.includes(w))) { btn.click(); return true; }"
+               "  }"
+               "  return false;"
+               "})()"
+           )
+           await asyncio.sleep(2)
+
     1. TRIGGER playback cheaply -- use ``page.evaluate()`` or
        ``page.click()`` on the ``<video>`` or play-button element.
        DO NOT use ``page.agent()`` for play-button clicks; it spawns
@@ -900,12 +919,22 @@ __VIDEO_SECTION_BEGIN__
 
     3. DOWNLOAD using the sniffed URL with a generous timeout.
        ALWAYS pass ``referer=`` with the page URL -- CDNs behind
-       Cloudflare (surrit.com, etc.) reject requests without it::
+       Cloudflare (surrit.com, etc.) reject requests without it.
+
+       URL selection: prefer a **master playlist** (``playlist.m3u8``,
+       ``master.m3u8``) which lets yt-dlp auto-select the best quality.
+       If none, use the **first** stream URL (usually the highest
+       quality variant).  Do NOT use ``streams[-1]`` — on pages with
+       multiple CDNs the last URL is often a low-quality fallback::
 
            if streams:
-               # prefer the LAST m3u8 (usually highest quality / master)
+               # prefer master playlist; else first stream (highest quality)
+               best = next(
+                   (u for u in streams if '/playlist' in u or '/master' in u),
+                   streams[0],
+               )
                r = await page.download_video(
-                   url=streams[-1],
+                   url=best,
                    referer=TARGET_URL,
                    timeout_s=3600,
                )
@@ -921,11 +950,23 @@ __VIDEO_SECTION_BEGIN__
         async def main():
             async with async_paprika.connect() as cli:
                 async with cli.session(initial_url=TARGET_URL) as page:
-                    # 1) age gate / consent
-                    await page.agent(
-                        "Accept any age verification or consent dialog.",
-                        max_steps=3,
+                    # 1) age gate / consent — use JS click, NOT page.agent()
+                    #    page.agent() spawns a vision loop that takes 180 s
+                    #    to timeout; a JS snippet finishes in < 1 s.
+                    await page.evaluate(
+                        "(() => {"
+                        "  const texts = ['enter','i am 18','18','yes','agree',"
+                        "    '入場','18歳以上','同意'];"
+                        "  for (const btn of document.querySelectorAll("
+                        "    'button, a, [role=button], input[type=submit]')) {"
+                        "    const t = (btn.textContent||btn.value||'').toLowerCase();"
+                        "    if (texts.some(w => t.includes(w))) { btn.click(); return true; }"
+                        "  }"
+                        "  return false;"
+                        "})()"
                     )
+                    await asyncio.sleep(2)
+
                     # 2) close ad popups
                     await page.close_popups()
 
@@ -947,9 +988,15 @@ __VIDEO_SECTION_BEGIN__
 
                     # 5) download with sniffed URL (or page URL fallback)
                     #    ALWAYS pass referer= for cross-origin CDN URLs
+                    #    Prefer master playlist; else first stream URL
                     if streams:
+                        best = next(
+                            (u for u in streams
+                             if '/playlist' in u or '/master' in u),
+                            streams[0],
+                        )
                         r = await page.download_video(
-                            url=streams[-1],
+                            url=best,
                             referer=TARGET_URL,
                             timeout_s=3600,
                         )
