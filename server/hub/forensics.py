@@ -377,12 +377,59 @@ async def run_forensics(
             tool_msg = f"PROBE {n} ERROR: {step.error}"
         else:
             tool_msg = f"PROBE {n} RESULT:\n{step.result}"
+        # Budget hint: tell the model how many probe steps remain so it
+        # can decide to wrap up. When the budget is nearly exhausted,
+        # escalate to an explicit instruction to finish -- otherwise an
+        # exploratory model burns every step and never synthesises a
+        # report (the operator then gets a raw probe dump, not an answer).
+        remaining = cap - n
+        if remaining <= 0:
+            tool_msg += (
+                "\n\n[BUDGET] This was the LAST probe step. Do NOT probe "
+                "again. Reply now with action=finish and a complete report "
+                "explaining your findings based on everything observed."
+            )
+        elif remaining <= 3:
+            tool_msg += (
+                f"\n\n[BUDGET] Only {remaining} probe step(s) left. If you "
+                "already have enough to explain the issue, reply with "
+                "action=finish now instead of probing further."
+            )
         history.append({"role": "user", "content": tool_msg})
 
     if not completed and not final_report:
-        # Hit the cap without the model calling finish. Synthesise a
-        # report from the conversation tail so the operator gets a
-        # bounded, debuggable artefact instead of nothing.
+        # Hit the cap without the model calling finish. Give it ONE last
+        # turn whose only job is to synthesise a report from everything
+        # gathered -- no further probing allowed. This turns "ran out of
+        # budget" from a raw probe dump into an actual answer.
+        history.append({
+            "role": "user",
+            "content": (
+                "STOP PROBING. You have reached the step cap. Using only "
+                "the evidence already gathered above, output a final JSON "
+                'object: {"action":"finish","report":"<your full findings '
+                'and best explanation of the goal, in Markdown>"}. '
+                "Do not request any more probes."
+            ),
+        })
+        try:
+            raw = await _chat(history)
+            act = _parse_action(raw)
+            rep = str(act.get("report") or "").strip()
+            if rep and rep != "(no report)":
+                final_report = rep
+                # Mark as completed only if the model genuinely emitted a
+                # finish action; otherwise leave completed=False so the UI
+                # still flags it as budget-truncated.
+                if str(act.get("action") or "").lower() == "finish":
+                    completed = True
+        except Exception:
+            pass
+
+    if not completed and not final_report:
+        # Synthesis call also failed/empty -- fall back to a bounded dump
+        # of the conversation tail so the operator gets *something*
+        # debuggable rather than nothing.
         tail = history[-1]["content"] if history else "(empty)"
         final_report = (
             f"Investigation hit max_steps={cap} without a final report. "
