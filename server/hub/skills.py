@@ -30,10 +30,9 @@ import json
 import re
 from dataclasses import asdict, dataclass, field
 from datetime import datetime
-from pathlib import Path
 from typing import Literal
 
-from server.hub._jsonstore import atomic_write_json
+from server.hub._jsonstore import TieredJsonRecordRegistry
 
 SkillTier = Literal["auto", "curated"]
 
@@ -112,58 +111,39 @@ class SkillRecord:
         )
 
 
-class SkillRegistry:
-    """File-backed CRUD over per-tier skill stores. O(1) per record,
-    O(N) for list (fine at paprika's scale -- tens, not millions)."""
+class SkillRegistry(TieredJsonRecordRegistry[SkillRecord]):
+    """File-backed CRUD over per-tier skill stores. Inherits the generic
+    tiered list / get / delete / atomic-write from
+    :class:`TieredJsonRecordRegistry`; only the skill-specific
+    (de)serialisation + the upsert / promote / demote / bump_use helpers
+    live here. O(1) per record, O(N) for list (fine at paprika's scale)."""
 
-    def __init__(self, data_dir: Path) -> None:
-        self.root = Path(data_dir) / "skills"
-        (self.root / "auto").mkdir(parents=True, exist_ok=True)
-        (self.root / "curated").mkdir(parents=True, exist_ok=True)
+    subdir = "skills"
+    # ``curated`` shadows ``auto`` -- searched first, listed first.
+    tiers = ("curated", "auto")
+    _sort_reverse = True  # within each tier, most-recently-updated first
 
-    def _tier_dir(self, tier: SkillTier) -> Path:
-        if tier not in ("auto", "curated"):
-            raise ValueError(f"unknown tier: {tier!r}")
-        return self.root / tier
+    # ---- TieredJsonRecordRegistry hooks -----------------------------------
 
-    def _path(self, slug: str, tier: SkillTier) -> Path:
-        return self._tier_dir(tier) / f"{normalise_slug(slug)}.json"
+    def _slug(self, key: str) -> str:
+        return normalise_slug(key)
 
-    # ----- read --------------------------------------------------------
+    def _key_of(self, rec: SkillRecord) -> str:
+        return rec.slug
 
-    def list_all(self) -> list[SkillRecord]:
-        """Both tiers. ``curated`` first, then ``auto``, each sorted by
-        most-recently-updated."""
-        out: list[SkillRecord] = []
-        for tier in ("curated", "auto"):
-            recs: list[SkillRecord] = []
-            for p in self._tier_dir(tier).glob("*.json"):
-                try:
-                    recs.append(SkillRecord.from_json(json.loads(p.read_text(encoding="utf-8"))))
-                except Exception:
-                    # Corrupt file -- skip; operator will see the gap in
-                    # the UI and can re-save manually.
-                    pass
-            recs.sort(key=lambda r: r.updated_at, reverse=True)
-            out.extend(recs)
-        return out
+    def _tier_of(self, rec: SkillRecord) -> str:
+        return rec.tier
 
-    def get(self, slug: str, tier: SkillTier | None = None) -> SkillRecord | None:
-        """Look up by slug. If ``tier`` is None, ``curated`` is
-        searched first (since promoted skills shadow their auto
-        counterparts)."""
-        slug = normalise_slug(slug)
-        tiers: tuple[SkillTier, ...] = (tier,) if tier else ("curated", "auto")
-        for t in tiers:
-            p = self._path(slug, t)
-            if p.exists():
-                try:
-                    return SkillRecord.from_json(json.loads(p.read_text(encoding="utf-8")))
-                except Exception:
-                    return None
-        return None
+    def _to_json(self, rec: SkillRecord) -> dict:
+        return rec.to_json()
 
-    # ----- write -------------------------------------------------------
+    def _from_json(self, d: dict) -> SkillRecord:
+        return SkillRecord.from_json(d)
+
+    def _sort_key(self, rec: SkillRecord):
+        return rec.updated_at
+
+    # ----- skill-specific write helpers --------------------------------
 
     def upsert(
         self,
@@ -209,20 +189,6 @@ class SkillRegistry:
         )
         self._write(rec)
         return rec
-
-    def delete(self, slug: str, tier: SkillTier | None = None) -> bool:
-        slug = normalise_slug(slug)
-        tiers: tuple[SkillTier, ...] = (tier,) if tier else ("curated", "auto")
-        any_removed = False
-        for t in tiers:
-            p = self._path(slug, t)
-            if p.exists():
-                try:
-                    p.unlink()
-                    any_removed = True
-                except Exception:
-                    pass
-        return any_removed
 
     def promote(self, slug: str) -> SkillRecord | None:
         """Move a skill from ``auto/`` to ``curated/``. The promoted
@@ -278,7 +244,3 @@ class SkillRegistry:
         rec.last_used_at = _utcnow_iso()
         self._write(rec)
         return rec
-
-    def _write(self, rec: SkillRecord) -> None:
-        # Atomic write so a crash mid-save can't corrupt the skill record.
-        atomic_write_json(self._path(rec.slug, rec.tier), rec.to_json())

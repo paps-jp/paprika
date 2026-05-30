@@ -110,6 +110,10 @@ class JsonRecordRegistry(Generic[T]):
     def _from_json(self, d: dict) -> T:  # pragma: no cover - abstract-ish
         raise NotImplementedError
 
+    # When True, :func:`list_all` sorts by ``_sort_key`` descending
+    # (e.g. newest-first by a timestamp key). Default ascending.
+    _sort_reverse: bool = False
+
     def _sort_key(self, rec: T):
         """Ordering for :func:`list_all`. Default: no sort (insertion /
         glob order). Override for a stable display order."""
@@ -130,7 +134,7 @@ class JsonRecordRegistry(Generic[T]):
                 # doesn't blank the whole listing.
                 continue
         try:
-            records.sort(key=self._sort_key)
+            records.sort(key=self._sort_key, reverse=self._sort_reverse)
         except Exception:
             pass
         return records
@@ -156,6 +160,131 @@ class JsonRecordRegistry(Generic[T]):
 
     def _write(self, rec: T) -> None:
         atomic_write_json(self._path(self._key_of(rec)), self._to_json(rec))
+
+
+class TieredJsonRecordRegistry(Generic[T]):
+    """Generic file-backed CRUD over *tiered* stores:
+    ``{data_dir}/<subdir>/<tier>/<slug>.json``, one JSON file per record.
+
+    For registries whose records live in priority-ordered tiers -- e.g.
+    skills / conventions, which keep a ``curated`` tier that shadows an
+    ``auto`` tier. ``list_all`` / ``get`` / ``delete`` walk :attr:`tiers`
+    in order (first entry = highest priority, searched first). This is
+    the de-duplicated form of the two hand-rolled two-tier registries.
+
+    Concrete subclass contract::
+
+        class FooRegistry(TieredJsonRecordRegistry[FooRecord]):
+            subdir = "foos"
+            tiers = ("curated", "auto")     # priority order
+
+            def _slug(self, key): ...
+            def _key_of(self, rec): ...
+            def _tier_of(self, rec): ...     # which tier a record belongs in
+            def _to_json(self, rec): ...
+            def _from_json(self, d): ...
+            # optional: _sort_key (within-tier) + _sort_reverse
+    """
+
+    subdir: str = ""
+    tiers: tuple[str, ...] = ()
+    _sort_reverse: bool = False
+
+    def __init__(self, data_dir: str | os.PathLike) -> None:
+        if not self.subdir:
+            raise ValueError(
+                f"{type(self).__name__} must set a class-level `subdir`"
+            )
+        if not self.tiers:
+            raise ValueError(
+                f"{type(self).__name__} must set a non-empty `tiers`"
+            )
+        self.root = Path(data_dir) / self.subdir
+        for t in self.tiers:
+            (self.root / t).mkdir(parents=True, exist_ok=True)
+
+    # ---- subclass hooks ---------------------------------------------------
+
+    def _slug(self, key: str) -> str:  # pragma: no cover - abstract-ish
+        raise NotImplementedError
+
+    def _key_of(self, rec: T) -> str:  # pragma: no cover - abstract-ish
+        raise NotImplementedError
+
+    def _tier_of(self, rec: T) -> str:  # pragma: no cover - abstract-ish
+        raise NotImplementedError
+
+    def _to_json(self, rec: T) -> dict:  # pragma: no cover - abstract-ish
+        raise NotImplementedError
+
+    def _from_json(self, d: dict) -> T:  # pragma: no cover - abstract-ish
+        raise NotImplementedError
+
+    def _sort_key(self, rec: T):
+        """Within-tier ordering for :func:`list_all`. Default: no sort."""
+        return 0
+
+    # ---- generic CRUD -----------------------------------------------------
+
+    def _tier_dir(self, tier: str) -> Path:
+        if tier not in self.tiers:
+            raise ValueError(f"unknown tier: {tier!r}")
+        return self.root / tier
+
+    def _path(self, key: str, tier: str) -> Path:
+        return self._tier_dir(tier) / f"{self._slug(key)}.json"
+
+    def list_all(self) -> list[T]:
+        """All records, tiers concatenated in :attr:`tiers` order; each
+        tier independently sorted by ``_sort_key``."""
+        out: list[T] = []
+        for tier in self.tiers:
+            recs: list[T] = []
+            for p in self._tier_dir(tier).glob("*.json"):
+                try:
+                    recs.append(self._from_json(json.loads(p.read_text(encoding="utf-8"))))
+                except Exception:
+                    continue
+            try:
+                recs.sort(key=self._sort_key, reverse=self._sort_reverse)
+            except Exception:
+                pass
+            out.extend(recs)
+        return out
+
+    def get(self, key: str, tier: str | None = None) -> T | None:
+        """Look up by key. ``tier=None`` searches every tier in priority
+        order and returns the first hit."""
+        search = (tier,) if tier else self.tiers
+        for t in search:
+            p = self._path(key, t)
+            if p.exists():
+                try:
+                    return self._from_json(json.loads(p.read_text(encoding="utf-8")))
+                except Exception:
+                    return None
+        return None
+
+    def delete(self, key: str, tier: str | None = None) -> bool:
+        """Delete from ``tier`` (or every tier when None). True iff any
+        file was removed."""
+        search = (tier,) if tier else self.tiers
+        removed = False
+        for t in search:
+            p = self._path(key, t)
+            if p.exists():
+                try:
+                    p.unlink()
+                    removed = True
+                except Exception:
+                    pass
+        return removed
+
+    def _write(self, rec: T) -> None:
+        atomic_write_json(
+            self._path(self._key_of(rec), self._tier_of(rec)),
+            self._to_json(rec),
+        )
 
 
 def iter_json_files(directory: Path) -> Iterable[Path]:

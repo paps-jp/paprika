@@ -36,13 +36,11 @@ Timestamps:
 
 from __future__ import annotations
 
-import json
 import re
 from dataclasses import asdict, dataclass, field
 from datetime import datetime
-from pathlib import Path
 
-from server.hub._jsonstore import atomic_write_json
+from server.hub._jsonstore import JsonRecordRegistry
 
 
 def _normalise_host(host: str) -> str:
@@ -438,39 +436,29 @@ def cookies_to_netscape(cookies: list[dict], fallback_host: str = "") -> str:
     return "\n".join(lines) + "\n"
 
 
-class HostRegistry:
-    """File-backed CRUD over the per-host cookie store. Operations are
-    O(1) (single-file read/write); the list endpoint is O(N) over
-    registered hosts which is fine for the typical scale (tens, not
-    millions)."""
+class HostRegistry(JsonRecordRegistry[HostRecord]):
+    """File-backed CRUD over the per-host cookie store. Inherits the
+    generic list / get / delete / atomic-write from
+    :class:`JsonRecordRegistry`; only the host-specific (de)serialisation
+    + the cookie / recipe / auto-login helpers live here. Operations are
+    O(1) (single-file read/write); list is O(N) over registered hosts,
+    fine at the typical scale (tens, not millions)."""
 
-    def __init__(self, data_dir: Path) -> None:
-        self.dir = Path(data_dir) / "hosts"
-        self.dir.mkdir(parents=True, exist_ok=True)
+    subdir = "hosts"
 
-    def _path(self, host: str) -> Path:
-        h = _normalise_host(host)
-        return self.dir / f"{_safe_filename(h)}.json"
+    # ---- JsonRecordRegistry hooks -----------------------------------------
 
-    def list_all(self) -> list[HostRecord]:
-        records: list[HostRecord] = []
-        for p in sorted(self.dir.glob("*.json")):
-            try:
-                records.append(HostRecord.from_json(json.loads(p.read_text(encoding="utf-8"))))
-            except Exception:
-                # Bad / corrupt file -- skip it; the operator will see
-                # the missing record in the UI and can re-save.
-                pass
-        return records
+    def _slug(self, key: str) -> str:
+        return _safe_filename(_normalise_host(key))
 
-    def get(self, host: str) -> HostRecord | None:
-        p = self._path(host)
-        if not p.exists():
-            return None
-        try:
-            return HostRecord.from_json(json.loads(p.read_text(encoding="utf-8")))
-        except Exception:
-            return None
+    def _key_of(self, rec: HostRecord) -> str:
+        return rec.host
+
+    def _to_json(self, rec: HostRecord) -> dict:
+        return rec.to_json()
+
+    def _from_json(self, d: dict) -> HostRecord:
+        return HostRecord.from_json(d)
 
     def upsert(
         self,
@@ -623,16 +611,6 @@ class HostRegistry:
         self._write(rec)
         return rec
 
-    def delete(self, host: str) -> bool:
-        p = self._path(host)
-        if not p.exists():
-            return False
-        try:
-            p.unlink()
-            return True
-        except Exception:
-            return False
-
     def touch_used(self, host: str) -> HostRecord | None:
         """Bump ``last_used_at`` to now. Returns the updated record,
         or None if no record exists for ``host``. Called by the hub
@@ -675,7 +653,3 @@ class HostRegistry:
             return True
         return (datetime.utcnow() - last).total_seconds() > ttl
 
-    def _write(self, rec: HostRecord) -> None:
-        # Atomic (.tmp + os.replace) so a crash mid-save can't leave a
-        # truncated host record on disk.
-        atomic_write_json(self._path(rec.host), rec.to_json())

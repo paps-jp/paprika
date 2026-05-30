@@ -31,10 +31,9 @@ import json
 import re
 from dataclasses import asdict, dataclass, field
 from datetime import datetime
-from pathlib import Path
 from typing import Literal
 
-from server.hub._jsonstore import atomic_write_json
+from server.hub._jsonstore import TieredJsonRecordRegistry
 
 ConventionTier = Literal["auto", "curated"]
 
@@ -119,55 +118,43 @@ class ConventionRecord:
         return "\n".join(lines)
 
 
-class ConventionRegistry:
-    """File-backed CRUD over the two-tier convention store. Mirrors
-    SkillRegistry; could be unified later, but the per-record shape
-    differs enough that the small duplication is cheaper than a
-    premature abstraction."""
+class ConventionRegistry(TieredJsonRecordRegistry[ConventionRecord]):
+    """File-backed CRUD over the two-tier convention store. Inherits the
+    generic tiered list / get / delete / atomic-write from
+    :class:`TieredJsonRecordRegistry`; only the convention-specific
+    (de)serialisation + the upsert / promote / demote / bump_use helpers
+    + the ``list_curated`` view live here."""
 
-    def __init__(self, data_dir: Path) -> None:
-        self.root = Path(data_dir) / "conventions"
-        (self.root / "auto").mkdir(parents=True, exist_ok=True)
-        (self.root / "curated").mkdir(parents=True, exist_ok=True)
+    subdir = "conventions"
+    # ``curated`` shadows ``auto`` -- searched first, listed first.
+    tiers = ("curated", "auto")
+    _sort_reverse = True  # within each tier, most-recently-updated first
 
-    def _tier_dir(self, tier: ConventionTier) -> Path:
-        if tier not in ("auto", "curated"):
-            raise ValueError(f"unknown tier: {tier!r}")
-        return self.root / tier
+    # ---- TieredJsonRecordRegistry hooks -----------------------------------
 
-    def _path(self, slug: str, tier: ConventionTier) -> Path:
-        return self._tier_dir(tier) / f"{normalise_slug(slug)}.json"
+    def _slug(self, key: str) -> str:
+        return normalise_slug(key)
 
-    def list_all(self) -> list[ConventionRecord]:
-        out: list[ConventionRecord] = []
-        for tier in ("curated", "auto"):
-            recs: list[ConventionRecord] = []
-            for p in self._tier_dir(tier).glob("*.json"):
-                try:
-                    recs.append(
-                        ConventionRecord.from_json(json.loads(p.read_text(encoding="utf-8")))
-                    )
-                except Exception:
-                    pass
-            recs.sort(key=lambda r: r.updated_at, reverse=True)
-            out.extend(recs)
-        return out
+    def _key_of(self, rec: ConventionRecord) -> str:
+        return rec.slug
+
+    def _tier_of(self, rec: ConventionRecord) -> str:
+        return rec.tier
+
+    def _to_json(self, rec: ConventionRecord) -> dict:
+        return rec.to_json()
+
+    def _from_json(self, d: dict) -> ConventionRecord:
+        return ConventionRecord.from_json(d)
+
+    def _sort_key(self, rec: ConventionRecord):
+        return rec.updated_at
+
+    # ---- convention-specific helpers --------------------------------------
 
     def list_curated(self) -> list[ConventionRecord]:
         """Just the curated tier -- what gets injected into prompts."""
         return [c for c in self.list_all() if c.tier == "curated"]
-
-    def get(self, slug: str, tier: ConventionTier | None = None) -> ConventionRecord | None:
-        slug = normalise_slug(slug)
-        tiers: tuple[ConventionTier, ...] = (tier,) if tier else ("curated", "auto")
-        for t in tiers:
-            p = self._path(slug, t)
-            if p.exists():
-                try:
-                    return ConventionRecord.from_json(json.loads(p.read_text(encoding="utf-8")))
-                except Exception:
-                    return None
-        return None
 
     def upsert(
         self,
@@ -215,20 +202,6 @@ class ConventionRegistry:
         self._write(rec)
         return rec
 
-    def delete(self, slug: str, tier: ConventionTier | None = None) -> bool:
-        slug = normalise_slug(slug)
-        tiers: tuple[ConventionTier, ...] = (tier,) if tier else ("curated", "auto")
-        any_removed = False
-        for t in tiers:
-            p = self._path(slug, t)
-            if p.exists():
-                try:
-                    p.unlink()
-                    any_removed = True
-                except Exception:
-                    pass
-        return any_removed
-
     def promote(self, slug: str) -> ConventionRecord | None:
         slug = normalise_slug(slug)
         src = self._path(slug, "auto")
@@ -273,10 +246,6 @@ class ConventionRegistry:
         rec.last_used_at = _utcnow_iso()
         self._write(rec)
         return rec
-
-    def _write(self, rec: ConventionRecord) -> None:
-        # Atomic write so a crash mid-save can't corrupt the record.
-        atomic_write_json(self._path(rec.slug, rec.tier), rec.to_json())
 
 
 def render_conventions_block(
