@@ -10029,7 +10029,8 @@ async function testMariadbConnection() {
       headers: {'Content-Type': 'application/json'},
       body: JSON.stringify(body),
     });
-    const d = await r.json();
+    let d;
+    try { d = await r.json(); } catch { d = { message: await r.text().catch(() => r.statusText) }; }
     if (d.ok) {
       if (statusEl) { statusEl.style.color = '#196b2c'; statusEl.textContent = `✓ ${d.message} (${d.version})`; }
       // Show migration section on successful connection
@@ -10056,7 +10057,8 @@ async function mdbCreateSchema() {
   if (statusEl) { statusEl.style.color = '#888'; statusEl.textContent = ''; }
   try {
     const r = await fetch('/settings/mariadb/schema', { method: 'POST' });
-    const d = await r.json();
+    let d;
+    try { d = await r.json(); } catch { d = { detail: await r.text().catch(() => r.statusText) }; }
     if (d.ok) {
       if (statusEl) { statusEl.style.color = '#196b2c'; statusEl.textContent = `✓ ${d.tables.length} テーブル作成済み`; }
       mdbRefreshTableCounts();
@@ -10082,7 +10084,8 @@ async function mdbMigrate(category) {
   if (statusEl) { statusEl.style.color = '#888'; statusEl.textContent = ''; }
   try {
     const r = await fetch('/settings/mariadb/migrate/' + category, { method: 'POST' });
-    const d = await r.json();
+    let d;
+    try { d = await r.json(); } catch { d = { detail: await r.text().catch(() => r.statusText) }; }
     if (d.ok) {
       if (statusEl) {
         statusEl.style.color = '#196b2c';
@@ -10107,7 +10110,8 @@ async function mdbRefreshTableCounts() {
   if (!el) return;
   try {
     const r = await fetch('/settings/mariadb/tables');
-    const d = await r.json();
+    let d;
+    try { d = await r.json(); } catch { d = {}; }
     if (d.ok && d.tables) {
       const rows = Object.entries(d.tables).map(([name, count]) => {
         const label = count < 0 ? '<span style="color:#a00">未作成</span>' : count.toLocaleString() + ' 行';

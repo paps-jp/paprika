@@ -360,27 +360,36 @@ async def mariadb_migrate(category: str) -> dict:
     pool = await _get_or_create_pool()
 
     # Ensure tables exist first
-    await mariadb.ensure_schema(pool)
+    try:
+        await mariadb.ensure_schema(pool)
+    except Exception as e:
+        raise HTTPException(500, f"テーブル作成失敗: {e}")
 
     if category == "jobs":
         if state.store is None:
             raise HTTPException(503, "JobStore が未初期化です")
-        result = await asyncio.to_thread(
-            lambda: None  # placeholder
-        ) if False else await mariadb.migrate_jobs(state.store, pool)
-        return result
+        try:
+            return await mariadb.migrate_jobs(state.store, pool)
+        except Exception as e:
+            raise HTTPException(500, f"Jobs 移行失敗: {e}")
 
     if category == "hosts":
         if state.hosts is None:
             raise HTTPException(503, "HostRegistry が未初期化です")
-        return await mariadb.migrate_hosts(state.hosts, pool)
+        try:
+            return await mariadb.migrate_hosts(state.hosts, pool)
+        except Exception as e:
+            raise HTTPException(500, f"Hosts 移行失敗: {e}")
 
     if category == "visited_urls":
         if state.hosts is None or state.host_visited is None:
             raise HTTPException(503, "HostRegistry / VisitedRegistry が未初期化です")
-        return await mariadb.migrate_visited_urls(
-            state.hosts, state.host_visited, pool,
-        )
+        try:
+            return await mariadb.migrate_visited_urls(
+                state.hosts, state.host_visited, pool,
+            )
+        except Exception as e:
+            raise HTTPException(500, f"Visited URLs 移行失敗: {e}")
 
     raise HTTPException(400, f"不明なカテゴリ: {category}")
 
