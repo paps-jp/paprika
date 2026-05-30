@@ -2242,6 +2242,14 @@ async def install_session_asset_capture(
             is_interesting = is_media or any(
                 mime.startswith(p) for p in ("image/", "audio/", "video/", "font/")
             )
+            # HLS/DASH playlists have MIME application/vnd.apple.mpegurl
+            # or application/dash+xml -- not image/audio/video, so the
+            # filter above misses them. Force-log any URL that matches
+            # the stream pattern so page.network() exposes .m3u8/.mpd
+            # entries and codegen scripts can sniff + pass them to
+            # page.download_video(url=...).
+            if not is_interesting and _STREAM_URL_RE.search(url):
+                is_interesting = True
             if is_interesting and url not in _net_logged_urls:
                 _net_logged_urls.add(url)
                 # Content-Length from response headers (if available).
