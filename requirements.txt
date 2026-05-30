@@ -1,6 +1,6 @@
 nodriver>=0.38
 yt-dlp>=2024.1.0
-curl_cffi>=0.7
+curl_cffi>=0.10,<0.15
 fastapi>=0.110
 uvicorn[standard]>=0.27
 pydantic>=2.5
