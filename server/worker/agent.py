@@ -3857,6 +3857,106 @@ class WorkerAgent:
                 pass
             ctx.reply.result = {"default_page_id": pid}
 
+    # ----- capture / screenshot / evaluate ---------------------------------
+
+    @_session_action("screenshot", read_only=True)
+    async def _act_screenshot(self, ctx: "_ActionCtx") -> None:
+        from nodriver import cdp
+
+        png_b64 = await ctx.tab.send(
+            cdp.page.capture_screenshot(format_="png"),
+        )
+        ctx.reply.result = png_b64
+        # Optional: publish to the parent job's gallery when a ``label``
+        # is given AND the session is job-bound. Keeps the plain
+        # byte-return path untouched for callers that don't want it.
+        label = ctx.action.get("label")
+        if label and ctx.state.asset_upload_base is not None:
+            try:
+                import base64 as _b64
+
+                ts = time.strftime("%Y%m%d-%H%M%S")
+                # ms suffix so a sub-second burst doesn't collide.
+                ms = int((time.time() % 1) * 1000)
+                safe = browser_ops.safe_label(str(label)) or "shot"
+                name = f"screenshot-{ts}-{ms:03d}-{safe}.png"
+                shots_dir = ctx.state.assets_dir / "screenshots"
+                shots_dir.mkdir(parents=True, exist_ok=True)
+                png_path = shots_dir / name
+                png_path.write_bytes(_b64.b64decode(png_b64))
+                await self._upload_one_session_asset(
+                    ctx.state,
+                    png_path,
+                    mime="image/png",
+                    asset_name=name,
+                )
+            except Exception as e:
+                ctx.slog(f"screenshot gallery upload failed: {e}")
+
+    @_session_action("evaluate", read_only=False)
+    async def _act_evaluate(self, ctx: "_ActionCtx") -> None:
+        # Arbitrary JS in the tab's page context -- the keystone the SDK
+        # builds Locator / wait_for_selector / hover / select_option on.
+        # nodriver returns arrays/objects as RemoteObject descriptors, so
+        # wrap as JSON.stringify(await (EXPR)) (a string crosses by value)
+        # + json.loads here. Trailing ``;`` is stripped because the
+        # wrapper needs a single expression (a ``;`` would null the result).
+        import json as _json
+
+        expr = ctx.action.get("expression") or ""
+        expr = expr.strip()
+        while expr.endswith(";"):
+            expr = expr[:-1].rstrip()
+        if not expr:
+            ctx.reply.status = "ERR: evaluate failed: empty expression"
+        else:
+            wrapped = "(async()=>{return JSON.stringify(await (" + expr + "));})()"
+            try:
+                raw = await ctx.tab.evaluate(wrapped, await_promise=True)
+                if isinstance(raw, str):
+                    try:
+                        ctx.reply.result = _json.loads(raw)
+                    except Exception:
+                        ctx.reply.result = raw
+                else:
+                    # undefined / non-serialisable -> null
+                    ctx.reply.result = None
+            except Exception as e:
+                ctx.reply.status = f"ERR: evaluate failed: {browser_ops.short_error(e)}"
+
+    @_session_action("capture", read_only=False)
+    async def _act_capture(self, ctx: "_ActionCtx") -> None:
+        label = ctx.action.get("label") or "capture"
+        step = int(ctx.action.get("step") or 0)
+        snap = await browser_ops.capture(
+            ctx.tab,
+            label=label,
+            step=step,
+            assets_dir=ctx.state.assets_dir,
+            log=ctx.slog,
+        )
+        # Upload the PNG only to the parent job's gallery (renamed to
+        # screenshot-* for the Live filter). HTML / axtree stay local.
+        if ctx.state.asset_upload_base is not None and snap.png_name:
+            png_path = ctx.state.assets_dir / snap.label / snap.png_name
+            if png_path.exists() and png_path.stat().st_size > 0:
+                ts = time.strftime("%Y%m%d-%H%M%S")
+                uploaded_name = f"screenshot-{ts}-{snap.label}.png"
+                await self._upload_one_session_asset(
+                    ctx.state,
+                    png_path,
+                    mime="image/png",
+                    page_url=snap.url or None,
+                    asset_name=uploaded_name,
+                )
+        ctx.reply.result = {
+            "label": snap.label,
+            "url": snap.url,
+            "html_name": snap.html_name,
+            "png_name": snap.png_name,
+            "axtree_name": snap.axtree_name,
+        }
+
     async def _handle_session_action(self, msg: HubSessionAction) -> None:
         """Dispatch one action against a bound session via browser_ops."""
         sid = msg.session_id
@@ -3971,96 +4071,6 @@ class WorkerAgent:
                 spec = _SESSION_ACTIONS.get(kind)
                 if spec is not None:
                     await spec.fn(self, ctx)
-                elif kind == "screenshot":
-                    from nodriver import cdp
-
-                    png_b64 = await tab.send(
-                        cdp.page.capture_screenshot(format_="png"),
-                    )
-                    reply.result = png_b64
-                    # Optional: also publish this frame to the parent
-                    # job's gallery so it shows in the Live tab's
-                    # "Screenshot" sub-tab (filter = name startswith
-                    # "screenshot-"). Triggered only when the caller
-                    # passed a ``label`` AND the session is bound to a
-                    # parent job (asset_upload_base set). Keeps the
-                    # plain page.screenshot() byte-return path untouched
-                    # for callers that don't want gallery noise.
-                    label = action.get("label")
-                    if label and state.asset_upload_base is not None:
-                        try:
-                            import base64 as _b64
-
-                            ts = time.strftime("%Y%m%d-%H%M%S")
-                            # millisecond suffix so a 0.5s-interval burst
-                            # (e.g. video frame capture) doesn't collide
-                            # within the same second.
-                            ms = int((time.time() % 1) * 1000)
-                            safe = browser_ops.safe_label(str(label)) or "shot"
-                            name = f"screenshot-{ts}-{ms:03d}-{safe}.png"
-                            shots_dir = state.assets_dir / "screenshots"
-                            shots_dir.mkdir(parents=True, exist_ok=True)
-                            png_path = shots_dir / name
-                            png_path.write_bytes(_b64.b64decode(png_b64))
-                            await self._upload_one_session_asset(
-                                state,
-                                png_path,
-                                mime="image/png",
-                                asset_name=name,
-                            )
-                        except Exception as e:
-                            _slog(f"screenshot gallery upload failed: {e}")
-                elif kind == "evaluate":
-                    # Arbitrary JS evaluation in the tab's page context.
-                    # The keystone the SDK builds Locator getters /
-                    # wait_for_selector / hover / select_option on top of
-                    # (all client-side JS, so only this one worker action
-                    # is needed).
-                    #
-                    # nodriver does NOT return arrays/objects by value --
-                    # they come back as RemoteObject descriptors
-                    # ([{type,value}, ...] / [[key,{value}], ...]). To give
-                    # callers clean JSON values (page.evaluate("[1,2,3]")
-                    # -> [1,2,3], not descriptors) we wrap the expression so
-                    # the browser does JSON.stringify(await (expr)) -- a
-                    # string always crosses by value -- and json.loads it
-                    # here. Same pattern as the ``links`` handler above.
-                    # Promises are awaited unconditionally (await on a
-                    # non-promise is a harmless no-op), so await_promise is
-                    # implied. DOM nodes / functions stringify to {} /
-                    # undefined rather than erroring.
-                    import json as _json
-
-                    expr = action.get("expression") or ""
-                    # The wrapper below embeds the expression as
-                    # ``JSON.stringify(await (EXPR))`` which REQUIRES EXPR to be
-                    # a single expression. A trailing ``;`` -- a very common
-                    # habit, especially in LLM-written probes like
-                    # ``(()=>{...})();`` -- turns it into ``await (EXPR;)``,
-                    # which the browser silently evaluates to null. The caller
-                    # then sees EVERY probe "return null" with no error, which
-                    # is impossible to debug from the outside (it cost a whole
-                    # forensics run). Strip trailing semicolons + whitespace so
-                    # ``(()=>{...})();`` behaves like ``(()=>{...})()``.
-                    expr = expr.strip()
-                    while expr.endswith(";"):
-                        expr = expr[:-1].rstrip()
-                    if not expr:
-                        reply.status = "ERR: evaluate failed: empty expression"
-                    else:
-                        wrapped = "(async()=>{return JSON.stringify(await (" + expr + "));})()"
-                        try:
-                            raw = await tab.evaluate(wrapped, await_promise=True)
-                            if isinstance(raw, str):
-                                try:
-                                    reply.result = _json.loads(raw)
-                                except Exception:
-                                    reply.result = raw
-                            else:
-                                # undefined / non-serialisable -> null
-                                reply.result = None
-                        except Exception as e:
-                            reply.status = f"ERR: evaluate failed: {browser_ops.short_error(e)}"
                 elif kind == "set_input_files":
                     # File upload: the client base64-encodes the file
                     # bytes, we materialise them in a worker tempdir and
@@ -4458,6 +4468,8 @@ class WorkerAgent:
                             # Strip common LLM-decorations (```json fences,
                             # leading "Here is the JSON:" prose, etc.) so
                             # plain json.loads succeeds without a regex zoo.
+                            import json as _json
+
                             raw = answer_text.strip()
                             if raw.startswith("```"):
                                 # Drop opening fence + optional language tag.
@@ -4487,46 +4499,6 @@ class WorkerAgent:
                                     f"{type(parsed).__name__} "
                                     f"({len(parsed) if hasattr(parsed, '__len__') else '-'})"
                                 )
-                elif kind == "capture":
-                    label = action.get("label") or "capture"
-                    step = int(action.get("step") or 0)
-                    snap = await browser_ops.capture(
-                        tab,
-                        label=label,
-                        step=step,
-                        assets_dir=state.assets_dir,
-                        log=_slog,
-                    )
-                    # Upload the PNG (only) to the parent job's /assets
-                    # endpoint so the Live tab's "Screenshot" sub-tab
-                    # can show it. The Live tab filter requires the
-                    # filename to start with "screenshot-" -- so we
-                    # rename on upload, keeping the local copy at its
-                    # original path for the script's own reference.
-                    # HTML and axtree stay local: the user-facing gallery
-                    # is for real page resources (image/video/audio)
-                    # that the passive CDP listener captures
-                    # automatically; HTML/axtree are mainly for
-                    # debugging and not worth shipping.
-                    if state.asset_upload_base is not None and snap.png_name:
-                        png_path = state.assets_dir / snap.label / snap.png_name
-                        if png_path.exists() and png_path.stat().st_size > 0:
-                            ts = time.strftime("%Y%m%d-%H%M%S")
-                            uploaded_name = f"screenshot-{ts}-{snap.label}.png"
-                            await self._upload_one_session_asset(
-                                state,
-                                png_path,
-                                mime="image/png",
-                                page_url=snap.url or None,
-                                asset_name=uploaded_name,
-                            )
-                    reply.result = {
-                        "label": snap.label,
-                        "url": snap.url,
-                        "html_name": snap.html_name,
-                        "png_name": snap.png_name,
-                        "axtree_name": snap.axtree_name,
-                    }
                 elif kind == "download_video":
                     # Late-enable iframe + nested-iframe deep network
                     # trace, if the session was opened with
