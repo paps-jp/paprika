@@ -1769,6 +1769,11 @@ function renderSessions(items) {
         <td>${s.visited_count ?? 0}</td>
         <td>${novnc}</td>
         <td style="white-space:nowrap;">
+          <button class="pill" style="background:#f3eeff; border-color:#b89fe0; color:#4a1f8a;"
+                  onclick="openForensicsModal('${sid}')"
+                  title="このセッションで Forensics 調査を実行 (LLM 読み取り/操作プローブ)">
+            <iconify-icon icon="lucide:microscope"></iconify-icon> forensics
+          </button>
           <button class="pill" style="background:#eef8ee; border-color:#7ab68a; color:#196b2c;"
                   onclick="saveSessionCookiesToHost('${sid}')"
                   title="今のブラウザの Cookie を Host レジストリに保存 (再ログイン不要に)">
