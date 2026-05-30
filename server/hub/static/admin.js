@@ -864,10 +864,13 @@ function setTab(name, { updateHash = true } = {}) {
   }
   // Settings tab: load hub settings + MariaDB/SMB status on activation
   // so the panel is populated when deep-linking via #settings or on
-  // browser refresh. loadSettingsPanel is hoisted (function decl), so
-  // it's safe to call from the initial setTab() at parse time.
+  // browser refresh. Deferred via setTimeout because setTab() runs at
+  // script-parse line ~1065 while SETTINGS_URL / UI_DEFAULTS_FALLBACK
+  // are const-declared much later (~9473); calling loadSettingsPanel()
+  // synchronously would hit the temporal dead zone. The macrotask fires
+  // after the full script has executed, so all constants are initialised.
   if (name === 'settings' && typeof loadSettingsPanel === 'function') {
-    loadSettingsPanel();
+    setTimeout(loadSettingsPanel, 0);
   }
   // Highlight the "More" dropdown when one of its children is active.
   const moreWrap = document.getElementById('moreTabWrap');
