@@ -47,6 +47,8 @@ from dataclasses import asdict, dataclass, field
 from datetime import datetime
 from pathlib import Path
 
+from server.hub._jsonstore import atomic_write_json
+
 # kebab-case slug, file-safe + URL-safe.
 _SLUG_RE = re.compile(r"^[A-Za-z0-9._\-]{1,64}$")
 
@@ -276,7 +278,7 @@ class ExtensionRegistry:
             updated_at=datetime.utcnow(),
             note=saved_note[:500],
         )
-        self._meta_path(slug).write_text(json.dumps(meta.to_json(), indent=2), encoding="utf-8")
+        atomic_write_json(self._meta_path(slug), meta.to_json())
         return meta
 
     def set_enabled(self, slug: str, enabled: bool) -> ExtensionMeta | None:
@@ -285,7 +287,7 @@ class ExtensionRegistry:
             return None
         meta.enabled = bool(enabled)
         meta.updated_at = datetime.utcnow()
-        self._meta_path(slug).write_text(json.dumps(meta.to_json(), indent=2), encoding="utf-8")
+        atomic_write_json(self._meta_path(slug), meta.to_json())
         return meta
 
     def set_note(self, slug: str, note: str) -> ExtensionMeta | None:
@@ -294,7 +296,7 @@ class ExtensionRegistry:
             return None
         meta.note = (note or "")[:500]
         meta.updated_at = datetime.utcnow()
-        self._meta_path(slug).write_text(json.dumps(meta.to_json(), indent=2), encoding="utf-8")
+        atomic_write_json(self._meta_path(slug), meta.to_json())
         return meta
 
     def delete(self, slug: str) -> bool:

@@ -19,9 +19,12 @@ from __future__ import annotations
 
 import json
 import os
+import threading
 from datetime import datetime
 from pathlib import Path
 from typing import Any
+
+from server.hub._jsonstore import atomic_write_json
 
 # Default schema. Keys map to (default, "type"). The type label is
 # advisory -- it shapes how the UI renders the field.
@@ -206,6 +209,12 @@ class SettingsRegistry:
         self.path = Path(data_dir) / "settings.json"
         # Cached state. Lazily loaded.
         self._cache: dict | None = None
+        # Guards the read-modify-write in update(). Without it two
+        # concurrent updates (e.g. a PUT /settings on the event loop
+        # racing the SMB watchdog's reg.update() running in a worker
+        # thread via asyncio.to_thread) both load the same base dict,
+        # both write, and the second silently drops the first's change.
+        self._lock = threading.Lock()
 
     def _load(self) -> dict:
         if self._cache is not None:
@@ -220,12 +229,10 @@ class SettingsRegistry:
         return data
 
     def _write(self, data: dict) -> None:
-        self.path.parent.mkdir(parents=True, exist_ok=True)
         data["_updated_at"] = _utcnow_iso()
-        self.path.write_text(
-            json.dumps(data, indent=2, ensure_ascii=False),
-            encoding="utf-8",
-        )
+        # Atomic so a crash mid-save can't truncate settings.json (which
+        # would wipe every operator-configured value on next start).
+        atomic_write_json(self.path, data)
         self._cache = data
 
     def schema(self) -> dict:
@@ -312,13 +319,15 @@ class SettingsRegistry:
 
     def update(self, partial: dict) -> dict:
         """Partial update -- merge ``partial`` into the persisted
-        dict, leaving other keys alone."""
-        merged = dict(self._load())
-        for k, (fb, kind) in _SCHEMA.items():
-            if k not in partial:
-                continue
-            merged[k] = self._coerce(kind, partial[k], fb)
-        # Drop the metadata key before writing -- _write re-stamps it.
-        merged.pop("_updated_at", None)
-        self._write(merged)
+        dict, leaving other keys alone. The read-modify-write is held
+        under a lock so concurrent updates don't clobber each other."""
+        with self._lock:
+            merged = dict(self._load())
+            for k, (fb, kind) in _SCHEMA.items():
+                if k not in partial:
+                    continue
+                merged[k] = self._coerce(kind, partial[k], fb)
+            # Drop the metadata key before writing -- _write re-stamps it.
+            merged.pop("_updated_at", None)
+            self._write(merged)
         return self.all()

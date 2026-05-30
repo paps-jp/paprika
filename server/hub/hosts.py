@@ -42,6 +42,8 @@ from dataclasses import asdict, dataclass, field
 from datetime import datetime
 from pathlib import Path
 
+from server.hub._jsonstore import atomic_write_json
+
 
 def _normalise_host(host: str) -> str:
     """Lowercase + strip ``www.`` prefix + strip whitespace.
@@ -674,9 +676,6 @@ class HostRegistry:
         return (datetime.utcnow() - last).total_seconds() > ttl
 
     def _write(self, rec: HostRecord) -> None:
-        path = self._path(rec.host)
-        path.parent.mkdir(parents=True, exist_ok=True)
-        path.write_text(
-            json.dumps(rec.to_json(), indent=2, ensure_ascii=False),
-            encoding="utf-8",
-        )
+        # Atomic (.tmp + os.replace) so a crash mid-save can't leave a
+        # truncated host record on disk.
+        atomic_write_json(self._path(rec.host), rec.to_json())

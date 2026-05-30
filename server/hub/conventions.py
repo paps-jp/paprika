@@ -34,6 +34,8 @@ from datetime import datetime
 from pathlib import Path
 from typing import Literal
 
+from server.hub._jsonstore import atomic_write_json
+
 ConventionTier = Literal["auto", "curated"]
 
 
@@ -273,12 +275,8 @@ class ConventionRegistry:
         return rec
 
     def _write(self, rec: ConventionRecord) -> None:
-        path = self._path(rec.slug, rec.tier)
-        path.parent.mkdir(parents=True, exist_ok=True)
-        path.write_text(
-            json.dumps(rec.to_json(), indent=2, ensure_ascii=False),
-            encoding="utf-8",
-        )
+        # Atomic write so a crash mid-save can't corrupt the record.
+        atomic_write_json(self._path(rec.slug, rec.tier), rec.to_json())
 
 
 def render_conventions_block(

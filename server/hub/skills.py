@@ -33,6 +33,8 @@ from datetime import datetime
 from pathlib import Path
 from typing import Literal
 
+from server.hub._jsonstore import atomic_write_json
+
 SkillTier = Literal["auto", "curated"]
 
 
@@ -278,9 +280,5 @@ class SkillRegistry:
         return rec
 
     def _write(self, rec: SkillRecord) -> None:
-        path = self._path(rec.slug, rec.tier)
-        path.parent.mkdir(parents=True, exist_ok=True)
-        path.write_text(
-            json.dumps(rec.to_json(), indent=2, ensure_ascii=False),
-            encoding="utf-8",
-        )
+        # Atomic write so a crash mid-save can't corrupt the skill record.
+        atomic_write_json(self._path(rec.slug, rec.tier), rec.to_json())
