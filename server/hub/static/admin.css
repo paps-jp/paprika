@@ -597,34 +597,61 @@
      accent on hover along with the label. */
   #liveJobPanel .ljp-actions-group .pill iconify-icon { font-size: 1.05em; }
 
-  /* noVNC per-session chrome bar (.ljp-vnc-head). Each button uses the
-     same .pill class as the LJP top header + --la-bg / --la-bd / --la-fg
-     inline custom props for accent colour. Unlike the LJP override the
-     accent is applied AT REST (not just on hover) so the buttons look
-     like a Chrome address bar with always-visible tinted chips. */
+  /* noVNC per-session chrome bar (.ljp-vnc-head). Mirror EXACTLY the
+     LJP top-header pill behaviour:
+       * default: transparent fill, muted ink (looks light/clean)
+       * hover:   apply --la-bg / --la-bd / --la-fg accent + lift + shadow
+     This keeps the bar visually consistent with the 一時停止 / 再開 /
+     その他 / 閉じる buttons above. Per-button inline --la-* props
+     still distinguish nav vs popup vs URL vs screenshot at hover. */
   .ljp-vnc-head .pill {
-    display: inline-flex; align-items: center; gap: 4px;
-    padding: 5px 10px; border-radius: 6px;
-    font: 600 .78rem/1 inherit;
-    background: var(--la-bg, #f0f0f6);
-    border: 1px solid var(--la-bd, #d8d8e2);
-    color: var(--la-fg, #2a2a35);
+    display: inline-flex; align-items: center; gap: 6px;
+    font-size: .78em; line-height: 1; font-weight: 600;
+    padding: 6px 10px; border-radius: 7px;
+    border: 1px solid transparent;
+    background: transparent;
+    color: #5a5a68;
     cursor: pointer; text-decoration: none;
-    transition: background .14s, color .14s, border-color .14s, transform .1s, box-shadow .14s;
+    transition: background .14s ease, border-color .14s ease,
+                color .14s ease, transform .1s ease, box-shadow .14s ease;
   }
   .ljp-vnc-head .pill:not(:disabled):hover {
+    background: var(--la-bg, #f0f0f6);
+    border-color: var(--la-bd, #d8d8e2);
+    color: var(--la-fg, #2a2a35);
     transform: translateY(-1px);
-    box-shadow: 0 2px 6px rgba(0,0,0,.10);
-    /* Slightly darker fill on hover -- inherits the same accent so the
-       button doesn't shift colour, just lifts. Achieved via filter so
-       we don't need to know the exact var(--la-bg) value. */
-    filter: brightness(.95);
+    box-shadow: 0 3px 9px rgba(0,0,0,.10);
+  }
+  .ljp-vnc-head .pill:not(:disabled):active {
+    transform: translateY(0);
+    box-shadow: 0 1px 2px rgba(0,0,0,.06);
   }
   .ljp-vnc-head .pill:disabled {
-    cursor: not-allowed; opacity: .45;
-    transform: none; box-shadow: none; filter: none;
+    cursor: not-allowed; opacity: .4;
+    box-shadow: none; transform: none;
   }
   .ljp-vnc-head .pill iconify-icon { font-size: 1.05em; }
+  /* URL input + zoom select inside the bar: match the same height and
+     border-radius so they read as one continuous control row alongside
+     the pills. */
+  .ljp-vnc-head input.ljp-vnc-url,
+  .ljp-vnc-head select.ljp-vnc-zoom {
+    font-size: .78em; line-height: 1;
+    padding: 6px 10px; border-radius: 7px;
+    border: 1px solid #d4cfca;
+    background: #fff;
+    color: #3a3a45;
+    font-weight: 600;
+  }
+  .ljp-vnc-head input.ljp-vnc-url {
+    font-family: ui-monospace, Consolas, monospace;
+    font-weight: 400;
+  }
+  .ljp-vnc-head input.ljp-vnc-url:focus {
+    outline: none;
+    border-color: #9bf;
+    box-shadow: 0 0 0 2px rgba(155,191,255,.35);
+  }
 
   /* ----- "more" overflow menu ----- */
   #liveJobPanel .ljp-more-wrap { position: relative; display: inline-flex; }

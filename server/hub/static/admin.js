@@ -5191,7 +5191,10 @@ function ljpMountVncFrame(key, s) {
   // behaviour -- per-button --la-bg accent applied at rest, gentle
   // lift on hover -- so the global .pill red-fill hover doesn't dominate.
   head.className = 'ljp-vnc-head';
-  head.style.cssText = 'background:#f3f0ec; color:#3a3a45; padding:6px 8px; display:flex; align-items:center; gap:6px; border-bottom:1px solid #d4cfca;';
+  // Bar height = padding 10px top/bottom. Same chrome (cream bg, thin
+  // bottom border) as before but slightly taller so the .pill buttons
+  // breathe like they do in the LJP top header.
+  head.style.cssText = 'background:#f3f0ec; color:#3a3a45; padding:10px 12px; display:flex; align-items:center; gap:6px; border-bottom:1px solid #d4cfca;';
   // Operator control buttons (learn-from-operator Phase 1). Shown only
   // for real sessions (not the synthetic '__job__' fetch placeholder).
   // Each press is forwarded to /operator_action which executes it AND
@@ -5223,11 +5226,13 @@ function ljpMountVncFrame(key, s) {
   // landed. Read-only synthetic placeholder ('__job__') sessions get
   // their session label instead since there's no real session to
   // navigate.
-  const _urlInputCss = 'flex:1; min-width:200px; background:#fff; color:#3a3a45; padding:5px 10px; border:1px solid #d4cfca; border-radius:6px; font-size:.78rem; font-family:ui-monospace,Consolas,monospace; outline:none;';
+  // URL input / read-only label both stretch via flex:1; visual styling
+  // (height, border, font) comes from .ljp-vnc-head CSS so the input
+  // lines up with the .pill buttons.
   const _initialVal = _opSid ? (s.initial_url || s.label || '') : (s.label || '');
   const urlInput = _opSid ?
-    `<input class="ljp-vnc-url" type="text" placeholder="https://example.com (Enter で移動)" value="${esc(_initialVal)}" style="${_urlInputCss}" autocomplete="off" spellcheck="false">` :
-    `<code style="flex:1; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; background:#fff; color:#5a5a68; padding:5px 10px; border:1px solid #d4cfca; border-radius:6px; font-size:.78rem; font-family:ui-monospace,Consolas,monospace;" title="${esc(s.label)}">${esc(s.label)}</code>`;
+    `<input class="ljp-vnc-url" type="text" placeholder="https://example.com (Enter で移動)" value="${esc(_initialVal)}" style="flex:1; min-width:200px;" autocomplete="off" spellcheck="false">` :
+    `<code style="flex:1; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; background:#fff; color:#5a5a68; padding:6px 10px; border:1px solid #d4cfca; border-radius:7px; font-size:.78em; font-family:ui-monospace,Consolas,monospace;" title="${esc(s.label)}">${esc(s.label)}</code>`;
   // Right cluster: screenshot, popup-close, zoom, fit, open.
   const shotBtn = _opSid ?
     `<button class="pill ljp-vnc-screenshot" style="${_shotAccent}" title="現在のフレームを保存 (POST /jobs/{id}/screenshot)"><iconify-icon icon="lucide:camera"></iconify-icon></button>` :
@@ -5235,8 +5240,10 @@ function ljpMountVncFrame(key, s) {
   const popupBtn = _opSid ?
     `<button class="pill ljp-op-popups" style="${_popupAccent}" title="広告などのポップアップ・別タブを閉じる (記録)"><iconify-icon icon="lucide:x"></iconify-icon> popup</button>` :
     '';
+  // Zoom select: styling comes from .ljp-vnc-head select.ljp-vnc-zoom
+  // in CSS (height/border/font aligned with the .pill row).
   const zoomSelect =
-    `<select class="ljp-vnc-zoom" title="ページズーム (Ctrl+/Ctrl- 相当)" style="background:#fff; color:#3a3a45; border:1px solid #d4cfca; border-radius:6px; padding:3px 6px; font-size:.78rem; font-weight:600;">` +
+    `<select class="ljp-vnc-zoom" title="ページズーム (Ctrl+/Ctrl- 相当)">` +
       `<option value="0.5">50%</option>` +
       `<option value="0.75">75%</option>` +
       `<option value="1.0" selected>100%</option>` +
