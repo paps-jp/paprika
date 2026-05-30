@@ -125,6 +125,11 @@ class AppState:
     # comes first). Only active when Redis store is in use; None
     # when running with InMemoryJobStore. See _log_batcher.py.
     log_batcher: object | None = None  # LogBatcher | None (lazy import)
+    # MariaDB connection pool (optional). Initialised lazily on first
+    # migration endpoint call when MariaDB settings are configured.
+    # None when MariaDB is not configured or the pool hasn't been
+    # created yet. See server/hub/mariadb.py.
+    mariadb_pool: object | None = None  # aiomysql.Pool | None (lazy)
 
 
 state = AppState()

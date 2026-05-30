@@ -197,6 +197,14 @@ async def lifespan(app: FastAPI):
             await state.log_batcher.flush_all()
         except Exception:
             pass
+    # Close MariaDB pool if it was lazily initialised.
+    if state.mariadb_pool is not None:
+        try:
+            from server.hub.mariadb import close_pool
+            await close_pool(state.mariadb_pool)
+            state.mariadb_pool = None
+        except Exception:
+            pass
     if state.store is not None:
         try:
             await state.store.close()

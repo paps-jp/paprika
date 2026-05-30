@@ -286,3 +286,110 @@ async def mariadb_test(body: dict | None = None) -> dict:
             return {"ok": False, "message": str(e)}
 
     return await _test()
+
+
+# -------------------------------------------------------------------
+# MariaDB pool helper + migration endpoints
+# -------------------------------------------------------------------
+
+async def _get_or_create_pool():
+    """Lazy-init the MariaDB connection pool from saved settings.
+
+    The pool is cached on ``state.mariadb_pool`` so subsequent calls
+    reuse the same connection pool.  If the pool is stale (ping fails),
+    a new one is created.
+    """
+    from server.hub.mariadb import close_pool, create_pool
+
+    # Re-use existing pool if healthy
+    if state.mariadb_pool is not None:
+        try:
+            async with state.mariadb_pool.acquire() as conn:
+                await conn.ping()
+            return state.mariadb_pool
+        except Exception:
+            await close_pool(state.mariadb_pool)
+            state.mariadb_pool = None
+
+    reg = _require_settings()
+    host = reg.get("mariadb_host", "")
+    if not host:
+        raise HTTPException(400, "MariaDB ホストが未設定です")
+    username = reg.get("mariadb_username", "")
+    if not username:
+        raise HTTPException(400, "MariaDB ユーザー名が未設定です")
+
+    try:
+        pool = await create_pool(
+            host=host,
+            port=int(reg.get("mariadb_port", 3306)),
+            database=reg.get("mariadb_database", "paprika"),
+            username=username,
+            password=reg.get("mariadb_password", ""),
+        )
+    except Exception as e:
+        raise HTTPException(500, f"MariaDB 接続失敗: {e}")
+
+    state.mariadb_pool = pool
+    return pool
+
+
+@router.post("/settings/mariadb/schema")
+async def mariadb_create_schema() -> dict:
+    """Create MariaDB tables (idempotent CREATE TABLE IF NOT EXISTS)."""
+    from server.hub.mariadb import ensure_schema
+
+    pool = await _get_or_create_pool()
+    try:
+        tables = await ensure_schema(pool)
+        return {"ok": True, "tables": tables}
+    except Exception as e:
+        raise HTTPException(500, f"テーブル作成失敗: {e}")
+
+
+@router.post("/settings/mariadb/migrate/{category}")
+async def mariadb_migrate(category: str) -> dict:
+    """Migrate one data category to MariaDB.
+
+    *category*: ``jobs`` | ``hosts`` | ``visited_urls``
+    """
+    import asyncio
+
+    from server.hub import mariadb
+
+    pool = await _get_or_create_pool()
+
+    # Ensure tables exist first
+    await mariadb.ensure_schema(pool)
+
+    if category == "jobs":
+        if state.store is None:
+            raise HTTPException(503, "JobStore が未初期化です")
+        result = await asyncio.to_thread(
+            lambda: None  # placeholder
+        ) if False else await mariadb.migrate_jobs(state.store, pool)
+        return result
+
+    if category == "hosts":
+        if state.hosts is None:
+            raise HTTPException(503, "HostRegistry が未初期化です")
+        return await mariadb.migrate_hosts(state.hosts, pool)
+
+    if category == "visited_urls":
+        if state.hosts is None or state.host_visited is None:
+            raise HTTPException(503, "HostRegistry / VisitedRegistry が未初期化です")
+        return await mariadb.migrate_visited_urls(
+            state.hosts, state.host_visited, pool,
+        )
+
+    raise HTTPException(400, f"不明なカテゴリ: {category}")
+
+
+@router.get("/settings/mariadb/tables")
+async def mariadb_table_status() -> dict:
+    """Return row counts for each MariaDB table."""
+    from server.hub.mariadb import table_counts
+
+    pool = await _get_or_create_pool()
+    counts = await table_counts(pool)
+    return {"ok": True, "tables": counts}
