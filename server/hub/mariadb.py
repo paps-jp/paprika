@@ -1205,6 +1205,18 @@ async def restore_presets(pool: Any, preset_registry: Any) -> int:
     return restored
 
 
+async def _mdb_count(pool: Any, table: str) -> int:
+    """Quick row count for a MariaDB table (0 if table missing)."""
+    try:
+        async with pool.acquire() as conn:
+            async with conn.cursor() as cur:
+                await cur.execute(f"SELECT COUNT(*) FROM `{table}`")
+                row = await cur.fetchone()
+                return row[0] if row else 0
+    except Exception:
+        return 0
+
+
 async def restore_all_registries(
     pool: Any,
     *,
@@ -1215,18 +1227,19 @@ async def restore_all_registries(
     engine_registry: Any = None,
     preset_registry: Any = None,
 ) -> dict[str, int]:
-    """Restore all registries from MariaDB if they are locally empty.
+    """Restore all registries from MariaDB.
 
-    Only restores a registry when its ``list_all()`` (or equivalent)
-    returns 0 records but MariaDB has data. Returns a dict of
-    ``{category: count_restored}``.
+    MariaDB is the source of truth after migration.  For each
+    category, if the MariaDB table has rows, upsert them into the
+    file-backed registry (overwrites local data with MariaDB data).
+    Returns ``{category: count_restored}``.
     """
     results: dict[str, int] = {}
 
     # Hosts
     if host_registry is not None:
         try:
-            if len(host_registry.list_all()) == 0:
+            if await _mdb_count(pool, "hosts") > 0:
                 n = await restore_hosts(pool, host_registry)
                 if n:
                     results["hosts"] = n
@@ -1234,17 +1247,10 @@ async def restore_all_registries(
         except Exception as e:
             log.warning("restore hosts failed: %s", e)
 
-    # Visited URLs (check only if host_registry has entries now)
-    if visited_registry is not None and host_registry is not None:
+    # Visited URLs
+    if visited_registry is not None:
         try:
-            # Quick check: does any host have visited URLs locally?
-            has_local = False
-            for rec in host_registry.list_all()[:5]:
-                host = getattr(rec, "host", None)
-                if host and visited_registry.all_urls(host):
-                    has_local = True
-                    break
-            if not has_local:
+            if await _mdb_count(pool, "visited_urls") > 0:
                 n = await restore_visited_urls(pool, visited_registry)
                 if n:
                     results["visited_urls"] = n
@@ -1255,7 +1261,7 @@ async def restore_all_registries(
     # Skills
     if skill_registry is not None:
         try:
-            if len(skill_registry.list_all()) == 0:
+            if await _mdb_count(pool, "skills") > 0:
                 n = await restore_skills(pool, skill_registry)
                 if n:
                     results["skills"] = n
@@ -1266,7 +1272,7 @@ async def restore_all_registries(
     # Conventions
     if convention_registry is not None:
         try:
-            if len(convention_registry.list_all()) == 0:
+            if await _mdb_count(pool, "conventions") > 0:
                 n = await restore_conventions(pool, convention_registry)
                 if n:
                     results["conventions"] = n
@@ -1277,7 +1283,7 @@ async def restore_all_registries(
     # Engines
     if engine_registry is not None:
         try:
-            if len(engine_registry.list_all()) == 0:
+            if await _mdb_count(pool, "engines") > 0:
                 n = await restore_engines(pool, engine_registry)
                 if n:
                     results["engines"] = n
@@ -1288,7 +1294,7 @@ async def restore_all_registries(
     # Presets
     if preset_registry is not None:
         try:
-            if len(preset_registry.list_all()) == 0:
+            if await _mdb_count(pool, "presets") > 0:
                 n = await restore_presets(pool, preset_registry)
                 if n:
                     results["presets"] = n
