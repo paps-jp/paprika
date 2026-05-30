@@ -76,7 +76,6 @@ from server.worker._browser_helpers import (
     _looks_like_player_iframe,
 )
 from server.worker.session_actions import (
-    SessionActionsMixin,
     _ActionCtx,
     _SESSION_ACTIONS,
 )
@@ -1816,7 +1815,7 @@ def _normalise_extracted_profile(root: Path, *, log=None) -> None:
 
 
 
-class WorkerAgent(SessionActionsMixin):
+class WorkerAgent:
     def __init__(
         self,
         hub_ws_url: str,
