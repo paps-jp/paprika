@@ -185,9 +185,9 @@ async def run_preset(name: str, request: Request, body: dict = None) -> JobInfo:
     except Exception:
         pass
 
-    # Hand off to the existing job-creation endpoint. Lazy import to
-    # avoid the routes/presets -> app -> routes/presets cycle (create_job
-    # still lives in app.py until #2B-G migrates /jobs).
-    from server.hub.app import create_job
+    # Hand off to the existing job-creation endpoint. create_job lives in
+    # routes/jobs.py; lazy-import at call time to avoid a presets<->jobs
+    # import cycle at module load.
+    from server.hub.routes.jobs import create_job
 
     return await create_job(req, request)

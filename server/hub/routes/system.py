@@ -45,7 +45,7 @@ def _hub_version() -> str:
     access in one place. Imported lazily so this module can be
     imported before app.py has finished loading.
     """
-    from server.hub.app import _hub_version as _v
+    from server.hub._version import _hub_version as _v
     return _v()
 
 

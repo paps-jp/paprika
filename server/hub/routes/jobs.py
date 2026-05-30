@@ -37,7 +37,7 @@ log = logging.getLogger(__name__)
 # below) and are re-exported from app.py for the /jobs routes still
 # there (GET /jobs / {id} / result / cancel / delete / cleanup,
 # POST /jobs/{id}/screenshot / /assets, etc).
-from server.hub.app import _safe_job_file
+from server.hub._helpers import _safe_job_file
 from server.hub.routes.novnc import _proxy_session_dict
 from server.hub.routes.sessions import (
     _novnc_autoconnect,
@@ -2131,7 +2131,7 @@ import uuid
 # the partial-app-load. Lazy-import at call time -- happy path, no
 # perf hit (one attribute lookup per /jobs/{id}/screenshot request).
 def _ffmpeg_q_from_quality_pct(pct: int) -> int:
-    from server.hub.app import _ffmpeg_q_from_quality_pct as _impl
+    from server.hub._helpers import _ffmpeg_q_from_quality_pct as _impl
 
     return _impl(pct)
 
@@ -2830,7 +2830,7 @@ def _run_codegen_loop_job(*args, **kwargs):  # type: ignore[no-untyped-def]
     ``server/hub/_jobrunner.py`` (the wrapper was previously hard-coded
     to ``(request, info)`` and silently broke when extra kwargs were
     added)."""
-    from server.hub.app import _run_codegen_loop_job as _impl
+    from server.hub._jobrunner import _run_codegen_loop_job as _impl
 
     return _impl(*args, **kwargs)
 
@@ -2843,31 +2843,31 @@ def _run_rerun_loop_job(*args, **kwargs):  # type: ignore[no-untyped-def]
     ...)``; this wrapper was previously declared as
     ``(request, info, source_jid)`` which made every rerun job 500 with
     "unexpected keyword argument 'inherited_state_files'"."""
-    from server.hub.app import _run_rerun_loop_job as _impl
+    from server.hub._jobrunner import _run_rerun_loop_job as _impl
 
     return _impl(*args, **kwargs)
 
 
 def _copy_session_state_dir(src_job_id: str, dst_job_id: str) -> int:
-    from server.hub.app import _copy_session_state_dir as _impl
+    from server.hub._jobrunner import _copy_session_state_dir as _impl
 
     return _impl(src_job_id, dst_job_id)
 
 
 async def _ensure_host_login(host: str, *, force: bool = False) -> dict:
-    from server.hub.app import _ensure_host_login as _impl
+    from server.hub.routes.hosts import _ensure_host_login as _impl
 
     return await _impl(host, force=force)
 
 
 def _hub_base_url(request) -> str:  # type: ignore[no-untyped-def]
-    from server.hub.app import _hub_base_url as _impl
+    from server.hub._helpers import _hub_base_url as _impl
 
     return _impl(request)
 
 
 def _asset_upload_url(base: str, job_id: str) -> str:
-    from server.hub.app import _asset_upload_url as _impl
+    from server.hub._helpers import _asset_upload_url as _impl
 
     return _impl(base, job_id)
 

@@ -34,13 +34,11 @@ log = logging.getLogger(__name__)
 
 
 async def close_session(session_id: str):
-    """Lazy bridge to the route-layer close_session. The reaper imports
-    this module at lifespan-start time when app.py is still loading,
-    so an eager ``from server.hub.app import close_session`` would
-    race the partial import. Wrap with a function-level lookup so the
-    resolution happens at first call (= reaper tick), by which point
-    app.py is fully loaded."""
-    from server.hub.app import close_session as _impl
+    """Lazy bridge to the route-layer close_session (defined in
+    routes/sessions.py). The reaper imports this module at
+    lifespan-start time when the route modules are still loading, so
+    resolve at first call (= reaper tick) rather than at import."""
+    from server.hub.routes.sessions import close_session as _impl
 
     return await _impl(session_id)
 

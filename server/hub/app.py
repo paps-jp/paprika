@@ -17,8 +17,6 @@ from pathlib import Path
 
 from fastapi import (
     FastAPI,
-    HTTPException,
-    Request,
 )
 
 from server._logging import setup_logging
@@ -409,32 +407,15 @@ from server.hub._jobrunner import (  # noqa: F401
 # ----------------------------------------------------------------------------
 
 
-def _safe_job_file(job_id: str, *parts: str) -> Path:
-    if any(p in ("", "..", ".") or "\\" in p or "/" in p for p in parts):
-        raise HTTPException(400, "invalid path component")
-    job_dir = get_storage_dir() / job_id
-    if not job_dir.exists():
-        raise HTTPException(404, f"job '{job_id}' not found")
-    p = job_dir.joinpath(*parts)
-    try:
-        p.resolve().relative_to(job_dir.resolve())
-    except ValueError:
-        raise HTTPException(400, "path escapes job dir")
-    if not p.exists():
-        raise HTTPException(404, f"file not found: {'/'.join(parts)}")
-    return p
-
-
-def _hub_base_url(request: Request) -> str:
-    """The URL workers should use to reach this hub. Override via config or
-    fall back to the incoming request's base."""
-    if config.public_base_url:
-        return config.public_base_url.rstrip("/")
-    return str(request.base_url).rstrip("/")
-
-
-def _asset_upload_url(base: str, job_id: str) -> str:
-    return f"{base}/jobs/{job_id}/assets"
+# These leaf helpers moved to server/hub/_helpers.py so route modules can
+# import them directly instead of lazy-importing through app.py (the old
+# cycle workaround). Re-exported here for backwards compatibility.
+from server.hub._helpers import (  # noqa: F401,E402
+    _asset_upload_url,
+    _ffmpeg_q_from_quality_pct,
+    _hub_base_url,
+    _safe_job_file,
+)
 
 
 # ---- Hub version resolver -- moved to _version.py (#2B-H) ---------------
@@ -703,21 +684,7 @@ app.include_router(_sessions_router)
 # ----------------------------------------------------------------------------
 
 
-def _ffmpeg_q_from_quality_pct(pct: int) -> int:
-    """Translate ``quality`` (0-100 perceptual) to ffmpeg's mjpeg
-    ``q:v`` (2-31, lower = higher quality). Linear interpolation:
-
-        quality=100 -> q=2  (best)
-        quality=50  -> q=16 (medium)
-        quality=0   -> q=31 (worst)
-
-    Clamps out-of-range inputs to the endpoint scale before
-    translating. This is the only place the inversion happens; the
-    worker just consumes the final ffmpeg q value.
-    """
-    p = max(0, min(100, int(pct)))
-    # 100 -> 2, 0 -> 31. ffmpeg_q = round(31 - p * 29 / 100)
-    return max(2, min(31, round(31 - p * 29 / 100)))
+# _ffmpeg_q_from_quality_pct moved to server/hub/_helpers.py (re-exported above).
 
 
 # ---- worker_lane_preview -- moved to routes/workers.py (#2B-G3-partial) -

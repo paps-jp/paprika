@@ -43,7 +43,7 @@ log = logging.getLogger(__name__)
 # _asset_upload_url is defined in app.py at L1334 -- import is safe at
 # module top because that definition runs WAY before app.py reaches the
 # include_router stanza for this module.
-from server.hub.app import _asset_upload_url
+from server.hub._helpers import _asset_upload_url
 from server.hub.codegen import (
     CODEGEN_LLM_URL,
     CODEGEN_MODEL_NAME,
@@ -64,7 +64,7 @@ def _proxy_session_dict(d: dict) -> dict:
     can't eager-import it. Wrap with a function-level import so the
     lookup happens at call time when app.py is fully loaded.
     """
-    from server.hub.app import _proxy_session_dict as _impl
+    from server.hub.routes.novnc import _proxy_session_dict as _impl
 
     return _impl(d)
 
@@ -74,7 +74,7 @@ def _disconnect_session_novnc_clients(session_id: str) -> None:
     noVNC viewers off a session being torn down. The implementation
     lives in app.py's noVNC subsection (defined after our
     include_router stanza), so wrap with a function-level import."""
-    from server.hub.app import _disconnect_session_novnc_clients as _impl
+    from server.hub.routes.novnc import _disconnect_session_novnc_clients as _impl
 
     return _impl(session_id)
 

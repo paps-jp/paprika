@@ -655,11 +655,8 @@ async def relogin_host(host: str) -> dict:
     """
     if state.hosts is None or state.hosts.get(_normalise_host(host)) is None:
         raise HTTPException(404, f"host '{host}' not registered")
-    # Lazy import: _ensure_host_login still lives in app.py because the
-    # job runner's pre-fetch hook also calls it. Once that hook moves
-    # (#2B-G), the function can migrate here too.
-    from server.hub.app import _ensure_host_login
-
+    # _ensure_host_login is defined later in THIS module (it used to be
+    # imported back through app.py -- a self-loop). Just call it directly.
     return await _ensure_host_login(host, force=True)
 
 

@@ -273,7 +273,7 @@ async def get_worker_source_tarball() -> Response:
     """
     # Lazy import: _hub_version still lives in app.py (file read +
     # cache). One round trip's worth of ms is fine for a tarball.
-    from server.hub.app import _hub_version
+    from server.hub._version import _hub_version
 
     try:
         data = _build_worker_source_tarball()
@@ -301,7 +301,7 @@ async def get_worker_plugins_tarball() -> Response:
     optional ``data/tools/catalog.json``). Stable -- the worker
     extractor enforces this exact prefix.
     """
-    from server.hub.app import _hub_version
+    from server.hub._version import _hub_version
 
     try:
         data = _build_worker_plugins_tarball()
@@ -407,7 +407,7 @@ import asyncio
 # AND routes/jobs.py:take_job_screenshot). Lazy-import to dodge the
 # app->routes/workers->app cycle.
 def _ffmpeg_q_from_quality_pct(pct: int) -> int:
-    from server.hub.app import _ffmpeg_q_from_quality_pct as _impl
+    from server.hub._helpers import _ffmpeg_q_from_quality_pct as _impl
 
     return _impl(pct)
 
@@ -543,7 +543,7 @@ from server.scheduler import WorkerRegistry
 # _hub_version lives in app.py (cached file read); lazy bridge to dodge
 # the routes/workers <-> app boot cycle.
 def _hub_version() -> str:
-    from server.hub.app import _hub_version as _impl
+    from server.hub._version import _hub_version as _impl
 
     return _impl()
 
