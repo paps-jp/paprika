@@ -2269,18 +2269,6 @@ def _normalise_extracted_profile(root: Path, *, log=None) -> None:
 # handlers: they all delegate uniformly to ``browser_ops.execute`` via the
 # router's ``else`` branch, so they need no per-kind entry.
 
-# Actions that are safe to run against a session a fetch job is actively
-# driving (read-only / non-tab-driving). Module-level constant (was
-# rebuilt per call as a local); referenced by the fetch-owned gate.
-_READ_ONLY_KINDS_FOR_FETCH = {
-    "outline", "state", "screenshot", "visited", "get_cookies", "links",
-    "exists", "ask", "network", "last_response", "pages", "switch_page",
-    "zoom", "ext",
-}
-# Kinds that operate on the session as a whole (not a specific tab); they
-# run under ``state.lock`` rather than the per-page lock.
-_SESSION_LEVEL_KINDS = {"pages", "new_page", "close_page", "switch_page"}
-
 
 @dataclass
 class _ActionCtx:
@@ -2311,18 +2299,14 @@ _SESSION_ACTIONS: dict[str, _ActionSpec] = {}
 def _session_action(kind: str, *, read_only: bool = False, session_level: bool = False):
     """Register a WorkerAgent method as the handler for ``kind``.
 
-    Asserts the declared flags match the legacy hardcoded sets so a
-    copy-paste error surfaces at import time (not as a silent mid-fetch
-    permission / locking bug) while the registry and the if/elif coexist.
-    Drop the asserts once the legacy sets are removed.
+    ``read_only`` marks kinds safe to run against a fetch-owned session
+    (the fetch loop is driving the tab; a write mid-fetch would race).
+    ``session_level`` marks kinds that act on the whole session, so they
+    run under ``state.lock`` rather than the per-page lock. Both flags
+    live on the resulting ``_ActionSpec`` and are the single source of
+    truth: the fetch gate and the lock picker in
+    ``_handle_session_action`` read them straight off the registry.
     """
-    assert read_only == (kind in _READ_ONLY_KINDS_FOR_FETCH), (
-        f"{kind!r}: read_only={read_only} disagrees with _READ_ONLY_KINDS_FOR_FETCH"
-    )
-    assert session_level == (kind in _SESSION_LEVEL_KINDS), (
-        f"{kind!r}: session_level={session_level} disagrees with _SESSION_LEVEL_KINDS"
-    )
-
     def deco(fn: Callable) -> Callable:
         _SESSION_ACTIONS[kind] = _ActionSpec(fn, read_only, session_level)
         return fn
@@ -5588,12 +5572,12 @@ class WorkerAgent:
             _logger.info(f"[session {sid}] {line}")
 
         # Fetch-owned sessions are read-only: the fetch loop is driving
-        # the tab and a write action mid-fetch would race. The set of
-        # allowed kinds (``_READ_ONLY_KINDS_FOR_FETCH``) and the
-        # session-level set (``_SESSION_LEVEL_KINDS``) are module-level
-        # constants now -- see the registry block above ``WorkerAgent``.
+        # the tab and a write action mid-fetch would race. Whether a kind
+        # is allowed mid-fetch (read-only) or is session-level is read off
+        # its registry ``_ActionSpec`` -- the single source of truth.
         action = msg.action or {}
         kind = action.get("kind") or ""
+        spec = _SESSION_ACTIONS.get(kind)
         # A read-only evaluate (forensics probe) is also permitted
         # mid-fetch. The hub's forensics loop pre-flights every probe
         # against a safety regex (rejects navigate / click / submit /
@@ -5605,13 +5589,14 @@ class WorkerAgent:
         _is_ro_evaluate = kind == "evaluate" and bool(action.get("read_only"))
         if (
             state.is_fetch_owned
-            and kind not in _READ_ONLY_KINDS_FOR_FETCH
+            and not (spec is not None and spec.read_only)
             and not _is_ro_evaluate
         ):
+            _ro_kinds = sorted(k for k, s in _SESSION_ACTIONS.items() if s.read_only)
             reply.status = (
                 f"ERR: session {sid} is owned by a running fetch job; "
                 f"only read-only actions are allowed "
-                f"({sorted(_READ_ONLY_KINDS_FOR_FETCH)} + read-only evaluate). "
+                f"({_ro_kinds} + read-only evaluate). "
                 f"Got: {kind!r}"
             )
             reply.elapsed_ms = int((time.time() - t0) * 1000)
@@ -5627,7 +5612,7 @@ class WorkerAgent:
         # page's own lock so two pages in the same session can run
         # actions in parallel.
         target_pid = action.get("page_id") or state.default_page_id
-        if kind in _SESSION_LEVEL_KINDS:
+        if spec is not None and spec.session_level:
             chosen_lock = state.lock
         else:
             chosen_lock = state.page_locks.get(target_pid) or state.lock
@@ -5638,7 +5623,7 @@ class WorkerAgent:
                 # session-level kinds, fall back to default (used only
                 # for the "snapshot URL" bookkeeping below).
                 tab = state.pages.get(target_pid) if target_pid else None
-                if tab is None and kind not in _SESSION_LEVEL_KINDS:
+                if tab is None and not (spec is not None and spec.session_level):
                     reply.status = (
                         f"ERR: unknown page_id {target_pid!r} (known: {sorted(state.pages.keys())})"
                     )
@@ -5673,7 +5658,6 @@ class WorkerAgent:
                     state=state, tab=tab, action=action, reply=reply,
                     cur=cur, slog=_slog, t0=t0, msg=msg,
                 )
-                spec = _SESSION_ACTIONS.get(kind)
                 if spec is not None:
                     await spec.fn(self, ctx)
                 else:
