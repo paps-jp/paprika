@@ -95,7 +95,14 @@ async def lifespan(app: FastAPI):
     if _sdir != config.data_dir:
         _sdir.mkdir(parents=True, exist_ok=True)
 
-    # ---- MariaDB: if configured, create pool for JobStore + restore ----
+    # ---- MariaDB: auto-connect, auto-migrate, use as primary store ----
+    # When MariaDB settings are configured, the hub:
+    #   1. Creates a connection pool
+    #   2. Ensures the schema (CREATE TABLE IF NOT EXISTS)
+    #   3. Auto-migrates data from Redis/files → MariaDB (INSERT IGNORE)
+    #   4. Uses MariaDBJobStore as the primary job store
+    #   5. Restores MariaDB data → file registries (so they stay in sync)
+    # If MariaDB is unreachable, falls back to Redis / in-memory.
     _mdb_pool = None
     if state.settings is not None:
         _mdb_host = state.settings.get("mariadb_host", "")
@@ -113,16 +120,41 @@ async def lifespan(app: FastAPI):
                 )
                 state.mariadb_pool = _mdb_pool
                 log.info("MariaDB pool created (%s@%s)", _mdb_user, _mdb_host)
+
+                # Auto-migrate: sync Redis/file data → MariaDB (no purge)
+                from server.hub.mariadb import auto_migrate_all
+
+                migrated = await auto_migrate_all(
+                    _mdb_pool,
+                    redis_url=config.redis_url,
+                    host_registry=state.hosts,
+                    visited_registry=state.host_visited,
+                    skill_registry=state.skills,
+                    convention_registry=state.conventions,
+                    engine_registry=state.engines,
+                    preset_registry=state.presets,
+                )
+                if migrated:
+                    log.info("MariaDB auto-migrate: %s", migrated)
+
             except Exception as e:
-                log.warning("MariaDB pool creation failed (%s); using Redis/in-memory", e)
+                log.warning(
+                    "MariaDB connection/migration failed (%s); "
+                    "falling back to Redis/in-memory",
+                    e,
+                )
                 _mdb_pool = None
+                state.mariadb_pool = None
 
     state.store, state.store_kind = await make_store(
         config.redis_url, mariadb_pool=_mdb_pool,
     )
     state._local_sem = asyncio.Semaphore(config.max_concurrent_jobs)
 
-    # ---- Restore file-backed registries from MariaDB if empty ----
+    # ---- Restore MariaDB data → file registries ----
+    # File-backed registries are still the runtime interface for hosts,
+    # skills, etc. After auto-migrate ensures MariaDB has the latest,
+    # restore overwrites local files so the registries serve MariaDB data.
     if _mdb_pool is not None:
         try:
             from server.hub.mariadb import restore_all_registries

@@ -334,6 +334,7 @@ async def migrate_jobs(
     pool: Any,
     *,
     progress: Callable[[int, int], None] | None = None,
+    purge: bool = True,
 ) -> dict:
     """Migrate all jobs from the current JobStore to MariaDB.
 
@@ -449,7 +450,7 @@ async def migrate_jobs(
 
     # ---- Purge source data (Redis) after successful migration ----
     purged = 0
-    if not errors:
+    if purge and not errors:
         for jid in job_ids:
             try:
                 await store.delete_job(jid)
@@ -477,6 +478,7 @@ async def migrate_hosts(
     pool: Any,
     *,
     progress: Callable[[int, int], None] | None = None,
+    purge: bool = True,
 ) -> dict:
     """Migrate HostRegistry files to MariaDB."""
     from dataclasses import asdict
@@ -545,7 +547,7 @@ async def migrate_hosts(
 
     # ---- Purge source data (JSON files) after successful migration ----
     purged = 0
-    if not errors:
+    if purge and not errors:
         for rec in all_hosts:
             host = getattr(rec, "host", None)
             if host:
@@ -581,6 +583,7 @@ async def migrate_visited_urls(
     pool: Any,
     *,
     progress: Callable[[int, int], None] | None = None,
+    purge: bool = True,
 ) -> dict:
     """Migrate per-host visited URL sets to MariaDB."""
     all_hosts = host_registry.list_all()
@@ -626,7 +629,7 @@ async def migrate_visited_urls(
 
     # ---- Purge source data (JSON files) after successful migration ----
     purged = 0
-    if not errors:
+    if purge and not errors:
         for rec in all_hosts:
             host = getattr(rec, "host", None)
             if host:
@@ -654,6 +657,8 @@ async def migrate_visited_urls(
 async def migrate_skills(
     skill_registry: Any,
     pool: Any,
+    *,
+    purge: bool = True,
 ) -> dict:
     """Migrate SkillRegistry files to MariaDB."""
     from dataclasses import asdict
@@ -705,7 +710,7 @@ async def migrate_skills(
 
     # ---- Purge source data (JSON files) after successful migration ----
     purged = 0
-    if not errors:
+    if purge and not errors:
         for rec in all_skills:
             slug = getattr(rec, "slug", None)
             if slug:
@@ -733,6 +738,8 @@ async def migrate_skills(
 async def migrate_conventions(
     convention_registry: Any,
     pool: Any,
+    *,
+    purge: bool = True,
 ) -> dict:
     """Migrate ConventionRegistry files to MariaDB."""
     from dataclasses import asdict
@@ -784,7 +791,7 @@ async def migrate_conventions(
 
     # ---- Purge source data (JSON files) after successful migration ----
     purged = 0
-    if not errors:
+    if purge and not errors:
         for rec in all_convs:
             slug = getattr(rec, "slug", None)
             if slug:
@@ -812,6 +819,8 @@ async def migrate_conventions(
 async def migrate_engines(
     engine_registry: Any,
     pool: Any,
+    *,
+    purge: bool = True,
 ) -> dict:
     """Migrate EngineRegistry files to MariaDB."""
     from dataclasses import asdict
@@ -870,7 +879,7 @@ async def migrate_engines(
 
     # ---- Purge source data (JSON files) after successful migration ----
     purged = 0
-    if not errors:
+    if purge and not errors:
         for rec in all_engines:
             slug = getattr(rec, "slug", None)
             if slug:
@@ -898,6 +907,8 @@ async def migrate_engines(
 async def migrate_presets(
     preset_registry: Any,
     pool: Any,
+    *,
+    purge: bool = True,
 ) -> dict:
     """Migrate PresetRegistry files to MariaDB."""
     from dataclasses import asdict
@@ -953,7 +964,7 @@ async def migrate_presets(
 
     # ---- Purge source data (JSON files) after successful migration ----
     purged = 0
-    if not errors:
+    if purge and not errors:
         for rec in all_presets:
             n = getattr(rec, "name", None)
             if n:
@@ -1301,5 +1312,135 @@ async def restore_all_registries(
                     log.info("restore: %d presets from MariaDB", n)
         except Exception as e:
             log.warning("restore presets failed: %s", e)
+
+    return results
+
+
+# ---------------------------------------------------------------------------
+# Auto-migrate: startup sync (Redis / files → MariaDB, no purge)
+# ---------------------------------------------------------------------------
+
+async def auto_migrate_all(
+    pool: Any,
+    *,
+    redis_url: str | None = None,
+    host_registry: Any = None,
+    visited_registry: Any = None,
+    skill_registry: Any = None,
+    convention_registry: Any = None,
+    engine_registry: Any = None,
+    preset_registry: Any = None,
+) -> dict[str, int]:
+    """Sync all current data sources into MariaDB at startup.
+
+    Called automatically when MariaDB settings are configured.
+    Uses ``INSERT IGNORE`` (idempotent) and **never purges** source
+    data, so re-runs are safe and the file/Redis backends stay intact
+    as a fallback.
+
+    Returns ``{category: migrated_count}`` for categories that had
+    new rows inserted.
+    """
+    # 1. Ensure schema (CREATE TABLE IF NOT EXISTS)
+    try:
+        await ensure_schema(pool)
+    except Exception as e:
+        log.warning("auto-migrate: schema creation failed: %s", e)
+        return {}
+
+    results: dict[str, int] = {}
+
+    # 2. Jobs from Redis → MariaDB
+    if redis_url:
+        try:
+            from server.store import RedisJobStore
+
+            tmp_store = RedisJobStore(redis_url)
+            try:
+                await tmp_store.initialize()
+                job_count = await tmp_store.count_jobs()
+                if job_count > 0:
+                    r = await migrate_jobs(tmp_store, pool, purge=False)
+                    if r.get("migrated", 0) > 0:
+                        results["jobs"] = r["migrated"]
+                        log.info(
+                            "auto-migrate: %d jobs → MariaDB (skipped %d)",
+                            r["migrated"], r.get("skipped", 0),
+                        )
+            finally:
+                try:
+                    await tmp_store.close()
+                except Exception:
+                    pass
+        except Exception as e:
+            log.warning("auto-migrate jobs failed: %s", e)
+
+    # 3. Hosts
+    if host_registry is not None:
+        try:
+            hosts = host_registry.list_all()
+            if hosts:
+                r = await migrate_hosts(host_registry, pool, purge=False)
+                if r.get("migrated", 0) > 0:
+                    results["hosts"] = r["migrated"]
+                    log.info("auto-migrate: %d hosts → MariaDB", r["migrated"])
+        except Exception as e:
+            log.warning("auto-migrate hosts failed: %s", e)
+
+    # 4. Visited URLs
+    if visited_registry is not None and host_registry is not None:
+        try:
+            r = await migrate_visited_urls(
+                host_registry, visited_registry, pool, purge=False,
+            )
+            if r.get("migrated", 0) > 0:
+                results["visited_urls"] = r["migrated"]
+                log.info("auto-migrate: %d visited URLs → MariaDB", r["migrated"])
+        except Exception as e:
+            log.warning("auto-migrate visited_urls failed: %s", e)
+
+    # 5. Skills
+    if skill_registry is not None:
+        try:
+            if skill_registry.list_all():
+                r = await migrate_skills(skill_registry, pool, purge=False)
+                if r.get("migrated", 0) > 0:
+                    results["skills"] = r["migrated"]
+                    log.info("auto-migrate: %d skills → MariaDB", r["migrated"])
+        except Exception as e:
+            log.warning("auto-migrate skills failed: %s", e)
+
+    # 6. Conventions
+    if convention_registry is not None:
+        try:
+            if convention_registry.list_all():
+                r = await migrate_conventions(convention_registry, pool, purge=False)
+                if r.get("migrated", 0) > 0:
+                    results["conventions"] = r["migrated"]
+                    log.info("auto-migrate: %d conventions → MariaDB", r["migrated"])
+        except Exception as e:
+            log.warning("auto-migrate conventions failed: %s", e)
+
+    # 7. Engines
+    if engine_registry is not None:
+        try:
+            if engine_registry.list_all():
+                r = await migrate_engines(engine_registry, pool, purge=False)
+                if r.get("migrated", 0) > 0:
+                    results["engines"] = r["migrated"]
+                    log.info("auto-migrate: %d engines → MariaDB", r["migrated"])
+        except Exception as e:
+            log.warning("auto-migrate engines failed: %s", e)
+
+    # 8. Presets
+    if preset_registry is not None:
+        try:
+            if preset_registry.list_all():
+                r = await migrate_presets(preset_registry, pool, purge=False)
+                if r.get("migrated", 0) > 0:
+                    results["presets"] = r["migrated"]
+                    log.info("auto-migrate: %d presets → MariaDB", r["migrated"])
+        except Exception as e:
+            log.warning("auto-migrate presets failed: %s", e)
 
     return results
