@@ -8,7 +8,7 @@ The public surface is:
 - `FetchResult`: structured output (html + saved assets + video detection + yt-dlp results).
 - `async fetch(opts) -> FetchResult`: the main worker.
 
-Helpers (`clone_chrome_profile`, `is_video_site`, `run_ytdlp`, etc.) are also exported
+Helpers (`clone_chrome_profile`, `run_ytdlp`, etc.) are also exported
 so the CLI can call them directly during option resolution.
 """
 from __future__ import annotations
@@ -336,37 +336,19 @@ def clone_chrome_profile(
 # Video site detection / yt-dlp wrapper
 # ----------------------------------------------------------------------------
 
-VIDEO_SITE_PATTERN = re.compile(
-    r"(?:^|\.)"
-    r"(?:youtube\.com|youtu\.be|youtube-nocookie\.com|"
-    r"vimeo\.com|player\.vimeo\.com|"
-    r"dailymotion\.com|dai\.ly|"
-    r"twitch\.tv|"
-    r"tiktok\.com|"
-    r"nicovideo\.jp|nico\.ms|"
-    r"bilibili\.com|"
-    r"streamable\.com|"
-    r"facebook\.com|fb\.watch|"
-    r"instagram\.com|"
-    r"reddit\.com)",
-    re.IGNORECASE,
-)
-_STATUS_VIDEO_PATTERN = re.compile(
-    r"^(?:https?://)?(?:www\.)?(?:twitter\.com|x\.com)/[^/]+/status/\d+",
-    re.IGNORECASE,
-)
-
-
-def is_video_site(url: str) -> bool:
-    if not url:
-        return False
-    if _STATUS_VIDEO_PATTERN.search(url):
-        return True
-    try:
-        host = urlparse(url).hostname or ""
-    except Exception:
-        return False
-    return bool(VIDEO_SITE_PATTERN.search(host))
+# Note: the hardcoded video-site whitelist (VIDEO_SITE_PATTERN /
+# _STATUS_VIDEO_PATTERN / is_video_site) that used to live here was
+# dropped on 2026-05-28. yt-dlp target collection is now driven by:
+#   * iframe-generic regex (player|embed|video|stream|watch|hub in the
+#     iframe URL) -- catches embedded YouTube / Vimeo / etc. without an
+#     allowlist,
+#   * network-stream passive capture (HLS .m3u8 / DASH .mpd) -- catches
+#     any provider that streams via standard manifest formats,
+#   * HostRecipe (server.hub.hosts) -- per-host playbook for the rare
+#     "direct page URL on a known video site" case (the page-url branch
+#     this whitelist used to cover).
+# Adding a new video site no longer needs a code edit; if a specific
+# site needs the page URL fed to yt-dlp directly, register a recipe.
 
 
 def _fmp4_box_type(path: Path) -> bytes:
@@ -2031,12 +2013,12 @@ async def fetch(opts: FetchOptions) -> FetchResult:
                     seen_targets.add(u)
                     ytdlp_targets.append((u, ref, lbl))
 
-            if is_video_site(url):
-                add_target(url, None, "page-url")
-            for f in result.video_detection.get("iframes", []):
-                src = f.get("src")
-                if src and is_video_site(src):
-                    add_target(src, url, "iframe")
+            # The old "page-url" branch (whitelist match on the fetched
+            # URL itself) and "iframe" branch (whitelist match on
+            # network-detected iframe srcs) were dropped along with
+            # VIDEO_SITE_PATTERN; iframe-generic regex below + the
+            # network-stream pass below + HostRecipe per-host targets
+            # cover the same ground without a static site list.
 
             try:
                 all_iframe_srcs = await tab.evaluate(
