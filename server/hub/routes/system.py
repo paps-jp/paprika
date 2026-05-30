@@ -230,7 +230,6 @@ _ADMIN_HTML = r"""<!DOCTYPE html>
   </div>
   <div class="submit-subpane" data-submit-subpane="form">
   <section>
-    <h2 data-i18n="submit.heading">Submit a job</h2>
     <form id="submit">
       <!-- Named-preset bar: dropdown was removed because operators
            can have 500+ presets which is unwieldy in a <select>.
