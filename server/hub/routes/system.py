@@ -221,6 +221,14 @@ _ADMIN_HTML = r"""<!DOCTYPE html>
 </nav>
 
 <div class="panel" data-panel="submit">
+  <!-- Submit パネル内サブタブ: "ジョブの実行" (フォーム) と "Live" (進行中
+       ジョブの監視) を切り替える。フォームは display:none で隠すだけなので
+       投入後にサブタブを行き来しても入力値は保持される。 -->
+  <div class="submit-subtabs" role="tablist" style="display:flex; gap:6px; margin-bottom:12px;">
+    <button type="button" class="submit-subtab active" data-submit-subtab="form" role="tab" aria-selected="true"><iconify-icon icon="lucide:send-horizontal"></iconify-icon> <span data-i18n="submit.subtab.form">ジョブの実行</span></button>
+    <button type="button" class="submit-subtab" data-submit-subtab="live" role="tab" aria-selected="false"><span id="submitSubtabLiveDot" style="display:inline-block; width:8px; height:8px; border-radius:50%; background:#bbb; margin-right:6px; vertical-align:middle;"></span><span data-i18n="submit.subtab.live">Live</span> <span id="submitSubtabLiveJobBadge" style="color:#888; font-family:ui-monospace,Consolas,monospace; font-size:.85em;"></span></button>
+  </div>
+  <div class="submit-subpane" data-submit-subpane="form">
   <section>
     <h2 data-i18n="submit.heading">Submit a job</h2>
     <form id="submit">
@@ -579,6 +587,7 @@ asyncio.run(main())"
       </div>
     </form>
   </section>
+  </div><!-- /.submit-subpane[form] -->
 
   <!-- Phase 2c: Save-as-HostRecipe approval modal. Opened from the job
        detail panel when the operator clicks "🍱 recipe として保存" on a
@@ -624,10 +633,19 @@ asyncio.run(main())"
     </form>
   </dialog>
 
-  <!-- Inline live panel: revealed after submit. Layout/styling is in
-       the page <style> block as `#liveJobPanel ...`; inline styles here
-       are kept to a minimum (only those that act as runtime state, like
-       "hidden by default" or specific pane heights). -->
+  <!-- Live サブペイン: 進行中ジョブの監視 UI を含む。 サブタブ "Live" が
+       選択されたときだけ表示される。inline display は submit-subpane
+       wrapper が制御するので #liveJobPanel 自体の hidden は不要。 -->
+  <div class="submit-subpane" data-submit-subpane="live" style="display:none;">
+  <!-- Live job panel: shows status / log / noVNC / code / gallery / etc.
+       Inside-of-sub-pane visibility is controlled by the sub-tab JS.
+       The "no job attached" placeholder below mirrors what was shown
+       previously by the section being display:none entirely. -->
+  <div id="ljpNoJobPlaceholder" style="display:none; padding:30px 20px; text-align:center; color:#888; font-size:.95em; background:#f7f7fc; border:1px dashed #ccd; border-radius:8px;">
+    <iconify-icon icon="lucide:radio-tower" style="font-size:1.6em; color:#888;"></iconify-icon>
+    <div style="margin-top:6px;">ジョブが attach されていません</div>
+    <div style="margin-top:4px; color:#aaa; font-size:.85em;">「ジョブの実行」タブからジョブを投入するか、Jobs タブから「watch live」を押して下さい。</div>
+  </div>
   <section id="liveJobPanel" style="display:none;">
     <h2 id="ljpHeader">
       <span class="ljp-status-group">
@@ -850,6 +868,7 @@ asyncio.run(main())"
          wrapper around the real gallery pane. -->
     <div id="ljpGalleryWrap" style="display:none;"></div>
   </section>
+  </div><!-- /.submit-subpane[live] -->
 
   <!-- Asset detail modal (overlay). One per page; populated on click. -->
   <div id="ljpAssetModal" style="display:none; position:fixed; inset:0; background:rgba(0,0,0,0.6); z-index:1000; align-items:center; justify-content:center; padding:20px;">

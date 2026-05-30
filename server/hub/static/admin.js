@@ -1037,9 +1037,11 @@ function _applyHashTab() {
   }
   const parsed = _parseHash();
   if (parsed.jobId) {
-    // Deep-link to a watched job: land on Submit and (re)attach the
-    // Live panel if it isn't already showing that job.
+    // Deep-link to a watched job: land on Submit, switch to the Live
+    // sub-tab, and (re)attach the Live panel if it isn't already
+    // showing that job.
     setTab('submit', { updateHash: false });
+    if (typeof setSubmitSubtab === 'function') setSubmitSubtab('live');
     if (typeof ljpAttach === 'function'
         && (typeof LJP === 'undefined' || LJP.jobId !== parsed.jobId)) {
       ljpAttach(parsed.jobId);
@@ -1050,8 +1052,65 @@ function _applyHashTab() {
     _entityDeepLinkOpeners[parsed.tab](parsed.entityId);
   } else if (parsed.tab) {
     setTab(parsed.tab, { updateHash: false });
+    // Bare #submit defaults to the form sub-tab so reload of #submit
+    // doesn't strand the operator on Live (an empty Live pane when
+    // no job attached is confusing).
+    if (parsed.tab === 'submit' && typeof setSubmitSubtab === 'function') {
+      setSubmitSubtab('form');
+    }
   }
 }
+
+// --- Submit panel sub-tabs (ジョブの実行 / Live) ----------------------
+// Two sub-panes share the Submit panel. The form sub-pane holds the job
+// submission UI; the live sub-pane holds the inline #liveJobPanel that
+// shows status / log / noVNC / etc. for an attached job. Switching
+// between them just toggles ``display`` -- the form's input values
+// persist because nothing is removed from the DOM.
+function setSubmitSubtab(name) {
+  if (name !== 'form' && name !== 'live') name = 'form';
+  document.querySelectorAll('.submit-subtab').forEach(t => {
+    const on = t.dataset.submitSubtab === name;
+    t.classList.toggle('active', on);
+    t.setAttribute('aria-selected', on ? 'true' : 'false');
+  });
+  document.querySelectorAll('.submit-subpane').forEach(p => {
+    p.style.display = (p.dataset.submitSubpane === name) ? '' : 'none';
+  });
+  // When the live sub-tab is shown but no job is attached, surface a
+  // placeholder so the pane doesn't look empty. ljpAttach / ljpReset
+  // also call into this code (via _updateLivePlaceholder) to keep the
+  // placeholder in sync as jobs come and go.
+  if (typeof _updateLivePlaceholder === 'function') _updateLivePlaceholder();
+}
+
+function _updateLivePlaceholder() {
+  const ph = document.getElementById('ljpNoJobPlaceholder');
+  const ljp = document.getElementById('liveJobPanel');
+  if (!ph || !ljp) return;
+  const attached = (typeof LJP !== 'undefined') && !!LJP.jobId;
+  ph.style.display = attached ? 'none' : '';
+  // The section's own inline display still controls whether the LJP
+  // chrome shows once a job is attached. ljpAttach sets it to '' and
+  // ljpReset to 'none'; we mirror that here so a tab switch with an
+  // attached job doesn't briefly flash the placeholder.
+  ljp.style.display = attached ? '' : 'none';
+  // Live sub-tab indicator (dot + jobId badge) reflects the attach state.
+  const dot = document.getElementById('submitSubtabLiveDot');
+  const badge = document.getElementById('submitSubtabLiveJobBadge');
+  if (dot) dot.style.background = attached ? '#c0392b' : '#bbb';
+  if (badge) badge.textContent = attached ? (LJP.jobId.slice(0, 12)) : '';
+}
+
+// Wire sub-tab clicks. Runs once at script load; the elements exist in
+// the static HTML.
+(function _wireSubmitSubtabs() {
+  document.querySelectorAll('.submit-subtab').forEach(btn => {
+    btn.addEventListener('click', () => {
+      setSubmitSubtab(btn.dataset.submitSubtab);
+    });
+  });
+})();
 window.addEventListener('hashchange', _applyHashTab);
 
 // restore previously selected tab. Precedence (first wins):
@@ -6250,6 +6309,9 @@ function ljpReset() {
   if (tCnt) tCnt.textContent = '0';
   ljpUpdateVncCount();
   document.getElementById('liveJobPanel').style.display = 'none';
+  // Refresh the Submit-panel Live sub-tab placeholder + indicator
+  // (LJP.jobId is null now -> show placeholder, grey dot).
+  if (typeof _updateLivePlaceholder === 'function') _updateLivePlaceholder();
 }
 
 // Reflect the attached job in the URL (#live/<id>) so the address bar
@@ -6284,6 +6346,12 @@ function ljpAttach(jobId) {
   document.getElementById('ljpOpenResult').href = '/jobs/' + encodeURIComponent(jobId) + '/result';
   document.getElementById('ljpOpenPageHtml').href = '/jobs/' + encodeURIComponent(jobId) + '/page.html';
   document.getElementById('liveJobPanel').style.display = '';
+  // Job is now attached -> hide placeholder, light up Live sub-tab
+  // dot, badge with shortened job id, and auto-switch to Live sub-tab
+  // so the operator immediately sees the running job (= what they
+  // pressed "submit" / "watch live" for).
+  if (typeof _updateLivePlaceholder === 'function') _updateLivePlaceholder();
+  if (typeof setSubmitSubtab === 'function') setSubmitSubtab('live');
   ljpSetStatus('queued');
   // Stream logs + poll for sessions and status. Tight intervals at the
   // start because the user just hit submit -- they want feedback fast.

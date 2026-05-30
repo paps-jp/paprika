@@ -649,6 +649,34 @@
     border: 1px solid; cursor: default;
   }
 
+  /* Submit panel internal sub-tabs (ジョブの実行 / Live).
+     Visually distinct from the main top-level tabs to communicate "this
+     is a sub-section toggle, not page navigation". Pill style with a
+     red-ish active accent matching the rest of the admin chrome. */
+  .submit-subtabs { padding: 0 2px; }
+  .submit-subtab {
+    background: #ecedf3;
+    border: 1px solid #ccd;
+    color: #555;
+    padding: 6px 14px;
+    font-size: .9em;
+    border-radius: 6px;
+    cursor: pointer;
+    display: inline-flex;
+    align-items: center;
+    gap: 4px;
+    transition: background .12s, color .12s;
+  }
+  .submit-subtab:hover {
+    background: #f5f5fa; color: #222;
+  }
+  .submit-subtab.active {
+    background: #fff;
+    color: #c0392b;
+    border-color: #c0392b;
+    font-weight: 600;
+  }
+
   /* Tab bar: clean active-state with bottom accent. */
   .ljp-tabbar {
     display: flex; gap: 2px;
