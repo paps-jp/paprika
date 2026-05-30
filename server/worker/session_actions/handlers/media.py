@@ -280,18 +280,82 @@ async def _act_download_video(agent, ctx: "_ActionCtx") -> None:
                 "label": "page url",
             })
 
-        # ---- yt-dlp + upload loop over candidates ----
-        # Stop after the first candidate that actually
-        # produces uploaded files; otherwise fall
-        # through to the next. Each candidate gets its
-        # own cookies.txt (host-scoped, see ``ask``).
+        # ---- yt-dlp + upload + verify loop over candidates ----
+        # Keep trying candidates / tiers until one yields a VALID video
+        # that we preserved (see the media oracle below); a mere uploaded
+        # file (which may be HTML-as-mp4 / 0-byte / a short ad) does NOT
+        # stop the search. Each candidate gets its own cookies.txt
+        # (host-scoped, see ``ask``).
         upload_timeout = 30 * 60.0
         uploaded: list[str] = []
         upload_errors: list[str] = []
         new_files_all: list[str] = []
+        validations: list[dict] = []
+        valid_uploaded: list[str] = []
         ok = False
         msg = ""
         tried_labels: list[str] = []
+        # Media-oracle duration floor; a caller who knows the target is
+        # long can tighten it with ``min_duration_s``.
+        min_dur = _MIN_VALID_VIDEO_S
+        try:
+            if action.get("min_duration_s") is not None:
+                min_dur = float(action.get("min_duration_s"))
+        except (TypeError, ValueError):
+            min_dur = _MIN_VALID_VIDEO_S
+
+        async def _ingest(cand_new, source_url, page_url):
+            """Upload + ffprobe-validate each freshly-downloaded file and
+            record it. Appends to ``uploaded`` / ``validations`` and, for a
+            valid + preserved file, ``valid_uploaded``. Returns True iff a
+            valid video was just preserved -- so the candidate search stops
+            on a real video, never on junk."""
+            got_valid = False
+            for name in cand_new:
+                path = videos_dir / name
+                mime = "video/mp4" if path.suffix == ".mp4" else None
+                up_ok = False
+                try:
+                    up_ok = await agent._upload_one_session_asset(
+                        state,
+                        path,
+                        mime=mime,
+                        source_url=source_url,
+                        page_url=page_url,
+                        timeout=upload_timeout,
+                    )
+                    if up_ok:
+                        uploaded.append(name)
+                    else:
+                        size_b = 0
+                        try:
+                            size_b = path.stat().st_size
+                        except Exception:
+                            pass
+                        upload_errors.append(
+                            f"{name} ({size_b // 1024} KB): upload did not "
+                            f"complete (asset_upload_base missing, "
+                            f"already-uploaded, or HTTP / timeout error -- "
+                            f"see worker stderr)"
+                        )
+                except Exception as e:
+                    upload_errors.append(f"{name}: {type(e).__name__}: {e}")
+                    _slog(f"[download_video] upload {name} failed: {e}")
+                # ffprobe every downloaded file (uploaded or not) so the
+                # result reports real-video-ness even when upload failed or
+                # there is no parent job; only a valid + preserved file lets
+                # the search stop.
+                v = await asyncio.to_thread(
+                    _probe_media_sync, str(path), min_dur
+                )
+                v["name"] = name
+                v["uploaded"] = up_ok
+                validations.append(v)
+                if v.get("valid") and up_ok:
+                    valid_uploaded.append(name)
+                    got_valid = True
+            return got_valid
+
         for cand in candidates:
             cand_url = cand["url"]
             cand_ref = cand["referer"]
@@ -342,47 +406,10 @@ async def _act_download_video(agent, ctx: "_ActionCtx") -> None:
             # default -- not nearly enough. Without this
             # override the upload silently ReadTimeouts
             # and the file is lost. (Job ad1846fbbcbc.)
-            for name in cand_new:
-                path = videos_dir / name
-                mime = (
-                    "video/mp4" if path.suffix == ".mp4" else None
-                )
-                try:
-                    ok_up = await agent._upload_one_session_asset(
-                        state,
-                        path,
-                        mime=mime,
-                        source_url=cand_url,
-                        page_url=target_url,
-                        timeout=upload_timeout,
-                    )
-                    if ok_up:
-                        uploaded.append(name)
-                    else:
-                        size_b = 0
-                        try:
-                            size_b = path.stat().st_size
-                        except Exception:
-                            pass
-                        upload_errors.append(
-                            f"{name} ({size_b // 1024} KB): "
-                            f"upload did not complete "
-                            f"(asset_upload_base missing, "
-                            f"already-uploaded, or HTTP / "
-                            f"timeout error -- see worker "
-                            f"stderr)"
-                        )
-                except Exception as e:
-                    upload_errors.append(
-                        f"{name}: {type(e).__name__}: {e}"
-                    )
-                    _slog(
-                        f"[download_video] upload {name} "
-                        f"failed: {e}"
-                    )
+            await _ingest(cand_new, cand_url, target_url)
             # First candidate that lands a file in the
             # gallery wins; skip remaining fallbacks.
-            if uploaded:
+            if valid_uploaded:
                 break
 
         # ---- Tier 3.5: post-failure re-sniff ----
@@ -405,7 +432,7 @@ async def _act_download_video(agent, ctx: "_ActionCtx") -> None:
         # up, re-sniff, and retry anything new.
         unsupported = "Unsupported URL" in (msg or "")
         if (
-            not uploaded
+            not valid_uploaded
             and not user_pinned_url
             and unsupported
         ):
@@ -468,34 +495,11 @@ async def _act_download_video(agent, ctx: "_ActionCtx") -> None:
                     }
                     cand_new = sorted(after - before)
                     new_files_all.extend(cand_new)
-                    for name in cand_new:
-                        path = videos_dir / name
-                        mime = (
-                            "video/mp4"
-                            if path.suffix == ".mp4" else None
-                        )
-                        try:
-                            ok_up = (
-                                await agent._upload_one_session_asset(
-                                    state,
-                                    path,
-                                    mime=mime,
-                                    source_url=stream_url,
-                                    page_url=target_url,
-                                    timeout=upload_timeout,
-                                )
-                            )
-                            if ok_up:
-                                uploaded.append(name)
-                        except Exception as e:
-                            upload_errors.append(
-                                f"{name}: "
-                                f"{type(e).__name__}: {e}"
-                            )
+                    await _ingest(cand_new, stream_url, target_url)
                     tried_labels.append(
                         "re-sniffed .m3u8/.mpd"
                     )
-                    if uploaded:
+                    if valid_uploaded:
                         break
 
         # ---- Tier 4: iframe walk (Phase 3a) ----
@@ -522,7 +526,7 @@ async def _act_download_video(agent, ctx: "_ActionCtx") -> None:
         # nested iframes are also visited.
         # All heuristics vendor-neutral.
         if (
-            not uploaded
+            not valid_uploaded
             and not user_pinned_url
             and iframe_walk_enabled
             and not iframe_walk_done
@@ -577,7 +581,7 @@ async def _act_download_video(agent, ctx: "_ActionCtx") -> None:
             # try yt-dlp with the frame's URL as referer.
             phase_a_winners: set[str] = set()
             for bucket, depth, fr in prio_frames:
-                if uploaded:
+                if valid_uploaded:
                     break
                 frame_id = fr["frame_id"]
                 frame_url = fr["url"] or ""
@@ -722,37 +726,8 @@ async def _act_download_video(agent, ctx: "_ActionCtx") -> None:
                     }
                     cand_new = sorted(after - before)
                     new_files_all.extend(cand_new)
-                    for name in cand_new:
-                        path = videos_dir / name
-                        mime = (
-                            "video/mp4"
-                            if path.suffix == ".mp4"
-                            else None
-                        )
-                        try:
-                            ok_up = (
-                                await agent._upload_one_session_asset(
-                                    state,
-                                    path,
-                                    mime=mime,
-                                    source_url=cand_url,
-                                    page_url=orig_url_for_restore,
-                                    timeout=upload_timeout,
-                                )
-                            )
-                            if ok_up:
-                                uploaded.append(name)
-                                phase_a_winners.add(frame_id)
-                            else:
-                                upload_errors.append(
-                                    f"{name}: upload did not "
-                                    f"complete"
-                                )
-                        except Exception as e:
-                            upload_errors.append(
-                                f"{name}: {type(e).__name__}: {e}"
-                            )
-                    if uploaded:
+                    await _ingest(cand_new, cand_url, orig_url_for_restore)
+                    if valid_uploaded:
                         break
 
             # ---------- Phase B: legacy navigate ----------
@@ -768,10 +743,10 @@ async def _act_download_video(agent, ctx: "_ActionCtx") -> None:
                 and _looks_like_player_iframe(fr["url"])
             ]
             for ifr_idx, (_b, _d, _fr) in enumerate(phase_b_frames, 1):
-                if uploaded:
+                if valid_uploaded:
                     break
                 ifr_src = _fr["url"]
-                if uploaded:
+                if valid_uploaded:
                     break
                 _slog(
                     f"[download_video] iframe walk Phase B "
@@ -908,36 +883,8 @@ async def _act_download_video(agent, ctx: "_ActionCtx") -> None:
                     }
                     cand_new = sorted(after - before)
                     new_files_all.extend(cand_new)
-                    for name in cand_new:
-                        path = videos_dir / name
-                        mime = (
-                            "video/mp4"
-                            if path.suffix == ".mp4"
-                            else None
-                        )
-                        try:
-                            ok_up = (
-                                await agent._upload_one_session_asset(
-                                    state,
-                                    path,
-                                    mime=mime,
-                                    source_url=cand_url,
-                                    page_url=orig_url_for_restore,
-                                    timeout=upload_timeout,
-                                )
-                            )
-                            if ok_up:
-                                uploaded.append(name)
-                            else:
-                                upload_errors.append(
-                                    f"{name}: upload did not "
-                                    f"complete"
-                                )
-                        except Exception as e:
-                            upload_errors.append(
-                                f"{name}: {type(e).__name__}: {e}"
-                            )
-                    if uploaded:
+                    await _ingest(cand_new, cand_url, orig_url_for_restore)
+                    if valid_uploaded:
                         break
             # Restore the operator's original view.
             # Best-effort: never fail the action if
@@ -971,35 +918,12 @@ async def _act_download_video(agent, ctx: "_ActionCtx") -> None:
         if upload_errors and ok:
             msg = msg + "\n[upload] " + "\n[upload] ".join(upload_errors)
 
-        # ---- media oracle (⑤): is what we preserved actually playable
-        # video of plausible length? yt-dlp exit 0 + a file appearing is
-        # NOT success on its own (HTML-as-mp4 / 0-byte / truncated / ad).
-        # We re-derive ``ok`` from ffprobe so the codegen-loop's
-        # success/selection signal can't be fooled. Degrades gracefully
-        # to the legacy ok=uploaded when ffprobe is unavailable.
-        min_dur = _MIN_VALID_VIDEO_S
-        try:
-            if action.get("min_duration_s") is not None:
-                min_dur = float(action.get("min_duration_s"))
-        except (TypeError, ValueError):
-            min_dur = _MIN_VALID_VIDEO_S
-        # Probe every downloaded artefact (not just the uploaded ones) so
-        # a valid file whose UPLOAD failed is still visible, and a
-        # job-less SDK session (no asset_upload_base) can still report
-        # whether the bytes it fetched are real video.
-        uploaded_set = set(uploaded)
-        validations: list[dict] = []
-        for name in sorted(set(new_files_all)):
-            v = await asyncio.to_thread(
-                _probe_media_sync, str(videos_dir / name), min_dur
-            )
-            v["name"] = name
-            v["uploaded"] = name in uploaded_set
-            validations.append(v)
+        # ---- media oracle (⑤): ``ok`` is derived from ffprobe, which ran
+        # inline as each candidate's files were ingested (see ``_ingest``),
+        # so yt-dlp exit 0 / a file merely appearing (HTML-as-mp4 / 0-byte
+        # / truncated / ad) can't fake success. ``valid_uploaded`` holds the
+        # preserved valid videos; ``validations`` every probed file.
         valid_files = [v["name"] for v in validations if v.get("valid")]
-        valid_uploaded = [
-            v["name"] for v in validations if v.get("valid") and v.get("uploaded")
-        ]
         oracle_unavailable = any(
             v.get("reason") == "ffprobe_missing" for v in validations
         )
