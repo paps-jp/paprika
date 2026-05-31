@@ -525,12 +525,13 @@ def _load_ytdlp_adapter() -> Any:
 
 
 def _hls_is_live(url: str, referer: Optional[str] = None) -> Optional[bool]:
-    """Fetch the first 8 KB of an HLS manifest and check for liveness.
+    """Fetch the HLS manifest and check for liveness.
 
     Returns:
-        True   – live stream (no #EXT-X-ENDLIST, no PLAYLIST-TYPE:VOD)
+        True   – live stream (explicit PLAYLIST-TYPE:EVENT, or short
+                 media playlist with no #EXT-X-ENDLIST)
         False  – VOD / finite recording
-        None   – couldn't determine (not HLS, network error, etc.)
+        None   – not HLS, master playlist, or couldn't determine
     """
     if not re.search(r"\.m3u8($|\?)", url, re.I):
         return None
@@ -540,8 +541,13 @@ def _hls_is_live(url: str, referer: Optional[str] = None) -> Optional[bool]:
         if referer:
             headers["Referer"] = referer
         req = _ur.Request(url, headers=headers)
+        # Read up to 256 KB so we don't truncate long VOD variant
+        # playlists. A 30-minute VOD at 10 s segments has ~180 #EXTINF
+        # lines + URLs ≈ 20-40 KB; 256 KB safely covers 4-hour movies.
+        # 8 KB used to mis-classify these as live because
+        # #EXT-X-ENDLIST sits at the end of the file.
         with _ur.urlopen(req, timeout=8) as resp:
-            content = resp.read(8192).decode("utf-8", errors="replace")
+            content = resp.read(262144).decode("utf-8", errors="replace")
     except Exception:
         return None
     # Master playlists (multi-variant) list sub-streams via
@@ -556,8 +562,13 @@ def _hls_is_live(url: str, referer: Optional[str] = None) -> Optional[bool]:
         return False
     if "#EXT-X-PLAYLIST-TYPE:VOD" in content:
         return False
-    # Live streams may explicitly say EVENT or LIVE, but the safest
-    # heuristic is simply: no ENDLIST → treat as live.
+    if "#EXT-X-PLAYLIST-TYPE:EVENT" in content:
+        return True
+    # No ENDLIST after 256 KB read. Distinguish very-long VOD
+    # (hundreds of #EXTINF entries) from a sliding-window live
+    # stream (usually <10 segments visible at any moment).
+    if content.count("#EXTINF") >= 50:
+        return False
     return True
 
 

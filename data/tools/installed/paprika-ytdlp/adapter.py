@@ -50,12 +50,14 @@ def _hls_is_live(
     referer: str | None = None,
     user_agent: str | None = None,
 ) -> bool | None:
-    """Fetch the first 8 KB of an HLS manifest and check for liveness.
+    """Fetch the HLS manifest and check for liveness.
 
     Returns:
-        True   – live stream (no #EXT-X-ENDLIST / PLAYLIST-TYPE:VOD)
+        True   – live stream (explicit PLAYLIST-TYPE:EVENT, or
+                 media playlist with no #EXT-X-ENDLIST anywhere)
         False  – VOD / finite recording
-        None   – not HLS, or couldn't determine (network error etc.)
+        None   – not HLS, master playlist, or couldn't determine
+                 (network error etc.)
     """
     if not re.search(r"\.m3u8($|\?)", url, re.I):
         return None
@@ -67,8 +69,13 @@ def _hls_is_live(
         if referer:
             headers["Referer"] = referer
         req = _ur.Request(url, headers=headers)
+        # Read up to 256 KB so we don't truncate long VOD variant
+        # playlists. A typical 30-minute VOD at 10s segments has
+        # ~180 #EXTINF lines + URLs ≈ 20-40 KB; 256 KB safely covers
+        # 4-hour movies. 8 KB used to mis-classify these as live
+        # because #EXT-X-ENDLIST sits at the very end of the file.
         with _ur.urlopen(req, timeout=8) as resp:
-            content = resp.read(8192).decode("utf-8", errors="replace")
+            content = resp.read(262144).decode("utf-8", errors="replace")
     except Exception:
         return None
     # Master playlists (multi-variant) list sub-streams via
@@ -82,6 +89,23 @@ def _hls_is_live(
     if "#EXT-X-ENDLIST" in content:
         return False
     if "#EXT-X-PLAYLIST-TYPE:VOD" in content:
+        return False
+    # Explicit live markers from HLS spec.
+    if "#EXT-X-PLAYLIST-TYPE:EVENT" in content:
+        return True
+    # No ENDLIST seen even after 256 KB.  Two cases:
+    #   (a) genuinely live stream -- usually has only a handful of
+    #       segments at any moment (sliding window).
+    #   (b) VERY long VOD whose manifest exceeds 256 KB -- e.g.
+    #       8h+ movies at short segments.  Distinguish by counting
+    #       #EXTINF: a sliding-window live playlist rarely has more
+    #       than ~10 segments; a VOD that doesn't fit in 256 KB has
+    #       hundreds.
+    extinf_count = content.count("#EXTINF")
+    if extinf_count >= 50:
+        # Almost certainly a long VOD whose ENDLIST is past the
+        # 256 KB read.  Safer to treat as VOD than to inject live
+        # flags that force MPEG-TS output.
         return False
     return True
 
