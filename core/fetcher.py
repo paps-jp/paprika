@@ -1807,6 +1807,12 @@ async def fetch(opts: FetchOptions) -> FetchResult:
                             f"  [url-capture] poll #{_hook_poll_n[0]}: "
                             f"+{len(captured)} URL(s) (total: {_hook_total[0]})"
                         )
+                        for _ent in captured[:5]:
+                            log(
+                                f"    [url-capture] "
+                                f"{_ent.get('api','?')} "
+                                f"{(_ent.get('url') or '')[:160]}"
+                            )
                     elif _hook_poll_n[0] in (5, 20, 40):
                         installs = getattr(
                             _read_url_capture, "_last_installs", "?"
