@@ -733,6 +733,18 @@ _AUTOPLAY_ENABLED = (
     os.environ.get("PAPRIKA_AUTOPLAY", "1").lower()
     not in ("0", "false", "no", "")
 )
+# Main-player-only autoplay (default): trigger_autoplay clicks ONLY the
+# largest visible player (one trusted Input click that hit-tests into the
+# main, possibly cross-origin, frame) instead of blasting a play-click
+# into EVERY attached OOPIF.  Blasting all frames also started decoy /
+# mirror players and the related-video preview grid -- flooding the
+# gallery with the wrong videos (observed: 278 files / ~5 GB, 4.9 GB of
+# PNG-disguised decoy junk).  Set PAPRIKA_AUTOPLAY_ALL_FRAMES=1 to restore
+# the old blast-every-OOPIF behaviour (captures more, over-captures more).
+_AUTOPLAY_ALL_FRAMES = (
+    os.environ.get("PAPRIKA_AUTOPLAY_ALL_FRAMES", "0").lower()
+    in ("1", "true", "yes", "on")
+)
 _MOUSE_STEPS = int(os.environ.get("PAPRIKA_MOUSE_STEPS", "30"))
 _MOUSE_DURATION_MS = int(os.environ.get("PAPRIKA_MOUSE_DURATION_MS", "250"))
 
@@ -2379,15 +2391,18 @@ async def trigger_autoplay(tab, log: LogFn | None = None) -> dict:
     their real HLS/DASH manifest (which the url-capture hook then sees).
 
     Fires ``_AUTOPLAY_CLICK_JS`` via Runtime.evaluate(user_gesture=True)
-    in the TOP frame AND in every attached cross-origin OOPIF session
-    (recorded by install_iframe_deep_trace in
-    ``tab._paprika_oopif_sessions``).  The top-frame eval result is read
-    back; OOPIF evals are fire-and-forget raw CDP sends (their captures
-    bubble up to the top via the url-capture postMessage relay).
+    in the TOP frame, then (default) dispatches ONE trusted CDP Input
+    click at the largest visible player rect so only the MAIN player
+    starts -- the click hit-tests through to whichever frame (incl. a
+    cross-origin OOPIF) sits at that pixel, leaving decoy / preview
+    players untouched.  Set ``PAPRIKA_AUTOPLAY_ALL_FRAMES=1`` to instead
+    blast the play-click into every attached OOPIF session
+    (``tab._paprika_oopif_sessions``) -- captures more, over-captures more.
 
-    Returns ``{"top": <result dict or None>, "oopif": <int count>}``.
-    The ``top`` dict carries ``biggest`` (a viewport-centre point) for
-    an optional trusted-Input fallback.  Never raises.
+    Returns ``{"top": <result dict or None>, "trusted": bool,
+    "oopif": <int count>}``.  The ``top`` dict carries ``biggest`` (a
+    viewport-centre point).  Idempotent on the main-player click via
+    ``tab._paprika_autoplay_trusted_done``.  Never raises.
     """
     result: dict = {"top": None, "oopif": 0}
     # --- top frame: real user gesture via the user_gesture flag ---
@@ -2404,39 +2419,62 @@ async def trigger_autoplay(tab, log: LogFn | None = None) -> dict:
         if log:
             log(f"  [autoplay] top-frame click failed: "
                 f"{type(e).__name__}: {e}")
-    # --- each OOPIF session: fire-and-forget raw CDP (own session) ---
-    sessions = getattr(tab, "_paprika_oopif_sessions", None) or {}
-    ws = getattr(tab, "socket", None)
-    if ws is not None and sessions:
-        import json as _json
-        ctr = getattr(tab, "_paprika_autoplay_msg_id", None)
-        if ctr is None:
-            ctr = [20_000_000]
-            setattr(tab, "_paprika_autoplay_msg_id", ctr)
-        for sid in list(sessions.keys()):
-            try:
-                ctr[0] += 1
-                await ws.send(_json.dumps({
-                    "id": ctr[0],
-                    "method": "Runtime.evaluate",
-                    "params": {
-                        "expression": _AUTOPLAY_CLICK_JS,
-                        "userGesture": True,
-                        "returnByValue": True,
-                        "awaitPromise": False,
-                    },
-                    "sessionId": sid,
-                }))
-                result["oopif"] += 1
-            except Exception as e:
-                if log:
-                    log(f"  [autoplay] OOPIF click failed "
-                        f"(sid {str(sid)[:8]}): {type(e).__name__}: {e}")
+    top = result["top"] or {}
+    result["trusted"] = False
+
+    if not _AUTOPLAY_ALL_FRAMES:
+        # MAIN-PLAYER-ONLY (default).  Rather than blasting a play-click
+        # into EVERY attached OOPIF -- which also starts decoy / mirror
+        # players and the related-video preview grid -- dispatch ONE
+        # trusted CDP Input click at the centre of the largest VISIBLE
+        # player rect.  The click hit-tests through to whatever frame
+        # occupies that pixel, so it reaches the main (possibly
+        # cross-origin) player WITHOUT touching hidden / smaller decoy
+        # iframes.  Fired once per tab; skipped when something is already
+        # playing so we never toggle it back off.
+        if (not getattr(tab, "_paprika_autoplay_trusted_done", False)
+                and not top.get("playing")):
+            biggest = top.get("biggest")
+            if biggest:
+                ok = await trigger_autoplay_trusted(tab, biggest, log=log)
+                if ok:
+                    setattr(tab, "_paprika_autoplay_trusted_done", True)
+                    result["trusted"] = True
+    else:
+        # Opt-in legacy: fire the play-click into EVERY OOPIF session
+        # (fire-and-forget raw CDP on each own session).  Captures more
+        # cross-origin players but also starts decoys / previews.
+        sessions = getattr(tab, "_paprika_oopif_sessions", None) or {}
+        ws = getattr(tab, "socket", None)
+        if ws is not None and sessions:
+            import json as _json
+            ctr = getattr(tab, "_paprika_autoplay_msg_id", None)
+            if ctr is None:
+                ctr = [20_000_000]
+                setattr(tab, "_paprika_autoplay_msg_id", ctr)
+            for sid in list(sessions.keys()):
+                try:
+                    ctr[0] += 1
+                    await ws.send(_json.dumps({
+                        "id": ctr[0],
+                        "method": "Runtime.evaluate",
+                        "params": {
+                            "expression": _AUTOPLAY_CLICK_JS,
+                            "userGesture": True,
+                            "returnByValue": True,
+                            "awaitPromise": False,
+                        },
+                        "sessionId": sid,
+                    }))
+                    result["oopif"] += 1
+                except Exception as e:
+                    if log:
+                        log(f"  [autoplay] OOPIF click failed "
+                            f"(sid {str(sid)[:8]}): {type(e).__name__}: {e}")
     if log:
-        top = result["top"] or {}
         log(f"  [autoplay] top: clicked={top.get('clicked')} "
             f"score={top.get('score')} playing={top.get('playing')}; "
-            f"oopif_sessions={result['oopif']}")
+            f"main_trusted={result['trusted']} oopif_sessions={result['oopif']}")
     return result
 
 
@@ -2983,34 +3021,22 @@ async def install_session_asset_capture(
             # after load), nudge the page to start playback so a
             # click-gated player begins fetching its real HLS/DASH
             # manifest -- which the hook above then captures.  Firing on
-            # multiple polls naturally covers OOPIF sessions that attach
-            # after poll #1, and the per-document one-shot click guard
-            # means repeats won't toggle playback off.  Stops once a
-            # stream URL is seen.
+            # multiple polls lets trigger_autoplay land its one-shot
+            # main-player trusted click once the player has laid out (it
+            # self-dedupes via tab._paprika_autoplay_trusted_done, so
+            # repeats don't toggle playback off).  Stops once a stream
+            # URL is seen.
             if (
                 _AUTOPLAY_ENABLED
                 and not _stream_captured[0]
                 and _hook_poll_n[0] <= 6
             ):
                 try:
-                    _ap = await trigger_autoplay(tab, log=log)
+                    await trigger_autoplay(tab, log=log)
                 except Exception as _ape:
-                    _ap = None
                     if log:
                         log(f"  [url-capture] autoplay attempt "
                             f"failed: {_ape}")
-                # Trusted-Input fallback, once (~poll #4): only when the
-                # scored eval-click found nothing clickable and nothing
-                # is playing yet (canvas / transparent-overlay players).
-                if _hook_poll_n[0] == 4 and not _stream_captured[0]:
-                    _top = (_ap or {}).get("top") or {}
-                    if (not _top.get("clicked")
-                            and not _top.get("playing")):
-                        try:
-                            await trigger_autoplay_trusted(
-                                tab, _top.get("biggest"), log=log)
-                        except Exception:
-                            pass
             for entry in captured:
                 url = entry.get("url") or ""
                 if not url or url in _hook_seen:
