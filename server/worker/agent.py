@@ -2295,9 +2295,13 @@ class WorkerAgent:
                 f"failed ({type(e).__name__}: {e})",
             )
 
-        # Run heartbeat + idle-tab reaper + message loop concurrently
+        # Run heartbeat + idle-tab reaper + disk-leak sweeper +
+        # message loop concurrently. The sweeper is the production
+        # backstop for stranded /tmp/paprika-* dirs from crashes /
+        # ungraceful teardown -- see _disk_cleanup_loop docstring.
         hb_task = asyncio.create_task(self._heartbeat_loop())
         reaper_task = asyncio.create_task(self._idle_tab_reaper_loop())
+        disk_task = asyncio.create_task(self._disk_cleanup_loop())
         try:
             async for raw in self._ws:
                 try:
@@ -2309,6 +2313,7 @@ class WorkerAgent:
         finally:
             hb_task.cancel()
             reaper_task.cancel()
+            disk_task.cancel()
 
     async def _heartbeat_loop(self) -> None:
         try:
@@ -2427,6 +2432,152 @@ class WorkerAgent:
                     f"lane #{lane.lane_idx}: closed {closed} leftover "
                     f"tab(s) (kept 1)",
                 )
+
+    # ----------------------------------------------------------------------
+    # Disk-leak sweeper
+    # ----------------------------------------------------------------------
+    # Even with the per-call cleanup paths fixed (profile sync drops its
+    # scratch parent, session teardown drops state.assets_dir.parent),
+    # ungraceful worker crashes (OOM kill, container restart, hub WS
+    # disconnect mid-fetch) still strand /tmp/paprika-*/ dirs from
+    # in-flight work. Production already saw a worker root FS hit 100%
+    # this way -- 313 leaked paprika-profile-sync-* entries and 4-5 GB
+    # yt-dlp partials inside orphaned paprika-ses-* dirs. Chrome and the
+    # worker process then can't write logs/state -> Lane WebSocket dies
+    # -> every fetch landing on that node crashes (manifests as
+    # "ConnectionClosedError: no close frame received or sent").
+    #
+    # This periodic sweep is the defense-in-depth net. It runs in the
+    # worker process (NOT a host cron) so it inherently knows which
+    # sessions are STILL live via self._sessions and never touches their
+    # tmpdirs. Conservative defaults: only entries older than
+    # PAPRIKA_TMP_SWEEP_MIN_AGE_S (default 30 min) are eligible, and a
+    # set of protected names (the persistent profile cache, the
+    # extensions cache) is hard-coded out of scope.
+
+    # Two prefixes the worker uses for transient scratch:
+    #   paprika-ses-<sid>-<rand>            (assets_dir parent, _handle_session_start)
+    #   paprika-profile-<scratch_key>-<rand> (extracted profile,  _fetch_to_temp)
+    #   paprika-profile-sync-<name>-<rand>  (sub-pattern of the above for HubProfileSync)
+    # scratch_key is one of: the sid (session profile install), the
+    # job_id (per-job profile install), or "sync-<profile_name>" (cache
+    # prefetch). Sessions/jobs we know about live in self._sessions; for
+    # everything else we rely on the age threshold to avoid racing a
+    # mid-flight extract.
+    _TMP_SWEEP_PROTECTED = {
+        "paprika-profile-cache",     # canonical sync cache root
+        "paprika-extensions",        # CRX cache, populated on register
+    }
+    _TMP_SWEEP_PREFIXES = (
+        "paprika-ses-",
+        "paprika-profile-",
+        "paprika-",                  # legacy / job tmpdirs (paprika-<jobid>-<rand>)
+    )
+
+    async def _disk_cleanup_loop(self) -> None:
+        """Periodically prune stale /tmp/paprika-* dirs left behind by
+        crashes / ungraceful teardown. Idempotent; safe to run while
+        new sessions are starting (age threshold + active-session check)."""
+        interval = float(
+            os.environ.get("PAPRIKA_TMP_SWEEP_INTERVAL_S") or 1800.0,  # 30 min
+        )
+        min_age = float(
+            os.environ.get("PAPRIKA_TMP_SWEEP_MIN_AGE_S") or 1800.0,  # 30 min
+        )
+        # One pass immediately on startup so a worker that just came up
+        # from a previous crash starts clean. Subsequent passes are spaced
+        # by ``interval``.
+        first = True
+        try:
+            while True:
+                if first:
+                    first = False
+                else:
+                    await asyncio.sleep(interval)
+                try:
+                    n, bytes_freed = await asyncio.to_thread(
+                        self._sweep_tmp_orphans, min_age,
+                    )
+                    if n:
+                        _logger.info(
+                            f"[worker {self.worker_id}] tmp sweep: "
+                            f"removed {n} orphan dir(s), "
+                            f"~{bytes_freed // (1024*1024)} MiB freed",
+                        )
+                except Exception as e:
+                    _logger.info(
+                        f"[worker {self.worker_id}] tmp sweep failed: "
+                        f"{type(e).__name__}: {e}",
+                    )
+        except asyncio.CancelledError:
+            return
+
+    def _sweep_tmp_orphans(self, min_age_s: float) -> tuple[int, int]:
+        """One sweep pass. Synchronous (run in a thread because rmtree of
+        multi-GB dirs is blocking). Returns ``(removed_count, bytes_freed)``."""
+        import time as _t
+
+        tmp = Path("/tmp")
+        if not tmp.exists():
+            return (0, 0)
+        # Snapshot of live session IDs so we don't race a session_end
+        # that fires mid-sweep. Slight race risk on a session that just
+        # started but hasn't populated self._sessions yet -- the
+        # min_age_s threshold (default 30 min) is the belt to the
+        # active-set's suspenders.
+        live_sids: set[str] = set(self._sessions.keys())
+        now = _t.time()
+        removed = 0
+        freed = 0
+        try:
+            entries = list(tmp.iterdir())
+        except Exception:
+            return (0, 0)
+        for entry in entries:
+            name = entry.name
+            if name in self._TMP_SWEEP_PROTECTED:
+                continue
+            if not any(name.startswith(p) for p in self._TMP_SWEEP_PREFIXES):
+                continue
+            try:
+                if not entry.is_dir():
+                    continue
+                age = now - entry.stat().st_mtime
+            except OSError:
+                continue
+            if age < min_age_s:
+                continue
+            # If the dir name embeds a live session id, keep it. Names
+            # follow paprika-ses-<sid>-<rand> / paprika-profile-<key>-<rand>.
+            # We strip the trailing -<rand> by treating everything up to
+            # the last "-" as the key. Loose but safe: false-positives
+            # only KEEP a stale dir an extra cycle, never delete a live one.
+            keep = False
+            for sid in live_sids:
+                if sid and sid in name:
+                    keep = True
+                    break
+            if keep:
+                continue
+            try:
+                # Best-effort directory size for the log line, capped so
+                # we don't os.walk a huge tree just for telemetry.
+                size = 0
+                for root, _, files in os.walk(entry):
+                    for f in files:
+                        try:
+                            size += os.path.getsize(os.path.join(root, f))
+                        except OSError:
+                            pass
+                        if size > 100 * 1024 * 1024 * 1024:  # cap at 100 GiB
+                            break
+                shutil.rmtree(entry, ignore_errors=True)
+                removed += 1
+                freed += size
+            except Exception:
+                # Best-effort: skip and try again next sweep.
+                continue
+        return (removed, freed)
 
     async def _fetch_cookies_txt_for(self, target_url, state, log=None):
         """Fetch a Netscape cookies.txt for ``target_url``'s host from
@@ -3348,6 +3499,23 @@ class WorkerAgent:
                     shutil.rmtree(wd, ignore_errors=True)
             except Exception:
                 pass
+            # Session assets_dir is rooted at /tmp/paprika-ses-<sid>-<rand>/
+            # (see _handle_session_start). Until now nothing cleaned it,
+            # so every closed session leaked its yt-dlp partials / HLS
+            # segment buffers / screenshot dumps -- on busy workers this
+            # accumulated multi-GB per orphan and filled the root FS,
+            # causing Chrome+WebSocket crashes. Drop the whole mkdtemp
+            # root (parent of state.assets_dir) now that teardown is
+            # done. assets_dir was uploaded to the hub during the fetch
+            # so on-disk copy is no longer needed.
+            try:
+                ad = getattr(state, "assets_dir", None)
+                if ad is not None:
+                    # state.assets_dir is <scratch>/assets; drop the
+                    # whole <scratch> the mkdtemp made.
+                    shutil.rmtree(Path(ad).parent, ignore_errors=True)
+            except Exception:
+                pass
 
     async def _handle_session_end(self, msg: HubSessionEnd) -> None:
         """Release the lane and detach nodriver. Tabs reset to about:blank
@@ -3880,6 +4048,13 @@ class WorkerAgent:
         new_dir = await self._fetch_to_temp(msg.url, scratch_key=f"sync-{msg.name}")
         if new_dir is None:
             return  # _fetch_to_temp logged the failure
+        # _fetch_to_temp returns ``<scratch>/"User Data"`` -- after we
+        # move the "User Data" subdir into the canonical cache below,
+        # the parent scratch dir is left orphaned in /tmp. Track it
+        # here so the post-rename cleanup can drop it (otherwise every
+        # sync leaks one empty paprika-profile-sync-<name>-<rand>/ in
+        # /tmp; over days the dentry count fills small VM root FSes).
+        scratch_parent = new_dir.parent
         # Move into the canonical cache location atomically (rename
         # is atomic on the same filesystem; both paths are in /tmp).
         self._profile_cache_root.mkdir(parents=True, exist_ok=True)
@@ -3903,6 +4078,8 @@ class WorkerAgent:
             # dir are unaffected because Lane.use_profile copies out
             # before launching Chrome.
             shutil.rmtree(old_dir, ignore_errors=True)
+            # Drop the now-empty scratch parent (see comment above).
+            shutil.rmtree(scratch_parent, ignore_errors=True)
             self._profile_cache[msg.name] = {
                 "etag": msg.etag,
                 "dir": str(canonical),
