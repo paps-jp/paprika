@@ -725,6 +725,14 @@ async def scroll(tab, direction: str, pixels: int, log: LogFn) -> str:
 # ---------------------------------------------------------------------------
 
 _HUMAN_MOUSE_ENABLED = os.environ.get("PAPRIKA_HUMAN_MOUSE", "1") != "0"
+# Auto-play trigger: when on, the session asset-capture poller clicks
+# the page's play button (and each cross-origin OOPIF's) during the
+# first few polls so click-gated players begin fetching their real
+# HLS/DASH manifest.  Set PAPRIKA_AUTOPLAY=0 to disable.
+_AUTOPLAY_ENABLED = (
+    os.environ.get("PAPRIKA_AUTOPLAY", "1").lower()
+    not in ("0", "false", "no", "")
+)
 _MOUSE_STEPS = int(os.environ.get("PAPRIKA_MOUSE_STEPS", "30"))
 _MOUSE_DURATION_MS = int(os.environ.get("PAPRIKA_MOUSE_DURATION_MS", "250"))
 
@@ -1931,6 +1939,17 @@ async def install_iframe_deep_trace(tab, log: LogFn | None = None) -> bool:
     if getattr(tab, "_paprika_iframe_deep_trace_on", False):
         return False
 
+    # Registry of attached cross-origin OOPIF sessions, keyed by
+    # sessionId -> {target_id, type, url}.  trigger_autoplay() reads
+    # this to fire a play-click into each OOPIF's OWN session (the top
+    # session can't reach an out-of-process frame's JS world).  Stashed
+    # on the tab so the asset-capture poller and download_video can both
+    # reach it.
+    oopif_sessions: dict = getattr(tab, "_paprika_oopif_sessions", None)
+    if oopif_sessions is None:
+        oopif_sessions = {}
+        setattr(tab, "_paprika_oopif_sessions", oopif_sessions)
+
     _attached_target_ids: set = set()
     # Counter for raw CDP message IDs we send to sub-sessions. Start
     # above any reasonable nodriver counter; nodriver uses an
@@ -1973,6 +1992,16 @@ async def install_iframe_deep_trace(tab, log: LogFn | None = None) -> bool:
                     )
                 return
             _attached_target_ids.add(ti.target_id)
+            # Record this OOPIF session so trigger_autoplay() can fire a
+            # play-click into its own JS world.  Keyed by sessionId.
+            try:
+                oopif_sessions[str(session_id)] = {
+                    "target_id": ti.target_id,
+                    "type": ti.type_,
+                    "url": ti.url or "",
+                }
+            except Exception:
+                pass
             # Enable Network on the sub-session by sending a raw CDP
             # message through the PARENT socket with explicit
             # sessionId routing. Routing through tab.socket means the
@@ -2230,6 +2259,204 @@ _URL_CAPTURE_HOOK_JS = r"""
   }
 })();
 """
+
+
+# JS that starts playback so click-gated players begin fetching their
+# real HLS/DASH manifest -- which the url-capture hook then sees.  Run
+# via Runtime.evaluate(user_gesture=True) so Chrome treats it as a real
+# user activation (the flag that unlocks autoplay-blocked .play()).
+#
+# Idempotency / no toggle-pause:
+#   * The scored play-element CLICK fires at most ONCE per document,
+#     guarded by window.__paprika_autoplay_clicked.  Re-running on every
+#     poll would otherwise toggle a play/pause button back off.  The
+#     flag resets naturally on navigation/reload (fresh window).
+#   * The <video>.play() nudge always runs -- play() on an already
+#     playing or buffering element is a no-op, so it's safe to repeat.
+#   * If a <video> is already playing, we skip the click entirely.
+#
+# Returns {playing, clicked, score, biggest} where ``biggest`` is the
+# centre of the largest <video>/<iframe> rect IN THIS DOCUMENT's
+# viewport coords -- the TOP-frame caller uses it for a trusted-Input
+# fallback click when scoring found nothing clickable.  (For OOPIF
+# sessions the result isn't read back; the click is fire-and-forget.)
+_AUTOPLAY_CLICK_JS = r"""
+(function(){
+  try {
+    var vids = Array.prototype.slice.call(document.querySelectorAll('video'));
+    var anyPlaying = function(){
+      return vids.some(function(v){
+        return !v.paused && !v.ended && v.currentTime > 0 && v.readyState > 2;
+      });
+    };
+    // Idempotent nudge: play() on a playing/buffering video is a no-op.
+    vids.forEach(function(v){ try { v.play(); } catch(e){} });
+    if (anyPlaying()) { return {playing:true, clicked:false}; }
+
+    var PLAY_TXT = /^(play|再生|スタート|start|▶|►|>)/i;
+    var ARIA_RX  = /(play|再生|start|スタート)/i;
+    var isVis = function(el){
+      if (!el || !el.getBoundingClientRect) return false;
+      var r = el.getBoundingClientRect();
+      return r.width >= 20 && r.height >= 20 && el.offsetParent !== null;
+    };
+    var score = function(el){
+      if (!isVis(el)) return -1;
+      var s = 0;
+      var aria = el.getAttribute('aria-label') || '';
+      var title = el.getAttribute('title') || '';
+      var txt = (el.textContent || '').trim();
+      var cls = (typeof el.className === 'string'
+        ? el.className : (el.className && el.className.baseVal) || '');
+      if (ARIA_RX.test(aria)) s += 10;
+      if (ARIA_RX.test(title)) s += 5;
+      if (PLAY_TXT.test(txt)) s += 5;
+      if (/play/i.test(cls)) s += 3;
+      if (el.tagName === 'VIDEO') s += 2;
+      return s;
+    };
+
+    var didClick = false, clickScore = 0;
+    // Click ONCE per document (see header comment).
+    if (!window.__paprika_autoplay_clicked) {
+      window.__paprika_autoplay_clicked = true;
+      var els = document.querySelectorAll(
+        'video, button, [role="button"], a, div, span');
+      var best = null, bestScore = 0;
+      for (var i = 0; i < els.length; i++) {
+        var sc = score(els[i]);
+        if (sc > bestScore) { best = els[i]; bestScore = sc; }
+      }
+      if (best && bestScore > 0) {
+        try {
+          var iv = best.querySelector ? best.querySelector('video') : null;
+          if (iv) { try { iv.play(); } catch(e){} }
+          best.click();
+          didClick = true; clickScore = bestScore;
+        } catch (e) {}
+      }
+    }
+
+    // Largest video/iframe rect (this document's viewport coords) for
+    // the top-frame trusted-Input fallback.
+    var biggest = null, biggestArea = 0;
+    var cands = document.querySelectorAll('video, iframe');
+    for (var j = 0; j < cands.length; j++) {
+      var rr = cands[j].getBoundingClientRect();
+      if (rr.width >= 80 && rr.height >= 60) {
+        var area = rr.width * rr.height;
+        if (area > biggestArea) {
+          biggestArea = area;
+          biggest = {x: Math.round(rr.left + rr.width / 2),
+                     y: Math.round(rr.top + rr.height / 2)};
+        }
+      }
+    }
+    return {playing:false, clicked:didClick, score:clickScore, biggest:biggest};
+  } catch (e) { return {error: String(e)}; }
+})()
+"""
+
+
+async def trigger_autoplay(tab, log: LogFn | None = None) -> dict:
+    """Best-effort: start playback so click-gated players begin loading
+    their real HLS/DASH manifest (which the url-capture hook then sees).
+
+    Fires ``_AUTOPLAY_CLICK_JS`` via Runtime.evaluate(user_gesture=True)
+    in the TOP frame AND in every attached cross-origin OOPIF session
+    (recorded by install_iframe_deep_trace in
+    ``tab._paprika_oopif_sessions``).  The top-frame eval result is read
+    back; OOPIF evals are fire-and-forget raw CDP sends (their captures
+    bubble up to the top via the url-capture postMessage relay).
+
+    Returns ``{"top": <result dict or None>, "oopif": <int count>}``.
+    The ``top`` dict carries ``biggest`` (a viewport-centre point) for
+    an optional trusted-Input fallback.  Never raises.
+    """
+    result: dict = {"top": None, "oopif": 0}
+    # --- top frame: real user gesture via the user_gesture flag ---
+    try:
+        remote, exc = await tab.send(cdp.runtime.evaluate(
+            expression=_AUTOPLAY_CLICK_JS,
+            user_gesture=True,
+            return_by_value=True,
+            await_promise=False,
+        ))
+        if exc is None and remote is not None:
+            result["top"] = getattr(remote, "value", None)
+    except Exception as e:
+        if log:
+            log(f"  [autoplay] top-frame click failed: "
+                f"{type(e).__name__}: {e}")
+    # --- each OOPIF session: fire-and-forget raw CDP (own session) ---
+    sessions = getattr(tab, "_paprika_oopif_sessions", None) or {}
+    ws = getattr(tab, "socket", None)
+    if ws is not None and sessions:
+        import json as _json
+        ctr = getattr(tab, "_paprika_autoplay_msg_id", None)
+        if ctr is None:
+            ctr = [20_000_000]
+            setattr(tab, "_paprika_autoplay_msg_id", ctr)
+        for sid in list(sessions.keys()):
+            try:
+                ctr[0] += 1
+                await ws.send(_json.dumps({
+                    "id": ctr[0],
+                    "method": "Runtime.evaluate",
+                    "params": {
+                        "expression": _AUTOPLAY_CLICK_JS,
+                        "userGesture": True,
+                        "returnByValue": True,
+                        "awaitPromise": False,
+                    },
+                    "sessionId": sid,
+                }))
+                result["oopif"] += 1
+            except Exception as e:
+                if log:
+                    log(f"  [autoplay] OOPIF click failed "
+                        f"(sid {str(sid)[:8]}): {type(e).__name__}: {e}")
+    if log:
+        top = result["top"] or {}
+        log(f"  [autoplay] top: clicked={top.get('clicked')} "
+            f"score={top.get('score')} playing={top.get('playing')}; "
+            f"oopif_sessions={result['oopif']}")
+    return result
+
+
+async def trigger_autoplay_trusted(
+    tab, rect: dict | None = None, log: LogFn | None = None,
+) -> bool:
+    """Trusted-Input fallback for the TOP frame: dispatch a real mouse
+    click (via :func:`click_at`, which routes through CDP Input) at the
+    centre of the largest player rect so canvas / transparent-overlay
+    players that the scored eval-click can't target still receive a
+    genuine user gesture.  ``rect`` = ``{"x":.., "y":..}`` (top-frame
+    viewport coords) or None → viewport centre.  Fire once; never raises.
+    """
+    try:
+        if not rect or "x" not in rect or "y" not in rect:
+            try:
+                remote, _exc = await tab.send(cdp.runtime.evaluate(
+                    expression=("({x: Math.round((window.innerWidth||1280)/2),"
+                                " y: Math.round((window.innerHeight||720)/2)})"),
+                    return_by_value=True,
+                ))
+                rect = getattr(remote, "value", None) or {"x": 640, "y": 360}
+            except Exception:
+                rect = {"x": 640, "y": 360}
+        x = int(rect.get("x", 640))
+        y = int(rect.get("y", 360))
+        _noop = (lambda *_a, **_k: None)
+        await click_at(tab, x, y, log or _noop)
+        if log:
+            log(f"  [autoplay] trusted Input click at ({x},{y})")
+        return True
+    except Exception as e:
+        if log:
+            log(f"  [autoplay] trusted Input click failed: "
+                f"{type(e).__name__}: {e}")
+        return False
 
 
 async def install_url_capture_hook(tab, log: LogFn | None = None) -> bool:
@@ -2703,6 +2930,9 @@ async def install_session_asset_capture(
     _hook_seen: set = set()
     _hook_poll_n = [0]
     _hook_total_captured = [0]
+    # Set once any stream URL is observed -- stops the early auto-play
+    # attempts (the player is clearly already loading its manifest).
+    _stream_captured = [False]
 
     async def _url_capture_poller():
         # Stagger the first poll so the page has time to load + the
@@ -2733,6 +2963,38 @@ async def install_session_asset_capture(
                         f"  [url-capture] poll #{_hook_poll_n[0]}: "
                         f"alive, bucket empty"
                     )
+            # Auto-play trigger.  For the first several polls (~2-10 s
+            # after load), nudge the page to start playback so a
+            # click-gated player begins fetching its real HLS/DASH
+            # manifest -- which the hook above then captures.  Firing on
+            # multiple polls naturally covers OOPIF sessions that attach
+            # after poll #1, and the per-document one-shot click guard
+            # means repeats won't toggle playback off.  Stops once a
+            # stream URL is seen.
+            if (
+                _AUTOPLAY_ENABLED
+                and not _stream_captured[0]
+                and _hook_poll_n[0] <= 6
+            ):
+                try:
+                    _ap = await trigger_autoplay(tab, log=log)
+                except Exception as _ape:
+                    _ap = None
+                    if log:
+                        log(f"  [url-capture] autoplay attempt "
+                            f"failed: {_ape}")
+                # Trusted-Input fallback, once (~poll #4): only when the
+                # scored eval-click found nothing clickable and nothing
+                # is playing yet (canvas / transparent-overlay players).
+                if _hook_poll_n[0] == 4 and not _stream_captured[0]:
+                    _top = (_ap or {}).get("top") or {}
+                    if (not _top.get("clicked")
+                            and not _top.get("playing")):
+                        try:
+                            await trigger_autoplay_trusted(
+                                tab, _top.get("biggest"), log=log)
+                        except Exception:
+                            pass
             for entry in captured:
                 url = entry.get("url") or ""
                 if not url or url in _hook_seen:
@@ -2743,6 +3005,7 @@ async def install_session_asset_capture(
                 # image/audio mime save path -- that path needs the
                 # response body, which we don't have here.
                 if _STREAM_URL_RE.search(url):
+                    _stream_captured[0] = True
                     if url not in _net_logged_urls:
                         _net_logged_urls.add(url)
                         _net_log.append({

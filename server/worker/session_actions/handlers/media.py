@@ -665,6 +665,20 @@ async def _act_download_video(agent, ctx: "_ActionCtx") -> None:
             and not iframe_walk_done
         ):
             iframe_walk_done = True
+            # Fire the cross-origin-aware auto-play trigger before
+            # walking frames.  The per-frame click below
+            # (_try_click_play_button_in_frame) uses a top-session
+            # isolated world, which a true out-of-process iframe (OOPIF)
+            # never reaches; trigger_autoplay clicks the play button
+            # inside each OOPIF's OWN session so a cross-origin player's
+            # HLS manifest starts loading.  Best-effort, never raises.
+            try:
+                await browser_ops.trigger_autoplay(tab, log=_slog)
+            except Exception as e:
+                _slog(
+                    f"[download_video] trigger_autoplay failed "
+                    f"(non-fatal): {type(e).__name__}: {e}"
+                )
             try:
                 all_frames = await _enumerate_all_frames(tab)
             except Exception as e:
