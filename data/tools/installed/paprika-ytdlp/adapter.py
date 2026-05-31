@@ -362,46 +362,82 @@ def _ffmpeg_direct_hls(
         "-i", url,
         "-c", "copy",
         "-bsf:a", "aac_adtstoasc",
+        # Fragmented MP4: the moov atom is written at the FRONT and
+        # each fragment is self-contained, so the output is playable
+        # even if ffmpeg is killed mid-download (timeout, token
+        # expiry, network drop).  A plain MP4 writes moov at the END,
+        # so a truncated file is unplayable ("moov atom not found").
+        # Critical for evidence preservation: a partial recording is
+        # still usable.
+        "-movflags", "+frag_keyframe+empty_moov+default_base_moof",
         str(out_path),
     ]
     log(f"  $ ffmpeg-direct -> {out_path.name}")
 
     deadline = time.monotonic() + timeout
+    rc = -1
     try:
-        with subprocess.Popen(
+        proc = subprocess.Popen(
             cmd,
+            stdin=subprocess.PIPE,
             stdout=subprocess.PIPE,
             stderr=subprocess.STDOUT,
             text=True,
             encoding="utf-8",
             errors="replace",
             bufsize=1,
-        ) as proc:
-            assert proc.stdout is not None
-            last_progress = ""
-            for raw in proc.stdout:
-                line = raw.rstrip("\r\n")
-                # ffmpeg progress is very chatty (one line per frame
-                # batch); only surface periodic progress + errors.
-                if line.startswith("frame=") or "time=" in line:
-                    last_progress = line
-                    continue
-                if line and ("error" in line.lower() or "Opening" in line):
-                    log(f"    [ffmpeg] {line[:160]}")
-                if time.monotonic() > deadline:
-                    proc.kill()
-                    return {"ok": False, "message": f"ffmpeg timeout after {timeout}s"}
-            proc.wait()
-            rc = proc.returncode
-            if last_progress:
-                log(f"    [ffmpeg] {last_progress[:120]}")
+        )
+        assert proc.stdout is not None
+        last_progress = ""
+        timed_out = False
+        import select as _select
+        while True:
+            if time.monotonic() > deadline:
+                # Graceful stop: send 'q' so ffmpeg finalises the
+                # current fragment + container before exiting, then
+                # give it a few seconds before a hard kill.
+                timed_out = True
+                try:
+                    if proc.stdin:
+                        proc.stdin.write("q")
+                        proc.stdin.flush()
+                except Exception:
+                    pass
+                try:
+                    proc.wait(timeout=8)
+                except Exception:
+                    try:
+                        proc.kill()
+                    except Exception:
+                        pass
+                break
+            line = proc.stdout.readline()
+            if not line:
+                break
+            line = line.rstrip("\r\n")
+            if line.startswith("frame=") or "time=" in line:
+                last_progress = line
+                continue
+            if line and ("error" in line.lower() or "Opening" in line):
+                log(f"    [ffmpeg] {line[:160]}")
+        try:
+            proc.wait(timeout=5)
+        except Exception:
+            pass
+        rc = proc.returncode if proc.returncode is not None else -1
+        if last_progress:
+            log(f"    [ffmpeg] {last_progress[:120]}")
     except Exception as exc:
         return {"ok": False, "message": f"ffmpeg spawn failed: {exc}"}
 
-    if rc == 0 and out_path.exists() and out_path.stat().st_size > 0:
+    # Success = a non-empty fragmented MP4 exists.  A graceful-'q'
+    # exit on timeout still produces a playable file, so treat that
+    # as success too (the file is real evidence, just truncated).
+    if out_path.exists() and out_path.stat().st_size > 0:
         sz = out_path.stat().st_size
+        tag = " (truncated at timeout)" if timed_out else ""
         return {
             "ok": True,
-            "message": f"ffmpeg-direct OK: {out_path.name} ({sz // 1024} KB)",
+            "message": f"ffmpeg-direct OK: {out_path.name} ({sz // 1024} KB){tag}",
         }
     return {"ok": False, "message": f"ffmpeg exited {rc}, no usable output"}
