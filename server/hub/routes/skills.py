@@ -174,6 +174,141 @@ async def merge_skills(body: dict) -> dict:
     return _skill_to_dict(rec, include_body=False)
 
 
+@router.get("/ai/oracle-stats")
+async def ai_oracle_stats(limit: int = 200) -> dict:
+    """L1 media-oracle stats across recently-captured video assets.
+
+    Walks ``{storage_dir}/*/assets/`` for video files, runs ffprobe on
+    each, and returns aggregate + per-file L1 verdicts. Hub-only -- no
+    worker change needed. Probe results are live (not cached); use
+    ``limit`` (default 200) to cap the scan to the N most-recently-written
+    video files across all jobs.
+    """
+    import asyncio
+    import json as _json
+    import subprocess
+
+    from server.hub._state import get_storage_dir
+
+    _VIDEO_EXTS = {"mp4", "webm", "mov", "m4v", "mkv"}
+    _MIN_DUR = 1.0
+
+    def _probe_one(fp):
+        try:
+            r = subprocess.run(
+                [
+                    "ffprobe", "-v", "quiet",
+                    "-print_format", "json",
+                    "-show_streams", "-show_format",
+                    str(fp),
+                ],
+                capture_output=True,
+                timeout=15,
+            )
+            if r.returncode != 0:
+                return {
+                    "valid": False, "reason": "ffprobe_error",
+                    "duration_s": None, "codec": None,
+                    "width": None, "height": None,
+                }
+            d = _json.loads(r.stdout)
+        except FileNotFoundError:
+            return {
+                "valid": False, "reason": "ffprobe_not_found",
+                "duration_s": None, "codec": None,
+                "width": None, "height": None,
+            }
+        except Exception:
+            return {
+                "valid": False, "reason": "probe_exc",
+                "duration_s": None, "codec": None,
+                "width": None, "height": None,
+            }
+        streams = d.get("streams", [])
+        vs = next((s for s in streams if s.get("codec_type") == "video"), None)
+        if vs is None:
+            return {
+                "valid": False, "reason": "no_video_stream",
+                "duration_s": None, "codec": None,
+                "width": None, "height": None,
+            }
+        try:
+            dur = float(
+                d.get("format", {}).get("duration")
+                or vs.get("duration")
+                or 0
+            )
+        except (ValueError, TypeError):
+            dur = 0.0
+        if dur < _MIN_DUR:
+            return {
+                "valid": False, "reason": "too_short",
+                "duration_s": round(dur, 2),
+                "codec": vs.get("codec_name"),
+                "width": vs.get("width"),
+                "height": vs.get("height"),
+            }
+        return {
+            "valid": True, "reason": "ok",
+            "duration_s": round(dur, 2),
+            "codec": vs.get("codec_name"),
+            "width": vs.get("width"),
+            "height": vs.get("height"),
+        }
+
+    def _collect_files():
+        storage = get_storage_dir()
+        found: list = []
+        try:
+            job_dirs = sorted(
+                (p for p in storage.iterdir() if p.is_dir()),
+                key=lambda p: p.stat().st_mtime,
+                reverse=True,
+            )
+        except Exception:
+            return found
+        for jd in job_dirs:
+            assets = jd / "assets"
+            if not assets.is_dir():
+                continue
+            for f in sorted(
+                (p for p in assets.iterdir() if p.is_file()),
+                key=lambda p: p.stat().st_mtime,
+                reverse=True,
+            ):
+                if f.suffix.lower().lstrip(".") in _VIDEO_EXTS:
+                    found.append((jd.name, f))
+                    if len(found) >= limit:
+                        return found
+        return found
+
+    loop = asyncio.get_event_loop()
+    pairs = await loop.run_in_executor(None, _collect_files)
+
+    async def _probe(jid, fp):
+        verdict = await loop.run_in_executor(None, _probe_one, fp)
+        try:
+            size = fp.stat().st_size
+        except Exception:
+            size = 0
+        return {"job_id": jid, "name": fp.name, "bytes": size, **verdict}
+
+    rows = list(await asyncio.gather(*(_probe(jid, fp) for jid, fp in pairs)))
+    total = len(rows)
+    valid_count = sum(1 for r in rows if r["valid"])
+    by_reason: dict = {}
+    for r in rows:
+        by_reason[r["reason"]] = by_reason.get(r["reason"], 0) + 1
+    return {
+        "total": total,
+        "valid": valid_count,
+        "invalid": total - valid_count,
+        "valid_pct": round(valid_count / total, 3) if total else None,
+        "by_reason": by_reason,
+        "files": rows,
+    }
+
+
 @router.get("/ai/groom-candidates")
 async def ai_groom_candidates() -> dict:
     """Retire (dud/zombie) + dedup (near-duplicate) candidates for the

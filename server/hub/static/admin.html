@@ -1658,6 +1658,7 @@ curl 'http://paprika.lan/extensions/ublock-lite/download' --output ublock-lite.t
       <button type="button" class="ai-subtab" data-ai-subtab="skills" role="tab" aria-selected="false"><iconify-icon icon="lucide:wand-sparkles"></iconify-icon> Skills <span class="count" id="cntSkills">0</span></button>
       <button type="button" class="ai-subtab" data-ai-subtab="conventions" role="tab" aria-selected="false"><iconify-icon icon="lucide:scroll-text"></iconify-icon> Conventions <span class="count" id="cntConventions">0</span></button>
       <button type="button" class="ai-subtab" data-ai-subtab="grooming" role="tab" aria-selected="false"><iconify-icon icon="lucide:brush-cleaning"></iconify-icon> Grooming <span class="count" id="cntGroom">0</span></button>
+      <button type="button" class="ai-subtab" data-ai-subtab="oracle" role="tab" aria-selected="false"><iconify-icon icon="lucide:scan-eye"></iconify-icon> Oracle <span class="count" id="cntOracle">0</span></button>
     </div>
     <div class="ai-subpane" data-ai-subpane="knowledge">
   <section>
@@ -1769,6 +1770,36 @@ curl 'http://paprika.lan/extensions/ublock-lite/download' --output ublock-lite.t
         <tbody><tr><td colspan=4 class="empty">loading…</td></tr></tbody>
       </table>
       <div class="ai-pager" id="pager-groom-dedup"></div>
+    </div>
+    <div class="ai-subpane" data-ai-subpane="oracle" style="display:none;">
+      <div style="display:flex; gap:10px; margin-bottom:12px; flex-wrap:wrap; align-items:flex-end;">
+        <div class="ai-tile">
+          <div class="ai-tile-label">Total videos</div>
+          <div class="ai-tile-value" id="oracleTotal">—</div>
+        </div>
+        <div class="ai-tile">
+          <div class="ai-tile-label">Valid (L1 ✓)</div>
+          <div class="ai-tile-value" id="oracleValid" style="color:#196b2c;">—</div>
+        </div>
+        <div class="ai-tile">
+          <div class="ai-tile-label">Invalid</div>
+          <div class="ai-tile-value" id="oracleInvalid" style="color:#933;">—</div>
+        </div>
+        <div class="ai-tile">
+          <div class="ai-tile-label">Valid %</div>
+          <div class="ai-tile-value" id="oracleValidPct">—</div>
+        </div>
+        <button id="oracleRefreshBtn" class="aibtn" style="margin-left:auto; align-self:center;"><iconify-icon icon="lucide:refresh-cw"></iconify-icon> 再読込</button>
+      </div>
+      <div style="font-size:.82em; color:#888; margin-bottom:8px;">
+        ※ L1 oracle（hub 側 ffprobe で再検証）。直近 200 件の動画アセットを走査。
+        <span id="oracleByReason" style="margin-left:8px; color:#666;"></span>
+      </div>
+      <table id="oracleTable" class="aitbl" style="width:100%;">
+        <thead><tr><th>job</th><th>file</th><th style="width:46px; text-align:center;">L1</th><th class="num">duration</th><th>codec</th><th class="num">dims</th><th class="num">size</th><th>reason</th></tr></thead>
+        <tbody><tr><td colspan=8 class="empty">loading…</td></tr></tbody>
+      </table>
+      <div class="ai-pager" id="pager-oracle"></div>
     </div>
   </section>
 </div>
@@ -1926,10 +1957,11 @@ table.aitbl code { font-size:0.95em; }
   // ---- AI self-improvement loop: skills & conventions (paged) ----
   const _AI_PAGE = 15;
   const _aiState = {
-    skills:         { items: [], page: 0, tableId: 'skTable', cntId: 'cntSkills',      cols: 6 },
-    conventions:    { items: [], page: 0, tableId: 'cvTable', cntId: 'cntConventions', cols: 6 },
-    'groom-retire': { items: [], page: 0, tableId: 'grTable', cntId: 'cntGroomRetire', cols: 7, rowFn: (x) => _groomRetireRow(x) },
-    'groom-dedup':  { items: [], page: 0, tableId: 'gdTable', cntId: 'cntGroomDedup',  cols: 4, rowFn: (x) => _groomDedupRow(x) },
+    skills:         { items: [], page: 0, tableId: 'skTable',      cntId: 'cntSkills',      cols: 6 },
+    conventions:    { items: [], page: 0, tableId: 'cvTable',      cntId: 'cntConventions', cols: 6 },
+    'groom-retire': { items: [], page: 0, tableId: 'grTable',      cntId: 'cntGroomRetire', cols: 7, rowFn: (x) => _groomRetireRow(x) },
+    'groom-dedup':  { items: [], page: 0, tableId: 'gdTable',      cntId: 'cntGroomDedup',  cols: 4, rowFn: (x) => _groomDedupRow(x) },
+    'oracle':       { items: [], page: 0, tableId: 'oracleTable',  cntId: 'cntOracle',      cols: 8, rowFn: (x) => _oracleRow(x) },
   };
 
   async function loadSkillsConventions() {
@@ -2013,6 +2045,8 @@ table.aitbl code { font-size:0.95em; }
       if (typeof loadKnowledge === 'function') loadKnowledge();
     } else if (name === 'grooming') {
       loadGrooming();
+    } else if (name === 'oracle') {
+      loadOracle();
     } else {
       loadSkillsConventions();
     }
@@ -2115,6 +2149,76 @@ table.aitbl code { font-size:0.95em; }
       const body = {}; body[key] = on;
       await fetch('/settings', { method: 'PUT', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body) });
     } catch (e) { alert('toggle failed: ' + e); }
+  }
+
+  // ---- Oracle sub-tab: L1 ffprobe re-probe of stored video assets ----
+  function _humanBytes(b) {
+    if (b == null) return '—';
+    if (b < 1024) return b + ' B';
+    if (b < 1048576) return (b / 1024).toFixed(1) + ' KB';
+    if (b < 1073741824) return (b / 1048576).toFixed(1) + ' MB';
+    return (b / 1073741824).toFixed(2) + ' GB';
+  }
+
+  function _oracleRow(x) {
+    const ok = x.valid;
+    const validMark = ok
+      ? '<span style="color:#196b2c; font-weight:700; font-size:1.05em;">✓</span>'
+      : '<span style="color:#c0392b; font-weight:700; font-size:1.05em;">✗</span>';
+    const dur = x.duration_s != null ? x.duration_s + 's' : '—';
+    const dims = (x.width && x.height) ? x.width + '×' + x.height : '—';
+    const jid = _esc(x.job_id || '');
+    const short = jid.slice(0, 8);
+    const name = _esc(x.name || '');
+    return '<tr>' +
+      '<td><a href="#jobs/' + jid + '" style="font-family:monospace;font-size:.83em;" title="' + jid + '">' + short + '…</a></td>' +
+      '<td style="font-size:.83em;font-family:monospace;max-width:220px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;" title="' + name + '">' + name + '</td>' +
+      '<td style="text-align:center;">' + validMark + '</td>' +
+      '<td class="num">' + dur + '</td>' +
+      '<td>' + _esc(x.codec || '—') + '</td>' +
+      '<td class="num">' + dims + '</td>' +
+      '<td class="num">' + _humanBytes(x.bytes) + '</td>' +
+      '<td style="font-size:.82em;color:' + (ok ? '#196b2c' : '#933') + ';">' + _esc(x.reason) + '</td>' +
+      '</tr>';
+  }
+
+  let _oracleLoading = false;
+  async function loadOracle() {
+    if (_oracleLoading) return;
+    _oracleLoading = true;
+    const tbody = document.querySelector('#oracleTable tbody');
+    if (tbody) tbody.innerHTML = '<tr><td colspan=8 class="empty">scanning… (ffprobe 実行中)</td></tr>';
+    try {
+      const r = await fetch('/ai/oracle-stats?limit=200');
+      if (!r.ok) {
+        if (tbody) tbody.innerHTML = '<tr><td colspan=8 class="empty">error: HTTP ' + r.status + '</td></tr>';
+        return;
+      }
+      const j = await r.json();
+      const set = (id, v) => { const el = document.getElementById(id); if (el) el.textContent = (v != null ? v : '—'); };
+      set('oracleTotal',    j.total);
+      set('oracleValid',    j.valid);
+      set('oracleInvalid',  j.invalid);
+      set('oracleValidPct', j.valid_pct != null ? Math.round(j.valid_pct * 100) + '%' : '—');
+      const cnt = document.getElementById('cntOracle'); if (cnt) cnt.textContent = j.total;
+      // By-reason summary chip row
+      const br = document.getElementById('oracleByReason');
+      if (br && j.by_reason) {
+        br.innerHTML = Object.entries(j.by_reason)
+          .sort((a, b) => b[1] - a[1])
+          .map(([k, v]) => '<span style="display:inline-block;margin:0 3px;padding:1px 7px;border-radius:10px;font-size:.82em;background:' +
+            (k === 'ok' ? '#eef8ee' : '#fdecea') + ';color:' + (k === 'ok' ? '#196b2c' : '#933') + ';border:1px solid ' +
+            (k === 'ok' ? '#7ab68a' : '#e8b4b0') + ';">' + _esc(k) + ':' + v + '</span>')
+          .join('');
+      }
+      _aiState['oracle'].items = j.files || [];
+      _aiState['oracle'].page  = 0;
+      _renderAiPage('oracle');
+    } catch (e) {
+      if (tbody) tbody.innerHTML = '<tr><td colspan=8 class="empty">error: ' + _esc('' + e) + '</td></tr>';
+    } finally {
+      _oracleLoading = false;
+    }
   }
 
   function renderSummary() {
@@ -2292,8 +2396,8 @@ table.aitbl code { font-size:0.95em; }
     document.querySelectorAll('.ai-subtab').forEach(btn => {
       btn.addEventListener('click', () => setAiSubtab(btn.dataset.aiSubtab));
     });
-    // Pager prev/next (delegated, per feature -- incl. grooming lists).
-    ['pager-skills', 'pager-conventions', 'pager-groom-retire', 'pager-groom-dedup'].forEach(id => {
+    // Pager prev/next (delegated, per feature -- incl. grooming + oracle).
+    ['pager-skills', 'pager-conventions', 'pager-groom-retire', 'pager-groom-dedup', 'pager-oracle'].forEach(id => {
       const el = document.getElementById(id);
       if (el) el.addEventListener('click', (ev) => {
         const b = ev.target.closest('button.aipg');
@@ -2318,6 +2422,8 @@ table.aitbl code { font-size:0.95em; }
     if (tr) tr.addEventListener('change', () => _setAutoToggle('auto_retire_enabled', tr.checked));
     const td = document.getElementById('tglAutoDedup');
     if (td) td.addEventListener('change', () => _setAutoToggle('auto_dedup_enabled', td.checked));
+    const oref = document.getElementById('oracleRefreshBtn');
+    if (oref) oref.addEventListener('click', loadOracle);
     document.getElementById('hkModalClose').addEventListener('click', () => {
       document.getElementById('hkModal').style.display = 'none';
     });
