@@ -2283,15 +2283,29 @@ _URL_CAPTURE_HOOK_JS = r"""
 _AUTOPLAY_CLICK_JS = r"""
 (function(){
   try {
-    var vids = Array.prototype.slice.call(document.querySelectorAll('video'));
-    var anyPlaying = function(){
-      return vids.some(function(v){
-        return !v.paused && !v.ended && v.currentTime > 0 && v.readyState > 2;
-      });
+    // Only operate on REAL-PLAYER-SIZED videos.  A media detail page
+    // (e.g. 7mmtv) is a grid of dozens of small related-work preview
+    // <video> thumbnails; a blanket play() on every <video> starts them
+    // all, which then each get auto-downloaded -- flooding the gallery
+    // with the wrong videos and spawning many parallel yt-dlp procs.
+    // The main player is large (or lives in its own OOPIF iframe, which
+    // is driven via its own session), so gating on size keeps the main
+    // video while ignoring the thumbnail grid.
+    var MIN_W = 320, MIN_H = 180;
+    var isBig = function(el){
+      if (!el || !el.getBoundingClientRect) return false;
+      var r = el.getBoundingClientRect();
+      return r.width >= MIN_W && r.height >= MIN_H;
     };
+    var allVids = Array.prototype.slice.call(
+      document.querySelectorAll('video'));
+    var bigVids = allVids.filter(isBig);
+    var anyPlaying = bigVids.some(function(v){
+      return !v.paused && !v.ended && v.currentTime > 0 && v.readyState > 2;
+    });
     // Idempotent nudge: play() on a playing/buffering video is a no-op.
-    vids.forEach(function(v){ try { v.play(); } catch(e){} });
-    if (anyPlaying()) { return {playing:true, clicked:false}; }
+    bigVids.forEach(function(v){ try { v.play(); } catch(e){} });
+    if (anyPlaying) { return {playing:true, clicked:false}; }
 
     var PLAY_TXT = /^(play|再生|スタート|start|▶|►|>)/i;
     var ARIA_RX  = /(play|再生|start|スタート)/i;
@@ -2312,7 +2326,9 @@ _AUTOPLAY_CLICK_JS = r"""
       if (ARIA_RX.test(title)) s += 5;
       if (PLAY_TXT.test(txt)) s += 5;
       if (/play/i.test(cls)) s += 3;
-      if (el.tagName === 'VIDEO') s += 2;
+      // Only reward a <video> as a click target if it's player-sized --
+      // never let a small grid thumbnail become the click winner.
+      if (el.tagName === 'VIDEO' && isBig(el)) s += 2;
       return s;
     };
 
@@ -2330,7 +2346,7 @@ _AUTOPLAY_CLICK_JS = r"""
       if (best && bestScore > 0) {
         try {
           var iv = best.querySelector ? best.querySelector('video') : null;
-          if (iv) { try { iv.play(); } catch(e){} }
+          if (iv && isBig(iv)) { try { iv.play(); } catch(e){} }
           best.click();
           didClick = true; clickScore = bestScore;
         } catch (e) {}
