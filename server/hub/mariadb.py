@@ -1015,10 +1015,14 @@ async def restore_hosts(pool: Any, host_registry: Any) -> int:
             rows = await cur.fetchall()
 
     # Deletion reconciliation (runs BEFORE upsert pass so a row
-    # dropped from MariaDB doesn't survive on disk).
-    mariadb_hosts = {row[0] for row in rows if row[0]}
+    # dropped from MariaDB doesn't survive on disk). Normalise both
+    # sides via the same ``_normalise_host`` the registry applies on
+    # write, so a "FOO.com" row in MariaDB doesn't false-positive
+    # against a "foo.com" file (delete-then-recreate cycle).
+    from server.hub.hosts import _normalise_host as _norm_host
+    mariadb_hosts = {_norm_host(row[0]) for row in rows if row[0]}
     for existing in list(host_registry.list_all()):
-        if existing.host not in mariadb_hosts:
+        if _norm_host(existing.host) not in mariadb_hosts:
             try:
                 if host_registry.delete(existing.host):
                     log.info(
@@ -1073,17 +1077,21 @@ async def restore_visited_urls(pool: Any, visited_registry: Any) -> int:
             )
             rows = await cur.fetchall()
 
-    # Group MariaDB rows by host -> set(urls) for O(1) membership checks.
+    # Group MariaDB rows by normalised host -> set(urls). The
+    # visited registry normalises hosts on write (lowercase, strip
+    # www.) so we apply the same on read; otherwise a "FOO.com"
+    # MariaDB row vs a "foo.com" file would false-positive.
     from collections import defaultdict
+    from server.hub.host_visited import _normalise_host as _norm_vh
     mariadb_by_host: dict[str, set[str]] = defaultdict(set)
     for host, url in rows:
         if host:
-            mariadb_by_host[host].add(url)
+            mariadb_by_host[_norm_vh(host)].add(url)
 
     # Enumerate hosts that have a file on disk. HostVisitedRegistry
     # doesn't expose a list_hosts() helper, so we glob its data dir
-    # and read each file's ``host`` field. Tolerate unreadable files
-    # (skip) rather than failing the whole restore.
+    # and read each file's ``host`` field (already normalised at
+    # write-time). Tolerate unreadable files rather than failing.
     file_hosts: set[str] = set()
     try:
         for p in _Path(visited_registry.dir).glob("*.json"):
@@ -1091,7 +1099,7 @@ async def restore_visited_urls(pool: Any, visited_registry: Any) -> int:
                 d = json.loads(p.read_text(encoding="utf-8"))
                 h = d.get("host")
                 if h:
-                    file_hosts.add(h)
+                    file_hosts.add(_norm_vh(h))
             except Exception:
                 continue
     except Exception as e:
@@ -1148,10 +1156,15 @@ async def restore_skills(pool: Any, skill_registry: Any) -> int:
             rows = await cur.fetchall()
 
     # Deletion reconciliation: drop any file-side (tier, slug) pair
-    # missing from MariaDB.
-    mariadb_keys = {(row[1] or "auto", row[0]) for row in rows if row[0]}
+    # missing from MariaDB. Slugs are normalised on both sides
+    # (SkillRegistry._slug applies ``normalise_slug`` on write) so
+    # case-mismatched MariaDB keys don't false-positive.
+    from server.hub.skills import normalise_slug as _norm_sk_slug
+    mariadb_keys = {
+        (row[1] or "auto", _norm_sk_slug(row[0])) for row in rows if row[0]
+    }
     for existing in list(skill_registry.list_all()):
-        key = (existing.tier, existing.slug)
+        key = (existing.tier, _norm_sk_slug(existing.slug))
         if key not in mariadb_keys:
             try:
                 if skill_registry.delete(existing.slug, tier=existing.tier):
@@ -1201,9 +1214,12 @@ async def restore_conventions(pool: Any, convention_registry: Any) -> int:
             )
             rows = await cur.fetchall()
 
-    mariadb_keys = {(row[1] or "auto", row[0]) for row in rows if row[0]}
+    from server.hub.conventions import normalise_slug as _norm_cv_slug
+    mariadb_keys = {
+        (row[1] or "auto", _norm_cv_slug(row[0])) for row in rows if row[0]
+    }
     for existing in list(convention_registry.list_all()):
-        key = (existing.tier, existing.slug)
+        key = (existing.tier, _norm_cv_slug(existing.slug))
         if key not in mariadb_keys:
             try:
                 if convention_registry.delete(existing.slug, tier=existing.tier):
@@ -1264,10 +1280,14 @@ async def restore_engines(pool: Any, engine_registry: Any) -> int:
 
     # Deletion reconciliation: any slug present on disk but missing in
     # MariaDB is dropped. Run BEFORE the upsert pass so a row that
-    # disappeared from MariaDB doesn't survive on disk.
-    mariadb_slugs = {row[0] for row in rows if row[0]}
+    # disappeared from MariaDB doesn't survive on disk. Both sides are
+    # passed through ``normalise_slug`` -- otherwise a "Claude" row in
+    # MariaDB compares unequal to a "claude" file and triggers a
+    # spurious delete-then-recreate cycle on every restart.
+    from server.hub.engines import normalise_slug as _norm_eng_slug
+    mariadb_slugs = {_norm_eng_slug(row[0]) for row in rows if row[0]}
     for existing in list(engine_registry.list_all()):
-        if existing.slug not in mariadb_slugs:
+        if _norm_eng_slug(existing.slug) not in mariadb_slugs:
             try:
                 if engine_registry.delete(existing.slug):
                     log.info(
@@ -1401,9 +1421,13 @@ async def restore_presets(pool: Any, preset_registry: Any) -> int:
             )
             rows = await cur.fetchall()
 
-    mariadb_names = {row[0] for row in rows if row[0]}
+    # Normalise both sides via PresetRegistry's filename-safe key so
+    # "Foo Bar" and "foo bar" (which both map to "foo-bar.json")
+    # don't cause spurious delete-then-recreate cycles.
+    from server.hub.presets import _safe_filename as _norm_preset
+    mariadb_names = {_norm_preset(row[0]) for row in rows if row[0]}
     for existing in list(preset_registry.list_all()):
-        if existing.name not in mariadb_names:
+        if _norm_preset(existing.name) not in mariadb_names:
             try:
                 if preset_registry.delete(existing.name):
                     log.info(
