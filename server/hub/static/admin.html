@@ -49,7 +49,6 @@
       <button class="tab" data-tab="profiles" role="menuitem"><iconify-icon icon="lucide:user-cog"></iconify-icon> <span data-i18n="tab.profiles">Profiles</span> <span class="count" id="cntProfiles">0</span></button>
       <button class="tab" data-tab="extensions" role="menuitem"><iconify-icon icon="lucide:puzzle"></iconify-icon> <span data-i18n="tab.extensions">Extensions</span> <span class="count" id="cntExtensions">0</span></button>
       <button class="tab" data-tab="engines" role="menuitem"><iconify-icon icon="lucide:wand-sparkles"></iconify-icon> <span data-i18n="tab.engines">AI Engines</span> <span class="count" id="cntEngines">0</span></button>
-      <button class="tab" data-tab="knowledge" role="menuitem"><iconify-icon icon="lucide:brain"></iconify-icon> <span data-i18n="tab.knowledge">Knowledge</span> <span class="count" id="cntKnowledge">0</span></button>
       <button class="tab" data-tab="ai" role="menuitem"><iconify-icon icon="lucide:sparkles"></iconify-icon> <span>AI</span></button>
       <button class="tab" data-tab="plugins" role="menuitem"><iconify-icon icon="lucide:plug"></iconify-icon> <span data-i18n="tab.plugins">Plugins</span> <span class="count" id="cntPlugins">0</span></button>
       <button class="tab" data-tab="settings" role="menuitem"><iconify-icon icon="lucide:settings"></iconify-icon> <span data-i18n="tab.settings">Settings</span></button>
@@ -1646,7 +1645,20 @@ curl 'http://paprika.lan/extensions/ublock-lite/download' --output ublock-lite.t
      Read-only at this milestone; future Phase 7 will let operators
      edit / pin / delete individual barrier strategies.
      ============================================================ -->
-<div class="panel" data-panel="knowledge">
+<!-- AI self-improvement loop (skills / conventions / …) -->
+<div class="panel" data-panel="ai">
+  <section style="padding-top:4px;">
+    <h2 style="margin:0 0 10px;"><iconify-icon icon="lucide:sparkles"></iconify-icon> AI 学習ループ
+      <span style="font-size:0.58em; color:#888; font-weight:normal; margin-left:8px;">
+        codegen-loop が学習した横断パターン。<code>success_rate = success / use</code> ＝ 実ジョブでの成功寄与（選別シグナル）。
+      </span>
+    </h2>
+    <div class="ai-subtabs" role="tablist">
+      <button type="button" class="ai-subtab active" data-ai-subtab="knowledge" role="tab" aria-selected="true"><iconify-icon icon="lucide:brain"></iconify-icon> Host Knowledge <span class="count" id="cntKnowledge">0</span></button>
+      <button type="button" class="ai-subtab" data-ai-subtab="skills" role="tab" aria-selected="false"><iconify-icon icon="lucide:wand-sparkles"></iconify-icon> Skills <span class="count" id="cntSkills">0</span></button>
+      <button type="button" class="ai-subtab" data-ai-subtab="conventions" role="tab" aria-selected="false"><iconify-icon icon="lucide:scroll-text"></iconify-icon> Conventions <span class="count" id="cntConventions">0</span></button>
+    </div>
+    <div class="ai-subpane" data-ai-subpane="knowledge">
   <section>
     <h2><iconify-icon icon="lucide:brain"></iconify-icon> <span data-i18n="tab.knowledge">Knowledge</span>
       <span style="font-size:0.7em; color:#888; font-weight:normal; margin-left:8px;" data-i18n="knowledge.subtitle">
@@ -1720,21 +1732,8 @@ curl 'http://paprika.lan/extensions/ublock-lite/download' --output ublock-lite.t
       <tbody><tr><td colspan=8 class="empty" data-i18n="knowledge.empty">no HostKnowledge yet — submit a job to start learning</td></tr></tbody>
     </table>
   </section>
-</div>
-
-<!-- AI self-improvement loop (skills / conventions / …) -->
-<div class="panel" data-panel="ai">
-  <section style="padding-top:4px;">
-    <h2 style="margin:0 0 10px;"><iconify-icon icon="lucide:sparkles"></iconify-icon> AI 学習ループ
-      <span style="font-size:0.58em; color:#888; font-weight:normal; margin-left:8px;">
-        codegen-loop が学習した横断パターン。<code>success_rate = success / use</code> ＝ 実ジョブでの成功寄与（選別シグナル）。
-      </span>
-    </h2>
-    <div class="ai-subtabs" role="tablist">
-      <button type="button" class="ai-subtab active" data-ai-subtab="skills" role="tab" aria-selected="true"><iconify-icon icon="lucide:wand-sparkles"></iconify-icon> Skills <span class="count" id="cntSkills">0</span></button>
-      <button type="button" class="ai-subtab" data-ai-subtab="conventions" role="tab" aria-selected="false"><iconify-icon icon="lucide:scroll-text"></iconify-icon> Conventions <span class="count" id="cntConventions">0</span></button>
     </div>
-    <div class="ai-subpane" data-ai-subpane="skills">
+    <div class="ai-subpane" data-ai-subpane="skills" style="display:none;">
       <table id="skTable" class="aitbl" style="width:100%;">
         <thead><tr><th>slug</th><th>tier</th><th class="num">use</th><th class="num">success</th><th>success_rate</th><th style="width:150px;">actions</th></tr></thead>
         <tbody><tr><td colspan=6 class="empty">loading…</td></tr></tbody>
@@ -1983,6 +1982,12 @@ table.aitbl code { font-size:0.95em; }
     document.querySelectorAll('.ai-subpane').forEach(p => {
       p.style.display = (p.dataset.aiSubpane === name) ? '' : 'none';
     });
+    // Lazy-load the activated sub-tab's data.
+    if (name === 'knowledge') {
+      if (typeof loadKnowledge === 'function') loadKnowledge();
+    } else {
+      loadSkillsConventions();
+    }
   }
 
   function _esc(s) { return (s == null ? '' : ('' + s)).replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/"/g, '&quot;'); }
@@ -2182,9 +2187,12 @@ table.aitbl code { font-size:0.95em; }
         aiAction(b.dataset.kind, b.dataset.slug, b.dataset.act);
       });
     });
-    // AI tab: load on activation (mirrors the Knowledge tab pattern).
+    // AI tab: load the currently-active sub-tab's data on activation.
     document.querySelectorAll('[data-tab="ai"]').forEach(btn => {
-      btn.addEventListener('click', () => { loadSkillsConventions(); });
+      btn.addEventListener('click', () => {
+        const active = document.querySelector('.ai-subtab.active');
+        setAiSubtab(active ? active.dataset.aiSubtab : 'knowledge');
+      });
     });
     // AI sub-tabs (Skills / Conventions) -- same design as the Submit tab.
     document.querySelectorAll('.ai-subtab').forEach(btn => {
