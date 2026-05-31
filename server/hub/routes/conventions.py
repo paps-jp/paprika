@@ -140,3 +140,20 @@ async def demote_convention(slug: str) -> dict:
     if rec is None:
         raise HTTPException(404, f"convention '{slug}' not found in curated/")
     return _convention_to_dict(rec, include_body=True)
+
+
+@router.post("/conventions/merge")
+async def merge_conventions(body: dict) -> dict:
+    """Fold near-duplicate auto conventions (``drops``) into ``keep``
+    (sum counts, union provenance, delete the rest). Auto tier only.
+    Body: ``{keep: slug, drops: [slug, ...]}``."""
+    reg = _require_conventions()
+    body = body or {}
+    keep = body.get("keep")
+    drops = body.get("drops") or []
+    if not keep or not isinstance(drops, list) or not drops:
+        raise HTTPException(400, "body must be {keep: <slug>, drops: [<slug>, ...]}")
+    rec = reg.merge(keep, drops)
+    if rec is None:
+        raise HTTPException(404, f"keep convention '{keep}' not found in auto/")
+    return _convention_to_dict(rec, include_body=False)

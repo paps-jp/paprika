@@ -155,3 +155,75 @@ async def demote_skill(slug: str) -> dict:
     if rec is None:
         raise HTTPException(404, f"skill '{slug}' not found in curated/")
     return _skill_to_dict(rec, include_body=True)
+
+
+@router.post("/skills/merge")
+async def merge_skills(body: dict) -> dict:
+    """Fold near-duplicate auto skills (``drops``) into the survivor
+    (``keep``): sum counts, union provenance, delete the rest. Auto tier
+    only. Body: ``{keep: slug, drops: [slug, ...]}``."""
+    reg = _require_skills()
+    body = body or {}
+    keep = body.get("keep")
+    drops = body.get("drops") or []
+    if not keep or not isinstance(drops, list) or not drops:
+        raise HTTPException(400, "body must be {keep: <slug>, drops: [<slug>, ...]}")
+    rec = reg.merge(keep, drops)
+    if rec is None:
+        raise HTTPException(404, f"keep skill '{keep}' not found in auto/")
+    return _skill_to_dict(rec, include_body=False)
+
+
+@router.get("/ai/groom-candidates")
+async def ai_groom_candidates() -> dict:
+    """Retire (dud/zombie) + dedup (near-duplicate) candidates for the
+    Grooming UI, for BOTH skills and conventions. Reuses the same logic
+    the hourly reaper applies as a dry-run -- nothing is mutated here. The
+    operator acts via the merge / delete endpoints or the auto_* toggles.
+    """
+    from server.hub._reaper import (
+        _dedup_clusters,
+        _dedup_pick,
+        _retire_reason,
+    )
+
+    def _rate(r):
+        uc = getattr(r, "use_count", 0) or 0
+        return round((getattr(r, "success_count", 0) or 0) / uc, 3) if uc else None
+
+    out: dict = {}
+    for kind, reg in (("skill", state.skills), ("convention", state.conventions)):
+        if reg is None:
+            out[kind] = {"retire": [], "dedup": []}
+            continue
+        try:
+            records = reg.list_all()
+        except Exception:
+            records = []
+        total_success = sum(getattr(r, "success_count", 0) or 0 for r in records)
+        allow_dud = kind == "skill" and total_success > 0
+        retire = [
+            {
+                "slug": getattr(rec, "slug", "?"),
+                "tier": getattr(rec, "tier", "auto"),
+                "reason": reason,
+                "use_count": getattr(rec, "use_count", 0),
+                "success_count": getattr(rec, "success_count", 0),
+            }
+            for rec in records
+            if (reason := _retire_reason(rec, allow_dud=allow_dud))
+        ]
+        dedup = []
+        for cluster in _dedup_clusters(records, kind):
+            keep, drops = _dedup_pick(cluster)
+            dedup.append({
+                "keep": keep.slug,
+                "drops": [d.slug for d in drops],
+                "members": [
+                    {"slug": r.slug, "use_count": getattr(r, "use_count", 0),
+                     "success_rate": _rate(r)}
+                    for r in cluster
+                ],
+            })
+        out[kind] = {"retire": retire, "dedup": dedup}
+    return out

@@ -33,6 +33,11 @@ _SCHEMA: dict[str, tuple[Any, str]] = {
     # the skill / convention distillation LLM calls.
     "skill_auto_extract_enabled": (True, "bool"),
     "convention_auto_extract_enabled": (True, "bool"),
+    # Grooming reaper: when on, the hourly reaper auto-deletes auto-tier
+    # duds/zombies (retire) / merges near-duplicates (dedup). Off by
+    # default -> the reaper only dry-run-logs candidates for review.
+    "auto_retire_enabled": (False, "bool"),
+    "auto_dedup_enabled": (False, "bool"),
     # How many skills the retriever picks per new job before injection.
     "skill_retrieval_top_k": (3, "int"),
     # Minimum byte size for a captured asset. Anything smaller than

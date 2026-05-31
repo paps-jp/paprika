@@ -1657,6 +1657,7 @@ curl 'http://paprika.lan/extensions/ublock-lite/download' --output ublock-lite.t
       <button type="button" class="ai-subtab active" data-ai-subtab="knowledge" role="tab" aria-selected="true"><iconify-icon icon="lucide:brain"></iconify-icon> Host Knowledge <span class="count" id="cntKnowledge">0</span></button>
       <button type="button" class="ai-subtab" data-ai-subtab="skills" role="tab" aria-selected="false"><iconify-icon icon="lucide:wand-sparkles"></iconify-icon> Skills <span class="count" id="cntSkills">0</span></button>
       <button type="button" class="ai-subtab" data-ai-subtab="conventions" role="tab" aria-selected="false"><iconify-icon icon="lucide:scroll-text"></iconify-icon> Conventions <span class="count" id="cntConventions">0</span></button>
+      <button type="button" class="ai-subtab" data-ai-subtab="grooming" role="tab" aria-selected="false"><iconify-icon icon="lucide:brush-cleaning"></iconify-icon> Grooming <span class="count" id="cntGroom">0</span></button>
     </div>
     <div class="ai-subpane" data-ai-subpane="knowledge">
   <section>
@@ -1747,6 +1748,27 @@ curl 'http://paprika.lan/extensions/ublock-lite/download' --output ublock-lite.t
         <tbody><tr><td colspan=6 class="empty">loading…</td></tr></tbody>
       </table>
       <div class="ai-pager" id="pager-conventions"></div>
+    </div>
+    <div class="ai-subpane" data-ai-subpane="grooming" style="display:none;">
+      <div style="display:flex; gap:18px; align-items:center; margin-bottom:14px; padding:10px 14px; background:#fff8e6; border:1px solid #f5d77a; border-radius:8px; font-size:.9em; flex-wrap:wrap;">
+        <span style="font-weight:600;"><iconify-icon icon="lucide:bot"></iconify-icon> 自動グルーミング（毎時 reaper）:</span>
+        <label style="display:inline-flex; gap:6px; align-items:center; cursor:pointer;"><input type="checkbox" id="tglAutoRetire"> auto retire</label>
+        <label style="display:inline-flex; gap:6px; align-items:center; cursor:pointer;"><input type="checkbox" id="tglAutoDedup"> auto dedup</label>
+        <span style="color:#888; font-size:.82em;">※ 既定 OFF（候補表示のみ）。ON で auto-tier を自動処理（curated は対象外・手動のみ）。</span>
+        <button id="groomRefreshBtn" class="aibtn" style="margin-left:auto;"><iconify-icon icon="lucide:refresh-cw"></iconify-icon> 再読込</button>
+      </div>
+      <div style="font-weight:600; margin:10px 0 4px;"><iconify-icon icon="lucide:trash-2"></iconify-icon> Retire 候補 <span class="count" id="cntGroomRetire">0</span> <span style="font-size:.8em; color:#999; font-weight:normal;">（dud=高use低成功率 / zombie=未使用かつ古い・auto のみ削除可）</span></div>
+      <table id="grTable" class="aitbl" style="width:100%;">
+        <thead><tr><th>kind</th><th>slug</th><th>tier</th><th>reason</th><th class="num">use</th><th class="num">success</th><th style="width:90px;">action</th></tr></thead>
+        <tbody><tr><td colspan=7 class="empty">loading…</td></tr></tbody>
+      </table>
+      <div class="ai-pager" id="pager-groom-retire"></div>
+      <div style="font-weight:600; margin:18px 0 4px;"><iconify-icon icon="lucide:combine"></iconify-icon> Dedup 候補 <span class="count" id="cntGroomDedup">0</span> <span style="font-size:.8em; color:#999; font-weight:normal;">（類似 auto を survivor へ統合）</span></div>
+      <table id="gdTable" class="aitbl" style="width:100%;">
+        <thead><tr><th>kind</th><th>keep (survivor)</th><th>merge in (drops)</th><th style="width:90px;">action</th></tr></thead>
+        <tbody><tr><td colspan=4 class="empty">loading…</td></tr></tbody>
+      </table>
+      <div class="ai-pager" id="pager-groom-dedup"></div>
     </div>
   </section>
 </div>
@@ -1904,8 +1926,10 @@ table.aitbl code { font-size:0.95em; }
   // ---- AI self-improvement loop: skills & conventions (paged) ----
   const _AI_PAGE = 15;
   const _aiState = {
-    skills:      { items: [], page: 0, tableId: 'skTable', cntId: 'cntSkills' },
-    conventions: { items: [], page: 0, tableId: 'cvTable', cntId: 'cntConventions' },
+    skills:         { items: [], page: 0, tableId: 'skTable', cntId: 'cntSkills',      cols: 6 },
+    conventions:    { items: [], page: 0, tableId: 'cvTable', cntId: 'cntConventions', cols: 6 },
+    'groom-retire': { items: [], page: 0, tableId: 'grTable', cntId: 'cntGroomRetire', cols: 7, rowFn: (x) => _groomRetireRow(x) },
+    'groom-dedup':  { items: [], page: 0, tableId: 'gdTable', cntId: 'cntGroomDedup',  cols: 4, rowFn: (x) => _groomDedupRow(x) },
   };
 
   async function loadSkillsConventions() {
@@ -1940,14 +1964,16 @@ table.aitbl code { font-size:0.95em; }
 
   function _renderAiPage(kind) {
     const st = _aiState[kind];
+    const cols = st.cols || 6;
     const tbody = document.querySelector('#' + st.tableId + ' tbody');
     const cnt = document.getElementById(st.cntId); if (cnt) cnt.textContent = st.items.length;
-    if (!st.items.length) { tbody.innerHTML = '<tr><td colspan=6 class="empty">none yet</td></tr>'; _renderAiPager(kind); return; }
+    if (!st.items.length) { tbody.innerHTML = '<tr><td colspan=' + cols + ' class="empty">none</td></tr>'; _renderAiPager(kind); return; }
     const pages = Math.max(1, Math.ceil(st.items.length / _AI_PAGE));
     if (st.page >= pages) st.page = pages - 1;
     if (st.page < 0) st.page = 0;
     const start = st.page * _AI_PAGE;
-    tbody.innerHTML = st.items.slice(start, start + _AI_PAGE).map(x => _aiRow(x, kind)).join('');
+    const rf = st.rowFn || ((x) => _aiRow(x, kind));
+    tbody.innerHTML = st.items.slice(start, start + _AI_PAGE).map(rf).join('');
     _renderAiPager(kind);
   }
 
@@ -1985,6 +2011,8 @@ table.aitbl code { font-size:0.95em; }
     // Lazy-load the activated sub-tab's data.
     if (name === 'knowledge') {
       if (typeof loadKnowledge === 'function') loadKnowledge();
+    } else if (name === 'grooming') {
+      loadGrooming();
     } else {
       loadSkillsConventions();
     }
@@ -2021,6 +2049,72 @@ table.aitbl code { font-size:0.95em; }
       if (!r.ok) { alert(act + ' failed: HTTP ' + r.status); return; }
     } catch (e) { alert(act + ' failed: ' + e); return; }
     loadSkillsConventions();
+  }
+
+  // ---- Grooming sub-tab: retire + dedup candidates + auto toggles ----
+  function _groomRetireRow(x) {
+    const slug = _esc(x.slug);
+    const auto = (x.tier === 'auto');
+    const tierBadge = '<span class="aibadge ' + (auto ? 'tier-auto' : 'tier-cur') + '">' + _esc(x.tier) + '</span>';
+    const act = auto
+      ? '<button class="aibtn del" data-act="delete" data-kind="' + _esc(x.kind) + '" data-slug="' + slug + '">delete</button>'
+      : '<span style="color:#999; font-size:.82em;">curated — 手動</span>';
+    return '<tr><td>' + _esc(x.kind) + '</td><td><code>' + slug + '</code></td><td>' + tierBadge + '</td>' +
+      '<td>' + _esc(x.reason) + '</td><td class="num">' + (x.use_count || 0) + '</td>' +
+      '<td class="num">' + (x.success_count || 0) + '</td><td>' + act + '</td></tr>';
+  }
+
+  function _groomDedupRow(x) {
+    const keep = _esc(x.keep);
+    const drops = (x.drops || []).map(_esc).join(', ');
+    const act = '<button class="aibtn" data-act="merge" data-kind="' + _esc(x.kind) +
+      '" data-keep="' + keep + '" data-drops="' + _esc((x.drops || []).join(',')) + '">merge</button>';
+    return '<tr><td>' + _esc(x.kind) + '</td><td><code>' + keep + '</code></td>' +
+      '<td><code style="color:#933;">' + drops + '</code></td><td>' + act + '</td></tr>';
+  }
+
+  async function loadGrooming() {
+    const retire = [], dedup = [];
+    try {
+      const r = await fetch('/ai/groom-candidates');
+      const j = await r.json();
+      for (const [sing, plural] of [['skill', 'skills'], ['convention', 'conventions']]) {
+        const sec = j[sing] || { retire: [], dedup: [] };
+        (sec.retire || []).forEach(x => retire.push(Object.assign({ kind: plural }, x)));
+        (sec.dedup || []).forEach(x => dedup.push(Object.assign({ kind: plural }, x)));
+      }
+    } catch (e) { /* leave empty */ }
+    _aiState['groom-retire'].items = retire; _aiState['groom-retire'].page = 0; _renderAiPage('groom-retire');
+    _aiState['groom-dedup'].items = dedup;   _aiState['groom-dedup'].page = 0;   _renderAiPage('groom-dedup');
+    const gc = document.getElementById('cntGroom'); if (gc) gc.textContent = retire.length + dedup.length;
+    // Reflect the auto-* toggles from hub settings.
+    try {
+      const s = await (await fetch('/settings')).json();
+      const v = s.values || {};
+      const tr = document.getElementById('tglAutoRetire'); if (tr) tr.checked = !!v.auto_retire_enabled;
+      const td = document.getElementById('tglAutoDedup');  if (td) td.checked = !!v.auto_dedup_enabled;
+    } catch (e) { /* ignore */ }
+  }
+
+  async function _groomMerge(kind, keep, dropsCsv) {
+    const drops = (dropsCsv || '').split(',').filter(Boolean);
+    if (!drops.length) return;
+    if (!confirm('Merge ' + drops.length + ' ' + kind + ' into "' + keep + '"?')) return;
+    try {
+      const r = await fetch('/' + kind + '/merge', {
+        method: 'POST', headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ keep: keep, drops: drops }),
+      });
+      if (!r.ok) { alert('merge failed: HTTP ' + r.status); return; }
+    } catch (e) { alert('merge failed: ' + e); return; }
+    loadGrooming();
+  }
+
+  async function _setAutoToggle(key, on) {
+    try {
+      const body = {}; body[key] = on;
+      await fetch('/settings', { method: 'PUT', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body) });
+    } catch (e) { alert('toggle failed: ' + e); }
   }
 
   function renderSummary() {
@@ -2198,8 +2292,8 @@ table.aitbl code { font-size:0.95em; }
     document.querySelectorAll('.ai-subtab').forEach(btn => {
       btn.addEventListener('click', () => setAiSubtab(btn.dataset.aiSubtab));
     });
-    // Pager prev/next (delegated, per feature).
-    ['pager-skills', 'pager-conventions'].forEach(id => {
+    // Pager prev/next (delegated, per feature -- incl. grooming lists).
+    ['pager-skills', 'pager-conventions', 'pager-groom-retire', 'pager-groom-dedup'].forEach(id => {
       const el = document.getElementById(id);
       if (el) el.addEventListener('click', (ev) => {
         const b = ev.target.closest('button.aipg');
@@ -2207,6 +2301,23 @@ table.aitbl code { font-size:0.95em; }
         _aiPagerClick(b.dataset.kind, b.dataset.aipg);
       });
     });
+    // Grooming: retire-table delete, dedup-table merge, refresh, toggles.
+    const grT = document.getElementById('grTable');
+    if (grT) grT.addEventListener('click', (ev) => {
+      const b = ev.target.closest('button.aibtn');
+      if (b && b.dataset.act === 'delete') aiAction(b.dataset.kind, b.dataset.slug, 'delete').then(loadGrooming);
+    });
+    const gdT = document.getElementById('gdTable');
+    if (gdT) gdT.addEventListener('click', (ev) => {
+      const b = ev.target.closest('button.aibtn');
+      if (b && b.dataset.act === 'merge') _groomMerge(b.dataset.kind, b.dataset.keep, b.dataset.drops);
+    });
+    const grefresh = document.getElementById('groomRefreshBtn');
+    if (grefresh) grefresh.addEventListener('click', loadGrooming);
+    const tr = document.getElementById('tglAutoRetire');
+    if (tr) tr.addEventListener('change', () => _setAutoToggle('auto_retire_enabled', tr.checked));
+    const td = document.getElementById('tglAutoDedup');
+    if (td) td.addEventListener('change', () => _setAutoToggle('auto_dedup_enabled', td.checked));
     document.getElementById('hkModalClose').addEventListener('click', () => {
       document.getElementById('hkModal').style.display = 'none';
     });
