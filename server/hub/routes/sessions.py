@@ -1940,15 +1940,25 @@ async def session_agent(session_id: str, body: dict) -> dict:
         info.current_action = f"agent({max_steps}, engine={engine})"
         # See _send_session_action for why we refresh here too.
         info.last_active_at = datetime.utcnow()
+        # Per-step timeout. cogagent step takes ~2s, qwen ~3-8s, the
+        # 'auto' chain ~10s.  20s/step gives healthy headroom while
+        # bailing fast when the session is wedged (Chrome hang, dead
+        # worker, runaway agent loop).  Was 60s/step before -- a single
+        # 3-step call would block 180s on a wedged session, burning
+        # the codegen attempt's budget for no useful work.
+        # Operator override: ``step_timeout_s`` in the request body.
+        step_timeout_s = float(body.get("step_timeout_s") or 20.0)
+        if step_timeout_s < 5.0:
+            step_timeout_s = 5.0
+        if step_timeout_s > 120.0:
+            step_timeout_s = 120.0
         try:
             reply = await worker.session_agent(
                 session_id,
                 goal,
                 max_steps,
                 engine=engine,
-                # cogagent calls add ~2s, qwen ~3-8s; auto can chain
-                # both. Give 60s/step headroom (+ initial 60s base).
-                timeout=max(60.0, max_steps * 60.0),
+                timeout=max(15.0, max_steps * step_timeout_s),
             )
         except TimeoutError:
             raise HTTPException(504, "page.agent() timed out")
