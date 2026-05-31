@@ -603,6 +603,14 @@ asyncio.run(main())"
       <button class="ljp-tab" data-ljp-tab="network"><iconify-icon icon="lucide:activity"></iconify-icon> <span data-i18n="ljp.network">Network</span> <span class="count" id="ljpNetCount">0</span></button>
       <button class="ljp-tab" data-ljp-tab="code"><iconify-icon icon="lucide:code-2"></iconify-icon> <span data-i18n="ljp.tab.code">Code</span> <span class="count" id="ljpCodeCount">0</span></button>
       <button class="ljp-tab" data-ljp-tab="gallery"><iconify-icon icon="lucide:image"></iconify-icon> <span data-i18n="ljp.tab.gallery">Gallery</span> <span class="count" id="ljpGalleryCount">0</span></button>
+      <!-- 実行: read-only mirror of the Submit form the operator used
+           when this job was submitted (URL + mode + every JobOption
+           checkbox / number / text input). Lets the operator look back
+           at "what did I actually click?" after the job has been
+           running for a while -- especially useful for jobs run from
+           presets / cron where the operator never even saw the Submit
+           form. -->
+      <button class="ljp-tab" data-ljp-tab="run-config"><iconify-icon icon="lucide:sliders-horizontal"></iconify-icon> <span data-i18n="ljp.tab.runconfig">実行</span></button>
     </div>
 
     <!-- Each pane has its body at height:720px so tab switches don't resize -->
@@ -773,6 +781,18 @@ asyncio.run(main())"
          JS doesn't NPE while we transition. It's now just a no-op
          wrapper around the real gallery pane. -->
     <div id="ljpGalleryWrap" style="display:none;"></div>
+
+    <!-- 実行: read-only mirror of the Submit form snapshot from when
+         this job was created. Reuses .fetch-options / .fetch-section /
+         .fetch-toggles / .fetch-grid styling so the layout matches the
+         live Submit form 1:1 (operator instantly recognises "ah,
+         scroll was on, headless was off"). Populated by
+         ljpRenderRunConfig() from /jobs/{id}.options. -->
+    <div class="ljp-pane" data-ljp-pane="run-config" style="display:none;">
+      <div id="ljpRunConfig" class="ljp-pane-body" style="padding:14px; height:720px; overflow:auto; background:#fafafb;">
+        <div style="color:#888; padding:20px; text-align:center;">読み込み中…</div>
+      </div>
+    </div>
   </section>
   </div><!-- /.submit-subpane[live] -->
 

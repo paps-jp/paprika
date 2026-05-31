@@ -249,6 +249,7 @@ const I18N_RESOURCES = {
     "ljp.tab.links":          "リンク",
     "ljp.tab.code":           "コード",
     "ljp.tab.gallery":        "ギャラリー",
+    "ljp.tab.runconfig":      "実行",
     "ljp.result":             "結果",
     "ljp.pagehtml":           "取得 HTML",
     "ljp.pagehtml.title":     "クロール時点の DOM スナップショット (page.html) を別タブで開く",
@@ -595,6 +596,7 @@ const I18N_RESOURCES = {
     "ljp.tab.links":          "Links",
     "ljp.tab.code":           "Code",
     "ljp.tab.gallery":        "Gallery",
+    "ljp.tab.runconfig":      "Run",
     "ljp.result":             "result",
     "ljp.pagehtml":           "page.html",
     "ljp.pagehtml.title":     "Open the captured DOM snapshot (page.html) in a new tab",
@@ -4720,6 +4722,14 @@ async function ljpRefreshStatus() {
     // enabled (codegen-loop / rerun have script; fetch doesn't).
     LJP.mode = (info.options || {}).mode || null;
     ljpSetStatus(info.status, info.progress && info.progress.phase);
+    // Render the read-only "run config" mirror once (the JobInfo's
+    // url + options don't change after submission). Gated by a per-
+    // attach flag so subsequent /jobs/{id} polls don't rebuild this
+    // tab's DOM 30 times.
+    if (!LJP._runConfigRendered) {
+      try { ljpRenderRunConfig(info); LJP._runConfigRendered = true; }
+      catch (e) { /* leave the placeholder; don't break the rest of the poll */ }
+    }
     // Asset counter -- visible as soon as the first asset lands.
     const saved = (info.progress && info.progress.assets_saved) || 0;
     const failed = (info.progress && info.progress.assets_failed) || 0;
@@ -5566,7 +5576,7 @@ function ljpUpdateVncCount() {
 
 // --- tab switching for the Live panel -------------------------------------
 function ljpSetTab(name) {
-  const all = ['log', 'vnc', 'screenshot', 'links', 'network', 'code', 'gallery'];
+  const all = ['log', 'vnc', 'screenshot', 'links', 'network', 'code', 'gallery', 'run-config'];
   if (!all.includes(name)) name = 'log';
   document.querySelectorAll('.ljp-tab').forEach(b => {
     b.classList.toggle('active', b.dataset.ljpTab === name);
@@ -5584,6 +5594,198 @@ function ljpSetTab(name) {
   if (typeof ljpLinksOnTabChange === 'function') ljpLinksOnTabChange(name);
   // Network tab -- only poll while visible.
   if (typeof ljpNetOnTabChange === 'function') ljpNetOnTabChange(name);
+}
+
+// --- "実行" (Run config) tab --------------------------------------------
+// Read-only mirror of the Submit form values that produced this job.
+// Reuses the .fetch-options / .fetch-section / .fetch-toggles /
+// .fetch-grid CSS so the layout matches the live Submit form 1:1 --
+// the operator instantly recognises what they (or a preset / cron)
+// clicked. Called from ljpRefreshStatus the first time it sees the
+// JobInfo (gated by LJP._runConfigRendered).
+function ljpRenderRunConfig(info) {
+  const host = document.getElementById('ljpRunConfig');
+  if (!host) return;
+  const opts = info.options || {};
+  const mode = opts.mode || 'fetch';
+
+  // ---- shared HTML helpers (escape + read-only widget builders) ----
+  const _esc = (s) => {
+    if (s === null || s === undefined) return '';
+    return String(s).replace(/[&<>"']/g, ch => ({
+      '&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;',
+    }[ch]));
+  };
+  const _check = (label, val, title) => {
+    const checked = val ? 'checked' : '';
+    const t = title ? ` title="${_esc(title)}"` : '';
+    return `<label${t} style="cursor:default;">
+      <input type="checkbox" ${checked} disabled> <span>${_esc(label)}</span>
+    </label>`;
+  };
+  const _row = (label, val, unit, title) => {
+    const t = title ? ` title="${_esc(title)}"` : '';
+    const v = (val === null || val === undefined || val === '') ? '' : val;
+    return `<div class="fetch-row"${t}>
+      <label>${_esc(label)}</label>
+      <input type="text" value="${_esc(v)}" disabled>
+      <span class="fg-unit">${_esc(unit || '')}</span>
+    </div>`;
+  };
+  const _wide = (label, val, placeholder, title) => {
+    const t = title ? ` title="${_esc(title)}"` : '';
+    const v = (val === null || val === undefined) ? '' : val;
+    const ph = placeholder ? ` placeholder="${_esc(placeholder)}"` : '';
+    return `<label for="" style="color:#555; font-size:.9em;"${t}>${_esc(label)}</label>
+      <input type="text" value="${_esc(v)}"${ph} disabled>`;
+  };
+
+  // ---- mode-specific top banner ----
+  const _modeBadge = ({
+    'fetch':         { ico: 'lucide:file-down',  color: '#196b2c', bg: '#eef8ee', label: 'Fetch' },
+    'codegen-loop':  { ico: 'lucide:sparkles',   color: '#5a3b8a', bg: '#f5edff', label: 'AI · LLM (codegen-loop)' },
+    'vision-agent':  { ico: 'lucide:eye',        color: '#8a5a00', bg: '#fff8e6', label: 'AI · Simple (vision-agent)' },
+    'rerun':         { ico: 'lucide:code-2',     color: '#3a5ca8', bg: '#eef0ff', label: 'Code rerun' },
+  })[mode] || { ico: 'lucide:help-circle', color: '#666', bg: '#eee', label: mode };
+
+  const subModeLabel = ({
+    'normal':         '通常 (recipe を無視)',
+    'recipe':         '登録 (recipe 適用)',
+    'ai_investigate': 'AI調査',
+  })[opts.fetch_strategy] || (opts.fetch_strategy || '');
+
+  // ---- assemble HTML in document order ----
+  const blocks = [];
+
+  // Header card: URL + mode + (fetch strategy / goal)
+  let headerExtra = '';
+  if (mode === 'fetch' && subModeLabel) {
+    headerExtra = `<div style="margin-top:6px; font-size:.9em; color:#555;">
+      <strong>実行モード:</strong> ${_esc(subModeLabel)}
+    </div>`;
+  }
+  if ((mode === 'codegen-loop' || mode === 'vision-agent') && opts.goal) {
+    headerExtra += `<div style="margin-top:6px;">
+      <div style="font-weight:600; color:#555; font-size:.85em;">Goal</div>
+      <div style="background:#fff; border:1px solid #e6e8ef; border-radius:5px; padding:6px 10px; margin-top:3px; white-space:pre-wrap; font-size:.9em;">${_esc(opts.goal)}</div>
+    </div>`;
+  }
+  if (mode === 'rerun' && opts.rerun_from) {
+    headerExtra += `<div style="margin-top:6px; font-size:.9em; color:#555;">
+      <strong>rerun from:</strong> <code>${_esc(opts.rerun_from)}</code>
+    </div>`;
+  }
+  blocks.push(`
+    <div class="fetch-section" style="background:#fff;">
+      <div class="fs-title">
+        <iconify-icon icon="${_modeBadge.ico}" style="color:${_modeBadge.color};"></iconify-icon>
+        ${_esc(_modeBadge.label)}
+      </div>
+      <div class="fetch-grid-wide">
+        <label>URL</label>
+        <input type="text" value="${_esc(info.url || '')}" disabled>
+      </div>
+      ${headerExtra}
+    </div>
+  `);
+
+  // codegen-loop / vision-agent: LLM-side knobs (max attempts / timeout / engine)
+  if (mode === 'codegen-loop' || mode === 'vision-agent') {
+    blocks.push(`
+      <div class="fetch-section">
+        <div class="fs-title">
+          <iconify-icon icon="lucide:bot"></iconify-icon> AI 設定
+        </div>
+        <div class="fetch-grid">
+          ${_row('最大試行回数', opts.max_codegen_attempts, '回')}
+          ${_row('1試行タイムアウト', opts.attempt_timeout_s, '秒')}
+        </div>
+        <div class="fetch-grid-wide" style="margin-top:8px;">
+          <label>コード生成 LLM</label>
+          <input type="text" value="${_esc(opts.codegen_engine || '(default — env)')}" disabled>
+        </div>
+      </div>
+    `);
+  }
+
+  // 動画 (download_video flag)
+  blocks.push(`
+    <div class="fetch-section video">
+      <div class="fs-title">
+        <iconify-icon icon="lucide:video"></iconify-icon> 動画
+      </div>
+      ${_check('動画をダウンロード', opts.download_video, 'iframe / ネスト iframe の通信トレース + yt-dlp 経路を有効化')}
+    </div>
+  `);
+
+  // 動作 (scroll / headless / capture / keep_session)
+  blocks.push(`
+    <div class="fetch-section">
+      <div class="fs-title">
+        <iconify-icon icon="lucide:settings-2"></iconify-icon> 動作
+      </div>
+      <div class="fetch-toggles">
+        ${_check('スクロール', opts.scroll, 'ページを最後までスクロールして遅延読み込みアセットを拾う')}
+        ${_check('ヘッドレス', opts.headless, '画面を出さずに実行 (Chrome --headless)')}
+        ${_check('アセットを保存', opts.capture_assets, '拾ったアセットをサーバ側に保存する')}
+        ${_check('セッションを継続', opts.keep_session, 'クロール後もセッションを閉じずに残す')}
+      </div>
+    </div>
+  `);
+
+  // タイミング / 制限
+  blocks.push(`
+    <div class="fetch-section">
+      <div class="fs-title">
+        <iconify-icon icon="lucide:timer"></iconify-icon> タイミング / 制限
+      </div>
+      <div class="fetch-grid">
+        ${_row('ページ読み込み待ち', opts.wait_seconds, '秒')}
+        ${_row('ネットワーク無通信', opts.idle_seconds, '秒')}
+        ${_row('最大待ち時間', opts.max_wait_seconds, '秒')}
+        ${_row('スクロール上限', opts.scroll_max, 'px')}
+        ${_row('クリック後の待ち', opts.post_click_seconds, '秒')}
+        ${_row('最小ファイルサイズ', opts.min_asset_size_bytes, 'bytes')}
+      </div>
+    </div>
+  `);
+
+  // ヘッダー / セッション再利用
+  blocks.push(`
+    <div class="fetch-section">
+      <div class="fs-title">
+        <iconify-icon icon="lucide:globe"></iconify-icon> ヘッダー / セッション再利用
+      </div>
+      <div class="fetch-grid-wide">
+        ${_wide('リファラー', opts.referer, 'https://...', 'Referer ヘッダ')}
+        ${_wide('ジョブに接続', opts.attach_to_job, 'job_id', '既存 job にログイン状態を引き継ぐ')}
+        ${_wide('Cookies from', opts.cookies_from, '', 'ホスト名 (HostRegistry から cookie 自動注入)')}
+        ${_wide('Use profile', opts.use_profile, '', 'paprika-client upload-profile した Chrome プロファイル名')}
+      </div>
+    </div>
+  `);
+
+  // Worker / lane / created info (footer-ish)
+  blocks.push(`
+    <div class="fetch-section" style="background:#f7f7fa; border-color:#dee0e7;">
+      <div class="fs-title">
+        <iconify-icon icon="lucide:info"></iconify-icon> 実行情報
+      </div>
+      <div class="fetch-grid-wide">
+        <label>job_id</label>
+        <input type="text" value="${_esc(info.job_id || '')}" disabled style="font-family: ui-monospace, Consolas, monospace;">
+        <label>worker / lane</label>
+        <input type="text" value="${_esc((info.worker_id || '—') + (info.lane_idx !== null && info.lane_idx !== undefined ? '  #' + info.lane_idx : ''))}" disabled>
+        <label>session_id</label>
+        <input type="text" value="${_esc(info.session_id || '—')}" disabled style="font-family: ui-monospace, Consolas, monospace;">
+        <label>created_at</label>
+        <input type="text" value="${_esc(info.created_at || '—')}" disabled>
+      </div>
+    </div>
+  `);
+
+  // Wrap everything in .fetch-options for the gradient background.
+  host.innerHTML = `<div class="fetch-options" style="margin:0;">${blocks.join('')}</div>`;
 }
 
 // --- Preview + Screenshot tab ---------------------------------------------
@@ -6491,6 +6693,16 @@ function ljpReset() {
   LJP_SHOT.currentIndex = -1;
   LJP_SHOT.followLatest = true;
   LJP.mode = null;
+  // Run-config tab: clear the "rendered once" guard so a fresh
+  // attach to a different job rebuilds the mirror with that job's
+  // options. The pane content itself is overwritten on the next
+  // ljpRefreshStatus, but reset the placeholder eagerly so a stale
+  // previous-job snapshot doesn't flash for one tick.
+  LJP._runConfigRendered = false;
+  try {
+    const _rc = document.getElementById('ljpRunConfig');
+    if (_rc) _rc.innerHTML = '<div style="color:#888; padding:20px; text-align:center;">読み込み中…</div>';
+  } catch (_) {}
   LJP_CODE.attempts = [];
   LJP_CODE.selectedN = null;
   LJP_CODE.scriptCache = {};
