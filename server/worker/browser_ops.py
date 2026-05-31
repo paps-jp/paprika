@@ -2052,6 +2052,49 @@ async def install_iframe_deep_trace(tab, log: LogFn | None = None) -> bool:
                             f"on sub-target {ti.type_} failed "
                             f"(non-fatal): {type(e).__name__}: {e}"
                         )
+
+                # Inject the url-capture hook into THIS (possibly
+                # cross-origin) sub-frame.  Same-origin iframes already
+                # get the hook via the top tab's
+                # addScriptToEvaluateOnNewDocument, but a cross-origin
+                # OOPIF runs in its own JS world that the top-frame
+                # registration never reaches.  Inject here so the hook's
+                # fetch/XHR monkey-patch runs inside the OOPIF too; its
+                # _record() then postMessages captures up to the top
+                # frame's bucket (the relay listener handles the
+                # cross-origin boundary).  Two sends: register for the
+                # next document load, AND evaluate now for the
+                # already-loaded one.
+                try:
+                    _subsession_msg_id[0] += 1
+                    await ws.send(_json.dumps({
+                        "id": _subsession_msg_id[0],
+                        "method": "Page.addScriptToEvaluateOnNewDocument",
+                        "params": {"source": _URL_CAPTURE_HOOK_JS},
+                        "sessionId": session_id,
+                    }))
+                    _subsession_msg_id[0] += 1
+                    await ws.send(_json.dumps({
+                        "id": _subsession_msg_id[0],
+                        "method": "Runtime.evaluate",
+                        "params": {
+                            "expression": _URL_CAPTURE_HOOK_JS,
+                            "returnByValue": True,
+                        },
+                        "sessionId": session_id,
+                    }))
+                    if log:
+                        log(
+                            f"  [iframe-trace] url-capture hook injected "
+                            f"into {ti.type_} {ti.target_id[:12]}"
+                        )
+                except Exception as e:
+                    if log:
+                        log(
+                            f"  [iframe-trace] url-capture inject on "
+                            f"sub-target {ti.type_} failed (non-fatal): "
+                            f"{type(e).__name__}: {e}"
+                        )
             except Exception as e:
                 if log:
                     log(
@@ -2109,53 +2152,68 @@ async def install_iframe_deep_trace(tab, log: LogFn | None = None) -> bool:
 
 # JS injected into every document on every navigation.  Monkey-patches
 # ``fetch`` and ``XMLHttpRequest.prototype.open`` so every request URL
-# (including those inside same-origin iframes that DON'T get their own
-# CDP target) is captured into ``window.top.__paprika_url_capture``.
+# is captured and bubbled up to ``window.top.__paprika_url_capture``.
 # A worker-side poller periodically reads that array and feeds the URLs
 # into the same maybe_download_video pipeline as the CDP Network
-# listener — so HLS manifests hidden inside same-origin player iframes
-# (e.g. 7mmtv.sx's play.php hosting hls.js → streamsuperpro.com m3u8)
-# show up in page.network() AND trigger automatic yt-dlp downloads.
+# listener — so HLS manifests hidden inside player iframes (e.g.
+# 7mmtv.sx's play.php → streamsuperpro.com m3u8) show up in
+# page.network() AND trigger automatic yt-dlp downloads.
 #
-# Caveats:
-#   * Cross-origin iframes can't access window.top via JS (security).
-#     For those we still rely on install_iframe_deep_trace's CDP attach.
-#   * The hook installs once per document.  Idempotency guard
-#     (__paprika_url_hook) avoids double-wrapping if a script re-runs.
+# Cross-origin reach:
+#   * same-origin iframes: _record() writes straight to window.top.
+#   * cross-origin iframes (OOPIF): window.top is unreachable by JS, so
+#     _record() posts the entry to window.parent via postMessage; each
+#     ancestor frame relays it further up until it lands in the top
+#     frame's bucket.  This requires the hook to be present in EVERY
+#     frame -- install_iframe_deep_trace injects it into each attached
+#     OOPIF session via CDP (Page.addScriptToEvaluateOnNewDocument +
+#     an immediate Runtime.evaluate).  The relay listener below makes
+#     the postMessage chain work.
+#
+# Notes:
+#   * Idempotency guard (__paprika_url_hook) avoids double-wrapping.
 #   * Errors are swallowed so a broken hook never crashes the page.
 _URL_CAPTURE_HOOK_JS = r"""
 (function() {
   if (window.__paprika_url_hook) return;
   window.__paprika_url_hook = true;
-  // Per-frame install counter so the worker-side poller can see proof
-  // that this hook actually executed in SOME context (useful when
-  // bucket is unexpectedly empty -- if hook_installs is 0 the script
-  // never ran; if > 0 the page just doesn't make fetch/XHR calls).
   try {
     var t = window.top;
     t.__paprika_hook_installs = (t.__paprika_hook_installs || 0) + 1;
   } catch (e) {
     window.__paprika_hook_installs = (window.__paprika_hook_installs || 0) + 1;
   }
-  function _bucket() {
+  // Record one capture entry, bubbling toward the top frame.
+  function _record(entry) {
     try {
+      // same-origin chain: write straight to the top bucket.
       var t = window.top;
       if (!t.__paprika_url_capture) t.__paprika_url_capture = [];
-      return t.__paprika_url_capture;
-    } catch (e) {
-      // Cross-origin top window -- fall back to our own window so the
-      // CDP-attached parent picks it up via Network.responseReceived
-      // for the same-target case it already handles.
-      if (!window.__paprika_url_capture) window.__paprika_url_capture = [];
-      return window.__paprika_url_capture;
-    }
+      t.__paprika_url_capture.push(entry);
+      return;
+    } catch (e) {}
+    // cross-origin boundary: hand the entry to our parent frame, whose
+    // own hook relays it further up (see the message listener below).
+    try { window.parent.postMessage({__paprika_cap: entry}, '*'); } catch (e) {}
   }
+  // Relay: a child frame's capture arrives here via postMessage; push
+  // it onward toward the top frame.  Cross-origin-safe (targetOrigin
+  // '*').  Always travels UP, so no loops.
+  try {
+    window.addEventListener('message', function(ev) {
+      var d = ev && ev.data;
+      if (d && typeof d === 'object' && d.__paprika_cap
+          && typeof d.__paprika_cap === 'object') {
+        _record(d.__paprika_cap);
+      }
+    }, false);
+  } catch (e) {}
   var origFetch = window.fetch;
   if (origFetch) {
     window.fetch = function(input) {
       try {
         var u = typeof input === 'string' ? input : (input && input.url) || '';
-        if (u) _bucket().push({api: 'fetch', url: u, t: Date.now()});
+        if (u) _record({api: 'fetch', url: u, t: Date.now()});
       } catch (e) {}
       return origFetch.apply(this, arguments);
     };
@@ -2165,7 +2223,7 @@ _URL_CAPTURE_HOOK_JS = r"""
     var origOpen = OrigXHR.prototype.open;
     OrigXHR.prototype.open = function(method, url) {
       try {
-        if (url) _bucket().push({api: 'xhr', method: method, url: String(url), t: Date.now()});
+        if (url) _record({api: 'xhr', method: method, url: String(url), t: Date.now()});
       } catch (e) {}
       return origOpen.apply(this, arguments);
     };
