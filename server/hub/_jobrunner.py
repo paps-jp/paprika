@@ -149,15 +149,15 @@ async def _run_codegen_loop_job(request: Request, info: JobInfo) -> None:
             t2.add_done_callback(_bg_tasks.discard)
         except Exception as _log_exc:
             # Logging must not break the run.
-            logger.warning("_log create_task failed: %s", _log_exc)
+            log.warning("_log create_task failed: %s", _log_exc)
 
     # Smoke-test: await a single append so we know the store works.
     try:
         await state.store.append_log_line(job_id, "__livelog_smoke_test__")
-        logger.info("[%s] livelog smoke-test: append_log_line OK (store=%s)",
+        log.info("[%s] livelog smoke-test: append_log_line OK (store=%s)",
                      job_id, type(state.store).__name__)
     except Exception as _smoke_exc:
-        logger.warning("[%s] livelog smoke-test FAILED: %s", job_id, _smoke_exc)
+        log.warning("[%s] livelog smoke-test FAILED: %s", job_id, _smoke_exc)
 
     _log(
         f"==> codegen-loop start: max_attempts={opts.max_codegen_attempts} "
