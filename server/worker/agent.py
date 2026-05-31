@@ -3422,6 +3422,22 @@ class WorkerAgent:
         (_aborted_sessions checkpoint in session_start) can reuse it.
         Best-effort throughout -- per-step failures are swallowed
         because the lane MUST be released no matter what."""
+        # Cancel any URL-capture polling tasks installed by
+        # browser_ops.install_session_asset_capture. They run in a
+        # tight while loop reading window.__paprika_url_capture; if we
+        # don't cancel them BEFORE the tab is killed they'll keep
+        # raising "tab closed" errors until the event loop notices.
+        try:
+            tab = getattr(state, "tab", None)
+            tasks = getattr(tab, "_paprika_url_capture_tasks", None) if tab else None
+            if tasks:
+                for t in tasks:
+                    if not t.done():
+                        t.cancel()
+                tasks.clear()
+        except Exception:
+            pass
+
         # Drain pending video downloads first. Sessions that triggered
         # an HLS yt-dlp or a direct mp4 fetch via the passive m3u8
         # listener may still have ffmpeg merging segments / httpx

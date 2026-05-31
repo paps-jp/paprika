@@ -2107,6 +2107,143 @@ async def install_iframe_deep_trace(tab, log: LogFn | None = None) -> bool:
         return False
 
 
+# JS injected into every document on every navigation.  Monkey-patches
+# ``fetch`` and ``XMLHttpRequest.prototype.open`` so every request URL
+# (including those inside same-origin iframes that DON'T get their own
+# CDP target) is captured into ``window.top.__paprika_url_capture``.
+# A worker-side poller periodically reads that array and feeds the URLs
+# into the same maybe_download_video pipeline as the CDP Network
+# listener — so HLS manifests hidden inside same-origin player iframes
+# (e.g. 7mmtv.sx's play.php hosting hls.js → streamsuperpro.com m3u8)
+# show up in page.network() AND trigger automatic yt-dlp downloads.
+#
+# Caveats:
+#   * Cross-origin iframes can't access window.top via JS (security).
+#     For those we still rely on install_iframe_deep_trace's CDP attach.
+#   * The hook installs once per document.  Idempotency guard
+#     (__paprika_url_hook) avoids double-wrapping if a script re-runs.
+#   * Errors are swallowed so a broken hook never crashes the page.
+_URL_CAPTURE_HOOK_JS = r"""
+(function() {
+  if (window.__paprika_url_hook) return;
+  window.__paprika_url_hook = true;
+  function _bucket() {
+    try {
+      var t = window.top;
+      if (!t.__paprika_url_capture) t.__paprika_url_capture = [];
+      return t.__paprika_url_capture;
+    } catch (e) {
+      // Cross-origin top window -- fall back to our own window so the
+      // CDP-attached parent picks it up via Network.responseReceived
+      // for the same-target case it already handles.
+      if (!window.__paprika_url_capture) window.__paprika_url_capture = [];
+      return window.__paprika_url_capture;
+    }
+  }
+  var origFetch = window.fetch;
+  if (origFetch) {
+    window.fetch = function(input) {
+      try {
+        var u = typeof input === 'string' ? input : (input && input.url) || '';
+        if (u) _bucket().push({api: 'fetch', url: u, t: Date.now()});
+      } catch (e) {}
+      return origFetch.apply(this, arguments);
+    };
+  }
+  var OrigXHR = window.XMLHttpRequest;
+  if (OrigXHR && OrigXHR.prototype && OrigXHR.prototype.open) {
+    var origOpen = OrigXHR.prototype.open;
+    OrigXHR.prototype.open = function(method, url) {
+      try {
+        if (url) _bucket().push({api: 'xhr', method: method, url: String(url), t: Date.now()});
+      } catch (e) {}
+      return origOpen.apply(this, arguments);
+    };
+  }
+})();
+"""
+
+
+async def install_url_capture_hook(tab, log: LogFn | None = None) -> bool:
+    """Inject ``_URL_CAPTURE_HOOK_JS`` into every new document via
+    ``Page.addScriptToEvaluateOnNewDocument``.  Runs once per tab;
+    idempotent on repeated calls.
+
+    The injected script writes captured URLs to
+    ``window.top.__paprika_url_capture`` so a single periodic poll of
+    the top window covers ALL same-origin iframes (hls.js inside an
+    embed iframe, ad widgets, lazy XHRs that don't surface in the CDP
+    Network domain for whatever reason).
+
+    Cross-origin iframes are already handled by
+    ``install_iframe_deep_trace`` which gives each cross-origin
+    target its own Network.enable.  This hook is the same-origin
+    counterpart that the OOPIF-only deep-trace can't reach.
+
+    Returns True on first install, False if already installed or the
+    CDP call failed (non-fatal).
+    """
+    if getattr(tab, "_paprika_url_capture_hook_on", False):
+        return False
+    try:
+        await tab.send(
+            cdp.page.add_script_to_evaluate_on_new_document(
+                source=_URL_CAPTURE_HOOK_JS,
+            )
+        )
+        setattr(tab, "_paprika_url_capture_hook_on", True)
+        if log:
+            log(
+                "  [url-capture] fetch+XHR hook installed "
+                "(catches same-origin iframe XHRs the CDP Network "
+                "domain misses)"
+            )
+        return True
+    except Exception as e:
+        if log:
+            log(
+                f"  [url-capture] install failed "
+                f"(non-fatal): {type(e).__name__}: {e}"
+            )
+        return False
+
+
+async def read_url_capture(tab) -> list[dict]:
+    """Read and clear ``window.top.__paprika_url_capture``.
+
+    Returns the freshly-captured entries (each ``{api, url, t, ...}``)
+    and resets the array so the next poll only sees new URLs.  Safe
+    to call even when the hook isn't installed -- returns ``[]``.
+
+    Called from the session-scope poller started by
+    ``install_session_asset_capture``.
+    """
+    try:
+        # Splice the array to empty and return what was there.  Done
+        # in one expression so we don't race with the page hook
+        # appending between read + reset.
+        result = await tab.evaluate(
+            "JSON.stringify(("
+            "window.__paprika_url_capture && "
+            "window.__paprika_url_capture.splice(0)"
+            ") || [])",
+            return_by_value=True,
+        )
+        import json as _json
+        # nodriver's evaluate returns the raw value when return_by_value
+        # is True.  Different versions return either the string directly
+        # or a (value, exception) tuple; handle both shapes.
+        if isinstance(result, tuple):
+            result = result[0]
+        if isinstance(result, str):
+            return _json.loads(result)
+        if isinstance(result, list):
+            return result
+        return []
+    except Exception:
+        return []
+
+
 async def install_session_asset_capture(
     tab,
     assets_dir: Path,
@@ -2401,6 +2538,83 @@ async def install_session_asset_capture(
             max_resource_buffer_size=512 * 1024 * 1024,
         )
     )
+
+    # Same-origin iframe XHR / fetch hook + poller. CDP's Network
+    # domain on the parent target SHOULD surface same-origin iframe
+    # requests, but in practice (observed on 7mmtv.sx → play.php iframe
+    # hosting hls.js → streamsuperpro.com m3u8) the iframe's hls.js
+    # XHRs don't appear in Network.responseReceived events for reasons
+    # that look like a Chromium quirk. Inject a fetch/XHR monkey-patch
+    # via Page.addScriptToEvaluateOnNewDocument and poll the result
+    # bucket so the hidden URLs land in network_log + trigger
+    # maybe_download_video the same way Network.responseReceived would.
+    await install_url_capture_hook(tab, log=log)
+
+    # Background poller. Reads window.top.__paprika_url_capture every
+    # 1.5 s and feeds new URLs through the same code path as on_response.
+    # Stops itself when the tab closes (evaluate throws); the outer
+    # session teardown also cancels the asyncio task.
+    _hook_seen: set = set()
+
+    async def _url_capture_poller():
+        # Stagger the first poll so the page has time to load + the
+        # hook to be applied to its initial document.
+        await asyncio.sleep(2.0)
+        while True:
+            try:
+                captured = await read_url_capture(tab)
+            except Exception:
+                # Tab closed or eval error -- bail out, the session
+                # cleanup will handle the rest.
+                return
+            for entry in captured:
+                url = entry.get("url") or ""
+                if not url or url in _hook_seen:
+                    continue
+                _hook_seen.add(url)
+                # Mirror the on_response logic for stream URLs: log to
+                # network_log + fire maybe_download_video. We skip the
+                # image/audio mime save path -- that path needs the
+                # response body, which we don't have here.
+                if _STREAM_URL_RE.search(url):
+                    if url not in _net_logged_urls:
+                        _net_logged_urls.add(url)
+                        _net_log.append({
+                            "url": url,
+                            "mime": "",
+                            "size": None,
+                            "saved": False,
+                            "document_url": "",
+                            "source": "iframe_xhr_hook",
+                            "timestamp": time.time(),
+                        })
+                    if on_stream_detected:
+                        try:
+                            on_stream_detected(url, "")
+                        except Exception as e:
+                            if log:
+                                log(
+                                    f"  [url-capture] on_stream_detected "
+                                    f"failed: {e}"
+                                )
+            try:
+                await asyncio.sleep(1.5)
+            except asyncio.CancelledError:
+                return
+
+    try:
+        _poller_task = asyncio.create_task(_url_capture_poller())
+        # Stash on tab so session teardown can cancel it cleanly. The
+        # task is otherwise fire-and-forget; an unhandled exception is
+        # absorbed by the bare try/except inside the poller body.
+        existing = getattr(tab, "_paprika_url_capture_tasks", None)
+        if existing is None:
+            existing = []
+            setattr(tab, "_paprika_url_capture_tasks", existing)
+        existing.append(_poller_task)
+    except Exception as e:
+        if log:
+            log(f"  [url-capture] poller spawn failed: {e}")
 
 
 async def force_single_tab(
