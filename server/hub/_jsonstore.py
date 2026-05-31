@@ -127,6 +127,18 @@ class JsonRecordRegistry(Generic[T]):
     def list_all(self) -> list[T]:
         records: list[T] = []
         for p in sorted(self.dir.glob("*.json")):
+            # Skip sentinel / helper files that share the registry
+            # directory but are NOT records. Convention: any filename
+            # starting with ``_`` is reserved for the registry's own
+            # internal use (e.g. EngineRegistry's ``_usage.json``
+            # counter file). Without this skip, those helpers got fed
+            # through ``_from_json`` -- which usually tolerated the
+            # bad shape via ``.get()`` defaults and produced a phantom
+            # record (e.g. an empty engine that normalised to
+            # slug="unnamed"), inflating list_all counts and confusing
+            # downstream code that expected one record per real file.
+            if p.name.startswith("_"):
+                continue
             try:
                 records.append(self._from_json(json.loads(p.read_text(encoding="utf-8"))))
             except Exception:
