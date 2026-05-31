@@ -1128,7 +1128,14 @@ async def restore_conventions(pool: Any, convention_registry: Any) -> int:
 
 
 async def restore_engines(pool: Any, engine_registry: Any) -> int:
-    """Restore EngineRegistry from MariaDB ``engines`` table."""
+    """Mirror MariaDB ``engines`` table to the file-backed EngineRegistry.
+
+    MariaDB is the source of truth: any engine that exists on the
+    filesystem but NOT in MariaDB is removed from the filesystem. This
+    propagates phpMyAdmin / direct-SQL deletions to the file mirror.
+    Previously this method only INSERTed; stale files were left
+    behind, causing UI count > MariaDB count drift.
+    """
     from server.hub.engines import EngineRecord
 
     async with pool.acquire() as conn:
@@ -1143,6 +1150,23 @@ async def restore_engines(pool: Any, engine_registry: Any) -> int:
                 "FROM engines"
             )
             rows = await cur.fetchall()
+
+    # Deletion reconciliation: any slug present on disk but missing in
+    # MariaDB is dropped. Run BEFORE the upsert pass so a row that
+    # disappeared from MariaDB doesn't survive on disk.
+    mariadb_slugs = {row[0] for row in rows if row[0]}
+    for existing in list(engine_registry.list_all()):
+        if existing.slug not in mariadb_slugs:
+            try:
+                if engine_registry.delete(existing.slug):
+                    log.info(
+                        "restore: removed %s.json (no longer in MariaDB)",
+                        existing.slug,
+                    )
+            except Exception as e:
+                log.warning(
+                    "restore: removing %s failed: %s", existing.slug, e,
+                )
 
     restored = 0
     for row in rows:
@@ -1171,6 +1195,81 @@ async def restore_engines(pool: Any, engine_registry: Any) -> int:
         except Exception as e:
             log.warning("restore engine %s failed: %s", row[0], e)
     return restored
+
+
+# ---------------------------------------------------------------------------
+# Write-through helpers (per-record CRUD against MariaDB)
+# ---------------------------------------------------------------------------
+#
+# When MariaDB is configured, route handlers call these AFTER updating
+# the file-backed registry so MariaDB stays in sync without waiting
+# for the next ``auto_migrate_all`` cycle. The "MariaDB is the source
+# of truth when connected" contract is preserved by:
+#   1. ``restore_engines`` (startup) -- file becomes a mirror of MariaDB
+#   2. ``upsert_engine_row`` (write) -- in-flight updates flow to MariaDB
+#   3. ``delete_engine_row`` (delete) -- in-flight deletes propagate
+# Failures are caught at the call site so a transient MariaDB outage
+# doesn't break the admin UI; the next ``auto_migrate_all`` will heal
+# the divergence.
+
+
+async def upsert_engine_row(pool: Any, rec: Any) -> None:
+    """INSERT-or-UPDATE one engine record in MariaDB."""
+    from dataclasses import asdict
+    d = asdict(rec) if hasattr(rec, "__dataclass_fields__") else rec
+    async with pool.acquire() as conn:
+        async with conn.cursor() as cur:
+            await cur.execute(
+                """INSERT INTO engines
+                   (slug, name, kind, protocol, endpoint, model,
+                    api_key_env, api_key, headers, timeout_s, promoted,
+                    supports_tools, use_for_codegen, daily_token_budget,
+                    daily_request_budget, notes, builtin,
+                    created_at, updated_at)
+                   VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)
+                   ON DUPLICATE KEY UPDATE
+                     name=VALUES(name), kind=VALUES(kind),
+                     protocol=VALUES(protocol), endpoint=VALUES(endpoint),
+                     model=VALUES(model), api_key_env=VALUES(api_key_env),
+                     api_key=VALUES(api_key), headers=VALUES(headers),
+                     timeout_s=VALUES(timeout_s), promoted=VALUES(promoted),
+                     supports_tools=VALUES(supports_tools),
+                     use_for_codegen=VALUES(use_for_codegen),
+                     daily_token_budget=VALUES(daily_token_budget),
+                     daily_request_budget=VALUES(daily_request_budget),
+                     notes=VALUES(notes), builtin=VALUES(builtin),
+                     updated_at=VALUES(updated_at)""",
+                (
+                    d.get("slug", ""),
+                    d.get("name", ""),
+                    d.get("kind", "chat"),
+                    d.get("protocol", "openai"),
+                    d.get("endpoint", ""),
+                    d.get("model", ""),
+                    d.get("api_key_env", ""),
+                    d.get("api_key", ""),
+                    _json_dumps(d.get("headers", {})),
+                    d.get("timeout_s", 120),
+                    1 if d.get("promoted") else 0,
+                    1 if d.get("supports_tools", True) else 0,
+                    1 if d.get("use_for_codegen") else 0,
+                    d.get("daily_token_budget", 0),
+                    d.get("daily_request_budget", 0),
+                    d.get("notes", ""),
+                    1 if d.get("builtin") else 0,
+                    _parse_dt(d.get("created_at")),
+                    _parse_dt(d.get("updated_at")),
+                ),
+            )
+
+
+async def delete_engine_row(pool: Any, slug: str) -> None:
+    """DELETE one engine row from MariaDB. No-op when the row doesn't
+    exist (no error -- aligns with the file registry's delete()
+    semantics which also tolerate missing records)."""
+    async with pool.acquire() as conn:
+        async with conn.cursor() as cur:
+            await cur.execute("DELETE FROM engines WHERE slug=%s", (slug,))
 
 
 async def restore_presets(pool: Any, preset_registry: Any) -> int:

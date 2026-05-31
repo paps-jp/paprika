@@ -119,9 +119,50 @@ async def lifespan(app: FastAPI):
                 state.mariadb_pool = _mdb_pool
                 log.info("MariaDB pool created (%s@%s)", _mdb_user, _mdb_host)
 
-                # Auto-migrate: sync Redis/file data → MariaDB (no purge)
-                from server.hub.mariadb import auto_migrate_all
+                # ORDER MATTERS: restore BEFORE migrate.
+                # The "MariaDB is source-of-truth when connected" contract
+                # requires deletions made directly in MariaDB (phpMyAdmin,
+                # ad-hoc SQL) to propagate to files on the next restart.
+                # If we migrated first, ``INSERT IGNORE`` would resurrect
+                # any file row whose slug had been deleted from MariaDB
+                # -- the subsequent restore would then never wipe it
+                # because MariaDB just "got it back". Doing restore
+                # first means the file mirror is brought into line with
+                # MariaDB (orphans deleted, present rows refreshed)
+                # BEFORE migrate runs, so migrate now only pushes
+                # genuinely new file-only entries (= engines created
+                # while MariaDB was disconnected).
+                #
+                # First-time-connecting safety: restore_all_registries
+                # internally gates each table on ``_mdb_count > 0``, so
+                # an empty MariaDB at first connection doesn't trigger
+                # the wipe and migrate gets to seed the table from files.
+                from server.hub.mariadb import (
+                    auto_migrate_all,
+                    restore_all_registries,
+                )
 
+                # 1. Restore: MariaDB → files (deletion-reconciling).
+                try:
+                    restored = await restore_all_registries(
+                        _mdb_pool,
+                        host_registry=state.hosts,
+                        visited_registry=state.host_visited,
+                        skill_registry=state.skills,
+                        convention_registry=state.conventions,
+                        engine_registry=state.engines,
+                        preset_registry=state.presets,
+                    )
+                    if restored:
+                        log.info("MariaDB restore: %s", restored)
+                except Exception as e:
+                    log.warning("MariaDB registry restore failed: %s", e)
+
+                # 2. Migrate: files → MariaDB (INSERT IGNORE).
+                #    Catches first-time-connect and engines created while
+                #    MariaDB was unreachable. After step 1, files are
+                #    already a subset (or exact mirror) of MariaDB, so
+                #    most rows here are no-ops.
                 migrated = await auto_migrate_all(
                     _mdb_pool,
                     redis_url=config.redis_url,
@@ -148,28 +189,6 @@ async def lifespan(app: FastAPI):
         config.redis_url, mariadb_pool=_mdb_pool,
     )
     state._local_sem = asyncio.Semaphore(config.max_concurrent_jobs)
-
-    # ---- Restore MariaDB data → file registries ----
-    # File-backed registries are still the runtime interface for hosts,
-    # skills, etc. After auto-migrate ensures MariaDB has the latest,
-    # restore overwrites local files so the registries serve MariaDB data.
-    if _mdb_pool is not None:
-        try:
-            from server.hub.mariadb import restore_all_registries
-
-            restored = await restore_all_registries(
-                _mdb_pool,
-                host_registry=state.hosts,
-                visited_registry=state.host_visited,
-                skill_registry=state.skills,
-                convention_registry=state.conventions,
-                engine_registry=state.engines,
-                preset_registry=state.presets,
-            )
-            if restored:
-                log.info("MariaDB restore: %s", restored)
-        except Exception as e:
-            log.warning("MariaDB registry restore failed: %s", e)
 
     # WorkerJobLog batcher: when using Redis, buffer log lines and
     # flush in pipeline batches (50 lines or 100ms). Cuts Redis ops

@@ -20,6 +20,7 @@ contained:
 """
 from __future__ import annotations
 
+import logging
 import os
 import time as _time
 from typing import Optional
@@ -36,6 +37,42 @@ from server.hub.engines import (
 
 
 router = APIRouter(tags=["Engines"])
+log = logging.getLogger(__name__)
+
+
+# ---------------------------------------------------------------------------
+# MariaDB write-through (source-of-truth when configured)
+# ---------------------------------------------------------------------------
+#
+# When MariaDB is hooked up, the file registry becomes a fast read
+# cache and MariaDB owns the durable state. After each mutating
+# operation in the routes we forward the change to MariaDB via these
+# thin wrappers, so the next hub restart (which restores from MariaDB)
+# sees the latest writes. Failures are logged but NOT raised -- a
+# transient MariaDB outage shouldn't take down the admin UI, and the
+# next startup ``auto_migrate_all`` push will heal the drift from the
+# file side.
+
+async def _mdb_upsert(rec: EngineRecord) -> None:
+    pool = state.mariadb_pool
+    if pool is None:
+        return
+    try:
+        from server.hub.mariadb import upsert_engine_row
+        await upsert_engine_row(pool, rec)
+    except Exception as e:
+        log.warning("mariadb upsert engine %s failed: %s", rec.slug, e)
+
+
+async def _mdb_delete(slug: str) -> None:
+    pool = state.mariadb_pool
+    if pool is None:
+        return
+    try:
+        from server.hub.mariadb import delete_engine_row
+        await delete_engine_row(pool, slug)
+    except Exception as e:
+        log.warning("mariadb delete engine %s failed: %s", slug, e)
 
 
 # ----------------------------------------------------------------------------
@@ -308,6 +345,7 @@ async def upsert_engine(slug: str, body: dict) -> dict:
         raise HTTPException(400, "endpoint is empty after normalisation")
 
     saved = er.upsert(rec)
+    await _mdb_upsert(saved)
     return _engine_to_dict(saved)
 
 
@@ -320,7 +358,9 @@ async def delete_engine(slug: str) -> dict:
         raise HTTPException(400, str(e))
     if not ok:
         raise HTTPException(404, f"engine '{slug}' not found")
-    return {"deleted": True, "slug": _engine_normalise_slug(slug)}
+    canonical = _engine_normalise_slug(slug)
+    await _mdb_delete(canonical)
+    return {"deleted": True, "slug": canonical}
 
 
 @router.post("/engines/{slug}/promote")
@@ -332,11 +372,16 @@ async def promote_engine(slug: str) -> dict:
     rec = er.get(slug)
     if rec is None:
         raise HTTPException(404, f"engine '{slug}' not found")
-    # Demote any other promoted-of-same-kind first.
+    # Demote any other promoted-of-same-kind first. Mirror each
+    # demotion to MariaDB so the "one promoted per kind" invariant
+    # holds even after a hub restart restores from MariaDB.
     for other in er.list_all():
         if other.slug != rec.slug and other.kind == rec.kind and other.promoted:
-            er.set_promoted(other.slug, False)
+            demoted = er.set_promoted(other.slug, False)
+            if demoted is not None:
+                await _mdb_upsert(demoted)
     saved = er.set_promoted(rec.slug, True)
+    await _mdb_upsert(saved)
     return _engine_to_dict(saved)
 
 
@@ -347,6 +392,7 @@ async def demote_engine(slug: str) -> dict:
     if rec is None:
         raise HTTPException(404, f"engine '{slug}' not found")
     saved = er.set_promoted(rec.slug, False)
+    await _mdb_upsert(saved)
     return _engine_to_dict(saved)
 
 
