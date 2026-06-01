@@ -1583,11 +1583,48 @@ async function refresh() {
     const startIdx = _jobsPage * pageSize;
     const endIdx   = Math.min(startIdx + pageSize, total);
     const visible  = sorted.slice(startIdx, endIdx);
+
+    // Signature of the rendered set. Excludes duration (time-based) so
+    // a tick that only advances the running-job clocks doesn't bust
+    // the cache and force a full rebuild. Includes session_id +
+    // status pair because the actions menu shows a "save cookies"
+    // entry that depends on (j.session_id && j.status === 'running').
+    const visSig = visible.map(j =>
+      j.job_id + '|' + j.status + '|' + (j.started_at || '')
+      + '|' + (j.completed_at || '') + '|' + (j.worker_id || '')
+      + '|' + (j.lane_idx ?? j.slot_idx ?? '')
+      + '|' + (j.session_id || '')
+    ).join('!') + '#' + _filter + '#' + total + '#' + _jobsPage + '#' + pageSize;
+
+    // Did this tick produce a structural change that warrants rebuilding
+    // the table + pager? Set to true only in the full-rebuild branch
+    // below; the duration-only fast path leaves it false so we skip
+    // applyJobCols + renderJobsPager's innerHTML churn too.
+    let didStructuralUpdate = false;
     if (menuOpen) {
-      // leave the rendered rows alone this tick
+      // leave the rendered rows alone this tick. Don't update _jobsLastSig
+      // either, so the next clean tick re-renders even if the user closed
+      // the menu while the data was changing.
     } else if (sorted.length === 0) {
-      jtbody.innerHTML = '<tr><td colspan=10 class="empty">no jobs yet</td></tr>';
+      if (_jobsLastSig !== '__empty__') {
+        jtbody.innerHTML = '<tr><td colspan=10 class="empty">no jobs yet</td></tr>';
+        _jobsLastSig = '__empty__';
+        didStructuralUpdate = true;
+      }
+    } else if (visSig === _jobsLastSig) {
+      // Fast path: nothing structurally changed since last render. Only
+      // update the duration cell of in-flight rows so the elapsed-time
+      // text keeps ticking. This skips the expensive per-row HTML
+      // template + innerHTML replacement that used to fire every 2 s.
+      for (const j of visible) {
+        if (j.status !== 'running' && j.status !== 'queued') continue;
+        const cell = jtbody.querySelector(
+          'tr[data-job-id="' + j.job_id + '"] td[data-col="duration"]'
+        );
+        if (cell) cell.innerHTML = fmtJobDuration(j);
+      }
     } else {
+      didStructuralUpdate = true;
       jtbody.innerHTML = visible.map(j => {
         const jid = esc(j.job_id);
         const mode = (j.options && j.options.mode) || 'fetch';
@@ -1634,7 +1671,7 @@ async function refresh() {
         // duration: started→completed for finished jobs, started→now while running.
         const durCell = fmtJobDuration(j);
         return `
-        <tr>
+        <tr data-job-id="${jid}">
           <td data-col="id"><code>${esc(j.job_id.substring(0,10))}</code></td>
           <td data-col="mode"><span class="badge">${modeLabel}</span></td>
           <td data-col="status"><span class="badge ${esc(j.status)}">${esc(j.status)}</span></td>
@@ -1675,9 +1712,12 @@ async function refresh() {
           </td>
         </tr>`;
       }).join('');
+      _jobsLastSig = visSig;
     }
-    applyJobCols();
-    renderJobsPager(total, startIdx, endIdx);
+    if (didStructuralUpdate) {
+      applyJobCols();
+      renderJobsPager(total, startIdx, endIdx);
+    }
   } catch (e) {
     document.getElementById('status').textContent = 'error: ' + e.message;
   }
@@ -1690,6 +1730,17 @@ async function refresh() {
 // refresh -- without that, every tick would reset to page 0 and
 // scrolling-to-page-3 would be impossible.
 let _jobsPage = 0;
+// Signature of the LAST rendered page of the jobs table -- captures
+// every visible row's identity + the fields that affect its rendered
+// HTML (status badge, started/ended timestamps, worker assignment,
+// session-cookie button visibility). Excludes the duration column,
+// which is recomputed against `now` on every tick and would otherwise
+// invalidate the cache constantly. When this matches the freshly-
+// computed sig we SKIP the innerHTML rebuild entirely and just update
+// the duration cells of running rows in place -- the win for an
+// 800-job operator on a 2 s poll: ~50× fewer DOM teardown/rebuild
+// cycles on a steady-state page where nothing structurally changed.
+let _jobsLastSig = '';
 // W: status filter for the Recent Jobs table. One of:
 //   'all' | 'completed' | 'failed' | 'running'
 // Persisted across page reloads so a debugging operator who switched
