@@ -7851,6 +7851,15 @@ document.getElementById('opRecStopBtn').addEventListener('click', async () => {
     document.getElementById('opRecActive').style.display = 'none';
     document.getElementById('opRecIdle').style.display = '';
 
+    // Make the result savable: stash events + start_url so the
+    // 「デモとして保存」 button can POST without re-draining the
+    // (now-closed) session.
+    if (events && events.length) {
+      _opRecMakeSavable(events, document.getElementById('opRecStartUrl').value || '');
+    } else {
+      _opRecClearSavable();
+    }
+
     OP_REC.sid = null;
     OP_REC.worker_id = null;
     OP_REC.tStarted = 0;
@@ -7880,6 +7889,7 @@ document.getElementById('opRecStopBtn').addEventListener('click', async () => {
     document.getElementById('opRecResult').style.display = '';
     document.getElementById('opRecActive').style.display = 'none';
     document.getElementById('opRecIdle').style.display = '';
+    _opRecClearSavable();
     OP_REC.sid = null;
     OP_REC.worker_id = null;
     OP_REC.tStarted = 0;
@@ -7888,6 +7898,200 @@ document.getElementById('opRecStopBtn').addEventListener('click', async () => {
     btn.innerHTML = origLabel;
   }
 });
+
+// --------------------------------------------------------------------------
+// Operator-recorder M2: save / list / view / delete demos.
+// --------------------------------------------------------------------------
+// State for the "current result is savable" flow: when stop succeeds and
+// produces events, we stash them here so the 「デモとして保存」 button
+// has something to POST without re-draining the (now-closed) session.
+const OP_REC_LASTRESULT = { events: null, start_url: '' };
+
+function _opRecMakeSavable(events, startUrl) {
+  OP_REC_LASTRESULT.events = events;
+  OP_REC_LASTRESULT.start_url = startUrl || '';
+  const btn = document.getElementById('opRecSaveDemoBtn');
+  if (btn) btn.style.display = (events && events.length) ? '' : 'none';
+}
+function _opRecClearSavable() {
+  OP_REC_LASTRESULT.events = null;
+  OP_REC_LASTRESULT.start_url = '';
+  const btn = document.getElementById('opRecSaveDemoBtn');
+  if (btn) btn.style.display = 'none';
+}
+
+// Open the save modal pre-filled with a sensible default title.
+document.getElementById('opRecSaveDemoBtn').addEventListener('click', () => {
+  if (!OP_REC_LASTRESULT.events) return;
+  const modal = document.getElementById('opRecSaveModal');
+  const tEl = document.getElementById('opRecSaveTitle');
+  const nEl = document.getElementById('opRecSaveNote');
+  const eEl = document.getElementById('opRecSaveError');
+  let host = '';
+  try { host = new URL(OP_REC_LASTRESULT.start_url).hostname || ''; } catch (_) {}
+  const stamp = new Date().toISOString().slice(0, 16).replace('T', ' ');
+  tEl.value = host ? `${host} demo · ${stamp}` : `demo · ${stamp}`;
+  nEl.value = '';
+  eEl.textContent = '';
+  eEl.style.display = 'none';
+  modal.showModal();
+  tEl.focus();
+});
+document.getElementById('opRecSaveCancel').addEventListener('click', () => {
+  document.getElementById('opRecSaveModal').close();
+});
+document.getElementById('opRecSaveSubmit').addEventListener('click', async () => {
+  const modal = document.getElementById('opRecSaveModal');
+  const eEl = document.getElementById('opRecSaveError');
+  const btn = document.getElementById('opRecSaveSubmit');
+  eEl.style.display = 'none';
+  if (!OP_REC_LASTRESULT.events || !OP_REC_LASTRESULT.events.length) {
+    eEl.textContent = '保存できるイベントがありません';
+    eEl.style.display = '';
+    return;
+  }
+  btn.disabled = true;
+  const orig = btn.textContent;
+  btn.textContent = '保存中…';
+  try {
+    const r = await fetch('/oprec/demos', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        events: OP_REC_LASTRESULT.events,
+        start_url: OP_REC_LASTRESULT.start_url,
+        title: document.getElementById('opRecSaveTitle').value.trim(),
+        note: document.getElementById('opRecSaveNote').value.trim(),
+      }),
+    });
+    if (!r.ok) {
+      const txt = await r.text();
+      throw new Error('HTTP ' + r.status + ': ' + txt.slice(0, 200));
+    }
+    modal.close();
+    _opRecClearSavable();
+    // Reload the list so the new entry shows up at the top.
+    _opRecRefreshList();
+  } catch (e) {
+    eEl.textContent = e.message || String(e);
+    eEl.style.display = '';
+  } finally {
+    btn.disabled = false;
+    btn.textContent = orig;
+  }
+});
+
+// ---- list / view / delete -------------------------------------------------
+async function _opRecRefreshList() {
+  const host = (document.getElementById('opRecListHost').value || '').trim();
+  const url = '/oprec/demos?limit=50' + (host ? '&host=' + encodeURIComponent(host) : '');
+  try {
+    const r = await fetch(url);
+    if (!r.ok) throw new Error('HTTP ' + r.status);
+    const d = await r.json();
+    const demos = d.demos || [];
+    document.getElementById('opRecSavedCount').textContent = String(demos.length);
+    const container = document.getElementById('opRecSavedList');
+    if (!demos.length) {
+      container.innerHTML = '<div style="color:#888; font-size:.85em; padding:6px;">保存済みデモはありません</div>';
+      return;
+    }
+    container.innerHTML = demos.map(d => {
+      const created = new Date(d.created_at).toLocaleString();
+      return `<div data-demo-id="${esc(d.id)}"
+                   style="background:#fff; border:1px solid #e8e0d0; border-radius:6px; padding:8px 10px;">
+        <div style="display:flex; align-items:center; gap:10px;">
+          <button type="button" class="oprec-expand-btn pill"
+                  style="background:#f5f5fa; border-color:#bbc; color:#333; padding:2px 8px; font-size:.8em;"
+                  data-demo-id="${esc(d.id)}">
+            <iconify-icon icon="lucide:chevron-right"></iconify-icon>
+          </button>
+          <strong style="font-size:.9em; flex:1; overflow:hidden; text-overflow:ellipsis; white-space:nowrap;">
+            ${esc(d.title || d.id)}
+          </strong>
+          <small style="color:#888; white-space:nowrap;">${esc(d.host || '(no host)')}</small>
+          <small style="color:#888; white-space:nowrap;">${d.event_count} ev / ${d.clip_count} clip</small>
+          <small style="color:#888; white-space:nowrap;">${esc(created)}</small>
+          <button type="button" class="oprec-delete-btn pill"
+                  style="background:#fee; border-color:#c88; color:#933; padding:2px 8px; font-size:.8em;"
+                  data-demo-id="${esc(d.id)}" title="削除">
+            <iconify-icon icon="lucide:trash"></iconify-icon>
+          </button>
+        </div>
+        ${d.note ? `<div style="font-size:.78em; color:#7a5a14; margin-top:4px; white-space:pre-wrap;">${esc(d.note)}</div>` : ''}
+        <div class="oprec-demo-body" data-demo-id="${esc(d.id)}" style="display:none; margin-top:8px;"></div>
+      </div>`;
+    }).join('');
+    // Wire the expand / delete buttons.
+    container.querySelectorAll('.oprec-expand-btn').forEach(btn => {
+      btn.addEventListener('click', () => _opRecToggleExpand(btn.dataset.demoId, btn));
+    });
+    container.querySelectorAll('.oprec-delete-btn').forEach(btn => {
+      btn.addEventListener('click', async () => {
+        if (!confirm('このデモを削除しますか? この操作は取り消せません。')) return;
+        const r = await fetch('/oprec/demos/' + encodeURIComponent(btn.dataset.demoId), { method: 'DELETE' });
+        if (r.ok) _opRecRefreshList();
+        else alert('削除失敗: HTTP ' + r.status);
+      });
+    });
+  } catch (e) {
+    document.getElementById('opRecSavedList').innerHTML =
+      '<div style="color:#c00; font-size:.85em;">読込失敗: ' + esc(e.message || String(e)) + '</div>';
+  }
+}
+
+async function _opRecToggleExpand(id, btn) {
+  const body = document.querySelector('.oprec-demo-body[data-demo-id="' + CSS.escape(id) + '"]');
+  if (!body) return;
+  if (body.style.display !== 'none' && body.innerHTML) {
+    body.style.display = 'none';
+    btn.innerHTML = '<iconify-icon icon="lucide:chevron-right"></iconify-icon>';
+    return;
+  }
+  btn.innerHTML = '<iconify-icon icon="lucide:loader-circle" class="spin"></iconify-icon>';
+  try {
+    const r = await fetch('/oprec/demos/' + encodeURIComponent(id));
+    if (!r.ok) throw new Error('HTTP ' + r.status);
+    const d = await r.json();
+    const events = d.events || [];
+    const clipped = events.filter(e => e && e.clip);
+    body.innerHTML = `
+      <div style="font-size:.82em; color:#666; margin-bottom:6px;">
+        URL: <a href="${esc(d.start_url)}" target="_blank">${esc(d.start_url)}</a>
+      </div>
+      ${clipped.length > 0 ? `
+        <div style="display:flex; flex-wrap:wrap; gap:6px; margin-bottom:6px;">
+          ${clipped.map(e => {
+            const lbl = ((e.type || '') + ' · ' + ((e.target && e.target.text) || (e.target && e.target.tag) || '?').slice(0, 30));
+            const summary = e.summary || '';
+            return `<div style="display:flex; flex-direction:column; max-width:180px;">
+              <img src="${esc(e.clip)}" alt="${esc(lbl)}"
+                   style="width:180px; max-height:120px; object-fit:contain; border:1px solid #ccc; border-radius:4px; cursor:zoom-in; background:#fafafa;"
+                   onclick="window.open(this.src, '_blank')">
+              <small style="color:#666; font-size:.7em; overflow:hidden; text-overflow:ellipsis; white-space:nowrap;">${esc(lbl)}</small>
+              ${summary ? `<small style="color:#196b2c; font-size:.75em; line-height:1.3; padding:2px 0;">${esc(summary).slice(0, 200)}</small>` : ''}
+            </div>`;
+          }).join('')}
+        </div>` : ''}
+      <details>
+        <summary style="cursor:pointer; font-size:.82em; color:#666;">全イベント JSON (${events.length} 件)</summary>
+        <pre style="background:#1f2330; color:#e6edf3; padding:8px; border-radius:4px; max-height:300px; overflow:auto; font-size:.75em; margin:6px 0 0;">${esc(JSON.stringify(events.map(e => e && e.clip ? { ...e, clip: (e.clip || '').slice(0, 60) + '… (truncated)' } : e), null, 2))}</pre>
+      </details>`;
+    body.style.display = '';
+    btn.innerHTML = '<iconify-icon icon="lucide:chevron-down"></iconify-icon>';
+  } catch (e) {
+    body.innerHTML = '<div style="color:#c00; font-size:.85em;">' + esc(e.message || String(e)) + '</div>';
+    body.style.display = '';
+    btn.innerHTML = '<iconify-icon icon="lucide:chevron-right"></iconify-icon>';
+  }
+}
+
+// host filter input + refresh button + initial load on page ready.
+document.getElementById('opRecListRefresh').addEventListener('click', _opRecRefreshList);
+document.getElementById('opRecListHost').addEventListener('change', _opRecRefreshList);
+// Initial load fires shortly after admin.js parses, so the saved-demos
+// section isn't empty when the operator first opens #submit.
+setTimeout(_opRecRefreshList, 300);
 
 // NOTE: "save skill" handler removed alongside the Skills tab (v2 cleanup).
 // Codegen-loop scripts are now distilled into HostKnowledge directly by the

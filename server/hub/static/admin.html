@@ -905,9 +905,15 @@ asyncio.run(main())"
 
     <!-- Result: show captured events -->
     <div id="opRecResult" style="display:none; margin-top:14px;">
-      <h3 style="margin:0 0 6px; font-size:.95em;">
+      <h3 style="margin:0 0 6px; font-size:.95em; display:flex; align-items:center; gap:10px; flex-wrap:wrap;">
         <span data-i18n="oprec.result">結果</span>
-        <span id="opRecResultMeta" style="color:#666; font-size:.85em; font-weight:normal; margin-left:8px;"></span>
+        <span id="opRecResultMeta" style="color:#666; font-size:.85em; font-weight:normal;"></span>
+        <span style="flex:1;"></span>
+        <button type="button" id="opRecSaveDemoBtn" class="pill"
+                style="background:#196b2c; border-color:#155022; color:#fff; font-weight:600; display:none;">
+          <iconify-icon icon="lucide:bookmark"></iconify-icon>
+          <span data-i18n="oprec.save_demo">デモとして保存</span>
+        </button>
       </h3>
       <!-- Visual gallery: each click/change event's bbox crop, rendered
            as a small thumbnail so the operator can see what the
@@ -923,7 +929,59 @@ asyncio.run(main())"
       <pre id="opRecEventsJson"
            style="background:#1f2330; color:#e6edf3; padding:10px 12px; border-radius:6px; max-height:400px; overflow:auto; font-size:.8em; margin:0;"></pre>
     </div>
+
+    <!-- Saved demonstrations browser (M2: persistence layer).
+         Renders a paged list of demos from /oprec/demos with optional
+         host filter. Each entry expands inline to show clips + summaries
+         from /oprec/demos/{id}. -->
+    <div style="margin-top:16px; border-top:1px solid #e0c8a0; padding-top:10px;">
+      <div style="display:flex; align-items:center; gap:10px; margin-bottom:6px;">
+        <strong style="font-size:.95em; color:#7a4a14;">
+          <iconify-icon icon="lucide:library"></iconify-icon>
+          <span data-i18n="oprec.saved">保存済みデモ</span>
+          (<span id="opRecSavedCount">0</span>)
+        </strong>
+        <label style="display:flex; align-items:center; gap:4px; font-size:.85em; color:#666;">
+          <span data-i18n="oprec.filter_host">host で絞り込み:</span>
+          <input type="text" id="opRecListHost" placeholder="例: example.com"
+                 style="padding:2px 6px; width:180px;">
+        </label>
+        <button type="button" id="opRecListRefresh" class="pill"
+                style="background:#fff; border-color:#bbb; color:#444;">
+          <iconify-icon icon="lucide:refresh-cw"></iconify-icon>
+          <span data-i18n="oprec.refresh">更新</span>
+        </button>
+      </div>
+      <div id="opRecSavedList"
+           style="display:flex; flex-direction:column; gap:6px;"></div>
+    </div>
   </section>
+
+  <!-- Save-as-demo modal (M2). Asks for title + note when the operator
+       hits 「デモとして保存」 on a fresh recording result. -->
+  <dialog id="opRecSaveModal" style="border:1px solid #ccc; border-radius:8px; padding:0; width:min(560px, 92vw);">
+    <form method="dialog" style="padding:16px 18px;">
+      <h3 style="margin:0 0 12px;">
+        <iconify-icon icon="lucide:bookmark"></iconify-icon>
+        <span data-i18n="oprec.save_modal_title">デモとして保存</span>
+      </h3>
+      <div style="display:grid; gap:8px;">
+        <label style="display:grid; gap:2px;">
+          <span style="font-size:.85em; color:#666;">タイトル(空欄ならホスト名から自動)</span>
+          <input type="text" id="opRecSaveTitle">
+        </label>
+        <label style="display:grid; gap:2px;">
+          <span style="font-size:.85em; color:#666;">メモ(operator 用)</span>
+          <textarea id="opRecSaveNote" rows="3" style="resize:vertical; font-family:inherit; padding:6px;"></textarea>
+        </label>
+        <div id="opRecSaveError" style="color:#c00; display:none; font-size:.9em;"></div>
+      </div>
+      <div style="display:flex; gap:8px; justify-content:flex-end; margin-top:12px;">
+        <button type="button" id="opRecSaveCancel">キャンセル</button>
+        <button type="button" id="opRecSaveSubmit" style="font-weight:600;">保存</button>
+      </div>
+    </form>
+  </dialog>
 
   <!-- Asset detail modal (overlay). One per page; populated on click. -->
   <div id="ljpAssetModal" style="display:none; position:fixed; inset:0; background:rgba(0,0,0,0.6); z-index:1000; align-items:center; justify-content:center; padding:20px;">
