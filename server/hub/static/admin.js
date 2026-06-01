@@ -4690,6 +4690,9 @@ const LJP = {
   // Map download-key -> {row, fill, stats, doneTimer} for the live
   // per-download progress bars (driven by [[paprika:progress]] markers).
   progress: new Map(),
+  // state-model v1: true while any session for the attached job is in
+  // "closing" (teardown). Drives the "closing" outer status label.
+  _anyClosing: false,
   // -1 = not yet polled; only re-render the thumbnail strip when the
   // count actually changes (avoids flicker on each 2.5s poll).
   galleryLastCount: -1,
@@ -4880,22 +4883,37 @@ function ljpSetStatus(s, phase) {
   //   * "keepalive"   -- keep_session job: capture done, the browser is
   //     held open for the operator to drive (idle, NOT working).
   // Both keep the running palette; only the label changes.
-  let _label = s || '…';
-  if (s === 'running' && phase === 'downloading') _label = 'downloading';
-  else if (s === 'running' && phase === 'keepalive') _label = 'keepalive';
-  el.textContent = _label;
-  // The status pill colour is driven by a CSS class -- swap the
-  // class based on the current state so the palette stays in sync
-  // with the rest of the panel.
+  // state-model v1: derive the 2-level label "outer · inner" from
+  // (status, phase).  Outer = queued / active / closing / closed.
+  //   active  : status=running (inner: downloading / keepalive; else none)
+  //   closing : teardown in progress (phase=="closing" or owning session
+  //             is closing -- LJP._anyClosing, set by ljpRefreshSessions)
+  //   closed  : terminal (inner: completed / failed / cancelled / timed_out)
+  // ``running`` (plain), ``codegen-loop:start`` etc. all read as "active".
+  let _outer = s || '…', _inner = '', cls = 'status-queued';
+  if (s === 'queued') {
+    _outer = 'queued'; cls = 'status-queued';
+  } else if (s === 'running') {
+    if (phase === 'closing' || LJP._anyClosing) {
+      _outer = 'closing'; cls = 'status-running';
+    } else {
+      _outer = 'active'; cls = 'status-running';
+      if (phase === 'downloading' || phase === 'keepalive') _inner = phase;
+    }
+  } else if (s === 'completed' || s === 'succeeded') {
+    _outer = 'closed'; _inner = 'completed'; cls = 'status-completed';
+  } else if (s === 'cancelled') {
+    _outer = 'closed'; _inner = 'cancelled'; cls = 'status-cancelled';
+  } else if (s === 'failed') {
+    _outer = 'closed';
+    _inner = (phase === 'timed_out') ? 'timed_out' : 'failed';
+    cls = 'status-failed';
+  }
+  el.textContent = _inner ? (_outer + ' · ' + _inner) : _outer;
   el.classList.remove(
     'status-queued', 'status-running', 'status-completed',
     'status-failed', 'status-cancelled',
   );
-  let cls = 'status-queued';
-  if (s === 'succeeded' || s === 'completed') cls = 'status-completed';
-  else if (s === 'failed')                    cls = 'status-failed';
-  else if (s === 'cancelled')                 cls = 'status-cancelled';
-  else if (s === 'running')                   cls = 'status-running';
   el.classList.add(cls);
   // Toggle the .running class on the header so the live-dot pulses
   // when (and only when) the job is in flight.
@@ -5377,6 +5395,10 @@ async function ljpRefreshSessions() {
     if (!r.ok) return;
     const data = await r.json();
     const sessions = data.sessions || [];
+    // state-model v1: surface the "closing" outer state. A session in
+    // teardown reports state=="closing"; ljpSetStatus reads this flag to
+    // show "closing" while a running job's session is being torn down.
+    LJP._anyClosing = sessions.some((x) => x && x.state === 'closing');
     const seen = new Set();
     for (const s of sessions) {
       seen.add(s.session_id);

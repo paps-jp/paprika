@@ -507,31 +507,14 @@ async def _proxy_novnc_websocket(
         if now - _last_touch_t < _ACTIVITY_THROTTLE_S:
             return
         _last_touch_t = now
+        # Refresh last_active_at so a watching operator's session isn't
+        # idle-reaped.  state-model v1: we intentionally DO NOT flip the
+        # job phase keepalive->running here anymore (the oscillation was
+        # removed); keepalive is a stable phase.  "Is someone watching"
+        # can be re-derived from live RFB connections separately without
+        # mutating job state.
         try:
             state.sessions.touch(session_id)
-        except Exception:
-            pass
-        # If the parent job is currently in "keepalive" phase, promote
-        # it to "running" so the screenshot tile turns red and the
-        # operator can see the session is actively driven. The reaper
-        # loop demotes back to "keepalive" once RFB events stop for
-        # _RUNNING_TO_KEEPALIVE_QUIET_S seconds; the idle_ttl_s reap
-        # clock is unaffected (still anchored to last_active_at).
-        try:
-            sinfo = state.sessions.get(session_id)
-        except Exception:
-            sinfo = None
-        if sinfo is None or not sinfo.job_id or state.store is None:
-            return
-        try:
-            jinfo = await state.store.get_job_info(sinfo.job_id)
-        except Exception:
-            return
-        if jinfo is None or jinfo.progress is None or jinfo.progress.phase != "keepalive":
-            return
-        jinfo.progress.phase = "running"
-        try:
-            await state.store.save_job_info(jinfo)
         except Exception:
             pass
 

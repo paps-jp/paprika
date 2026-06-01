@@ -351,7 +351,6 @@ async def lifespan(app: FastAPI):
 # ---- Session reaper + orphan-job recovery -- moved to _reaper.py (#2B-H) ---
 from server.hub._reaper import (  # noqa: F401
     _REAPER_INTERVAL_S,
-    _RUNNING_TO_KEEPALIVE_QUIET_S,
     _recover_orphan_running_jobs,
     _session_reaper_loop,
     _skill_convention_reaper_loop,

@@ -601,12 +601,13 @@ async def close_session(session_id: str) -> dict:
             if job is not None and job.status == JobStatus.running:
                 job.status = JobStatus.completed
                 job.completed_at = datetime.utcnow()
-                # phase: idle_timeout (= reaper-triggered) vs
-                # keepalive_closed (= operator-triggered DELETE).
-                # We can't easily tell from inside close_session,
-                # so just use a neutral marker -- the reaper logs
-                # its reason separately if interesting.
-                job.progress.phase = "keepalive_closed"
+                # state-model v1: a keep_session job whose held session is
+                # closed (operator DELETE or idle/absolute TTL reap) is a
+                # NORMAL completion -- the capture already succeeded, the
+                # held browser just expired.  Phase mirrors status; the
+                # old "keepalive_closed" marker (which nothing read) is
+                # gone.
+                job.progress.phase = "completed"
                 await state.store.save_job_info(job)
                 # Release in_flight that WorkerJobComplete skipped.
                 if state.registry is not None and job.worker_id:

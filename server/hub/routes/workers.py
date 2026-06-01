@@ -794,7 +794,10 @@ async def worker_link(ws: WebSocket, worker_id: str):
                     # already saved.
                     jinfo.status = JobStatus.completed
                     if jinfo.progress is not None:
-                        jinfo.progress.phase = "keepalive_closed"
+                        # state-model v1: keepalive close = normal
+                        # completion (capture already saved). Phase
+                        # mirrors status; "keepalive_closed" is retired.
+                        jinfo.progress.phase = "completed"
                     jinfo.completed_at = datetime.utcnow()
                 else:
                     jinfo.status = JobStatus.failed

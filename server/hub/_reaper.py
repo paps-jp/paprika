@@ -5,9 +5,9 @@ of app.py so the module is just FastAPI() + lifespan + include_router
 stanzas + _apply_route_tags() now.
 
 * ``_session_reaper_loop``: forever-loop that closes sessions whose
-  ``idle_ttl_s`` / ``absolute_ttl_s`` has elapsed, and bumps
-  keep_session jobs back to "keepalive" phase when noVNC RFB
-  activity goes quiet for ``_RUNNING_TO_KEEPALIVE_QUIET_S`` seconds.
+  ``idle_ttl_s`` / ``absolute_ttl_s`` has elapsed. (The old
+  running<->keepalive phase oscillation was removed in state-model v1;
+  keepalive is now a stable phase.)
 
 * ``_recover_orphan_running_jobs``: one-shot run at hub startup.
   Anything persisted as ``status=running`` but missing from the
@@ -48,20 +48,8 @@ async def close_session(session_id: str):
 # Background tasks
 # ----------------------------------------------------------------------------
 
-# How often the reaper looks for expired sessions, seconds. Also drives
-# the running->keepalive phase demotion below, so this cannot be slower
-# than _RUNNING_TO_KEEPALIVE_QUIET_S without making the demote feel
-# laggy.
+# How often the reaper looks for expired sessions, seconds.
 _REAPER_INTERVAL_S = 5
-
-# When a keep_session job's phase is bumped to "running" by RFB activity
-# (mouse / keyboard / clipboard from the noVNC viewer), how long the
-# session can sit with no fresh RFB activity before we demote it back
-# to "keepalive". Must be > _ACTIVITY_THROTTLE_S (10 s, see the noVNC
-# proxy) so a continuous mouse drag -- which produces one throttled
-# touch every 10 s -- doesn't flicker running->keepalive->running
-# between touches.
-_RUNNING_TO_KEEPALIVE_QUIET_S = 15
 
 
 async def _recover_orphan_running_jobs() -> int:
@@ -153,36 +141,13 @@ async def _session_reaper_loop():
             except Exception:
                 continue
 
-            # ---- running -> keepalive demote ----------------------
-            # Operator was interacting (phase==running) but the noVNC
-            # proxy hasn't seen an RFB event for QUIET_S seconds. Flip
-            # the parent job back to "keepalive" so the screenshot tile
-            # changes color (orange) and the operator can tell the
-            # session is now just warming up, not actively driven.
-            # Skipped when no parent job (read-only inspection sessions
-            # opened from /sessions don't have a job tag) and when the
-            # session is already past its idle TTL (the close branch
-            # below will reap it in this same tick).
-            if (
-                s.job_id
-                and idle > _RUNNING_TO_KEEPALIVE_QUIET_S
-                and not (s.idle_ttl_s and idle > s.idle_ttl_s)
-            ):
-                try:
-                    jinfo = await state.store.get_job_info(s.job_id)
-                except Exception:
-                    jinfo = None
-                if (
-                    jinfo is not None
-                    and jinfo.status == JobStatus.running
-                    and jinfo.progress is not None
-                    and jinfo.progress.phase == "running"
-                ):
-                    jinfo.progress.phase = "keepalive"
-                    try:
-                        await state.store.save_job_info(jinfo)
-                    except Exception:
-                        pass
+            # NOTE: the running<->keepalive phase oscillation was removed
+            # (state-model v1). A keep_session job's phase is set to
+            # "keepalive" ONCE when its capture finishes and stays there;
+            # noVNC RFB activity still refreshes last_active_at (touch, in
+            # routes/novnc.py) so an operator who is watching isn't
+            # reaped, but we no longer flip the job phase back to
+            # "running". The TTL reap below is unchanged.
 
             expired = (s.idle_ttl_s and idle > s.idle_ttl_s) or (
                 s.absolute_ttl_s and age > s.absolute_ttl_s
