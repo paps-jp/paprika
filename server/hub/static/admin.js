@@ -7780,25 +7780,50 @@ document.getElementById('opRecStopBtn').addEventListener('click', async () => {
       { cmd: 'getOperatorEvents', args: { drain: true } },
     );
     const ext = (got && got.result) || {};
-    const events = ext.events || [];
+    let events = ext.events || [];
 
-    // Visual gallery of bbox crops. We render each clipped event as a
-    // small thumbnail; click to enlarge. The JSON dump below shows the
-    // event metadata with the clip dataURL ABBREVIATED so the operator
-    // can read the structure without scrolling through 30KB base64.
+    document.getElementById('opRecResultMeta').textContent =
+      events.length + ' 件キャプチャ · session=' + sid + ' · 言語化中…';
+
+    // Send events to the hub for VLM verbalisation. One-shot per event
+    // against the qwen vision-chat engine (Qwen3-VL-32B FP8). Adds a
+    // .summary field to each. Best-effort: any per-event error lands in
+    // .summary_error and the rendering below shows it.
+    try {
+      const r = await fetch('/oprec/verbalize', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ events }),
+      });
+      if (r.ok) {
+        const vd = await r.json();
+        events = vd.events || events;
+      }
+    } catch (_) {
+      // verbalisation is decoration -- if it fails the raw events still render
+    }
+
+    // Visual gallery of bbox crops with per-clip natural-language
+    // captions from the VLM. The JSON dump below shows the event
+    // metadata with the clip dataURL ABBREVIATED so the operator can
+    // read the structure without scrolling through 30KB base64.
     const gallery = document.getElementById('opRecClipGrid');
     const clipped = events.filter(e => e && e.clip);
     if (clipped.length > 0) {
-      gallery.innerHTML = clipped.map((e, i) => {
+      gallery.innerHTML = clipped.map((e) => {
         const idx = events.indexOf(e);
         const lbl = (e.type || '').toString() + ' · ' +
           ((e.target && e.target.text) || (e.target && e.target.tag) || '?').slice(0, 30);
+        const summary = e.summary || e.summary_error || '';
         return `<div title="event #${idx + 1}  ${esc(lbl)}"
-                     style="display:flex; flex-direction:column; align-items:center; gap:2px;">
+                     style="display:flex; flex-direction:column; align-items:flex-start; gap:2px; max-width:200px;">
           <img src="${esc(e.clip)}" alt="${esc(lbl)}"
-               style="max-width:160px; max-height:120px; border:1px solid #ccc; border-radius:4px; cursor:zoom-in;"
+               style="width:200px; max-height:140px; object-fit:contain; border:1px solid #ccc; border-radius:4px; cursor:zoom-in; background:#fafafa;"
                onclick="window.open(this.src, '_blank')">
-          <small style="color:#666; font-size:.72em; max-width:160px; overflow:hidden; text-overflow:ellipsis; white-space:nowrap;">#${idx + 1} ${esc(lbl)}</small>
+          <small style="color:#666; font-size:.72em; max-width:200px; overflow:hidden; text-overflow:ellipsis; white-space:nowrap;">#${idx + 1} ${esc(lbl)}</small>
+          ${summary
+            ? `<small style="color:${e.summary_error ? '#a00' : '#196b2c'}; font-size:.78em; max-width:200px; line-height:1.3; padding:2px 0;">${esc(summary).slice(0, 220)}</small>`
+            : ''}
         </div>`;
       }).join('');
       document.getElementById('opRecClipCount').textContent = String(clipped.length);
@@ -7808,8 +7833,10 @@ document.getElementById('opRecStopBtn').addEventListener('click', async () => {
       gallery.innerHTML = '';
     }
 
+    const withSummary = events.filter(e => e && e.summary).length;
     document.getElementById('opRecResultMeta').textContent =
-      events.length + ' 件キャプチャ · クロップ ' + clipped.length + ' 件 · session=' + sid;
+      events.length + ' 件キャプチャ · クロップ ' + clipped.length
+      + ' 件 · 言語化 ' + withSummary + ' 件 · session=' + sid;
 
     // Abbreviate the data: URL of each clip so the JSON dump stays
     // skim-able. The full image is already shown in the gallery above.

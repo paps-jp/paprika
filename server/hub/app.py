@@ -618,6 +618,9 @@ app.include_router(_settings_router)
 from server.hub.routes.forensics import router as _forensics_router
 app.include_router(_forensics_router)
 
+from server.hub.routes.oprec import router as _oprec_router
+app.include_router(_oprec_router)
+
 from server.hub.routes.llm import router as _llm_router
 
 app.include_router(_llm_router)
