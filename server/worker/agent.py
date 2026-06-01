@@ -4987,6 +4987,40 @@ class WorkerAgent:
                 async def _recipe_cb(tab):
                     if _picked_recipe:
                         await _apply_fetch_recipe(tab, _picked_recipe, _log)
+
+                # Incremental asset upload (resilience). The fetcher fires
+                # this once per asset right after it's written to
+                # assets_dir; we ship each one to the hub immediately so a
+                # mid-fetch failure (worker disconnect, crash, hub restart)
+                # leaves the already-captured assets in the gallery instead
+                # of discarding the whole batch -- the legacy behaviour
+                # uploaded nothing until fetch() returned successfully.
+                # The end-of-fetch _upload_files() pass then reconciles
+                # (page.html, log, late yt-dlp output, and anything whose
+                # inline upload failed). uploaded_names dedupes the two
+                # passes so a file is never shipped twice.
+                uploaded_names: set[str] = set()
+                page_url_for_assets = assign.url or None
+
+                async def _on_asset_saved(path, info):
+                    try:
+                        name = (info or {}).get("name") or path.name
+                    except Exception:
+                        return
+                    if name in uploaded_names:
+                        return
+                    ok = await self._upload_asset(
+                        assign,
+                        path,
+                        name,
+                        source_url=(info or {}).get("url"),
+                        mime=(info or {}).get("mime"),
+                        page_url=page_url_for_assets,
+                        timeout=300.0,
+                    )
+                    if ok:
+                        uploaded_names.add(name)
+
                 fetch_opts = self._build_fetch_options(
                     assign.url,
                     assign.options,
@@ -5001,6 +5035,7 @@ class WorkerAgent:
                     network_log=fetch_network_log,
                     # V: operator-managed URL deny list from Settings.
                     asset_url_blacklist=list(getattr(assign, "asset_url_blacklist", []) or []),
+                    on_asset_saved=_on_asset_saved,
                 )
                 # Detach big-video downloads from the lane. When the
                 # operator asked for video AND this isn't a keep_session
@@ -5020,6 +5055,38 @@ class WorkerAgent:
                     result = await fetch(fetch_opts)
                 except Exception as e:
                     _log(f"  !! fetch crashed: {type(e).__name__}: {e}")
+                    # Salvage: ship any assets captured before the crash
+                    # that the incremental on_asset_saved callback didn't
+                    # already upload (the file mid-write when fetch raised,
+                    # or one whose inline upload failed). Without this they
+                    # would be rmtree'd below, unsent -- a contributor to
+                    # "errored job has empty assets". Best-effort; never
+                    # let salvage failures mask the original error.
+                    salvaged = 0
+                    try:
+                        if assets_dir and assets_dir.exists():
+                            for _p in sorted(assets_dir.iterdir()):
+                                if not _p.is_file() or _p.name in uploaded_names:
+                                    continue
+                                if await self._upload_asset(
+                                    assign,
+                                    _p,
+                                    _p.name,
+                                    page_url=page_url_for_assets,
+                                    timeout=300.0,
+                                ):
+                                    uploaded_names.add(_p.name)
+                                    salvaged += 1
+                        if salvaged:
+                            _log(
+                                f"  ... salvaged {salvaged} captured "
+                                f"asset(s) despite fetch error"
+                            )
+                    except Exception as _sx:
+                        _log(
+                            f"  (salvage pass failed: "
+                            f"{type(_sx).__name__}: {_sx})"
+                        )
                     log_fp.close()
                     await self._upload_log(assign, log_path)
                     await self._send(
@@ -5036,8 +5103,11 @@ class WorkerAgent:
                 page_path.write_text(result.html, encoding="utf-8")
                 log_fp.close()
 
-                # Upload all outputs to hub
-                await self._upload_files(assign, workdir, result)
+                # Upload all outputs to hub. Assets already shipped by the
+                # incremental on_asset_saved callback are skipped; this
+                # pass reconciles page.html, log, late yt-dlp output and
+                # any inline-upload failures.
+                await self._upload_files(assign, workdir, result, uploaded_names)
 
                 # Build the JobResult Pydantic object with hub-side hrefs.
                 # page_url: every fetch-mode asset belongs to the single
@@ -5214,6 +5284,7 @@ class WorkerAgent:
         on_after_navigate=None,
         network_log: list | None = None,
         asset_url_blacklist: list[str] | None = None,
+        on_asset_saved=None,
     ) -> FetchOptions:
         # Server-side normalization (Swagger 'string' guard etc)
         def _norm(v):
@@ -5285,6 +5356,10 @@ class WorkerAgent:
             # blocked URLs never reach disk or yt-dlp.
             asset_url_blacklist=list(asset_url_blacklist or []),
             network_log=network_log,
+            # Incremental upload: fire per asset as it lands so a
+            # mid-fetch failure (worker disconnect / crash / hub restart)
+            # doesn't discard everything captured so far. None disables.
+            on_asset_saved=on_asset_saved,
         )
 
     def _make_fetch_session_callbacks(
@@ -5676,8 +5751,16 @@ class WorkerAgent:
         assign: HubAssignJob,
         workdir: Path,
         fetch_result,
+        already_uploaded: set[str] | None = None,
     ) -> None:
-        """Upload page.html, log.txt, and all asset files to the hub."""
+        """Upload page.html, log.txt, and all asset files to the hub.
+
+        ``already_uploaded`` is the set of asset names the incremental
+        on_asset_saved callback already shipped during capture; those are
+        skipped here so the end-of-fetch reconcile pass only uploads the
+        stragglers (page.html, log, late yt-dlp output, and any asset
+        whose inline upload failed)."""
+        done = already_uploaded if already_uploaded is not None else set()
         await self._upload_log(assign, workdir / "log.txt")
         await self._upload_special(assign, workdir / "page.html", "page.html")
         # Page URL = the URL the user told us to fetch. Every captured
@@ -5685,16 +5768,19 @@ class WorkerAgent:
         page_url = assign.url or None
         # Assets
         for a in fetch_result.assets_saved:
+            if a["name"] in done:
+                continue
             path = Path(a["path"])
             if path.exists():
-                await self._upload_asset(
+                if await self._upload_asset(
                     assign,
                     path,
                     a["name"],
                     source_url=a.get("url"),
                     mime=a.get("mime"),
                     page_url=page_url,
-                )
+                ):
+                    done.add(a["name"])
         # yt-dlp may have produced extra files in assets_dir not in
         # assets_saved (since fetcher tracks only its own captures, not
         # yt-dlp downloads). Walk the dir and upload anything we missed.
@@ -5705,7 +5791,7 @@ class WorkerAgent:
         if assets_dir.exists():
             known = {a["name"] for a in fetch_result.assets_saved}
             for p in assets_dir.iterdir():
-                if p.is_file() and p.name not in known:
+                if p.is_file() and p.name not in known and p.name not in done:
                     await self._upload_asset(
                         assign,
                         p,
@@ -5797,7 +5883,12 @@ class WorkerAgent:
         mime: str | None = None,
         page_url: str | None = None,
         timeout: float | None = None,
-    ) -> None:
+    ) -> bool:
+        """Upload one fetch-mode asset to the hub. Returns True on
+        success, False on failure. The bool lets the incremental
+        on_asset_saved callback track which names actually landed so the
+        end-of-fetch reconcile pass can re-try only the ones that didn't.
+        """
         url = assign.asset_upload_base
         try:
             with open(path, "rb") as f:
@@ -5822,6 +5913,7 @@ class WorkerAgent:
                     post_kwargs["timeout"] = float(timeout)
                 r = await self._http.post(url, **post_kwargs)
                 r.raise_for_status()
+            return True
         except Exception as e:
             await self._send(
                 WorkerJobLog(
@@ -5829,6 +5921,7 @@ class WorkerAgent:
                     line=f"  !! asset upload failed: {name}: {e}",
                 )
             )
+            return False
 
     async def _upload_special(self, assign: HubAssignJob, path: Path, kind: str) -> None:
         # /jobs/{id}/files/{kind} replaces the asset_upload_base path.

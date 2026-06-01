@@ -15,6 +15,7 @@ from __future__ import annotations
 
 import asyncio
 import base64
+import inspect
 import json
 import os
 import re
@@ -1394,6 +1395,17 @@ class FetchOptions:
     # Live-panel "Network" tab can display traffic in real time. When
     # None the fetch simply skips the bookkeeping.
     network_log: Optional[list] = None
+    # Async (or sync) callback fired once per asset, right after it has
+    # been written to ``assets_dir``. Receives ``(path: Path, info: dict)``
+    # where ``info`` matches the FetchResult.assets_saved entry
+    # (name/path/size/url/mime). The worker uses this to upload each
+    # captured asset to the hub *incrementally* so a mid-fetch failure
+    # (worker disconnect, crash, hub restart) doesn't discard everything
+    # captured up to that point -- the legacy behaviour was a single
+    # batch upload only after fetch() returned successfully. Best-effort:
+    # a callback error is logged and swallowed; it must never cancel the
+    # fetch. None disables incremental upload.
+    on_asset_saved: Optional[Any] = None  # cb(path, info) -> None | Awaitable
 
 
 @dataclass
@@ -1486,6 +1498,23 @@ async def fetch(opts: FetchOptions) -> FetchResult:
             log(f"  !! could not rewrite websocket_url: {e}")
 
     result = FetchResult(html="")
+
+    async def _fire_on_saved(entry: dict) -> None:
+        """Notify the caller that one asset just landed on disk, so it
+        can upload it to the hub incrementally. Best-effort: never let a
+        callback error abort the capture loop."""
+        cb = opts.on_asset_saved
+        if cb is None:
+            return
+        try:
+            res = cb(Path(entry["path"]), entry)
+            if inspect.isawaitable(res):
+                await res
+        except Exception as _cb_exc:
+            log(
+                f"  (on_asset_saved cb failed for {entry.get('name')}: "
+                f"{type(_cb_exc).__name__}: {_cb_exc})"
+            )
 
     try:
         if attaching:
@@ -1686,6 +1715,7 @@ async def fetch(opts: FetchOptions) -> FetchResult:
                                 f"[{len(_data)/1024:>8.1f} KB] "
                                 f"{_fb_path.resolve()}"
                             )
+                            await _fire_on_saved(result.assets_saved[-1])
                             return
                         else:
                             log(
@@ -1746,6 +1776,7 @@ async def fetch(opts: FetchOptions) -> FetchResult:
                     entry["saved"] = True
                     break
             log(f"  SAVED [{len(data)/1024:>8.1f} KB] {path.resolve()}")
+            await _fire_on_saved(result.assets_saved[-1])
 
         async def on_failed(event: cdp.network.LoadingFailed):
             nonlocal in_flight, last_activity
