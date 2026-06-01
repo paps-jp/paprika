@@ -1846,6 +1846,16 @@ async def fetch(opts: FetchOptions) -> FetchResult:
                         if not u or u in _hook_seen_urls:
                             continue
                         _hook_seen_urls.add(u)
+                        # Blacklist gate (Y bugfix): the JS fetch/XHR
+                        # hook is a separate capture surface that
+                        # bypasses the CDP on_response gate. Without
+                        # this check, `https://*.saawsedge.com*` etc.
+                        # are still leaked into network_log + video_urls_seen
+                        # via this poller (job 9dc8d38174e4 post-mortem).
+                        _bl_hit = _fetch_blacklisted(u)
+                        if _bl_hit is not None:
+                            log(f"  [url-capture] BLOCK (blacklist={_bl_hit!r}) {u[:120]}")
+                            continue
                         # Record to network_log so the Live panel
                         # shows the URL (mirrors on_response).
                         if u not in _net_logged_urls:

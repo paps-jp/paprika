@@ -2968,6 +2968,19 @@ async def install_session_asset_capture(
                 if not url or url in _hook_seen:
                     continue
                 _hook_seen.add(url)
+                # Blacklist gate (Y bugfix): the JS fetch/XHR hook is a
+                # separate capture surface from CDP Network — it has its
+                # own bucket and its own poller, so the on_response gate
+                # above misses these. Apply the same matcher here so a
+                # `https://*.saawsedge.com*` rule blocks both the CDP-
+                # observed playlist and the iframe-captured one. Pre-
+                # blacklist log was leaking via this exact path
+                # (job 9dc8d38174e4 / edge-hls.saawsedge.com).
+                _bl_hit = _is_blacklisted(url)
+                if _bl_hit is not None:
+                    if log:
+                        log(f"  [url-capture] BLOCK (blacklist={_bl_hit!r}) {url[:120]}")
+                    continue
                 # Mirror the on_response logic for stream URLs: log to
                 # network_log + fire maybe_download_video. We skip the
                 # image/audio mime save path -- that path needs the
