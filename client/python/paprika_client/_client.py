@@ -467,6 +467,7 @@ class PaprikaClient:
         absolute_ttl_s: Optional[int] = None,
         parent_job_id: Optional[str] = None,
         use_profile: Optional[str] = None,
+        auto_reopen: bool = True,
     ) -> "Session":
         """Reserve a Lane and return a :class:`Session` bound to it.
 
@@ -511,7 +512,34 @@ class PaprikaClient:
         # Import here to avoid the _page <-> _client circular at module
         # import time.
         from ._page import Session
-        return Session(self, info)
+
+        # Stash the open args on the Session so its auto-reopen-on-404
+        # path (see _SessionReopenProxy in _page.py) can recreate the
+        # same shape of session after a hub/worker restart: same
+        # profile, same parent job (= same gallery), same initial URL,
+        # same lane pin if any. ``parent_job_id`` re-uses the
+        # resolved value (env fallback or explicit) so a reopen
+        # doesn't suddenly land in a different gallery.
+        open_kwargs: dict = {}
+        if initial_url is not None:
+            open_kwargs["initial_url"] = initial_url
+        if worker_id is not None:
+            open_kwargs["worker_id"] = worker_id
+        if lane_hint is not None:
+            open_kwargs["lane_hint"] = lane_hint
+        if idle_ttl_s is not None:
+            open_kwargs["idle_ttl_s"] = idle_ttl_s
+        if absolute_ttl_s is not None:
+            open_kwargs["absolute_ttl_s"] = absolute_ttl_s
+        if effective_pjid:
+            open_kwargs["parent_job_id"] = effective_pjid
+        if use_profile:
+            open_kwargs["use_profile"] = use_profile
+        return Session(
+            self, info,
+            open_kwargs=open_kwargs,
+            auto_reopen=auto_reopen,
+        )
 
     def session(self, initial_url: Optional[str] = None, **kwargs) -> "_SessionHandle":
         """Open a paprika session against an available Lane.

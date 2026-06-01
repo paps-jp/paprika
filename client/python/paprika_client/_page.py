@@ -2427,6 +2427,103 @@ class Page:
 # ---------------------------------------------------------------------------
 
 
+# ---------------------------------------------------------------------------
+# Auto-reopen on session 404
+# ---------------------------------------------------------------------------
+#
+# Hub or worker restarts (deploy / self-update / crash / network blip)
+# drop the in-memory session registry, so the NEXT session-action call
+# from the client gets ``HTTP 404 session '...' not found`` -- even
+# though the operator's high-level intent ("keep scraping this page")
+# is unchanged. Without recovery, every restart kills every running
+# script.
+#
+# The proxy below intercepts ``_json`` calls that target
+# ``/sessions/{sid}/...``: on a 404 it asks the owning Session to
+# re-open with the same open args (use_profile / parent_job_id /
+# initial_url / lane_hint / ...), rewrites the URL with the new sid,
+# and retries the call once. All inherited Page primitives go through
+# ``self._client._json(...)``, so installing this proxy on
+# ``Session.__init__`` retrofits resilience onto every method without
+# rewriting any individual call site (~50 methods).
+#
+# What is NOT preserved across a reopen:
+#   * Page state: cookies set via document.cookie, localStorage,
+#     scroll position, video playback, dirty form inputs. The fresh
+#     session opens at ``initial_url`` from scratch.
+#   * Per-job assets are still bound to the same ``parent_job_id`` so
+#     captures continue accumulating in the same gallery.
+# Operators who need stronger continuity (e.g. cookies) should re-run
+# their own setup steps after a reopen -- exposed via the
+# ``Session.add_on_reopen(callback)`` hook.
+
+def _is_session_not_found_error(exc) -> bool:
+    """True if *exc* is a hub 404 saying the session vanished.
+
+    Recognises both shapes the hub uses:
+      * ``HTTP 404: {'detail': "session 'ses_XXX' not found"}`` from
+        the per-session action endpoints (the common case after a hub
+        restart wipes the in-memory SessionRegistry).
+      * ``HTTP 404: session '...' not found`` (rare textual shape).
+    """
+    from ._client import PaprikaError
+
+    if not isinstance(exc, PaprikaError):
+        return False
+    if getattr(exc, "status_code", None) != 404:
+        return False
+    msg = str(exc)
+    return ("session" in msg) and ("not found" in msg)
+
+
+class _SessionReopenProxy:
+    """Wraps a :class:`PaprikaClient` so per-session HTTP calls
+    auto-reopen the session on a ``session not found`` 404.
+
+    Behaviour:
+      * Any ``_json`` call whose ``path`` does NOT contain
+        ``/sessions/{owner_sid}/`` passes straight through.
+      * A matching session-scoped call is tried once; on a 404 with
+        the not-found marker, the owning Session is reopened (using
+        its stashed open args), the new sid is substituted into the
+        URL, and the call is retried exactly once.
+      * Any other attribute access is delegated to the real client, so
+        ``page._client.fetch(...)`` and other non-session APIs work
+        unchanged.
+
+    Concurrency: ``Session._reopen()`` is guarded by an ``asyncio.Lock``
+    so concurrent failed calls all converge on a single new session.
+    """
+
+    __slots__ = ("_session", "_real")
+
+    def __init__(self, session: "Session", real_client) -> None:
+        self._session = session
+        self._real = real_client
+
+    def __getattr__(self, name: str):
+        # Fallback delegation for non-_json attributes (open_session,
+        # fetch, health, job_assets, _http, _base_url, ...).
+        return getattr(self._real, name)
+
+    async def _json(self, method: str, path: str, **kwargs):
+        sid = self._session._sid
+        marker = f"/sessions/{sid}/"
+        if marker not in path:
+            return await self._real._json(method, path, **kwargs)
+        try:
+            return await self._real._json(method, path, **kwargs)
+        except Exception as e:  # noqa: BLE001 -- specific check below
+            if not _is_session_not_found_error(e):
+                raise
+            if not getattr(self._session, "_auto_reopen", True):
+                raise
+            await self._session._reopen()
+            new_sid = self._session._sid
+            new_path = path.replace(marker, f"/sessions/{new_sid}/")
+            return await self._real._json(method, new_path, **kwargs)
+
+
 class Session(Page):
     """A live paprika session, exposed as a Page-shaped container of
     tabs. ``cli.session(url)`` returns one of these.
@@ -2457,10 +2554,46 @@ class Session(Page):
             # ctx exit no longer closes; operator drives via noVNC
     """
 
-    def __init__(self, client: "PaprikaClient", info: dict) -> None:
+    def __init__(
+        self,
+        client: "PaprikaClient",
+        info: dict,
+        *,
+        open_kwargs: Optional[dict] = None,
+        auto_reopen: bool = True,
+    ) -> None:
         # Initialise as the default tab. The session_start ack on the
         # worker always registers the initial tab under "p_default".
         super().__init__(client, info, page_id="p_default")
+        # Stash the open args so _reopen() can recreate the session
+        # with the same profile / parent_job_id / initial_url / etc.
+        # after a hub-restart 404. Populated by
+        # ``PaprikaClient.open_session`` -- empty dict for the rare
+        # caller that builds a Session by hand.
+        self._open_kwargs: dict = dict(open_kwargs or {})
+        # Operator opt-out: pass ``auto_reopen=False`` to disable the
+        # auto-reopen-on-404 retry (e.g. when the caller explicitly
+        # wants 404s to bubble up as fatal).
+        self._auto_reopen: bool = bool(auto_reopen)
+        # Concurrency guard for _reopen(): if N parallel calls all
+        # race a 404, exactly one performs the reopen; the rest see
+        # the already-updated sid and resume without rebuilding.
+        self._reopen_lock = asyncio.Lock()
+        # Optional callbacks invoked AFTER a successful reopen so
+        # operator scripts can re-install state that the new session
+        # has no idea about (cookies set via document.cookie, custom
+        # navigation, video playback resume). Registered via
+        # ``sess.add_on_reopen(callback)``. Each callback is awaited
+        # in order; exceptions are logged and don't break the retry.
+        self._on_reopen: list = []
+        # Keep an unwrapped reference to the real PaprikaClient
+        # (without the reopen-proxy) so _reopen() itself doesn't
+        # recurse through the proxy when it calls open_session.
+        self._real_client = client
+        # Install the reopen-proxy. After this line, every inherited
+        # Page method that does ``self._client._json(...)`` gets
+        # transparent retry-on-404 without rewriting the call site.
+        self._client = _SessionReopenProxy(self, client)
         # Local cache of tabs. Index 0 is `self`. Tabs added via
         # ``sess.open(url)`` are appended. The worker may spawn popup
         # tabs we don't see locally; call ``await sess.refresh()`` to
@@ -2500,6 +2633,83 @@ class Session(Page):
 
     def __iter__(self):
         return iter(self._pages)
+
+    # ----- auto-reopen on session-404 ----------------------------------
+
+    def add_on_reopen(self, callback) -> None:
+        """Register an async callback to run after every successful
+        auto-reopen of this session.
+
+        Useful for re-establishing state the new session has no idea
+        about: a previous navigation, document.cookie writes, video
+        playback resume, scroll position, etc. The callback receives
+        the Session as its single argument and is awaited; exceptions
+        are logged and don't break the in-flight retry.
+
+        Example::
+
+            sess = await cli.open_session("https://example.com")
+            async def _resume(s):
+                await s.goto("https://example.com/page/42")
+                await s.evaluate("document.cookie='auth=...'")
+            sess.add_on_reopen(_resume)
+
+        Multiple callbacks are run in registration order.
+        """
+        if not callable(callback):
+            raise TypeError("add_on_reopen: callback must be callable")
+        self._on_reopen.append(callback)
+
+    async def _reopen(self) -> None:
+        """Re-open the underlying paprika session with the same args
+        used to create it. Rewrites ``self._sid`` / ``self._info``
+        in place; in-flight retries pick up the new id transparently.
+
+        Called from :class:`_SessionReopenProxy` when a session-404 is
+        detected. Idempotent under concurrent calls -- the lock makes
+        the first concurrent caller perform the reopen while the rest
+        return as soon as the lock releases (they'll see the updated
+        sid in the calling proxy).
+        """
+        from ._client import PaprikaError
+
+        old_sid = self._sid
+        async with self._reopen_lock:
+            # Someone already reopened while we waited on the lock.
+            if self._sid != old_sid:
+                return
+            try:
+                new_session = await self._real_client.open_session(
+                    **self._open_kwargs,
+                )
+            except Exception as e:
+                raise PaprikaError(
+                    f"auto-reopen failed (was {old_sid}): {e}",
+                ) from e
+            # Adopt the new session's identity. The new Session object
+            # itself is discarded (we keep our own self, with its
+            # callbacks / open_kwargs / locks intact).
+            self._sid = new_session._sid
+            self._info = new_session._info
+            self._url = new_session._url or self._url
+            # Run operator-supplied resume callbacks. Failures are
+            # logged but don't fail the outer retry -- the caller's
+            # original method call still gets a chance to run.
+            for cb in list(self._on_reopen):
+                try:
+                    res = cb(self)
+                    if hasattr(res, "__await__"):
+                        await res
+                except Exception as e:
+                    # We don't have a logger here; fall back to a
+                    # plain warning. Operators can install a logging
+                    # callback explicitly if they want richer output.
+                    import warnings
+                    warnings.warn(
+                        f"on_reopen callback {cb!r} failed: {e}",
+                        RuntimeWarning,
+                        stacklevel=2,
+                    )
 
     # ----- multi-tab convenience ---------------------------------------
 
