@@ -177,6 +177,44 @@ async def health() -> dict:
     except Exception:
         gpu_gate = None
 
+    # 推論 AI (Reasoning AI) 抽象化 (T): UI 上は「R1」と呼ばれていた
+    # judge / distiller のバックエンドエンジンを露出。EngineRegistry の
+    # PAPRIKA_R1_DISTILLER_ENGINE 設定が指す実体 (deepseek-r1 / chatgpt51 /
+    # claude など) を operator が一目で確認できる。
+    reasoning_engine: dict | None = None
+    try:
+        import os
+        distiller_slug = (
+            os.environ.get("PAPRIKA_R1_DISTILLER_ENGINE", "deepseek-r1")
+            or "deepseek-r1"
+        )
+        judge_mode = (
+            os.environ.get("PAPRIKA_R1_JUDGE_MODE", "off")
+            or "off"
+        )
+        distiller_mode = (
+            os.environ.get("PAPRIKA_R1_DISTILLER_MODE", "off")
+            or "off"
+        )
+        # Try to resolve the engine record for richer info (model / endpoint).
+        engine_info: dict = {"slug": distiller_slug}
+        try:
+            if state.engines is not None:
+                rec = state.engines.get(distiller_slug)
+                if rec is not None:
+                    engine_info["name"] = getattr(rec, "name", "") or distiller_slug
+                    engine_info["model"] = getattr(rec, "model", "") or ""
+                    engine_info["endpoint"] = getattr(rec, "endpoint", "") or ""
+        except Exception:
+            pass
+        reasoning_engine = {
+            "distiller_engine": engine_info,
+            "judge_mode": judge_mode,
+            "distiller_mode": distiller_mode,
+        }
+    except Exception:
+        reasoning_engine = None
+
     return {
         "status": "ok",
         "store": state.store_kind,
@@ -198,6 +236,11 @@ async def health() -> dict:
         # limit=0 means unlimited (default); set PAPRIKA_CODEGEN_LOOP_CONCURRENCY
         # to throttle.
         "gpu_gate": gpu_gate,
+        # Reasoning AI (judge / distiller) actual backend (T).
+        # "R1" was DeepSeek-R1 specifically; this surface lets operators see
+        # which engine slug PAPRIKA_R1_DISTILLER_ENGINE currently points at
+        # (could be deepseek-r1 / chatgpt51 / claude / etc.) plus the modes.
+        "reasoning_engine": reasoning_engine,
     }
 
 

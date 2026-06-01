@@ -1669,25 +1669,33 @@ curl 'http://paprika.lan/extensions/ublock-lite/download' --output ublock-lite.t
     <div id="aiTicker" class="ai-ticker" style="margin:6px 0 12px;">
       <div class="ai-ticker-label">
         <iconify-icon icon="lucide:radio-tower" style="vertical-align:middle;"></iconify-icon>
-        <span style="margin-left:6px;">最新の R1 学習</span>
+        <span style="margin-left:6px;" data-i18n="ai.ticker.label">最新の 推論 AI 学習</span>
         <!-- GPU gauge: ぱっぷす環境では Qwen-VL 自前 GPU (RTX 6000) が
              24 ライン共有のボトルネック。active/peak がリアルタイムで
              見えると sampling rate を絞るべきかが分かる。 -->
-        <span class="ai-gpu-gauge" id="aiGpuGauge" title="hub-side Qwen-VL inference concurrency / peak / total" style="margin-left:14px; font-size:0.85em; color:#888;">
+        <span class="ai-gpu-gauge" id="aiGpuGauge" data-i18n-title="ai.gpu.title" title="hub-side ビジョン LLM の同時推論数 / ピーク / 累計" style="margin-left:14px; font-size:0.85em; color:#888;">
           <iconify-icon icon="lucide:cpu" style="vertical-align:middle;"></iconify-icon>
           <span id="aiGpuGaugeText">GPU: idle</span>
         </span>
+        <!-- Reasoning AI badge: PAPRIKA_R1_DISTILLER_ENGINE が実際に
+             どのエンジン (deepseek-r1 / chatgpt51 / claude …) を指している
+             かを表示。「R1」が固有名詞ではなくバックエンドの slug を
+             指していることが operator に分かる。 -->
+        <span class="ai-reasoning-chip" id="aiReasoningChip" data-i18n-title="ai.reason.title" title="現在の推論 AI バックエンド (PAPRIKA_R1_DISTILLER_ENGINE)" style="margin-left:10px; font-size:0.85em; color:#888;">
+          <iconify-icon icon="lucide:brain-circuit" style="vertical-align:middle;"></iconify-icon>
+          <span id="aiReasoningChipText" data-i18n="ai.reason.loading">推論 AI: 読込中…</span>
+        </span>
       </div>
       <div class="ai-ticker-rail" id="aiTickerRail">
-        <span class="ai-ticker-empty">読み込み中…</span>
+        <span class="ai-ticker-empty" data-i18n="ai.ticker.loading">読み込み中…</span>
       </div>
     </div>
     <div class="ai-subtabs" role="tablist">
-      <button type="button" class="ai-subtab active" data-ai-subtab="knowledge" role="tab" aria-selected="true"><iconify-icon icon="lucide:brain"></iconify-icon> Host Knowledge <span class="count" id="cntKnowledge">0</span></button>
-      <button type="button" class="ai-subtab" data-ai-subtab="skills" role="tab" aria-selected="false"><iconify-icon icon="lucide:wand-sparkles"></iconify-icon> Skills <span class="count" id="cntSkills">0</span></button>
-      <button type="button" class="ai-subtab" data-ai-subtab="conventions" role="tab" aria-selected="false"><iconify-icon icon="lucide:scroll-text"></iconify-icon> Conventions <span class="count" id="cntConventions">0</span></button>
-      <button type="button" class="ai-subtab" data-ai-subtab="grooming" role="tab" aria-selected="false"><iconify-icon icon="lucide:brush-cleaning"></iconify-icon> Grooming <span class="count" id="cntGroom">0</span></button>
-      <button type="button" class="ai-subtab" data-ai-subtab="oracle" role="tab" aria-selected="false"><iconify-icon icon="lucide:scan-eye"></iconify-icon> Oracle <span class="count" id="cntOracle">0</span></button>
+      <button type="button" class="ai-subtab active" data-ai-subtab="knowledge" role="tab" aria-selected="true"><iconify-icon icon="lucide:brain"></iconify-icon> <span data-i18n="ai.subtab.knowledge">ホスト知識</span> <span class="count" id="cntKnowledge">0</span></button>
+      <button type="button" class="ai-subtab" data-ai-subtab="skills" role="tab" aria-selected="false"><iconify-icon icon="lucide:wand-sparkles"></iconify-icon> <span data-i18n="ai.subtab.skills">スキル</span> <span class="count" id="cntSkills">0</span></button>
+      <button type="button" class="ai-subtab" data-ai-subtab="conventions" role="tab" aria-selected="false"><iconify-icon icon="lucide:scroll-text"></iconify-icon> <span data-i18n="ai.subtab.conventions">作法</span> <span class="count" id="cntConventions">0</span></button>
+      <button type="button" class="ai-subtab" data-ai-subtab="grooming" role="tab" aria-selected="false"><iconify-icon icon="lucide:brush-cleaning"></iconify-icon> <span data-i18n="ai.subtab.grooming">整理</span> <span class="count" id="cntGroom">0</span></button>
+      <button type="button" class="ai-subtab" data-ai-subtab="oracle" role="tab" aria-selected="false"><iconify-icon icon="lucide:scan-eye"></iconify-icon> <span data-i18n="ai.subtab.oracle">オラクル</span> <span class="count" id="cntOracle">0</span></button>
     </div>
     <div class="ai-subpane" data-ai-subpane="knowledge">
   <section>
@@ -1698,52 +1706,54 @@ curl 'http://paprika.lan/extensions/ublock-lite/download' --output ublock-lite.t
       <span class="hctrl">
         <input type="search" id="hkSearch" data-i18n-placeholder="knowledge.search.placeholder" placeholder="filter by host" style="padding:4px 8px; min-width:220px;">
         <select id="hkTierFilter" style="padding:4px 8px;">
-          <option value="" data-i18n="knowledge.tier.all">all tiers</option>
-          <option value="high">high</option>
-          <option value="medium">medium</option>
-          <option value="low">low</option>
-          <option value="stale">stale</option>
+          <option value="" data-i18n="knowledge.tier.all">全 tier</option>
+          <option value="high" data-i18n="knowledge.tier.high">高信頼</option>
+          <option value="medium" data-i18n="knowledge.tier.medium">中信頼</option>
+          <option value="low" data-i18n="knowledge.tier.low">低信頼</option>
+          <option value="stale" data-i18n="knowledge.tier.stale">古い</option>
         </select>
         <button id="hkRefreshBtn" class="pill" style="background:#f5f5fa; border-color:#bbc; color:#444;"><iconify-icon icon="lucide:refresh-cw"></iconify-icon> <span data-i18n="knowledge.refresh">refresh</span></button>
       </span>
     </h2>
     <div id="hkSummary" style="display:flex; gap:12px; margin:12px 0; flex-wrap:wrap;">
-      <div class="hk-stat" data-stat="total"><strong id="hkTotal">0</strong><span data-i18n="knowledge.tile.hosts"> hosts</span></div>
-      <div class="hk-stat hk-tier-high" data-stat="high"><strong id="hkHigh">0</strong><span> high</span></div>
-      <div class="hk-stat hk-tier-medium" data-stat="medium"><strong id="hkMedium">0</strong><span> medium</span></div>
-      <div class="hk-stat hk-tier-low" data-stat="low"><strong id="hkLow">0</strong><span> low</span></div>
-      <div class="hk-stat hk-tier-stale" data-stat="stale"><strong id="hkStale">0</strong><span> stale</span></div>
-      <div class="hk-stat" data-stat="barriers"><strong id="hkBarriersTotal">0</strong><span data-i18n="knowledge.tile.barriers"> barriers learned</span></div>
-      <div class="hk-stat" data-stat="ce"><strong id="hkExtractionsTotal">0</strong><span data-i18n="knowledge.tile.extractions"> extractions learned</span></div>
+      <div class="hk-stat" data-stat="total"><strong id="hkTotal">0</strong><span data-i18n="knowledge.tile.hosts"> ホスト</span></div>
+      <div class="hk-stat hk-tier-high" data-stat="high"><strong id="hkHigh">0</strong><span data-i18n="knowledge.tile.high"> 高信頼</span></div>
+      <div class="hk-stat hk-tier-medium" data-stat="medium"><strong id="hkMedium">0</strong><span data-i18n="knowledge.tile.medium"> 中信頼</span></div>
+      <div class="hk-stat hk-tier-low" data-stat="low"><strong id="hkLow">0</strong><span data-i18n="knowledge.tile.low"> 低信頼</span></div>
+      <div class="hk-stat hk-tier-stale" data-stat="stale"><strong id="hkStale">0</strong><span data-i18n="knowledge.tile.stale"> 古い</span></div>
+      <div class="hk-stat" data-stat="barriers"><strong id="hkBarriersTotal">0</strong><span data-i18n="knowledge.tile.barriers"> 障壁を学習済</span></div>
+      <div class="hk-stat" data-stat="ce"><strong id="hkExtractionsTotal">0</strong><span data-i18n="knowledge.tile.extractions"> 抽出を学習済</span></div>
     </div>
 
-    <!-- AI Insights tile: judge comparison + R1 distiller activity -->
+    <!-- AI Insights tile: judge comparison + Reasoning AI distiller activity.
+         「R1」は DeepSeek-R1 を指していたが、OpenAI o1/o3 等他の推論モデルも
+         同じ EngineRegistry slot で扱えるよう "推論 AI" に統一表記。 -->
     <div style="background:#f6f8fa; border:1px solid #d1d9e0; border-radius:10px; padding:14px 18px; margin:10px 0 16px;">
       <div style="display:flex; align-items:center; gap:10px; margin-bottom:8px;">
         <iconify-icon icon="lucide:cpu" style="font-size:1.2em;"></iconify-icon>
-        <strong data-i18n="knowledge.ai.heading">AI Insights</strong>
-        <span style="color:#888; font-size:0.85em;" data-i18n="knowledge.ai.sub">Phase 3-6 ─ shadow judge & R1 distiller</span>
+        <strong data-i18n="knowledge.ai.heading">AI インサイト</strong>
+        <span style="color:#888; font-size:0.85em;" data-i18n="knowledge.ai.sub">影判定 ＆ 推論 AI による蒸留</span>
         <span style="flex:1;"></span>
         <a href="/admin/judge_comparisons" target="_blank" rel="noopener" class="pill" style="background:#fff; border-color:#bbc; color:#444; font-size:0.85em;"><span data-i18n="knowledge.ai.rawapi">raw API</span> ↗</a>
       </div>
       <div id="aiInsights" style="display:grid; grid-template-columns:repeat(auto-fit, minmax(220px, 1fr)); gap:10px;">
         <div class="ai-tile">
-          <div class="ai-tile-label" data-i18n="knowledge.ai.paired">Judge verdicts paired</div>
+          <div class="ai-tile-label" data-i18n="knowledge.ai.paired">Judge 判定ペア数</div>
           <div class="ai-tile-value" id="aiPaired">—</div>
-          <div class="ai-tile-sub" id="aiPairedSub" data-i18n="knowledge.ai.paired.sub">legacy vs R1 shadow</div>
+          <div class="ai-tile-sub" id="aiPairedSub" data-i18n="knowledge.ai.paired.sub">従来 vs 推論 AI シャドウ</div>
         </div>
         <div class="ai-tile">
-          <div class="ai-tile-label" data-i18n="knowledge.ai.agree">Agreement rate</div>
+          <div class="ai-tile-label" data-i18n="knowledge.ai.agree">一致率</div>
           <div class="ai-tile-value" id="aiAgree">—</div>
-          <div class="ai-tile-sub" id="aiAgreeSub" data-i18n="knowledge.ai.agree.sub">higher = R1 ready to promote</div>
+          <div class="ai-tile-sub" id="aiAgreeSub" data-i18n="knowledge.ai.agree.sub">高いほど推論 AI への切替が安全</div>
         </div>
         <div class="ai-tile">
-          <div class="ai-tile-label" data-i18n="knowledge.ai.distilled">Recent R1 distiller updates</div>
+          <div class="ai-tile-label" data-i18n="knowledge.ai.distilled">推論 AI 蒸留の最近の更新</div>
           <div class="ai-tile-value" id="aiDistilled">—</div>
-          <div class="ai-tile-sub" id="aiDistilledSub" data-i18n="knowledge.ai.distilled.sub">across all hosts</div>
+          <div class="ai-tile-sub" id="aiDistilledSub" data-i18n="knowledge.ai.distilled.sub">全ホスト合計</div>
         </div>
         <div class="ai-tile">
-          <div class="ai-tile-label" data-i18n="knowledge.ai.r1hosts">Hosts with R1-learned data</div>
+          <div class="ai-tile-label" data-i18n="knowledge.ai.r1hosts">推論 AI が学習に貢献したホスト</div>
           <div class="ai-tile-value" id="aiR1Hosts">—</div>
           <div class="ai-tile-sub" data-i18n="knowledge.ai.r1hosts.sub">provenance: distiller-r1</div>
         </div>
@@ -1762,6 +1772,27 @@ curl 'http://paprika.lan/extensions/ublock-lite/download' --output ublock-lite.t
       </tr></thead>
       <tbody><tr><td colspan=8 class="empty" data-i18n="knowledge.empty">no HostKnowledge yet — submit a job to start learning</td></tr></tbody>
     </table>
+    <!-- Pagination for the host knowledge table.
+         Filter / search / page-size changes reset to page 1. -->
+    <div id="hkPager" class="hk-pager" style="display:flex; gap:8px; align-items:center; justify-content:space-between; margin-top:10px; font-size:0.9em;">
+      <span id="hkPagerInfo" style="color:#666;"></span>
+      <span style="display:flex; gap:6px; align-items:center;">
+        <label style="color:#666;">
+          <span data-i18n="knowledge.pager.size">表示件数</span>
+          <select id="hkPageSize" style="padding:3px 6px; margin-left:4px;">
+            <option value="20">20</option>
+            <option value="50" selected>50</option>
+            <option value="100">100</option>
+            <option value="500">500</option>
+          </select>
+        </label>
+        <button id="hkPagerFirst" class="pill" style="background:#f5f5fa; border-color:#bbc; color:#444;" title="最初のページ">«</button>
+        <button id="hkPagerPrev" class="pill" style="background:#f5f5fa; border-color:#bbc; color:#444;" title="前のページ">‹</button>
+        <span id="hkPagerCurrent" style="min-width:80px; text-align:center; color:#444;">1 / 1</span>
+        <button id="hkPagerNext" class="pill" style="background:#f5f5fa; border-color:#bbc; color:#444;" title="次のページ">›</button>
+        <button id="hkPagerLast" class="pill" style="background:#f5f5fa; border-color:#bbc; color:#444;" title="最後のページ">»</button>
+      </span>
+    </div>
   </section>
     </div>
     <div class="ai-subpane" data-ai-subpane="skills" style="display:none;">
@@ -1961,15 +1992,20 @@ table.aitbl code { font-size:0.95em; }
       const j = await r.json();
       const counts = j.counts || {};
       const paired = counts.total_paired || 0;
+      const _tt2 = (k, fb) => (window.i18next && window.i18next.t) ? window.i18next.t(k, { defaultValue: fb }) : fb;
       document.getElementById('aiPaired').textContent = paired;
       document.getElementById('aiPairedSub').textContent =
-        paired > 0 ? `agree=${counts.agree} disagree=${counts.disagree}` : 'enable PAPRIKA_R1_JUDGE_MODE=shadow';
+        paired > 0
+          ? `${_tt2('knowledge.ai.paired.agree', '一致')}=${counts.agree} ${_tt2('knowledge.ai.paired.disagree', '不一致')}=${counts.disagree}`
+          : _tt2('knowledge.ai.paired.disabled', 'PAPRIKA_R1_JUDGE_MODE=shadow を有効化してください');
       const agreeRate = paired > 0 ? Math.round((counts.agree / paired) * 100) + '%' : '—';
       document.getElementById('aiAgree').textContent = agreeRate;
     } catch (e) {
       document.getElementById('aiPaired').textContent = '?';
     }
-    // R1 distiller stats — count hosts whose provenance.last_updated_by == 'distiller-r1'
+    // 推論 AI distiller stats — count hosts whose provenance.last_updated_by == 'distiller-r1'.
+    // 内部識別子 'distiller-r1' は DB/履歴互換のため固定 (元は DeepSeek-R1 由来)。
+    // UI 表記は engine 非依存の「推論 AI」に統一。
     const r1Hosts = _hkData.filter(e => ((e.k.provenance || {}).last_updated_by || '') === 'distiller-r1');
     document.getElementById('aiR1Hosts').textContent = r1Hosts.length;
     // Recent updates in the last 24h
@@ -1980,9 +2016,12 @@ table.aitbl code { font-size:0.95em; }
       const ts = Date.parse(t);
       return !isNaN(ts) && ts >= cutoff;
     });
+    const _tt3 = (k, fb) => (window.i18next && window.i18next.t) ? window.i18next.t(k, { defaultValue: fb }) : fb;
     document.getElementById('aiDistilled').textContent = recent.length;
     document.getElementById('aiDistilledSub').textContent =
-      recent.length > 0 ? 'in last 24h' : 'no R1 updates in last 24h';
+      recent.length > 0
+        ? _tt3('knowledge.ai.distilled.recent', '直近 24 時間以内')
+        : _tt3('knowledge.ai.distilled.none', '直近 24 時間以内の更新なし');
   }
 
   // ---- AI self-improvement loop: skills & conventions (paged) ----
@@ -2272,6 +2311,16 @@ table.aitbl code { font-size:0.95em; }
     document.getElementById('hkExtractionsTotal').textContent = extractionsTotal;
   }
 
+  // --- pagination state --------------------------------------------------
+  // 100+ ホストでスクロール地獄になるのを防ぐ。filter / search が変わったら
+  // 1 ページ目に戻す (= _hkPage = 0)。page size は select から取得。
+  let _hkPage = 0;
+
+  function _hkPageSize() {
+    const sel = document.getElementById('hkPageSize');
+    return sel ? (parseInt(sel.value, 10) || 50) : 50;
+  }
+
   function renderTable() {
     const tbody = document.querySelector('#hkTable tbody');
     const q = (document.getElementById('hkSearch').value || '').toLowerCase();
@@ -2287,9 +2336,20 @@ table.aitbl code { font-size:0.95em; }
     });
     if (rows.length === 0) {
       tbody.innerHTML = '<tr><td colspan=8 class="empty">no matches</td></tr>';
+      _updateHkPagerControls(0, 0, 0);
       return;
     }
-    tbody.innerHTML = rows.map(e => {
+    // --- apply pagination ---
+    const pageSize = _hkPageSize();
+    const totalPages = Math.max(1, Math.ceil(rows.length / pageSize));
+    // Clamp the page index if filter has narrowed results below current page.
+    if (_hkPage >= totalPages) _hkPage = totalPages - 1;
+    if (_hkPage < 0) _hkPage = 0;
+    const start = _hkPage * pageSize;
+    const end   = Math.min(start + pageSize, rows.length);
+    const visible = rows.slice(start, end);
+    _updateHkPagerControls(start + 1, end, rows.length);
+    tbody.innerHTML = visible.map(e => {  // eslint-disable-line no-shadow
       const k = e.k;
       const stats = k.stats || {};
       const tier = stats.overall_confidence || 'low';
@@ -2302,9 +2362,12 @@ table.aitbl code { font-size:0.95em; }
       // script / operator UI). Plus "suggested_tool" chip when any
       // barrier carries a pre-flight plugin recommendation -- that's
       // the actionable bit R1 produced.
+      // provenance.last_updated_by は内部識別子のまま 'distiller-r1' を維持
+      // (DB と過去ジョブの履歴を壊さないため)。UI 表記だけ「推論 AI」に統一。
       const writtenByR1 = (prov.last_updated_by || '') === 'distiller-r1';
+      const _tt = (k, fb) => (window.i18next && window.i18next.t) ? window.i18next.t(k, { defaultValue: fb }) : fb;
       const r1Badge = writtenByR1
-        ? '<span class="hk-r1-badge" title="R1 Distiller が直近更新">R1</span>'
+        ? `<span class="hk-r1-badge" title="${_tt('knowledge.badge.r1.title', '推論 AI が直近更新')}">${_tt('knowledge.badge.r1', '推論AI')}</span>`
         : '';
       const suggestedTools = presentBarriers
         .map(([kk, v]) => v && v.suggested_tool)
@@ -2326,6 +2389,30 @@ table.aitbl code { font-size:0.95em; }
     tbody.querySelectorAll('tr[data-host]').forEach(tr => {
       tr.addEventListener('click', () => openHkModal(tr.dataset.host));
     });
+  }
+
+  // Update the pager controls (prev/next buttons, page indicator, info text).
+  function _updateHkPagerControls(fromIdx, toIdx, total) {
+    const pageSize = _hkPageSize();
+    const totalPages = Math.max(1, Math.ceil(total / pageSize));
+    const info = document.getElementById('hkPagerInfo');
+    const cur  = document.getElementById('hkPagerCurrent');
+    const prev = document.getElementById('hkPagerPrev');
+    const next = document.getElementById('hkPagerNext');
+    const first = document.getElementById('hkPagerFirst');
+    const last  = document.getElementById('hkPagerLast');
+    if (info) {
+      info.textContent = total === 0
+        ? '0 件'
+        : `${fromIdx}-${toIdx} / ${total} 件`;
+    }
+    if (cur) cur.textContent = `${_hkPage + 1} / ${totalPages}`;
+    const atFirst = _hkPage <= 0;
+    const atLast  = _hkPage >= totalPages - 1;
+    if (prev) prev.disabled = atFirst;
+    if (first) first.disabled = atFirst;
+    if (next) next.disabled = atLast;
+    if (last) last.disabled = atLast;
   }
 
   function openHkModal(host) {
@@ -2419,8 +2506,26 @@ table.aitbl code { font-size:0.95em; }
     const ref = document.getElementById('hkRefreshBtn');
     if (!ref) { setTimeout(wire, 200); return; }
     ref.addEventListener('click', loadKnowledge);
-    document.getElementById('hkSearch').addEventListener('input', renderTable);
-    document.getElementById('hkTierFilter').addEventListener('change', renderTable);
+    // Filter / search changes always go back to page 1 so the operator
+    // sees results from the top rather than a stale offset.
+    document.getElementById('hkSearch').addEventListener('input', () => { _hkPage = 0; renderTable(); });
+    document.getElementById('hkTierFilter').addEventListener('change', () => { _hkPage = 0; renderTable(); });
+    // Pager controls.
+    const _pagerSize = document.getElementById('hkPageSize');
+    if (_pagerSize) _pagerSize.addEventListener('change', () => { _hkPage = 0; renderTable(); });
+    const _pgFirst = document.getElementById('hkPagerFirst');
+    if (_pgFirst) _pgFirst.addEventListener('click', () => { _hkPage = 0; renderTable(); });
+    const _pgPrev  = document.getElementById('hkPagerPrev');
+    if (_pgPrev)  _pgPrev.addEventListener('click',  () => { if (_hkPage > 0) { _hkPage--; renderTable(); } });
+    const _pgNext  = document.getElementById('hkPagerNext');
+    if (_pgNext)  _pgNext.addEventListener('click',  () => { _hkPage++; renderTable(); });
+    const _pgLast  = document.getElementById('hkPagerLast');
+    if (_pgLast)  _pgLast.addEventListener('click',  () => {
+      const total = _hkData.length;
+      const ps = _hkPageSize();
+      _hkPage = Math.max(0, Math.ceil(total / ps) - 1);
+      renderTable();
+    });
     // Delegated handler for the skills/conventions action buttons (works
     // regardless of script scope -- no global onclick needed).
     ['skTable', 'cvTable'].forEach(id => {
@@ -2502,14 +2607,37 @@ table.aitbl code { font-size:0.95em; }
         const vi = j.vision_inference;
         const el = document.getElementById('aiGpuGaugeText');
         const wrap = document.getElementById('aiGpuGauge');
-        if (!el || !wrap) return;
-        if (!vi) { el.textContent = 'GPU: n/a'; return; }
-        const active = vi.active || 0;
-        const peak   = vi.peak   || 0;
-        const total  = vi.total  || 0;
-        el.textContent = `GPU: ${active > 0 ? '🟢 busy' : '⚪ idle'} (active=${active}, peak=${peak}, total=${total})`;
-        // Color the chip red if peak >= 3 (queue building up); orange if 2.
-        wrap.style.color = peak >= 3 ? '#d24' : (peak >= 2 ? '#d80' : '#888');
+        const _ttG = (k, fb) => (window.i18next && window.i18next.t) ? window.i18next.t(k, { defaultValue: fb }) : fb;
+        if (el && wrap) {
+          if (!vi) {
+            el.textContent = 'GPU: ' + _ttG('ai.gpu.na', '不明');
+          } else {
+            const active = vi.active || 0;
+            const peak   = vi.peak   || 0;
+            const total  = vi.total  || 0;
+            const stateTxt = active > 0
+              ? `🟢 ${_ttG('ai.gpu.busy', '稼働中')}`
+              : `⚪ ${_ttG('ai.gpu.idle', 'アイドル')}`;
+            el.textContent = `GPU: ${stateTxt} (${_ttG('ai.gpu.active', '実行中')}=${active}, ${_ttG('ai.gpu.peak', 'ピーク')}=${peak}, ${_ttG('ai.gpu.total', '累計')}=${total})`;
+            // Color the chip red if peak >= 3 (queue building up); orange if 2.
+            wrap.style.color = peak >= 3 ? '#d24' : (peak >= 2 ? '#d80' : '#888');
+          }
+        }
+        // Reasoning AI chip — show actual backend engine (T)
+        const re = j.reasoning_engine;
+        const rEl = document.getElementById('aiReasoningChipText');
+        if (rEl) {
+          if (re && re.distiller_engine) {
+            const eng = re.distiller_engine;
+            const name = eng.name || eng.slug || '?';
+            const model = eng.model ? ` (${eng.model})` : '';
+            const dist = re.distiller_mode || 'off';
+            const judg = re.judge_mode || 'off';
+            rEl.textContent = `${_ttG('ai.reason.label', '推論 AI')}: ${name}${model} · ${_ttG('ai.reason.distill', '蒸留')}=${dist} · ${_ttG('ai.reason.judge', '判定')}=${judg}`;
+          } else {
+            rEl.textContent = _ttG('ai.reason.na', '推論 AI: 未設定');
+          }
+        }
       } catch (e) { /* swallow */ }
     }
     updateGpuGauge();
@@ -2541,12 +2669,14 @@ table.aitbl code { font-size:0.95em; }
       .sort((a, b) => (b.at > a.at ? 1 : -1))
       .slice(0, 5);
     if (!r1.length) {
-      rail.innerHTML = '<span class="ai-ticker-empty">R1 の更新はまだありません</span>';
+      const _ttE = (k, fb) => (window.i18next && window.i18next.t) ? window.i18next.t(k, { defaultValue: fb }) : fb;
+      rail.innerHTML = `<span class="ai-ticker-empty">${_ttE('ai.ticker.empty', '推論 AI の更新はまだありません')}</span>`;
       return;
     }
     const nowMs = Date.now();
+    const _ttU = (k, fb) => (window.i18next && window.i18next.t) ? window.i18next.t(k, { defaultValue: fb }) : fb;
     rail.innerHTML = r1.map(x => {
-      let what = '更新';
+      let what = _ttU('ai.ticker.what.update', '更新');
       const sug = Object.values(x.barriers).map(v => v && v.suggested_tool).filter(t => t);
       if (sug.length) what = '→ ' + sug[0];
       const ageMs = Math.max(0, nowMs - Date.parse(x.at));
