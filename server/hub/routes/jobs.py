@@ -2892,6 +2892,49 @@ from server.hub.app import (  # noqa: E402
 # ----------------------------------------------------------------------------
 
 
+# state-model v1.1: queued-timeout guard.  A job that never leaves
+# `queued` (no worker/lane, or a dispatch task that died) should resolve
+# to a terminal state, not sit forever.  Implemented event-driven (one
+# fire-once task per job) rather than polling the whole store.
+_QUEUE_TIMEOUT_S = float(os.environ.get("PAPRIKA_QUEUE_TIMEOUT_S", "180"))
+_QUEUE_GUARD_TASKS: set = set()
+
+
+async def _queued_timeout_guard(job_id: str, deadline_s: float) -> None:
+    try:
+        await asyncio.sleep(deadline_s)
+        jinfo = await state.store.get_job_info(job_id)
+        if jinfo is None or jinfo.status != JobStatus.queued:
+            return  # already dispatched / terminal -- nothing to do
+        jinfo.status = JobStatus.failed
+        jinfo.completed_at = datetime.utcnow()
+        if jinfo.progress is not None:
+            jinfo.progress.phase = "timed_out"
+        jinfo.error = (
+            f"queued for >{deadline_s:.0f}s without assignment "
+            f"(no worker/lane available)"
+        )
+        await state.store.save_job_info(jinfo)
+        try:
+            await state.store.publish_log(job_id, "  !! " + jinfo.error)
+            await state.store.publish_log(job_id, DONE_SENTINEL)
+        except Exception:
+            pass
+    except asyncio.CancelledError:
+        pass
+    except Exception:
+        pass
+
+
+def _spawn_queued_timeout_guard(job_id: str) -> None:
+    try:
+        t = asyncio.create_task(_queued_timeout_guard(job_id, _QUEUE_TIMEOUT_S))
+        _QUEUE_GUARD_TASKS.add(t)
+        t.add_done_callback(_QUEUE_GUARD_TASKS.discard)
+    except RuntimeError:
+        pass  # no running loop (shouldn't happen in request context)
+
+
 @router.post("/jobs", response_model=JobInfo)
 async def create_job(req: JobRequest, request: Request) -> JobInfo:
     if not req.url:
@@ -2928,6 +2971,14 @@ async def create_job(req: JobRequest, request: Request) -> JobInfo:
         progress=JobProgress(phase="queued"),
     )
     await state.store.save_job_info(info)
+
+    # state-model v1.1: queued-timeout guard. Dispatch is normally
+    # immediate (codegen/rerun create_task; fetch dispatches inline), so
+    # this almost always no-ops -- but if a job is still `queued` after
+    # the window (dispatch task died silently, or no worker/lane ever
+    # picked it up), fail it as closed·timed_out instead of leaving it
+    # stuck queued. Fires once; harmless once the status moved on.
+    _spawn_queued_timeout_guard(job_id)
 
     # Persist the consultation summary to the job log for operator
     # visibility. ``append_log_line`` rpushes to the Redis list (and the

@@ -426,7 +426,16 @@ async def _run_codegen_loop_job(request: Request, info: JobInfo) -> None:
     else:
         info.status = JobStatus.failed
         info.error = outcome.error or "all attempts failed"
-        info.progress.phase = "failed"
+        # state-model v1.1: if the FINAL attempt died on its time budget,
+        # surface as closed·timed_out (vs generic failure) so capacity/
+        # slow cases triage apart from real errors.
+        _last = outcome.attempts[-1] if getattr(outcome, "attempts", None) else None
+        info.progress.phase = (
+            "timed_out"
+            if (_last is not None
+                and getattr(getattr(_last, "result", None), "timed_out", False))
+            else "failed"
+        )
         msg = (
             f"==> FAILED after {len(outcome.attempts)} attempt(s) "
             f"({outcome.total_elapsed_ms} ms total) -- last error: "
@@ -1069,7 +1078,14 @@ async def _run_rerun_loop_job(
     else:
         info.status = JobStatus.failed
         info.error = outcome.error or "rerun failed"
-        info.progress.phase = "failed"
+        # state-model v1.1: timeout-class failure -> closed·timed_out.
+        _last = outcome.attempts[-1] if getattr(outcome, "attempts", None) else None
+        info.progress.phase = (
+            "timed_out"
+            if (_last is not None
+                and getattr(getattr(_last, "result", None), "timed_out", False))
+            else "failed"
+        )
         msg = f"==> FAILED ({outcome.total_elapsed_ms} ms): {(outcome.error or '')[:120]}"
     _log(msg)
     try:
