@@ -2499,11 +2499,11 @@ class Page:
 # their own setup steps after a reopen -- exposed via the
 # ``Session.add_on_reopen(callback)`` hook.
 
-def _is_session_recoverable_error(exc) -> bool:
+def _is_session_recoverable_error(exc, path: str = "") -> bool:
     """True if *exc* is a hub-side failure that auto-reopening the
     session can plausibly fix.
 
-    Three failure shapes are covered:
+    Four failure shapes are covered:
 
       * **HTTP 404** ``session 'ses_XXX' not found`` -- a hub restart
         wiped the in-memory SessionRegistry (the original case this
@@ -2515,15 +2515,21 @@ def _is_session_recoverable_error(exc) -> bool:
       * **HTTP 502** ``no active worker`` -- the scheduler can't find
         an alive worker right now. A reopen retries which works as
         soon as fleet recovers.
+      * **HTTP 504** ``session action timed out`` on any session-action
+        endpoint -- empirically the dominant cause is NOT the
+        destination site being slow but the worker's per-lane state
+        being stuck. Reopen + retry picks a fresh worker / tab and
+        the action almost always completes immediately. The single
+        retry cap (= 1) keeps the worst case bounded.
 
     Intentionally NOT covered:
 
-      * **HTTP 504** ``session action timed out`` -- the worker IS
-        alive and reachable but the underlying action (e.g. ``goto``
-        to a 1 GB mp4) is slow. Reopening would just hit the same
-        timeout on the new session.
-      * Generic transport errors (DNS / connect refused) -- the hub
-        itself is unreachable; a reopen won't help.
+      * Other 5xx errors / generic transport errors (DNS / connect
+        refused) -- the hub itself is unreachable; a reopen won't help.
+
+    ``path``: kept in the signature for backwards compatibility and
+    possible future per-endpoint gates. Not used today -- the proxy
+    already scopes us to session-action paths via its marker check.
     """
     from ._client import PaprikaError
 
@@ -2542,6 +2548,23 @@ def _is_session_recoverable_error(exc) -> bool:
         # transient (fleet mid-restart). Retry the open.
         if "no active worker" in msg:
             return True
+    if code == 504 and "session action timed out" in msg:
+        # Action-level timeout. Empirically the dominant cause is
+        # NOT the destination site being genuinely slow but the
+        # worker's per-lane processing being stuck (previous slow
+        # goto / a hung browser / CDP socket in a weird state) --
+        # observed running crawl_movie.py against twidouga.net where
+        # goto succeeded in 25s but solve_cloudflare AND the next
+        # evaluate both 504'd at 55s and 30s, on a page that loads
+        # cleanly in 3s when a fresh worker is given the same URL.
+        # Reopen + retry picks a different worker (or a fresh tab
+        # on the same worker) and the action usually completes
+        # immediately. ALL session-action paths are covered -- the
+        # outer marker check (`/sessions/{sid}/`) already scopes
+        # this to actions, not to other 504s.
+        # The single retry cap keeps the worst case bounded (2x60s)
+        # so a site that's genuinely slow doesn't spiral.
+        return True
     return False
 
 
@@ -2588,7 +2611,9 @@ class _SessionReopenProxy:
         try:
             return await self._real._json(method, path, **kwargs)
         except Exception as e:  # noqa: BLE001 -- specific check below
-            if not _is_session_recoverable_error(e):
+            # Pass the request path so the 504-on-navigate branch can
+            # gate on it (other 504s stay non-recoverable).
+            if not _is_session_recoverable_error(e, path):
                 raise
             if not getattr(self._session, "_auto_reopen", True):
                 raise
