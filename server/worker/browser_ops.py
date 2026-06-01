@@ -725,6 +725,7 @@ async def scroll(tab, direction: str, pixels: int, log: LogFn) -> str:
 # ---------------------------------------------------------------------------
 
 _HUMAN_MOUSE_ENABLED = os.environ.get("PAPRIKA_HUMAN_MOUSE", "1") != "0"
+_SHOW_CURSOR = os.environ.get("PAPRIKA_SHOW_CURSOR", "1") != "0"
 # Auto-play trigger: when on, the session asset-capture poller clicks
 # the page's play button (and each cross-origin OOPIF's) during the
 # first few polls so click-gated players begin fetching their real
@@ -811,16 +812,139 @@ def _ease_in_out(t: float) -> float:
     return 0.5 * (1 - math.cos(math.pi * t))
 
 
+# ---------------------------------------------------------------------------
+# Virtual cursor overlay (visible on noVNC)
+#
+# CDP Input.dispatchMouseEvent injects events into Chrome's input pipeline
+# but does NOT move the OS-level cursor — so noVNC viewers see nothing.
+# We fix this by injecting a small DOM element (a red dot with a tail
+# trail) into the page and moving it along the Bézier path via
+# Runtime.evaluate. A click ripple animation plays on mousePressed.
+#
+# Disable with PAPRIKA_SHOW_CURSOR=0 (the CDP events still fire, just
+# without the visual overlay).
+# ---------------------------------------------------------------------------
+
+_CURSOR_INJECT_JS = r"""
+(function() {
+  if (document.getElementById('__paprika_cursor')) return;
+
+  var css = document.createElement('style');
+  css.textContent = `
+    #__paprika_cursor {
+      position: fixed; z-index: 2147483647; pointer-events: none;
+      width: 20px; height: 20px; margin-left: -10px; margin-top: -10px;
+      border-radius: 50%;
+      background: rgba(220, 50, 50, 0.7);
+      box-shadow: 0 0 6px 2px rgba(220, 50, 50, 0.4);
+      transition: left 0.01s linear, top 0.01s linear;
+      display: none;
+    }
+    #__paprika_cursor.visible { display: block; }
+    @keyframes __paprika_ripple {
+      0%   { transform: scale(1);   opacity: 0.7; }
+      100% { transform: scale(3.5); opacity: 0; }
+    }
+    .__paprika_click_ring {
+      position: fixed; z-index: 2147483646; pointer-events: none;
+      width: 20px; height: 20px; margin-left: -10px; margin-top: -10px;
+      border-radius: 50%;
+      border: 2px solid rgba(220, 50, 50, 0.8);
+      animation: __paprika_ripple 0.5s ease-out forwards;
+    }
+  `;
+  document.head.appendChild(css);
+
+  var dot = document.createElement('div');
+  dot.id = '__paprika_cursor';
+  document.body.appendChild(dot);
+})();
+"""
+
+_CURSOR_MOVE_JS = r"""
+(function(x, y) {
+  var c = document.getElementById('__paprika_cursor');
+  if (!c) return;
+  c.classList.add('visible');
+  c.style.left = x + 'px';
+  c.style.top  = y + 'px';
+})(%d, %d);
+"""
+
+_CURSOR_CLICK_JS = r"""
+(function(x, y) {
+  var ring = document.createElement('div');
+  ring.className = '__paprika_click_ring';
+  ring.style.left = x + 'px';
+  ring.style.top  = y + 'px';
+  document.body.appendChild(ring);
+  setTimeout(function() { ring.remove(); }, 600);
+})(%d, %d);
+"""
+
+_CURSOR_HIDE_JS = r"""
+(function() {
+  var c = document.getElementById('__paprika_cursor');
+  if (c) c.classList.remove('visible');
+})();
+"""
+
+# Track which tabs already have the cursor injected.
+_cursor_injected: set[str] = set()
+
+
+async def _ensure_cursor(tab) -> None:
+    """Inject the virtual cursor overlay if not already present."""
+    if not _SHOW_CURSOR:
+        return
+    tab_id = str(id(tab))
+    if tab_id in _cursor_injected:
+        return
+    try:
+        await tab.send(cdp.runtime.evaluate(expression=_CURSOR_INJECT_JS))
+        _cursor_injected.add(tab_id)
+    except Exception:
+        pass  # page not ready / navigating — skip silently
+
+
+async def _move_cursor(tab, x: int, y: int) -> None:
+    """Move the virtual cursor dot to (x, y)."""
+    if not _SHOW_CURSOR:
+        return
+    try:
+        await tab.send(cdp.runtime.evaluate(
+            expression=_CURSOR_MOVE_JS % (x, y),
+        ))
+    except Exception:
+        pass
+
+
+async def _flash_click(tab, x: int, y: int) -> None:
+    """Show a ripple animation at (x, y) on click."""
+    if not _SHOW_CURSOR:
+        return
+    try:
+        await tab.send(cdp.runtime.evaluate(
+            expression=_CURSOR_CLICK_JS % (x, y),
+        ))
+    except Exception:
+        pass
+
+
 async def _human_move_to(tab, x: int, y: int) -> None:
     """Trace a human-like Bézier path from the last known position to (x, y).
 
-    Each waypoint fires a CDP ``Input.dispatchMouseEvent("mouseMoved")``.
+    Each waypoint fires a CDP ``Input.dispatchMouseEvent("mouseMoved")``
+    and updates the virtual cursor overlay (visible on noVNC).
     The total travel time is ``_MOUSE_DURATION_MS`` with the inter-step
     delay spread across the waypoints (typically 6-10 ms each for 30 steps).
     """
     tab_id = str(id(tab))
     start = _last_mouse.get(tab_id, (x // 2, y + 80))  # default: below-centre
     _last_mouse[tab_id] = (x, y)
+
+    # Ensure the virtual cursor element exists in the DOM.
+    await _ensure_cursor(tab)
 
     none_enum = _mouse_button("none")
     points = _bezier_curve(start, (x, y), _MOUSE_STEPS)
@@ -835,6 +959,8 @@ async def _human_move_to(tab, x: int, y: int) -> None:
                 button=none_enum,
             )
         )
+        # Update the visual cursor position (non-blocking best-effort).
+        await _move_cursor(tab, px, py)
         if delay > 0:
             await asyncio.sleep(delay)
 
@@ -892,6 +1018,8 @@ async def click_at(
                     button=none_enum,
                 )
             )
+        # Show click ripple on the virtual cursor overlay.
+        await _flash_click(tab, x, y)
         await tab.send(
             cdp.input_.dispatch_mouse_event(
                 type_="mousePressed",
