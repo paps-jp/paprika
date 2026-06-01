@@ -289,8 +289,20 @@ def seed_default_pricing(registry: "EngineRegistry") -> int:
     Called once at hub startup so a fresh deploy gets sensible defaults
     without operator UI clicking."""
     n = 0
+    # JsonRecordRegistry exposes list_all(); old call site used .all()
+    # which does not exist, silently swallowed by the broad except below
+    # — that's why the first deploy stayed at ¥0/¥0 across all engines.
     try:
-        for rec in registry.all():
+        records = registry.list_all()
+    except Exception as e:
+        import logging as _log_mod
+        _log_mod.getLogger(__name__).warning(
+            "seed_default_pricing: list_all() crashed: %s: %s",
+            type(e).__name__, e,
+        )
+        return 0
+    for rec in records:
+        try:
             if rec.cost_input_per_1m_jpy or rec.cost_output_per_1m_jpy:
                 continue  # operator already priced this
             hit = default_pricing_for(rec.slug, rec.model)
@@ -301,9 +313,12 @@ def seed_default_pricing(registry: "EngineRegistry") -> int:
             rec.cost_output_per_1m_jpy = out_jpy
             registry._write(rec)  # bypass upsert (no slug normalisation needed)
             n += 1
-    except Exception:
-        # Best-effort: pricing seed must not crash hub startup.
-        pass
+        except Exception as e:
+            import logging as _log_mod
+            _log_mod.getLogger(__name__).warning(
+                "seed_default_pricing: %s failed: %s: %s",
+                rec.slug if rec else "?", type(e).__name__, e,
+            )
     return n
 
 
