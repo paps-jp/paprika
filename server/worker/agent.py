@@ -3075,7 +3075,7 @@ class WorkerAgent:
                 except Exception:
                     pass
 
-            maybe_download_video_session, drain_video_session = _make_video_downloader(
+            _raw_downloader, drain_video_session = _make_video_downloader(
                 assets_dir=state.assets_dir,
                 min_asset_size=int(
                     os.environ.get("MIN_ASSET_SIZE_BYTES", "0") or 0
@@ -3096,6 +3096,26 @@ class WorkerAgent:
                 ),
                 user_agent=_session_ua,
             )
+            # Asset URL blacklist wrapper (V): the passive on_stream_detected
+            # callback inside install_session_asset_capture skips blocked
+            # URLs at the capture layer, but explicit SDK calls
+            # (page.download_video(url=...)) reach the closure directly --
+            # filter here too so the same deny list governs both paths.
+            _video_bl = tuple(
+                s.lower() for s in (getattr(msg, "asset_url_blacklist", []) or ()) if s
+            )
+
+            def maybe_download_video_session(url, referer=""):
+                if _video_bl and url:
+                    u = url.lower()
+                    for pat in _video_bl:
+                        if pat in u:
+                            _logger.info(
+                                f"[session {sid}] yt-dlp BLOCK (blacklist={pat!r}) {url[:120]}"
+                            )
+                            return None
+                return _raw_downloader(url, referer)
+
             state.video_downloader = maybe_download_video_session
             state.video_drainer = drain_video_session
 
@@ -3132,6 +3152,11 @@ class WorkerAgent:
                 # passive listener drops anything below the
                 # threshold without writing or uploading it.
                 min_asset_size_bytes=getattr(msg, "min_asset_size_bytes", 0) or 0,
+                # Asset URL blacklist (V): operator-managed substring
+                # deny list pulled from Settings. The same list is also
+                # checked in maybe_download_video_session below so
+                # blocked URLs don't trigger yt-dlp.
+                url_blacklist=tuple(getattr(msg, "asset_url_blacklist", []) or ()),
                 # Feed the session's network_log list so the Live
                 # panel "Network" tab can display all observed media
                 # traffic and let the operator cherry-pick assets.
@@ -4961,6 +4986,8 @@ class WorkerAgent:
                     on_browser_closing=closing_cb,
                     on_after_navigate=_recipe_cb if _picked_recipe else None,
                     network_log=fetch_network_log,
+                    # V: operator-managed URL deny list from Settings.
+                    asset_url_blacklist=list(getattr(assign, "asset_url_blacklist", []) or []),
                 )
                 # Detach big-video downloads from the lane. When the
                 # operator asked for video AND this isn't a keep_session
@@ -5173,6 +5200,7 @@ class WorkerAgent:
         on_browser_closing=None,
         on_after_navigate=None,
         network_log: list | None = None,
+        asset_url_blacklist: list[str] | None = None,
     ) -> FetchOptions:
         # Server-side normalization (Swagger 'string' guard etc)
         def _norm(v):
@@ -5239,6 +5267,10 @@ class WorkerAgent:
             on_after_navigate=on_after_navigate,
             # Hub-managed min-size filter (Settings → "Asset capture").
             min_asset_size_bytes=int(getattr(opts, "min_asset_size_bytes", 0) or 0),
+            # Asset URL blacklist (V). Caller passes the list it pulled
+            # from HubAssignJob; applied at fetcher's on_response so
+            # blocked URLs never reach disk or yt-dlp.
+            asset_url_blacklist=list(asset_url_blacklist or []),
             network_log=network_log,
         )
 

@@ -64,6 +64,10 @@ const I18N_RESOURCES = {
     "jobs.cleanup":      "古いジョブを削除…",
     "jobs.deleteall":    "すべて削除",
     "jobs.cols":         "列",
+    "jobs.tab.all":      "全部",
+    "jobs.tab.success":  "成功",
+    "jobs.tab.error":    "エラー",
+    "jobs.tab.running":  "実行中",
     "jobs.th.id":        "ID",
     "jobs.th.mode":      "モード",
     "jobs.th.status":    "ステータス",
@@ -459,6 +463,10 @@ const I18N_RESOURCES = {
     "jobs.cleanup":      "cleanup old…",
     "jobs.deleteall":    "delete all",
     "jobs.cols":         "columns",
+    "jobs.tab.all":      "all",
+    "jobs.tab.success":  "success",
+    "jobs.tab.error":    "errors",
+    "jobs.tab.running":  "running",
     "jobs.th.id":        "id",
     "jobs.th.mode":      "mode",
     "jobs.th.status":    "status",
@@ -1538,7 +1546,30 @@ async function refresh() {
     // jobs table -- skip rebuild while a row's actions menu is open,
     // otherwise the 2-second refresh would tear it down underneath the
     // user. Counts in the tab header still tick.
-    const sorted = [...jobList].sort((a,b) => (b.created_at || '').localeCompare(a.created_at || ''));
+    const sortedAll = [...jobList].sort((a,b) => (b.created_at || '').localeCompare(a.created_at || ''));
+    // W: status filter tabs. Counts always reflect the unfiltered list
+    // so the operator can see at a glance how many errors exist even
+    // while looking at a different tab.
+    const _cntAll = sortedAll.length;
+    let _cntSuccess = 0, _cntError = 0, _cntRunning = 0;
+    for (const _j of sortedAll) {
+      const _st = _j.status;
+      if (_st === 'completed') _cntSuccess++;
+      else if (_st === 'failed') _cntError++;
+      else if (_st === 'running' || _st === 'queued') _cntRunning++;
+    }
+    const _setCnt = (id, n) => { const el = document.getElementById(id); if (el) el.textContent = n; };
+    _setCnt('jobsCntAll',     _cntAll);
+    _setCnt('jobsCntSuccess', _cntSuccess);
+    _setCnt('jobsCntError',   _cntError);
+    _setCnt('jobsCntRunning', _cntRunning);
+    // Apply the current filter to derive the rendered list.
+    const _filter = _jobsStatusFilter || 'all';
+    let sorted;
+    if (_filter === 'completed') sorted = sortedAll.filter(j => j.status === 'completed');
+    else if (_filter === 'failed') sorted = sortedAll.filter(j => j.status === 'failed');
+    else if (_filter === 'running') sorted = sortedAll.filter(j => j.status === 'running' || j.status === 'queued');
+    else sorted = sortedAll;
     const jtbody = document.querySelector('#jobsTable tbody');
     const menuOpen = !!document.querySelector('#jobsTable .menu.open');
     // Pager state: page index + page size persist across refresh()
@@ -1659,6 +1690,16 @@ async function refresh() {
 // refresh -- without that, every tick would reset to page 0 and
 // scrolling-to-page-3 would be impossible.
 let _jobsPage = 0;
+// W: status filter for the Recent Jobs table. One of:
+//   'all' | 'completed' | 'failed' | 'running'
+// Persisted across page reloads so a debugging operator who switched
+// to "エラー" doesn't lose their context on F5.
+const JOBS_STATUS_FILTER_KEY = 'paprika.jobs.statusFilter';
+let _jobsStatusFilter = 'all';
+try {
+  const _v = localStorage.getItem(JOBS_STATUS_FILTER_KEY);
+  if (_v && ['all','completed','failed','running'].includes(_v)) _jobsStatusFilter = _v;
+} catch (_) {}
 const JOBS_PAGE_SIZE_KEY = 'paprika.jobs.pageSize';
 const JOBS_PAGE_SIZE_OPTIONS = [10, 20, 50, 100, 200];
 
@@ -2836,6 +2877,37 @@ document.getElementById('bulkDelete').addEventListener('click', bulkDelete);
 document.getElementById('bulkCleanup').addEventListener('click', bulkCleanup);
 document.getElementById('openSessionBtn').addEventListener('click', openSessionInteractive);
 document.getElementById('closeAllSessions').addEventListener('click', closeAllSessions);
+
+// W: Recent jobs status filter tabs. Click handler delegates by
+// data-jobs-status attribute, persists the choice in localStorage,
+// updates the .active class for visual feedback, and triggers a
+// refresh() so the table re-renders with the new filter immediately.
+document.querySelectorAll('#jobsStatusTabs [data-jobs-status]').forEach(btn => {
+  btn.addEventListener('click', () => {
+    const val = btn.dataset.jobsStatus || 'all';
+    _jobsStatusFilter = val;
+    try { localStorage.setItem(JOBS_STATUS_FILTER_KEY, val); } catch (_) {}
+    // Reset to page 1 so the operator sees results from the top.
+    _jobsPage = 0;
+    // Visual: toggle .active across siblings.
+    document.querySelectorAll('#jobsStatusTabs [data-jobs-status]').forEach(b => {
+      const sel = b.dataset.jobsStatus === val;
+      b.classList.toggle('active', sel);
+      b.setAttribute('aria-selected', sel ? 'true' : 'false');
+    });
+    // Trigger immediate re-render via the next refresh tick. refresh()
+    // is the routine that rebuilds the table; we don't have a
+    // standalone renderJobs() here, so just force a poll.
+    if (typeof refresh === 'function') refresh();
+  });
+});
+// Restore the persisted .active state on page load (after the tab
+// buttons exist in the DOM).
+document.querySelectorAll('#jobsStatusTabs [data-jobs-status]').forEach(b => {
+  const sel = b.dataset.jobsStatus === _jobsStatusFilter;
+  b.classList.toggle('active', sel);
+  b.setAttribute('aria-selected', sel ? 'true' : 'false');
+});
 
 // Default goal stuffed when LLM mode is picked with an empty Goal field.
 // Tuned for a multi-hour to single-day crawl (target 10,000 pages). The
@@ -10562,6 +10634,9 @@ async function loadSettingsPanel() {
       document.getElementById('setConventionAutoExtract').checked = !!hub.convention_auto_extract_enabled;
       document.getElementById('setSkillTopK').value               = hub.skill_retrieval_top_k ?? 3;
       document.getElementById('setMinAssetSize').value            = hub.min_asset_size_bytes ?? 0;
+      // V: URL blacklist textarea
+      const _blEl = document.getElementById('setAssetUrlBlacklist');
+      if (_blEl) _blEl.value = hub.asset_url_blacklist ?? '';
       // Fetch defaults
       document.getElementById('setFetchWait').value         = hub.fetch_wait_seconds       ?? 20;
       document.getElementById('setFetchSettle').value       = hub.fetch_settle_seconds     ?? 0;
@@ -10713,11 +10788,17 @@ async function saveSettingsAssetCapture() {
   if (errEl) errEl.textContent = '';
   const raw = parseHumanBytes(document.getElementById('setMinAssetSize').value);
   const v = (Number.isFinite(raw) && raw >= 0) ? raw : 0;
+  // V: URL blacklist (newline-separated string, persisted as-is).
+  const blEl = document.getElementById('setAssetUrlBlacklist');
+  const blacklist = blEl ? (blEl.value || '').trim() : '';
   try {
     const r = await fetch(SETTINGS_URL, {
       method: 'PUT',
       headers: {'Content-Type': 'application/json'},
-      body: JSON.stringify({ min_asset_size_bytes: v }),
+      body: JSON.stringify({
+        min_asset_size_bytes: v,
+        asset_url_blacklist: blacklist,
+      }),
     });
     if (!r.ok) {
       const t = await r.text();

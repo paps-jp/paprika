@@ -867,6 +867,34 @@ asyncio.run(main())"
         <button id="bulkDelete" class="pill" style="--la-bg:#fee; --la-bd:#c88; --la-fg:#933;"><iconify-icon icon="lucide:trash-2"></iconify-icon> <span data-i18n="jobs.deleteall">delete all</span></button>
       </span>
     </h2>
+    <!-- W: Status filter tabs (全部 / 成功 / エラー / 実行中).
+         Designed to match the Submit form's ai-subtabs visual language.
+         Filter is client-side: refresh() always loads the full job list
+         (the API doesn't need a status query because the list is small
+         and operator wants instant tab switching). State persists across
+         refreshes via _jobsStatusFilter module var; reset = "all". -->
+    <div id="jobsStatusTabs" class="ai-subtabs" role="tablist" style="margin-bottom:10px;">
+      <button type="button" class="ai-subtab active" data-jobs-status="all" role="tab" aria-selected="true">
+        <iconify-icon icon="lucide:list"></iconify-icon>
+        <span data-i18n="jobs.tab.all">全部</span>
+        <span class="count" id="jobsCntAll">0</span>
+      </button>
+      <button type="button" class="ai-subtab" data-jobs-status="completed" role="tab" aria-selected="false">
+        <iconify-icon icon="lucide:check-circle-2" style="color:#196b2c;"></iconify-icon>
+        <span data-i18n="jobs.tab.success">成功</span>
+        <span class="count" id="jobsCntSuccess">0</span>
+      </button>
+      <button type="button" class="ai-subtab" data-jobs-status="failed" role="tab" aria-selected="false">
+        <iconify-icon icon="lucide:alert-circle" style="color:#c02020;"></iconify-icon>
+        <span data-i18n="jobs.tab.error">エラー</span>
+        <span class="count" id="jobsCntError">0</span>
+      </button>
+      <button type="button" class="ai-subtab" data-jobs-status="running" role="tab" aria-selected="false">
+        <iconify-icon icon="lucide:loader" style="color:#3a5ca8;"></iconify-icon>
+        <span data-i18n="jobs.tab.running">実行中</span>
+        <span class="count" id="jobsCntRunning">0</span>
+      </button>
+    </div>
     <table id="jobsTable"><thead>
       <tr><th data-col="id" data-i18n="jobs.th.id">id</th><th data-col="mode" data-i18n="jobs.th.mode">mode</th><th data-col="status" data-i18n="jobs.th.status">status</th><th data-col="url">URL</th><th data-col="worker" data-i18n="jobs.th.worker">worker/lane</th><th data-col="started" data-i18n="jobs.th.started">started</th><th data-col="ended" data-i18n="jobs.th.ended">ended</th><th data-col="duration" data-i18n="jobs.th.duration">duration</th><th data-col="actions" data-i18n="jobs.th.actions">actions</th></tr>
     </thead><tbody><tr><td colspan=9 class="empty" data-i18n="jobs.empty">no jobs yet</td></tr></tbody></table>
@@ -3419,6 +3447,20 @@ table.aitbl code { font-size:0.95em; }
           このサイズ未満の asset は保存しない。<strong>0</strong> = フィルタ無効。
           目安: <code>1024</code>=1KB / <code>4096</code>=4KB / <code>10240</code>=10KB
         </span>
+      </div>
+
+      <!-- V: Asset URL blacklist. 1 行 1 パターン (case-insensitive substring)。
+           マッチした URL は assets/ に保存されず、yt-dlp も発火しない。
+           広告 CDN や計測ピクセルなど不要なノイズを除外できる。 -->
+      <label for="setAssetUrlBlacklist" style="align-self:start; padding-top:6px;">URL ブラックリスト:</label>
+      <div>
+        <textarea id="setAssetUrlBlacklist" rows="4"
+          placeholder="1 行 1 パターン (case-insensitive 部分一致)。例:&#10;media-hls.saawsedge.com&#10;/tracker.gif&#10;.cloudfront.net/ads/&#10;# 行頭 # はコメント"
+          style="width:100%; max-width:560px; padding:5px 8px; font-family:monospace; font-size:12px;"></textarea>
+        <div style="color:#888; font-size:.85em; margin-top:4px;">
+          マッチした URL は <strong>asset 保存スキップ</strong> & <strong>yt-dlp も発火しない</strong>。
+          1 行 1 パターン (case-insensitive 部分一致)。<code>#</code> 行頭はコメント。
+        </div>
       </div>
 
       <div></div>

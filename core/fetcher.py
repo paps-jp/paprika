@@ -1355,6 +1355,11 @@ class FetchOptions:
     # right after the response body is fetched, so the bytes don't
     # land on disk and don't fire ``on_saved`` upload callbacks.
     min_asset_size_bytes: int = 0
+    # Asset URL blacklist (V): substring deny list. Any media response
+    # whose URL contains one of these is silently dropped (not saved,
+    # not yt-dlp'd). Match is case-insensitive substring. Same source
+    # as HubAssignJob.asset_url_blacklist on the worker session path.
+    asset_url_blacklist: list[str] = field(default_factory=list)
     # Async callback fired right before fetch returns, given the full
     # post-fetch cookie jar (CDP Cookie dicts). Used by the worker to
     # auto-upsert any cookies the page set during this fetch back into
@@ -1516,6 +1521,21 @@ async def fetch(opts: FetchOptions) -> FetchResult:
         _net_log: list = opts.network_log if opts.network_log is not None else []
         _net_logged_urls: set = set()
 
+        # URL blacklist (V): operator-managed substring deny list.
+        # Pre-lower for cheap per-response substring checks.
+        _fetch_bl_lower = tuple(
+            s.lower() for s in (opts.asset_url_blacklist or ()) if s
+        )
+
+        def _fetch_blacklisted(u: str) -> str | None:
+            if not _fetch_bl_lower:
+                return None
+            ul = (u or "").lower()
+            for pat in _fetch_bl_lower:
+                if pat in ul:
+                    return pat
+            return None
+
         async def on_response(event: cdp.network.ResponseReceived):
             nonlocal in_flight, last_activity
             server_mime = (event.response.mime_type or "").lower()
@@ -1525,6 +1545,13 @@ async def fetch(opts: FetchOptions) -> FetchResult:
             # too) but they can't be fetched separately and their base64
             # payloads would bloat _net_log and the metadata dict.
             if not evt_url.startswith(("http://", "https://")):
+                return
+            # Blacklist gate: drop matching URLs before any save/yt-dlp
+            # decision. Logged once via the network log entry below would
+            # leak the URL into operator view, so silent skip is correct.
+            _bl_pat = _fetch_blacklisted(evt_url)
+            if _bl_pat is not None:
+                log(f"  BLOCK (blacklist={_bl_pat!r}) {evt_url[:120]}")
                 return
             # _effective_mime falls back to URL extension when the
             # server returns no / generic Content-Type -- Cloudflare-

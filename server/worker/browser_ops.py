@@ -2584,6 +2584,7 @@ async def install_session_asset_capture(
     network_log: list | None = None,
     on_stream_detected=None,
     enable_iframe_deep_trace: bool = True,
+    url_blacklist: tuple = (),
 ) -> None:
     """Hook CDP network listeners so every image/video/audio response
     the browser loads while this tab is alive lands in ``assets_dir``.
@@ -2648,6 +2649,20 @@ async def install_session_asset_capture(
     assets_dir = Path(assets_dir)
     assets_dir.mkdir(parents=True, exist_ok=True)
     metadata: dict = {}
+    # URL blacklist (V): operator-managed substring deny list. Pre-process
+    # to lower-case so the per-response check is a cheap substring scan.
+    # Empty entries / # comments are filtered upstream by the hub.
+    _bl_lower = tuple(s.lower() for s in (url_blacklist or ()) if s)
+
+    def _is_blacklisted(url: str) -> str | None:
+        """Return the first matching pattern, or None when not blocked."""
+        if not _bl_lower:
+            return None
+        u = (url or "").lower()
+        for pat in _bl_lower:
+            if pat in u:
+                return pat
+        return None
     # request_id -> document_url snapshot at the time the request was
     # issued. Populated by on_request (RequestWillBeSent) and consumed
     # by on_response so we know which page initiated each asset request.
@@ -2686,6 +2701,16 @@ async def install_session_asset_capture(
         try:
             url = event.response.url or ""
             if url in seen_urls:
+                return
+            # Blacklist gate (V): drop matching URLs BEFORE mime/save
+            # decisions, log once, and short-circuit so yt-dlp doesn't
+            # fire either. Mark as seen so we don't re-log if the same
+            # URL re-appears across navigations.
+            _bl_pat = _is_blacklisted(url)
+            if _bl_pat is not None:
+                seen_urls.add(url)
+                if log:
+                    log(f"  [session-assets] BLOCK (blacklist={_bl_pat!r}) {url[:120]}")
                 return
             server_mime = (event.response.mime_type or "").lower()
             # _session_effective_mime falls back to URL extension when

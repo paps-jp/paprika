@@ -722,6 +722,18 @@ class HubAssignJob(BaseModel):
         "lookup key; matching cached extraction is reused, "
         "stale -> refetch.",
     )
+    asset_url_blacklist: list[str] = Field(
+        default_factory=list,
+        description="Operator-managed deny list of substring patterns. "
+        "Any asset URL containing one of these substrings is "
+        "NOT saved to assets/ and is NOT passed to yt-dlp "
+        "(even when an .m3u8/.mpd is observed). Pulled from "
+        "Settings.asset_url_blacklist at dispatch time and "
+        "stamped onto the job so a Settings edit mid-fleet "
+        "takes effect on the next job. Match is plain "
+        "case-insensitive substring (e.g. "
+        "'media-hls.saawsedge.com').",
+    )
 
 
 class HubCancelJob(BaseModel):
@@ -815,6 +827,14 @@ class HubSessionStart(BaseModel):
         "bytes. 0 = no filter. Filled in by the hub from "
         "Settings; the worker plumbs it into the session "
         "asset capture handler.",
+    )
+    asset_url_blacklist: list[str] = Field(
+        default_factory=list,
+        description="Substring deny list. Any asset URL containing one "
+        "of these is dropped at capture time and excluded "
+        "from yt-dlp triggers. Mirrors HubAssignJob field "
+        "of the same name; hub fills both from "
+        "Settings.asset_url_blacklist.",
     )
     popup_policy: str = Field(
         "kill",

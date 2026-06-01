@@ -3367,6 +3367,21 @@ async def create_job(req: JobRequest, request: Request) -> JobInfo:
             # initial sync broadcast).
             _profile_etag = state.profiles.etag(_profile_name)
 
+        # Asset URL blacklist (V): pull operator-managed list from Settings
+        # and stamp onto every assignment so an admin UI edit takes effect
+        # on the next dispatched job. Stored as newline-separated string;
+        # split + trim + drop blanks here so the worker just iterates.
+        _bl_raw = ""
+        if state.settings is not None:
+            try:
+                _bl_raw = (state.settings.get("asset_url_blacklist", "") or "").strip()
+            except Exception:
+                _bl_raw = ""
+        _asset_url_blacklist = [
+            line.strip()
+            for line in _bl_raw.splitlines()
+            if line.strip() and not line.strip().startswith("#")
+        ]
         assign = HubAssignJob(
             job_id=job_id,
             url=req.url,
@@ -3380,6 +3395,7 @@ async def create_job(req: JobRequest, request: Request) -> JobInfo:
             profile_url=_profile_url,
             profile_name=_profile_name,
             profile_etag=_profile_etag,
+            asset_url_blacklist=_asset_url_blacklist,
         )
         # Bump the registry's last_used_at so the Hosts tab reflects
         # that the cookies actually rode along on a real job.

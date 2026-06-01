@@ -302,6 +302,21 @@ async def create_session(body: dict) -> dict:
         except Exception:
             min_asset = 0
 
+    # URL blacklist (V): operator-managed substring deny list. Worker
+    # drops matching URLs at the asset capture layer AND skips yt-dlp
+    # for them. Same source as HubAssignJob.asset_url_blacklist.
+    asset_bl: list[str] = []
+    if state.settings is not None:
+        try:
+            _raw = (state.settings.get("asset_url_blacklist", "") or "").strip()
+            asset_bl = [
+                line.strip()
+                for line in _raw.splitlines()
+                if line.strip() and not line.strip().startswith("#")
+            ]
+        except Exception:
+            asset_bl = []
+
     # Optional operator Chrome profile -- same shape as
     # JobOptions.use_profile but exposed on /sessions directly so SDK
     # callers (cli.session(use_profile=...)) get the same plumbing.
@@ -342,6 +357,7 @@ async def create_session(body: dict) -> dict:
             asset_upload_base=session_upload_base,
             cookies=auto_cookies,
             min_asset_size_bytes=min_asset,
+            asset_url_blacklist=asset_bl,
             popup_policy=auto_popup_policy,
             profile_url=profile_url,
             profile_name=profile_name,

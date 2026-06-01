@@ -49,6 +49,19 @@ _SCHEMA: dict[str, tuple[Any, str]] = {
     # Applied by both core.fetcher (Fetch mode) and the worker session
     # asset capture (Code / LLM modes via paprika-runner sessions).
     "min_asset_size_bytes": (0, "int"),
+    # Asset URL blacklist (V). Newline-separated list of case-insensitive
+    # substrings; any matching URL is dropped at the capture layer and
+    # is also blocked from triggering yt-dlp (so HLS playlists served
+    # from these CDNs don't spawn downloads either). Use for:
+    #   - 広告 CDN (媒体無関係の素材)
+    #   - 計測ピクセル / トラッカー
+    #   - 動画プレーヤーの preview thumbnail などノイズアセット
+    # Pulled into HubAssignJob.asset_url_blacklist at dispatch so a
+    # Settings edit takes effect on the next job. Example values:
+    #   media-hls.saawsedge.com
+    #   /tracker.gif
+    #   .cloudfront.net/ads/
+    "asset_url_blacklist": ("", "str"),
     # ---- Fetch defaults --------------------------------------------------
     # Mirrors of FetchOptions / JobOptions knobs. The hub overlays these
     # onto JobOptions on dispatch for any field the client didn't set
