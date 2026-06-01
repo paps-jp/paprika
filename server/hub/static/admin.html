@@ -1361,6 +1361,19 @@ curl 'http://paprika.lan/extensions/ublock-lite/download' --output ublock-lite.t
           左のリストから 1 つ選ぶか、上部の add engine で新規追加してください。
         </div>
         <div id="enginesDetailForm" style="display:none;">
+          <!-- 14 日履歴グラフ (U): 一番目立つ位置に置いてコスト把握を最優先。
+               token 使用量 (棒) と ¥ コスト (線) を dual-axis で表示。
+               Chart.js は admin.html の <head> でグローバル読込済み。 -->
+          <div style="margin:0 0 14px; padding:10px 12px; background:#fafafb; border:1px solid #e0e0e8; border-radius:6px;">
+            <div style="display:flex; align-items:center; gap:8px; margin-bottom:6px; font-weight:600; color:#444;">
+              <iconify-icon icon="lucide:line-chart" style="vertical-align:middle;"></iconify-icon>
+              <span>14日履歴 — トークン / コスト</span>
+            </div>
+            <canvas id="engineCostChart" style="max-height:220px; width:100%;"></canvas>
+            <div id="engineCostChartEmpty" style="font-size:.85em; color:#888; padding:8px 0; display:none;">
+              履歴データなし (このエンジンはまだ利用されていません)。
+            </div>
+          </div>
           <div style="display:grid; grid-template-columns:max-content 1fr; gap:8px 10px; align-items:center;">
             <label for="engineSlug" style="font-weight:600;">Slug</label>
             <input type="text" id="engineSlug" placeholder="claude-sonnet-3.5 (lowercase, kebab-case)" style="padding:5px 8px;">
@@ -1461,16 +1474,6 @@ curl 'http://paprika.lan/extensions/ublock-lite/download' --output ublock-lite.t
               <div id="engineCostToday" style="font-size:.82em; color:#666;">本日のコスト: 読み込み中…</div>
               <div style="font-size:.75em; color:#888;">
                 参考レート (2026 年時点・¥150/USD 換算): DeepSeek-R1 ¥85/¥330、GPT-5 ¥375/¥1500、Claude Sonnet ¥450/¥2250、自前 GPU ¥0/¥0
-              </div>
-            </div>
-
-            <!-- 14 日履歴グラフ: token 使用量 (棒) と ¥ コスト (線) を
-                 dual-axis で表示。Chart.js は loadEngines 後に lazy-load。 -->
-            <label style="font-weight:600; align-self:start; padding-top:5px;">14日履歴</label>
-            <div style="display:flex; flex-direction:column; gap:6px;">
-              <canvas id="engineCostChart" style="max-height:200px; width:100%;"></canvas>
-              <div id="engineCostChartEmpty" style="font-size:.85em; color:#888; padding:8px 0; display:none;">
-                履歴データなし (このエンジンはまだ利用されていません)。
               </div>
             </div>
 
