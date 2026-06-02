@@ -517,7 +517,9 @@ from server.hub._state import config, get_storage_dir
 from server.hub.routes.profiles import _sync_all_profiles_to_worker
 from server.hub.sessions import SessionInfo
 from server.protocol import (
+    ASSET_CAPTURE_MARKER,
     JOB_PROGRESS_MARKER,
+    LINKS_CAPTURE_MARKER,
     NET_CAPTURE_MARKER,
     HubRegistered,
     JobResult,
@@ -1081,8 +1083,15 @@ async def _handle_worker_message(worker, msg) -> None:
         # stored log.
         #   * JOB_PROGRESS_MARKER -> per-download progress bars
         #   * NET_CAPTURE_MARKER  -> live Network tab (captured URLs)
-        if msg.line.startswith(JOB_PROGRESS_MARKER) or msg.line.startswith(
-            NET_CAPTURE_MARKER
+        #   * ASSET_CAPTURE_MARKER -> gallery refresh signal
+        #   * LINKS_CAPTURE_MARKER -> links tab refresh signal
+        if msg.line.startswith(
+            (
+                JOB_PROGRESS_MARKER,
+                NET_CAPTURE_MARKER,
+                ASSET_CAPTURE_MARKER,
+                LINKS_CAPTURE_MARKER,
+            )
         ):
             try:
                 await state.store.publish_log(msg.job_id, msg.line)

@@ -4696,6 +4696,11 @@ const LJP_PROGRESS_MARKER = '[[paprika:progress]] ';
 // ephemeral network-capture deltas that ride the log channel and feed the
 // Network tab in real time -- replaces the page.network() pull that 504s.
 const LJP_NETCAP_MARKER = '[[paprika:netcap]] ';
+// Ephemeral "a thing landed, refresh it" signals (must match
+// server.protocol). Event-driven refresh replaces the periodic gallery /
+// links polling.
+const LJP_ASSET_MARKER = '[[paprika:asset]] ';
+const LJP_LINKS_MARKER = '[[paprika:links]] ';
 const LJP = {
   jobId: null,
   ws: null,
@@ -4774,6 +4779,18 @@ function ljpAppendLine(text, cls) {
   if (typeof text === 'string' && text.startsWith(LJP_NETCAP_MARKER)) {
     try { ljpNetIngest(JSON.parse(text.slice(LJP_NETCAP_MARKER.length))); }
     catch (_) { /* malformed marker -- ignore */ }
+    return;
+  }
+  // Asset uploaded -> mark the gallery dirty; ljpRefreshStatus refreshes it
+  // on the next tick (coalesces a burst of uploads into one fetch).
+  if (typeof text === 'string' && text.startsWith(LJP_ASSET_MARKER)) {
+    LJP._galleryDirty = true;
+    return;
+  }
+  // Page links captured -> refresh the Links tab once (links are a final
+  // snapshot, so no periodic polling needed).
+  if (typeof text === 'string' && text.startsWith(LJP_LINKS_MARKER)) {
+    try { ljpLinksRefresh(); } catch (_) {}
     return;
   }
 
@@ -5220,14 +5237,20 @@ async function ljpRefreshStatus() {
     } else if (_statusTerminal && LJP.vncIframes.has('__job__')) {
       ljpRemoveVncFrame('__job__', 'セッションは終了しました（noVNC は利用できません）');
     }
-    // Refresh the thumbnail strip once the job is past the queued
-    // phase. Cheap fetch -- only the gallery HTML -- but rate-limit it
-    // by terminal-status so we don't hammer the disk forever.
+    // Refresh the thumbnail strip past the queued phase -- but event-driven
+    // now: only re-fetch when an asset actually landed (LJP._galleryDirty,
+    // set by the [[paprika:asset]] marker) OR on the terminal final pass.
+    // This replaces the every-tick /assets.json poll. _galleryDirty is set
+    // true on attach for the initial load.
     if (info.status && info.status !== 'queued') {
       if (!LJP.galleryStopped) {
-        await ljpRefreshGallery();
-        if (info.status === 'completed' || info.status === 'succeeded' || info.status === 'failed') {
-          LJP.galleryStopped = true; // one more pass after terminal status, then stop polling it
+        const _galTerm = info.status === 'completed' || info.status === 'succeeded' || info.status === 'failed';
+        if (LJP._galleryDirty || _galTerm) {
+          LJP._galleryDirty = false;
+          await ljpRefreshGallery();
+        }
+        if (_galTerm) {
+          LJP.galleryStopped = true; // one more pass after terminal status, then stop
         }
       }
     }
@@ -6721,7 +6744,8 @@ function ljpLinksOnTabChange(activeTab) {
     return;
   }
   ljpLinksRefresh();
-  ljpLinksResetTimer();
+  // No periodic poll -- links are a final snapshot, refreshed on the
+  // [[paprika:links]] marker (was ljpLinksResetTimer()).
 }
 
 function ljpLinksStopTimer() {
@@ -7278,6 +7302,7 @@ function ljpReset() {
   LJP.galleryLastCount = -1;
   LJP.gallerySignature = "";
   LJP.galleryStopped = false;
+  LJP._galleryDirty = true;   // initial gallery load; then driven by [[paprika:asset]]
   LJP._terminalStopped = false;
   // Reset the saved-screenshots viewer so a fresh attach starts at
   // index 0 (no shots) and follow-latest defaults back to true.

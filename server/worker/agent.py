@@ -52,7 +52,9 @@ from server.protocol import (
     WorkerJobAccepted,
     WorkerJobComplete,
     WorkerJobFailed,
+    ASSET_CAPTURE_MARKER,
     JOB_PROGRESS_MARKER,
+    LINKS_CAPTURE_MARKER,
     NET_CAPTURE_MARKER,
     WorkerJobLog,
     WorkerJobProgress,
@@ -3745,6 +3747,16 @@ class WorkerAgent:
                 },
                 timeout=10.0,
             )
+            # Signal the Live panel to refresh its Links tab (ephemeral
+            # marker over /events; replaces the periodic /links poll).
+            _pjid = getattr(state, "job_id", None)
+            if _pjid:
+                try:
+                    await self._send(
+                        WorkerJobLog(job_id=_pjid, line=LINKS_CAPTURE_MARKER)
+                    )
+                except Exception:
+                    pass
         except Exception as e:
             _logger.info(
                 f"[session {sid}] links snapshot POST failed: {type(e).__name__}: {e}",
@@ -6028,6 +6040,17 @@ class WorkerAgent:
                 )
                 r.raise_for_status()
             state.uploaded_assets.add(name)
+            # Signal the parent job's Live panel to refresh its gallery
+            # (ephemeral marker over /events; replaces the periodic
+            # /assets.json poll). No-op when there's no parent job.
+            _pjid = getattr(state, "job_id", None)
+            if _pjid:
+                try:
+                    await self._send(
+                        WorkerJobLog(job_id=_pjid, line=ASSET_CAPTURE_MARKER)
+                    )
+                except Exception:
+                    pass
             return True
         except Exception as e:
             _logger.info(
@@ -6075,6 +6098,14 @@ class WorkerAgent:
                     post_kwargs["timeout"] = float(timeout)
                 r = await self._http.post(url, **post_kwargs)
                 r.raise_for_status()
+            # Signal the Live panel gallery to refresh (event-driven;
+            # replaces the periodic /assets.json poll).
+            try:
+                await self._send(
+                    WorkerJobLog(job_id=assign.job_id, line=ASSET_CAPTURE_MARKER)
+                )
+            except Exception:
+                pass
             return True
         except Exception as e:
             await self._send(

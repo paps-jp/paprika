@@ -479,6 +479,19 @@ JOB_PROGRESS_MARKER = "[[paprika:progress]] "
 #   * server/hub/static/admin.js  ljpAppendLine     (render)
 NET_CAPTURE_MARKER = "[[paprika:netcap]] "
 
+# Sentinel prefixes for EPHEMERAL "a thing landed, refresh it" signals that
+# ride the same WorkerJobLog channel. Like the markers above, the hub
+# broadcasts them to /events viewers WITHOUT persisting; the admin Live panel
+# treats them as event-driven refresh triggers (and drops the periodic poll
+# timers), so assets/links update on change instead of on a 2.5s clock.
+#   * ASSET_CAPTURE_MARKER -> a new asset was uploaded -> refresh the gallery
+#   * LINKS_CAPTURE_MARKER -> page links were captured  -> refresh the links tab
+# Emitted by server/worker/agent.py (_upload_asset / _upload_one_session_asset
+# / the links_snapshot POST); handled in server/hub/routes/workers.py
+# (ephemeral branch) + server/hub/static/admin.js (ljpAppendLine).
+ASSET_CAPTURE_MARKER = "[[paprika:asset]] "
+LINKS_CAPTURE_MARKER = "[[paprika:links]] "
+
 
 class WorkerJobProgress(BaseModel):
     type: Literal["progress"] = "progress"
