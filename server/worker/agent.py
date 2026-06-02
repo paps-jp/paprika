@@ -53,6 +53,7 @@ from server.protocol import (
     WorkerJobComplete,
     WorkerJobFailed,
     JOB_PROGRESS_MARKER,
+    NET_CAPTURE_MARKER,
     WorkerJobLog,
     WorkerJobProgress,
     WorkerRegister,
@@ -3192,6 +3193,54 @@ class WorkerAgent:
                 except Exception:
                     pass
 
+            # Stream captured-network deltas to the parent job's Live panel
+            # Network tab (ephemeral netcap markers over the one /events
+            # pipe), mirroring the fetch-mode url-capture poller. Sessions
+            # don't run fetch()'s poller, so without this codegen-loop /
+            # manual sessions never populate the Network tab live. Emits
+            # only the delta since the last cycle (client dedups by URL);
+            # _maybe_send_job_log no-ops when there's no parent job.
+            # Cancelled in _teardown_session_state; the iteration cap is a
+            # backstop against a leaked task if teardown is ever skipped.
+            async def _netcap_streamer():
+                _idx = 0
+                for _ in range(2600):  # ~3900s >= session absolute_ttl
+                    try:
+                        await asyncio.sleep(1.5)
+                    except asyncio.CancelledError:
+                        return
+                    try:
+                        _nl = getattr(state, "network_log", None) or []
+                        if len(_nl) > _idx:
+                            _delta = _nl[_idx:]
+                            _idx = len(_nl)
+                            _net = [
+                                {
+                                    "url": _e.get("url", ""),
+                                    "mime": _e.get("mime", ""),
+                                    "size": _e.get("size"),
+                                    "saved": bool(_e.get("saved")),
+                                    "source": _e.get("source", ""),
+                                }
+                                for _e in _delta
+                                if isinstance(_e, dict) and _e.get("url")
+                            ]
+                            if _net:
+                                _maybe_send_job_log(
+                                    NET_CAPTURE_MARKER
+                                    + json.dumps({"net": _net}, ensure_ascii=False)
+                                )
+                    except Exception:
+                        pass
+
+            try:
+                _old_nct = getattr(state, "netcap_task", None)
+                if _old_nct is not None and not _old_nct.done():
+                    _old_nct.cancel()
+            except Exception:
+                pass
+            state.netcap_task = asyncio.ensure_future(_netcap_streamer())
+
             _raw_downloader, drain_video_session = _make_video_downloader(
                 assets_dir=state.assets_dir,
                 min_asset_size=int(
@@ -3721,6 +3770,15 @@ class WorkerAgent:
                     if not t.done():
                         t.cancel()
                 tasks.clear()
+        except Exception:
+            pass
+
+        # Cancel the per-session netcap streamer (Live-panel Network feed).
+        try:
+            _nct = getattr(state, "netcap_task", None)
+            if _nct is not None and not _nct.done():
+                _nct.cancel()
+            state.netcap_task = None
         except Exception:
             pass
 
