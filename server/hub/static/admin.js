@@ -1366,10 +1366,18 @@ async function _refreshJson(url, fallback) {
 
 async function refresh() {
   try {
+    // Only the Jobs tab needs the full job list (status-count chips +
+    // paginated table). Everywhere else (Live panel, Workers, etc.) the
+    // header just needs the total count, so fetch ?limit=1 instead of
+    // hydrating all ~3000 jobs every ~2s -- that was a ~17MB response +
+    // one get_job_info DB query PER job, per poll. The {total} in the
+    // envelope still gives the header count cheaply.
+    const _tab = (location.hash || '').replace(/^#/, '').split('/')[0];
+    const jobsTabActive = (_tab === '' || _tab === 'jobs');
     const [h, workers, jobs, sessions] = await Promise.all([
       _refreshJson('/health', { store: '?', workers: '?' }),
       _refreshJson('/workers', { count: 0, workers: [] }),
-      _refreshJson('/jobs', { total: 0, jobs: [] }),
+      _refreshJson(jobsTabActive ? '/jobs' : '/jobs?limit=1', { total: 0, jobs: [] }),
       _refreshJson('/sessions', { count: 0, sessions: [] }),
     ]);
     const wcount = workers.count || 0;
@@ -1541,7 +1549,12 @@ async function refresh() {
     // SessionInfo records which (worker, lane) is in use.
     // Normalise jobs response: API now returns {jobs:[...], total, ...}
     // but keep compat with the legacy bare-array response.
-    const jobList = Array.isArray(jobs) ? jobs : (jobs.jobs || []);
+    // When not on the Jobs tab we only fetched ?limit=1 (header count),
+    // so skip the table/chip work entirely -- the panel is hidden anyway
+    // and the next refresh after switching to #jobs repopulates it.
+    const jobList = jobsTabActive
+      ? (Array.isArray(jobs) ? jobs : (jobs.jobs || []))
+      : [];
     syncScreenshotBusyState(jobList, sessions.sessions || []);
     sortScreenshotGrid();
 
