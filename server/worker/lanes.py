@@ -463,12 +463,19 @@ class Lane:
             while not self._stopping:
                 await asyncio.sleep(2.0)
                 proc = self._chrome_proc
-                if proc is None or proc.poll() is None:
-                    continue  # still alive
-                code = proc.returncode
+                if proc is not None and proc.poll() is None:
+                    continue  # alive
+                # proc is None means the lane was left with NO Chrome at
+                # all -- e.g. a profile-swap restore that got cancelled
+                # after killing Chrome but before respawning. The old
+                # check treated that as "nothing to watch" and skipped,
+                # stranding the lane (dead Chrome, no watchdog action)
+                # until some later job happened to trigger a swap. Treat
+                # it the same as an exited Chrome and respawn.
+                code = None if proc is None else proc.returncode
                 _log(
                     self.lane_idx,
-                    f"Chrome :{self.chrome_port} exited (code={code}); "
+                    f"Chrome :{self.chrome_port} down (code={code}); "
                     f"respawning in {backoff:.0f}s",
                 )
                 await asyncio.sleep(backoff)
@@ -575,8 +582,13 @@ class Lane:
             await self._spawn_chrome()
         except Exception as e:
             _log(self.lane_idx, f"profile swap spawn failed: {e!r}; watchdog will retry")
-        self._watchdog_task = asyncio.create_task(self._chrome_watchdog())
-        self._profile_swap_active = True
+        finally:
+            # See restore_default_profile: restart the watchdog even on
+            # spawn failure or cancellation so the lane can't be stranded
+            # with no Chrome and no watchdog.
+            if self._watchdog_task is None or self._watchdog_task.done():
+                self._watchdog_task = asyncio.create_task(self._chrome_watchdog())
+            self._profile_swap_active = True
         _log(self.lane_idx, "profile swap: Chrome up with operator profile")
 
     # ------ ambient (default) profile install ---------------------------
@@ -762,9 +774,56 @@ class Lane:
             await self._spawn_chrome()
         except Exception as e:
             _log(self.lane_idx, f"profile swap spawn failed: {e!r}; watchdog will retry")
-        self._watchdog_task = asyncio.create_task(self._chrome_watchdog())
-        self._profile_swap_active = False
+        finally:
+            # Restart the watchdog even if _spawn_chrome raised OR this
+            # coroutine is cancelled (job timeout / worker churn) between
+            # the Chrome-kill above and here. Without the finally, a
+            # cancel in that window leaves the lane with NO Chrome and NO
+            # watchdog; acquire() would still hand it to the next job
+            # ("Failed to connect to browser"). The watchdog's
+            # proc-is-None recovery then brings Chrome back.
+            if self._watchdog_task is None or self._watchdog_task.done():
+                self._watchdog_task = asyncio.create_task(self._chrome_watchdog())
+            self._profile_swap_active = False
         _log(self.lane_idx, "profile swap: lane default restored")
+
+    async def ensure_chrome_alive(self) -> None:
+        """Guarantee Chrome is up and answering on the debug port before a
+        job attaches to this lane. The pool calls this at acquire time.
+
+        Recovers a lane whose Chrome died without the watchdog catching it
+        yet: a crash mid-cycle, a profile-swap restore that was cancelled
+        before respawning, or a Chrome that is process-alive but whose
+        debug port never came up (zombie under heavy host load). Cheap on
+        the happy path -- a single local HTTP probe.
+        """
+        if self._stopping:
+            return
+        # The debug port answering is the only thing the attach actually
+        # needs, so probe it directly -- this covers both "no Chrome
+        # process" and "process alive but port dead".
+        if await _wait_http(
+            f"http://localhost:{self.chrome_port}/json/version",
+            timeout=3.0,
+        ):
+            return
+        # Unresponsive: kill any stale/zombie process, then respawn.
+        proc = self._chrome_proc
+        if proc is not None and proc.poll() is None:
+            try:
+                proc.kill()
+                proc.wait(timeout=5)
+            except Exception:
+                pass
+        self._chrome_proc = None
+        _log(
+            self.lane_idx,
+            f"acquire: Chrome :{self.chrome_port} not answering; "
+            f"respawning before handing lane to job",
+        )
+        await self._spawn_chrome()
+        if self._watchdog_task is None or self._watchdog_task.done():
+            self._watchdog_task = asyncio.create_task(self._chrome_watchdog())
 
     async def screenshot(
         self,
@@ -876,23 +935,51 @@ class LanePool:
         """If `lane_hint` is None: return any free lane (or None).
         If `lane_hint` is set: wait until THAT lane is free, then take it.
         Returns None for hint pointing outside range.
+
+        Before returning, the lane's Chrome liveness is verified (and
+        Chrome respawned if dead) so a job never attaches to a lane whose
+        Chrome died -- the cause of fleet-wide "Failed to connect to
+        browser" failures on lane 0, where per-job profile swaps churn
+        Chrome and a cancelled/slow restore could leave it down. The
+        liveness gate runs OUTSIDE the pool lock so a slow respawn on one
+        lane doesn't block acquires on the others.
         """
+        lane: Lane | None = None
         if lane_hint is not None:
             if not (0 <= lane_hint < len(self.lanes)):
                 return None
             target = self.lanes[lane_hint]
-            while True:
+            while lane is None:
                 async with self._lock:
                     if not target.busy:
                         target.busy = True
-                        return target
-                await asyncio.sleep(0.5)
-        async with self._lock:
-            for s in self.lanes:
-                if not s.busy:
-                    s.busy = True
-                    return s
-            return None
+                        lane = target
+                if lane is None:
+                    await asyncio.sleep(0.5)
+        else:
+            async with self._lock:
+                for s in self.lanes:
+                    if not s.busy:
+                        s.busy = True
+                        lane = s
+                        break
+            if lane is None:
+                return None
+        # Liveness gate (outside the lock). Best-effort: if Chrome can't
+        # be brought up at all (host wedged), still return the lane so the
+        # job surfaces a clear error rather than acquire hanging the
+        # queue -- but the common case (Chrome was simply dead) is now
+        # repaired before the job ever attaches.
+        try:
+            await lane.ensure_chrome_alive()
+        except Exception as e:
+            log.warning(
+                "[pool] lane %d Chrome respawn at acquire failed: %r; "
+                "handing lane over anyway",
+                lane.lane_idx,
+                e,
+            )
+        return lane
 
     def release(self, lane: Lane) -> None:
         lane.busy = False
