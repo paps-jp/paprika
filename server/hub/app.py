@@ -219,11 +219,15 @@ async def lifespan(app: FastAPI):
     )
     state._local_sem = asyncio.Semaphore(config.max_concurrent_jobs)
 
-    # WorkerJobLog batcher: when using Redis, buffer log lines and
-    # flush in pipeline batches (50 lines or 100ms). Cuts Redis ops
-    # from ~10 000/sec to ~200/sec at 200 workers. No-op for
-    # InMemoryJobStore (which is already zero-cost).
-    if state.store_kind == "redis":
+    # WorkerJobLog batcher: for persistent stores (Redis or MariaDB),
+    # buffer log lines and flush in batches (50 lines or 100ms) OFF the
+    # worker WS receive loop. Redis: pipelined RPUSH+PUBLISH (~10 000 ->
+    # ~200 ops/sec at 200 workers). MariaDB: one multi-row INSERT into
+    # job_logs per batch instead of a per-line SELECT+INSERT awaited
+    # inline in the WS loop (which otherwise stalls session-action
+    # forwarding -- e.g. page.network() -- under heavy log volume).
+    # No-op for InMemoryJobStore (already zero-cost).
+    if state.store_kind in ("redis", "mariadb"):
         from server.hub._log_batcher import LogBatcher
 
         state.log_batcher = LogBatcher(state.store)

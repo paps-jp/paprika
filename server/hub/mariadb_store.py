@@ -252,6 +252,29 @@ class MariaDBJobStore:
                     "INSERT INTO job_logs (job_id, line_num, line) "
                     "VALUES (%s, %s, %s)", (job_id, next_num, line))
 
+    async def append_log_lines(self, job_id: str, lines: list[str]) -> None:
+        """Batch-append log lines in a single multi-row INSERT.
+
+        Used by the LogBatcher so the worker WS receive loop is not blocked
+        on a per-line ``SELECT MAX + INSERT`` round-trip. ``line_num``
+        continues from the current MAX, computed once for the whole batch
+        (the batcher serialises flushes per job_id, so there is no
+        concurrent appender racing the same job's counter).
+        """
+        if not lines:
+            return
+        async with self._pool.acquire() as conn:
+            async with conn.cursor() as cur:
+                await cur.execute(
+                    "SELECT COALESCE(MAX(line_num), -1) + 1 "
+                    "FROM job_logs WHERE job_id=%s", (job_id,))
+                row = await cur.fetchone()
+                base = row[0] if row else 0
+                await cur.executemany(
+                    "INSERT INTO job_logs (job_id, line_num, line) "
+                    "VALUES (%s, %s, %s)",
+                    [(job_id, base + i, ln) for i, ln in enumerate(lines)])
+
     async def get_log_lines(self, job_id: str) -> list[str]:
         async with self._pool.acquire() as conn:
             async with conn.cursor() as cur:

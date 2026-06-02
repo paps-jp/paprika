@@ -89,7 +89,7 @@ class LogBatcher:
             # Flush any buffered lines first, then send the sentinel
             # as a standalone message so split() doesn't merge it.
             await self._flush(job_id)
-            await self._write_to_redis(job_id, [line])
+            await self._write(job_id, [line])
             return
 
         buf = self._buffers[job_id]
@@ -127,11 +127,50 @@ class LogBatcher:
         if not buf:
             return
 
-        await self._write_to_redis(job_id, buf)
+        await self._write(job_id, buf)
 
-    async def _write_to_redis(self, job_id: str, lines: list[str]) -> None:
-        """Single-pipeline RPUSH + PUBLISH."""
-        r = self._store._r
+    async def _write(self, job_id: str, lines: list[str]) -> None:
+        """Persist a batch of log lines + publish them live.
+
+        Dispatches on the store backend so the batcher works for any
+        persistent store, not just Redis:
+
+        * **MariaDB store** (exposes ``_pool``): one batched multi-row
+          INSERT into ``job_logs`` via ``append_log_lines`` -- so the
+          persisted-log read path (``get_log_lines`` / ``GET
+          /jobs/{id}/log.txt``) keeps working -- then a single
+          ``publish_log`` for the live stream.
+        * **Redis store** (exposes ``_r``): a single pipeline ``RPUSH`` +
+          ``PUBLISH`` (unchanged legacy path).
+
+        Either way the write happens OFF the worker WS receive loop, so a
+        slow or failing store can't stall WS message handling (incl.
+        session-action forwarding) for the whole fleet.
+        """
+        store = self._store
+
+        # MariaDB-backed store: batch INSERT into the job_logs table.
+        # (Checked first: the MariaDB store also holds a Redis client for
+        # pub/sub, so it would otherwise match the _r branch and write
+        # logs to a Redis list that get_log_lines never reads.)
+        if getattr(store, "_pool", None) is not None:
+            try:
+                await store.append_log_lines(job_id, lines)
+                # One PUBLISH carries the whole batch; the subscriber
+                # splits on "\n" to recover individual lines.
+                await store.publish_log(job_id, "\n".join(lines))
+            except Exception:
+                log.exception(
+                    "LogBatcher: failed to flush %d lines for job %s (mariadb)",
+                    len(lines),
+                    job_id[:8],
+                )
+            return
+
+        # Redis-backed store: single pipeline RPUSH + PUBLISH.
+        r = getattr(store, "_r", None)
+        if r is None:
+            return
         try:
             async with r.pipeline(transaction=False) as pipe:
                 pipe.rpush(f"paprika:job:{job_id}:log", *lines)
