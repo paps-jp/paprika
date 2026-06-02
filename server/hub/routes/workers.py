@@ -536,6 +536,13 @@ _PREVIEW_INFLIGHT = {}
 _PREVIEW_CACHE_TTL = 1.5        # secs a frame stays "live enough" to reuse
 _PREVIEW_MAX_CONCURRENCY = 8    # simultaneous screenshot RPCs across the fleet
 _PREVIEW_MAX_LANES = 96         # hard cap on lanes per batch (abuse guard)
+_PREVIEW_RPC_TIMEOUT = 4.0      # per-lane capture deadline. Kept below the
+                                # grid's poll interval so one slow/idle lane
+                                # can't hold the whole batch open (and delay
+                                # the next tick) -- the straggler's frame still
+                                # lands in the cache for the following round.
+                                # (The single-tile GET keeps the 8s default for
+                                # the focused Live-panel view.)
 _preview_sem = None             # lazily bound to the running loop
 
 
@@ -562,6 +569,7 @@ async def _do_capture_frame(key):
         try:
             reply = await worker.request_screenshot(
                 lane, max_width=width, quality=ffmpeg_q,
+                timeout=_PREVIEW_RPC_TIMEOUT,
             )
         except TimeoutError:
             return None, "timeout"
