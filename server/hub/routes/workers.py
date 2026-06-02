@@ -1074,13 +1074,28 @@ async def _handle_worker_message(worker, msg) -> None:
         # When the LogBatcher is active (Redis store), buffer the line
         # and let it flush in pipeline batches (50 lines or 100ms).
         # This cuts Redis ops from ~10 000/sec to ~200/sec at scale.
-        # For InMemoryJobStore the batcher is None; fall through to
-        # the direct (zero-cost) path.
-        if state.log_batcher is not None:
-            await state.log_batcher.add(msg.job_id, msg.line)
-        else:
-            await state.store.append_log_line(msg.job_id, msg.line)
-            await state.store.publish_log(msg.job_id, msg.line)
+        # For InMemoryJobStore the batcher is None and the direct path is
+        # zero-cost; for the MariaDB store the batcher is also None and the
+        # direct path runs a synchronous INSERT right here.
+        #
+        # Persisting a log line is best-effort telemetry and must NEVER
+        # tear down the worker control link. A store error -- e.g. a
+        # MariaDB FK violation when the parent job was deleted mid-stream
+        # (job_logs -> jobs is ON DELETE CASCADE), a deadlock, or a
+        # timeout -- would otherwise escape the WS receive loop and
+        # disconnect the worker, sending the whole fleet into a
+        # reconnect/restart storm.
+        try:
+            if state.log_batcher is not None:
+                await state.log_batcher.add(msg.job_id, msg.line)
+            else:
+                await state.store.append_log_line(msg.job_id, msg.line)
+                await state.store.publish_log(msg.job_id, msg.line)
+        except Exception:
+            log.debug(
+                "drop log line for job %s (store error)",
+                msg.job_id, exc_info=True,
+            )
         # Mirror onto the per-worker ring buffer so the operator can
         # browse "what has this worker been doing" without correlating
         # job ids by hand. Short job-id prefix keeps lines greppable.
