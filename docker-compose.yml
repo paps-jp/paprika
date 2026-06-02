@@ -109,6 +109,28 @@ services:
       #   0 = 無制限 (デフォルト)、3 = 3 ジョブまで。
       #   24 ライン環境で page.agent を含むジョブが暴れて GPU 独占するのを防ぐ。
       - PAPRIKA_CODEGEN_LOOP_CONCURRENCY=${PAPRIKA_CODEGEN_LOOP_CONCURRENCY:-3}
+      # ----- Object-store mirror (multi-hub foundation / phase 2) ---------
+      # DORMANT by default: with PAPRIKA_S3_ENABLED unset the hub writes
+      # assets only to the local /data/jobs volume, exactly as before.
+      # Set these (host env / .env) to mirror job assets to a shared
+      # S3/MinIO bucket so that, behind nginx, any hub can serve an asset
+      # another hub produced (write-through + local-first read-fallback).
+      # Keep the access/secret keys OUT of the repo — supply via env only.
+      # See server/hub/objstore.py + deploy/scale/README.md.
+      - PAPRIKA_S3_ENABLED=${PAPRIKA_S3_ENABLED:-}
+      - PAPRIKA_S3_ENDPOINT=${PAPRIKA_S3_ENDPOINT:-}
+      - PAPRIKA_S3_BUCKET=${PAPRIKA_S3_BUCKET:-paprika}
+      - PAPRIKA_S3_PREFIX=${PAPRIKA_S3_PREFIX:-jobs}
+      - PAPRIKA_S3_ACCESS_KEY=${PAPRIKA_S3_ACCESS_KEY:-}
+      - PAPRIKA_S3_SECRET_KEY=${PAPRIKA_S3_SECRET_KEY:-}
+      - PAPRIKA_S3_REGION=${PAPRIKA_S3_REGION:-us-east-1}
+      # ----- Job leases (multi-hub foundation / phase 4) ------------------
+      # DORMANT by default: with PAPRIKA_JOB_LEASE_ENABLED unset the lease
+      # loop never runs — single-hub behaviour is unchanged. Turn it ON
+      # (set it on EVERY hub) only in the multi-hub scale-out so a surviving
+      # hub can re-dispatch codegen-loop/rerun jobs that a crashed hub was
+      # running. See server/hub/_leases.py + deploy/scale/README.md.
+      - PAPRIKA_JOB_LEASE_ENABLED=${PAPRIKA_JOB_LEASE_ENABLED:-}
     # Docker socket: the hub spawns ephemeral runner containers per
     # codegen attempt. LAN-trusted deployment; the hub already executes
     # arbitrary CDP commands and writes to disk, so a privileged

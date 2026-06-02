@@ -19,25 +19,107 @@ make it *correct* have not.
   heartbeat, compare-and-deleted on disconnect).
 - **Session Map in Redis** — `SessionRegistry` mirrors
   `paprika:session:{sid} = {worker_id, hub}` (write-only, TTL'd).
+- **Object-store mirror plumbing** (`server/hub/objstore.py`) — job
+  assets (`/assets`, `page.html`, `log.txt`, screenshots, per-attempt
+  files) are written through to an S3/MinIO bucket and served with a
+  local-first / object-store-fallback read path. **Gated by
+  `PAPRIKA_S3_ENABLED`, default OFF**; all bucket IO runs in
+  `asyncio.to_thread` so it can't block the hub loop.
 
-All of the above is **dormant for a single hub**: the keys are written
-but nothing reads them back, so single-hub behaviour is unchanged.
+All of the above is **dormant for a single hub**: the Redis keys are
+written but nothing reads them back, and the object-store mirror is off
+unless `PAPRIKA_S3_ENABLED` is set, so single-hub behaviour is
+unchanged.
 
 ### Not done (required before enabling this)
 
-1. **Hub→Hub forwarding** (control-plane *phase 3*). Without it, a
-   `/sessions/*` request that nginx round-robins onto a hub that does
-   **not** own the target worker's WS fails with
-   `502 session worker ... is no longer connected`. The forwarding
-   layer must: look up `paprika:worker:{id}:owner`, and forward the
-   action to that hub over internal HTTP (or Redis RPC).
-2. **Shared object storage** (*phase 2 / MinIO*). Each hub currently
-   writes job assets to its own local `/data/jobs`. Behind nginx,
-   uploads + reads scatter across replicas and 404. Move to S3/MinIO
-   (with an async client) and serve via signed URLs.
-3. **Redis HA + lease TTL** (*phase 4*). A single Redis is the new
-   SPOF. Use Sentinel / a managed Redis, and put TTLs on job leases so a
-   dead hub's in-flight jobs get re-dispatched.
+1. **Hub→Hub forwarding** (control-plane *phase 3*) — **DONE.** When a
+   `/sessions/*` request lands on a hub that doesn't hold the session,
+   the hub looks it up in the Redis Session Map
+   (`paprika:session:{id} = {worker_id, hub}`) and forwards to the
+   owning hub, which runs it against its live WS:
+
+   - **actions** (everything via `_send_session_action`: click, fill,
+     navigate, outline, evaluate, screenshot, cookies, …) forward as an
+     action dict to `POST /internal/sessions/{id}/action` (worker-secret
+     guarded, OpenAPI-hidden, local-only on receipt).
+   - **close** (`DELETE /sessions/{id}`) and **status**
+     (`GET /sessions/{id}`) reverse-proxy the raw request to the owner
+     hub (it holds the WS and does the cookie-save / video-drain /
+     parent-job cascade). A one-hop loop guard (`X-Paprika-Hub-Forwarded`)
+     stops a stale map from bouncing a request between hubs.
+   - **noVNC** — HTTP viewer assets reverse-proxy to the owner hub (same
+     loop guard); the `websockify` WS bridges operator ⇄ this-hub ⇄
+     owner-hub ⇄ worker, guarded against bounce by a `?_fwd=1` marker.
+
+   Dormant on a single hub: a locally-held session short-circuits before
+   any Redis lookup. Forward target defaults to `http://{hub_id}:8000`
+   (override via `PAPRIKA_HUB_INTERNAL_FMT`), matching the hub-a/b/c
+   service names below.
+
+   **Minor follow-up:** `GET /sessions` is per-hub (lists only this
+   hub's sessions); cross-hub aggregation is unbuilt. Not a correctness
+   issue — individual session ops all resolve correctly via forwarding.
+2. **Shared object storage** (*phase 2 / MinIO*). The mirror code has
+   **landed but ships OFF** (`server/hub/objstore.py`, gated by
+   `PAPRIKA_S3_ENABLED`). To enable: set the `PAPRIKA_S3_*` env (see
+   below) on every hub so uploads write through to the shared bucket
+   and reads fall back to it. Until enabled, each hub still writes
+   assets only to its own local `/data/jobs` and the others 404 them.
+
+   ```
+   PAPRIKA_S3_ENABLED=1
+   PAPRIKA_S3_ENDPOINT=http://<minio-host>:9000
+   PAPRIKA_S3_BUCKET=paprika
+   PAPRIKA_S3_PREFIX=jobs
+   PAPRIKA_S3_ACCESS_KEY=<key>      # secret — env only, never commit
+   PAPRIKA_S3_SECRET_KEY=<secret>   # secret — env only, never commit
+   PAPRIKA_S3_REGION=us-east-1
+   ```
+3. **Redis HA + lease TTL** (*phase 4*) — **DONE (ships OFF).** A single
+   Redis is the new SPOF; the code now addresses both halves, and both
+   stay dormant for a single hub.
+
+   - **Redis HA** — the client (`server/store.py:make_redis_client`,
+     used by both the job store and the live-log pub/sub) understands
+     `redis+sentinel://` URLs and returns a master connection that
+     follows Sentinel failover automatically. Plain `redis://` is
+     unchanged. To enable, point every hub's `--redis-url` at a Sentinel
+     pool:
+
+     ```
+     redis+sentinel://sentinel-a:26379,sentinel-b:26379,sentinel-c:26379/paprika
+     ```
+
+     where the last path segment (`paprika`) is the Sentinel-monitored
+     master name (`mymaster` if omitted). Or just use a managed Redis
+     and keep a plain `redis://` URL.
+   - **Job leases** (`server/hub/_leases.py`, gated by
+     `PAPRIKA_JOB_LEASE_ENABLED`, default OFF). Each hub writes a
+     TTL'd lease (`paprika:job:{id}:lease = {hub, requeues}`) for every
+     **hub-orchestrated** job it's running (codegen-loop + rerun) and
+     refreshes it on a timer. If a hub dies it stops refreshing; once the
+     lease expires a surviving hub atomically re-claims (`SET NX`) and
+     re-dispatches the job — shared object storage (phase 2) lets the new
+     hub read the orphaned job's prior attempts. A durable requeue
+     counter caps re-dispatches (`PAPRIKA_JOB_LEASE_MAX_REQUEUES`,
+     default 1) so a poison job can't bounce the fleet forever; once
+     exhausted (or for an unrecoverable rerun) the job is failed out.
+
+     ```
+     PAPRIKA_JOB_LEASE_ENABLED=1
+     PAPRIKA_JOB_LEASE_TTL_S=90          # lease lifetime without refresh
+     PAPRIKA_JOB_LEASE_REFRESH_S=30      # owner re-write cadence (< ttl)
+     PAPRIKA_JOB_LEASE_MAX_REQUEUES=1    # re-dispatch budget per job
+     ```
+
+     Dormant on a single hub: with the flag OFF the lease loop returns
+     immediately, no keys are written, and the existing startup
+     "mark orphaned running jobs failed" recovery is unchanged. When ON,
+     that startup recovery defers to the lease reaper (so a restarting
+     hub never fails a live peer's jobs). **Not covered:** worker-
+     dispatched *fetch* jobs — those live on a worker that re-homes to
+     another hub on its own, so they don't need hub-side re-dispatch.
 
 ## Files
 

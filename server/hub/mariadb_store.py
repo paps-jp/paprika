@@ -36,12 +36,14 @@ class MariaDBJobStore:
             async with conn.cursor() as cur:
                 await cur.execute("SELECT 1")
 
-        # Init Redis for pub/sub if available
+        # Init Redis for pub/sub if available. make_redis_client handles both
+        # plain redis:// and Sentinel (redis+sentinel://) URLs transparently
+        # -- control-plane phase 4 (Redis HA); plain URLs are unchanged.
         if self._redis_url:
             try:
-                import redis.asyncio as redis
-                self._r = redis.from_url(self._redis_url, decode_responses=True)
-                self._pubsub_r = redis.from_url(self._redis_url, decode_responses=True)
+                from server.store import make_redis_client
+                self._r = make_redis_client(self._redis_url, decode_responses=True)
+                self._pubsub_r = make_redis_client(self._redis_url, decode_responses=True)
                 await self._r.ping()
             except Exception as e:
                 log.warning("Redis pub/sub unavailable: %s (live logs disabled)", e)

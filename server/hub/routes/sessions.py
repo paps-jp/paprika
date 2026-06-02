@@ -28,12 +28,13 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import os
 import re as _re
 from datetime import datetime
 from pathlib import Path
 
 import httpx
-from fastapi import APIRouter, HTTPException
+from fastapi import APIRouter, HTTPException, Request
 from fastapi.responses import Response
 
 from server.hub._state import config, get_storage_dir, state
@@ -128,12 +129,172 @@ def _route_to_page(
     return action
 
 
+# ----------------------------------------------------------------------------
+# Hub→Hub forwarding (multi-hub control-plane, phase 3)
+#
+# Behind nginx, /sessions/* requests are round-robined across hubs but a
+# session lives only on the ONE hub that owns its worker's WebSocket
+# (create_session always picks from this hub's in-process `connections`).
+# So a request can land on a hub that doesn't hold the session. When it
+# does, we look the session up in the Redis Session Map (sid -> {worker,
+# hub}) and forward the *action* to the owning hub over internal HTTP;
+# that hub runs it against its live WS and returns the result.
+#
+# Dormant on a single hub: a locally-held session short-circuits to the
+# local path before any Redis lookup, so behaviour is byte-for-byte
+# unchanged for single-hub deployments and tests.
+# ----------------------------------------------------------------------------
+
+
+def _hub_internal_url(hub_id: str, path: str) -> str:
+    """Internal base URL of a sibling hub. ``hub_id`` doubles as the
+    resolvable service/host name in the scale compose (hub-a/b/c), so the
+    default ``http://{hub}:8000`` Just Works there; override the shape via
+    PAPRIKA_HUB_INTERNAL_FMT for other topologies."""
+    fmt = os.environ.get("PAPRIKA_HUB_INTERNAL_FMT") or "http://{hub}:8000"
+    base = fmt.format(hub=hub_id).rstrip("/")
+    return f"{base}{path}"
+
+
+async def _forward_session_action(
+    owner_hub: str,
+    session_id: str,
+    action: dict,
+    timeout: float,
+):
+    """Forward an action to the hub that owns the session, return its
+    JSON result verbatim. Raises HTTPException on transport failure so
+    the caller sees a clean 502/504 instead of a raw exception."""
+    url = _hub_internal_url(owner_hub, f"/internal/sessions/{session_id}/action")
+    headers = {}
+    if config.worker_secret:
+        headers["X-Paprika-Worker-Secret"] = config.worker_secret
+    # Allow a little slack over the action timeout for the extra hop.
+    try:
+        async with httpx.AsyncClient(timeout=timeout + 15.0) as client:
+            r = await client.post(
+                url,
+                json={"action": action, "timeout": timeout},
+                headers=headers,
+            )
+    except Exception as e:
+        raise HTTPException(
+            502,
+            f"hub forward to '{owner_hub}' failed: {type(e).__name__}: {e}",
+        )
+    if r.status_code == 404:
+        # Owner hub no longer has the session (closed / reaped / it
+        # restarted). Surface as 404 -- the session is genuinely gone.
+        raise HTTPException(404, f"session '{session_id}' not found")
+    if r.status_code >= 500:
+        raise HTTPException(r.status_code, r.text)
+    try:
+        return r.json()
+    except Exception:
+        raise HTTPException(502, "hub forward returned a non-JSON body")
+
+
+# Marker header set on a forwarded request so the receiving hub knows
+# NOT to forward again -- a stale Session Map must never bounce a request
+# between hubs forever. One hop only: origin -> owner.
+_FWD_MARK = "X-Paprika-Hub-Forwarded"
+
+
+async def _proxy_request_to_hub(owner_hub: str, request: Request, forward_timeout: float):
+    """Reverse-proxy the *raw* incoming request (method, path, query,
+    body, headers) to the hub that owns the session and return its
+    response verbatim. Used for whole-request endpoints (close / status)
+    where the owner hub must run the handler locally -- it holds the
+    worker WS, the SessionInfo and does the cookie-save / drain / cascade
+    work a non-owner hub structurally cannot."""
+    body = await request.body()
+    path = request.url.path
+    url = _hub_internal_url(owner_hub, path)
+    if request.url.query:
+        url = f"{url}?{request.url.query}"
+    fwd_headers = {
+        k: v
+        for k, v in request.headers.items()
+        if k.lower() not in ("host", "content-length")
+    }
+    fwd_headers[_FWD_MARK] = config.hub_id or "1"
+    if config.worker_secret:
+        fwd_headers["X-Paprika-Worker-Secret"] = config.worker_secret
+    try:
+        async with httpx.AsyncClient(timeout=forward_timeout) as client:
+            r = await client.request(
+                request.method, url, content=body, headers=fwd_headers
+            )
+    except Exception as e:
+        raise HTTPException(
+            502,
+            f"hub forward to '{owner_hub}' failed: {type(e).__name__}: {e}",
+        )
+    # Strip hop-by-hop / length headers; let Starlette recompute them.
+    drop = {"content-length", "transfer-encoding", "connection"}
+    resp_headers = {k: v for k, v in r.headers.items() if k.lower() not in drop}
+    return Response(
+        content=r.content,
+        status_code=r.status_code,
+        headers=resp_headers,
+        media_type=r.headers.get("content-type"),
+    )
+
+
+async def _maybe_forward_session(
+    session_id: str, request: Request, *, forward_timeout: float = 60.0
+):
+    """If ``session_id`` isn't held by THIS hub but the Session Map says
+    another hub owns it, reverse-proxy the request there and return that
+    Response. Returns None to mean "handle locally" -- which is always
+    the case on a single hub, when the session is unknown everywhere, or
+    when the request was already forwarded once (loop guard)."""
+    _require_session_infra()
+    if state.sessions.get(session_id) is not None:
+        return None  # local -- handle here (the only single-hub path)
+    if request.headers.get(_FWD_MARK):
+        return None  # already a forwarded hop; never bounce again
+    owner = await state.sessions.lookup_owner(session_id)
+    if owner is None:
+        return None  # unknown -> let the local handler 404 as before
+    _worker_id, owner_hub = owner
+    if not owner_hub or owner_hub == config.hub_id:
+        return None
+    return await _proxy_request_to_hub(owner_hub, request, forward_timeout)
+
+
 async def _send_session_action(session_id: str, action: dict, *, timeout: float = 30.0):
-    """Look up the bound worker, forward an action, return the result.
+    """Route a session action to whichever hub owns the session.
+
+    Local-first: when this hub holds the session, run it here (the only
+    path that ever executes on a single hub). Otherwise consult the
+    Redis Session Map and forward to the owning hub; fall through to the
+    same 404 as before when the session is unknown everywhere.
+    """
+    _require_session_infra()
+    if state.sessions.get(session_id) is not None:
+        return await _send_session_action_local(session_id, action, timeout=timeout)
+    # Not local -- maybe another hub owns it (multi-hub only).
+    owner = await state.sessions.lookup_owner(session_id)
+    if owner is not None:
+        _worker_id, owner_hub = owner
+        if owner_hub and owner_hub != config.hub_id:
+            return await _forward_session_action(
+                owner_hub, session_id, action, timeout
+            )
+    raise HTTPException(404, f"session '{session_id}' not found")
+
+
+async def _send_session_action_local(
+    session_id: str, action: dict, timeout: float = 30.0
+):
+    """Run an action against the worker WS held by THIS hub.
 
     Serialises actions per-session via the session's lock, so two
     concurrent HTTP requests for the same session can't interleave
-    CDP traffic on the same tab.
+    CDP traffic on the same tab. Raises 404 if the session is not held
+    locally (the forwarding wrapper / internal endpoint guarantees it
+    is before calling here).
     """
     info = _get_session_or_404(session_id)
     worker = state.registry.connections.get(info.worker_id)
@@ -179,6 +340,34 @@ async def _send_session_action(session_id: str, action: dict, *, timeout: float 
         "elapsed_ms": reply.elapsed_ms,
         "result": reply.result,
     }
+
+
+@router.post("/internal/sessions/{session_id}/action", include_in_schema=False)
+async def internal_session_action(session_id: str, body: dict, request: Request):
+    """Hub→Hub forwarding sink (phase 3). A sibling hub that received a
+    /sessions/* request it doesn't own POSTs the action here, to the hub
+    that holds the worker WS. We run it LOCALLY (never re-forward, so a
+    stale Session Map can't bounce a request between hubs) and return the
+    same shape the public endpoints do.
+
+    Internal-only: guarded by the worker secret (same shared secret the
+    workers use) and never published in the OpenAPI schema. Not reachable
+    from the public surface in the single-hub default.
+    """
+    if config.worker_secret:
+        sent = request.headers.get("X-Paprika-Worker-Secret")
+        if sent != config.worker_secret:
+            raise HTTPException(401, "bad secret")
+    action = body.get("action")
+    if not isinstance(action, dict):
+        raise HTTPException(400, "body.action must be an object")
+    try:
+        timeout = float(body.get("timeout") or 30.0)
+    except (TypeError, ValueError):
+        timeout = 30.0
+    # Local-only: 404s here (rather than re-forwarding) when the session
+    # isn't actually on this hub, so the origin hub surfaces a clean 404.
+    return await _send_session_action_local(session_id, action, timeout=timeout)
 
 
 @router.post("/sessions")
@@ -540,7 +729,7 @@ async def _auto_save_session_cookies(info) -> dict | None:
 
 
 @router.delete("/sessions/{session_id}")
-async def close_session(session_id: str) -> dict:
+async def close_session(session_id: str, request: Request) -> dict:
     """Release the Lane bound to ``session_id``.
 
     Before sending HubSessionEnd to the worker, the hub dumps the
@@ -550,6 +739,15 @@ async def close_session(session_id: str) -> dict:
     explicitly opens a session against ends up in the Hosts tab,
     Cookie state preserved across script restarts.
     """
+    # Multi-hub: a close that lands on a non-owner hub is forwarded to
+    # the owning hub, which holds the worker WS + does the cookie-save /
+    # video-drain / parent-job cascade. Generous timeout to cover the
+    # worker-side drain window (PAPRIKA_VIDEO_DRAIN_HARD_S, default 30m).
+    import os as _os_fwd
+    _close_to = float(_os_fwd.environ.get("PAPRIKA_VIDEO_DRAIN_HARD_S", "1800.0")) + 120.0
+    fwd = await _maybe_forward_session(session_id, request, forward_timeout=_close_to)
+    if fwd is not None:
+        return fwd
     _require_session_infra()
     # Mark as closing BEFORE removing from registry so list_sessions
     # mid-close shows the transition state.
@@ -713,9 +911,13 @@ async def list_sessions() -> dict:
 
 
 @router.get("/sessions/{session_id}")
-async def get_session(session_id: str) -> dict:
+async def get_session(session_id: str, request: Request) -> dict:
     """Single-session details with ``novnc_url`` rewritten to the
     session-rooted hub proxy URL (see /sessions)."""
+    # Multi-hub: forward to the owning hub when this hub doesn't hold it.
+    fwd = await _maybe_forward_session(session_id, request, forward_timeout=15.0)
+    if fwd is not None:
+        return fwd
     info = _get_session_or_404(session_id)
     d = _proxy_session_dict(info.to_json())
     d["novnc_url_autoconnect"] = _novnc_autoconnect(d.get("novnc_url"))

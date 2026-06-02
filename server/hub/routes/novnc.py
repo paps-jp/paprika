@@ -36,7 +36,7 @@ import httpx
 from fastapi import APIRouter, HTTPException, Request, WebSocket, WebSocketDisconnect
 from fastapi.responses import Response, StreamingResponse
 
-from server.hub._state import state
+from server.hub._state import config, state
 from server.protocol import JobInfo
 
 router = APIRouter(tags=["noVNC"])
@@ -430,9 +430,14 @@ async def _proxy_novnc_websocket(
     port: int,
     *,
     session_id: str | None = None,
+    upstream_url: str | None = None,
 ) -> None:
     """Bidirectional WS bridge from the accepted client ``ws`` to the
     worker's websockify at ``ws://{host}:{port}/websockify``.
+
+    ``upstream_url`` overrides the default ``ws://{host}:{port}/websockify``
+    target. The Hub→Hub forwarder uses it to bridge to a sibling hub's
+    ``/sessions/{id}/novnc/websockify`` instead of straight to a worker.
 
     Caller is responsible for ``ws.accept()`` (which has to happen
     before this is called so we can mirror the subprotocol). On any
@@ -451,7 +456,7 @@ async def _proxy_novnc_websocket(
     """
     import websockets
 
-    upstream_url = f"ws://{host}:{port}/websockify"
+    upstream_url = upstream_url or f"ws://{host}:{port}/websockify"
     chosen = ws.scope.get("__chosen_subproto")  # set by the route handler
     try:
         upstream = await websockets.connect(
@@ -580,6 +585,61 @@ async def _proxy_novnc_websocket(
 
 
 # ----------------------------------------------------------------------------
+# Hub→Hub forwarding for noVNC (multi-hub control-plane, phase 3)
+#
+# A noVNC view is a window into ONE worker lane, owned by exactly one hub.
+# Behind nginx the viewer's HTTP asset GETs round-robin across hubs while
+# the worker WS is pinned (sticky hash) to its owner -- so a viewer load
+# can land on a hub that doesn't hold the session. We then reverse-proxy
+# to the owning hub: HTTP assets reuse the generic session forwarder
+# (loop-guarded by X-Paprika-Hub-Forwarded); the websockify WS bridges
+# operator <-> this-hub <-> owner-hub <-> worker, guarded against bounce
+# by a ?_fwd=1 query marker. All dormant on a single hub.
+# ----------------------------------------------------------------------------
+
+
+async def _maybe_forward_novnc_http(session_id: str, request: Request):
+    """Reverse-proxy a noVNC asset GET to the owning hub when this hub
+    doesn't hold the session. Returns a Response to send back, or None to
+    serve locally (single-hub, local session, unknown, or already a
+    forwarded hop). Lazy import dodges the sessions<->novnc cycle."""
+    from server.hub.routes.sessions import _maybe_forward_session
+
+    return await _maybe_forward_session(session_id, request, forward_timeout=30.0)
+
+
+async def _novnc_remote_owner(session_id: str) -> str | None:
+    """Owner hub id when the session belongs to a DIFFERENT hub, else
+    None (= local / unknown / single-hub)."""
+    if state.sessions is None:
+        return None
+    if state.sessions.get(session_id) is not None:
+        return None
+    owner = await state.sessions.lookup_owner(session_id)
+    if owner is None:
+        return None
+    _worker_id, owner_hub = owner
+    if not owner_hub or owner_hub == config.hub_id:
+        return None
+    return owner_hub
+
+
+def _hub_internal_ws_url(owner_hub: str, session_id: str) -> str:
+    """ws:// (or wss://) URL of the owning hub's websockify, tagged with
+    the ?_fwd=1 one-hop guard so the owner won't forward again."""
+    from server.hub.routes.sessions import _hub_internal_url
+
+    http_url = _hub_internal_url(
+        owner_hub, f"/sessions/{session_id}/novnc/websockify?_fwd=1"
+    )
+    if http_url.startswith("https://"):
+        return "wss://" + http_url[len("https://"):]
+    if http_url.startswith("http://"):
+        return "ws://" + http_url[len("http://"):]
+    return http_url
+
+
+# ----------------------------------------------------------------------------
 # Public endpoints
 # ----------------------------------------------------------------------------
 
@@ -597,6 +657,9 @@ async def session_novnc_index(session_id: str, request: Request) -> Response:
     Returns 502 if the session exists but the worker has lost its
     upstream HTTP socket somehow.
     """
+    fwd = await _maybe_forward_novnc_http(session_id, request)
+    if fwd is not None:
+        return fwd
     target = _resolve_session_novnc_target(session_id)
     if target is None:
         raise HTTPException(404, f"session '{session_id}' not found or not bound to a lane")
@@ -624,6 +687,9 @@ async def session_novnc_asset(
     upstream which replies with whatever websockify does on a
     non-upgrade request -- typically 400. That's a fine no-op.
     """
+    fwd = await _maybe_forward_novnc_http(session_id, request)
+    if fwd is not None:
+        return fwd
     target = _resolve_session_novnc_target(session_id)
     if target is None:
         raise HTTPException(404, f"session '{session_id}' not found or not bound to a lane")
@@ -650,6 +716,24 @@ async def session_novnc_websockify(ws: WebSocket, session_id: str) -> None:
         s.strip() for s in ws.headers.get("sec-websocket-protocol", "").split(",") if s.strip()
     ]
     chosen = next((p for p in offered if p in ("binary", "base64")), None)
+
+    # Multi-hub: if this hub doesn't own the session, bridge to the
+    # owning hub's websockify instead of a local worker. ?_fwd=1 marks a
+    # request that is already a forwarded hop so the owner never bounces
+    # it again (one hop only). Dormant on a single hub.
+    if ws.query_params.get("_fwd") != "1":
+        owner_hub = await _novnc_remote_owner(session_id)
+        if owner_hub:
+            await ws.accept(subprotocol=chosen)
+            ws.scope["__chosen_subproto"] = chosen
+            await _proxy_novnc_websocket(
+                ws,
+                "",
+                0,
+                session_id=None,
+                upstream_url=_hub_internal_ws_url(owner_hub, session_id),
+            )
+            return
 
     target = _resolve_session_novnc_target(session_id)
     if target is None:

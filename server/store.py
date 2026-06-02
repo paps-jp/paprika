@@ -22,6 +22,100 @@ from server.protocol import JobInfo, JobResult
 
 log = logging.getLogger(__name__)
 
+
+# ----------------------------------------------------------------------------
+# Redis connection factory (plain + Sentinel)
+# ----------------------------------------------------------------------------
+#
+# Multi-hub control-plane *phase 4* (Redis HA). A single Redis is the new
+# SPOF behind nginx + Hub×N; production should front it with Sentinel or a
+# managed Redis. ``make_redis_client`` is the one place that turns a URL into
+# a ``redis.asyncio.Redis``, so both the job store and the live-log pub/sub
+# client pick up HA transparently.
+#
+# Plain mode (DEFAULT, unchanged): a ``redis://`` / ``rediss://`` /
+# ``unix://`` URL goes straight to ``redis.asyncio.from_url`` -- byte-for-byte
+# the previous behaviour, so single-Redis and dev are untouched.
+#
+# Sentinel mode (opt-in): a ``redis+sentinel://`` (alias ``sentinel://``) URL
+# is parsed into a Sentinel pool and we hand back a master connection that
+# automatically follows failover. Format::
+#
+#     redis+sentinel://[:password@]host1:port1,host2:port2,.../<service>[/<db>]
+#
+# e.g. ``redis+sentinel://sentinel-a:26379,sentinel-b:26379,sentinel-c:26379/paprika``
+# where ``paprika`` is the Sentinel-monitored master name (``mymaster`` by
+# default if the path is empty).
+
+_SENTINEL_SCHEMES = ("redis+sentinel://", "sentinel://")
+
+
+def _is_sentinel_url(url: str) -> bool:
+    return isinstance(url, str) and url.startswith(_SENTINEL_SCHEMES)
+
+
+def make_redis_client(url: str, *, decode_responses: bool = True):
+    """Build a ``redis.asyncio.Redis`` from ``url``.
+
+    Plain ``redis://`` URLs are passed verbatim to ``from_url`` (no behaviour
+    change). ``redis+sentinel://`` URLs are resolved through a Sentinel pool
+    and the returned client tracks the current master across failover --
+    control-plane phase 4 (Redis HA). Lazy ``import redis.asyncio`` so the
+    dependency is only required when a Redis backend is actually used.
+    """
+    import redis.asyncio as redis
+
+    if not _is_sentinel_url(url):
+        return redis.from_url(url, decode_responses=decode_responses)
+
+    from urllib.parse import urlsplit, unquote
+
+    from redis.asyncio.sentinel import Sentinel
+
+    # Strip the scheme, then split optional ``user:pass@`` auth from the
+    # ``host:port,host:port/service/db`` remainder. We parse by hand because
+    # urlsplit can't represent the comma-separated multi-host netloc.
+    scheme, rest = url.split("://", 1)
+    auth = None
+    if "@" in rest:
+        auth_part, rest = rest.rsplit("@", 1)
+        # auth_part is ``[user]:[password]`` -- Sentinel only needs password.
+        auth = auth_part
+    netloc, _, path = rest.partition("/")
+    sentinels: list[tuple[str, int]] = []
+    for hostport in netloc.split(","):
+        hostport = hostport.strip()
+        if not hostport:
+            continue
+        host, _, port = hostport.partition(":")
+        sentinels.append((host, int(port) if port else 26379))
+    if not sentinels:
+        raise ValueError(f"sentinel URL has no sentinel hosts: {url!r}")
+
+    parts = [p for p in path.split("/") if p != ""]
+    service_name = parts[0] if parts else "mymaster"
+    db = int(parts[1]) if len(parts) > 1 and parts[1].isdigit() else 0
+
+    password = None
+    if auth is not None:
+        _, _, pw = auth.partition(":")
+        password = unquote(pw) if pw else None
+
+    conn_kwargs: dict = {"decode_responses": decode_responses, "db": db}
+    if password:
+        conn_kwargs["password"] = password
+    sentinel_kwargs: dict = {}
+    if password:
+        sentinel_kwargs["password"] = password
+
+    sentinel = Sentinel(
+        sentinels,
+        sentinel_kwargs=sentinel_kwargs,
+        **conn_kwargs,
+    )
+    return sentinel.master_for(service_name, **conn_kwargs)
+
+
 # ----------------------------------------------------------------------------
 # Protocol
 # ----------------------------------------------------------------------------
@@ -162,10 +256,11 @@ class RedisJobStore:
         self._pubsub_r = None  # separate client for pubsub (recommended)
 
     async def initialize(self) -> None:
-        import redis.asyncio as redis  # lazy import (only if used)
-
-        self._r = redis.from_url(self.url, decode_responses=True)
-        self._pubsub_r = redis.from_url(self.url, decode_responses=True)
+        # make_redis_client understands both plain redis:// and Sentinel
+        # (redis+sentinel://) URLs -- control-plane phase 4 (Redis HA).
+        # Plain URLs behave exactly as before.
+        self._r = make_redis_client(self.url, decode_responses=True)
+        self._pubsub_r = make_redis_client(self.url, decode_responses=True)
         # quick ping
         await self._r.ping()
 

@@ -255,6 +255,14 @@ async def lifespan(app: FastAPI):
     from server.hub._reaper import _dead_worker_reaper_loop
     dead_worker_task = asyncio.create_task(_dead_worker_reaper_loop())
 
+    # Job-lease loop (multi-hub control-plane phase 4: dead-hub recovery).
+    # Refreshes leases for this hub's in-flight codegen-loop/rerun jobs and
+    # re-dispatches jobs orphaned by a crashed peer. Gated by
+    # PAPRIKA_JOB_LEASE_ENABLED (default OFF) -- the loop returns immediately
+    # when off, so single-hub behaviour is unchanged.
+    from server.hub._reaper import _job_lease_loop
+    job_lease_task = asyncio.create_task(_job_lease_loop())
+
     # SMB storage: a cifs mount does not survive a restart, so re-mount
     # the configured share NOW (before the first job needs storage_dir)
     # and spawn a watchdog that re-mounts it if it ever drops (NAS
@@ -328,6 +336,7 @@ async def lifespan(app: FastAPI):
     reaper_task.cancel()
     retire_task.cancel()
     dead_worker_task.cancel()
+    job_lease_task.cancel()
     if smb_watchdog_task is not None:
         smb_watchdog_task.cancel()
     for t in list(state.local_tasks.values()):

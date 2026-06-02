@@ -153,6 +153,27 @@ class SessionRegistry:
         except Exception:
             pass
 
+    async def lookup_owner(self, session_id: str) -> tuple[str, str] | None:
+        """Read the Redis Session Map for a session this hub does NOT hold
+        locally: returns ``(worker_id, hub)`` or None.
+
+        This is the *read* side of the map (add/remove are the writes).
+        The Hub→Hub forwarding layer calls it when a ``/sessions/*``
+        request lands on a hub that doesn't own the session, to discover
+        which hub does. Fully dormant (returns None) when no redis client
+        is bound -- i.e. single-hub deployments and tests -- so callers
+        fall through to their existing 404 path unchanged."""
+        if self._r is None:
+            return None
+        try:
+            raw = await self._r.get(self._k_session(session_id))
+            if not raw:
+                return None
+            d = json.loads(raw)
+            return (d.get("worker_id") or ""), (d.get("hub") or "")
+        except Exception:
+            return None
+
     def add(self, info: SessionInfo) -> None:
         self._sessions[info.session_id] = info
         # Mirror to Redis with a TTL a bit beyond the session's absolute

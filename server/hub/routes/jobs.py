@@ -37,6 +37,7 @@ log = logging.getLogger(__name__)
 # below) and are re-exported from app.py for the /jobs routes still
 # there (GET /jobs / {id} / result / cancel / delete / cleanup,
 # POST /jobs/{id}/screenshot / /assets, etc).
+from server.hub import objstore
 from server.hub._helpers import _safe_job_file
 from server.hub.routes.novnc import _proxy_session_dict
 from server.hub.routes.sessions import (
@@ -56,6 +57,9 @@ router = APIRouter(tags=["Jobs"])
 
 @router.get("/jobs/{job_id}/page.html")
 async def get_page_html(job_id: str):
+    # Multi-hub read-fallback: pull from shared object storage if a
+    # different hub wrote it (no-op locally / single-hub).
+    await objstore.ensure_local(get_storage_dir() / job_id / "page.html")
     return FileResponse(_safe_job_file(job_id, "page.html"), media_type="text/html")
 
 
@@ -804,6 +808,7 @@ async def get_page_meta(job_id: str) -> dict:
 
 @router.get("/jobs/{job_id}/log.txt")
 async def get_log(job_id: str):
+    await objstore.ensure_local(get_storage_dir() / job_id / "log.txt")
     return FileResponse(_safe_job_file(job_id, "log.txt"), media_type="text/plain")
 
 
@@ -1245,6 +1250,9 @@ async def get_attempt_file(job_id: str, n: int, filename: str):
     }
     if filename not in allowed:
         raise HTTPException(400, "invalid attempt file name")
+    await objstore.ensure_local(
+        get_storage_dir() / job_id / "attempts" / str(n) / filename
+    )
     return FileResponse(
         _safe_job_file(job_id, "attempts", str(n), filename),
         media_type=allowed[filename],
@@ -1255,6 +1263,7 @@ async def get_attempt_file(job_id: str, n: int, filename: str):
 # after the job completes). Single file per job at workdir root.
 @router.get("/jobs/{job_id}/perception")
 async def get_job_perception(job_id: str):
+    await objstore.ensure_local(get_storage_dir() / job_id / "perception.json")
     return FileResponse(
         _safe_job_file(job_id, "perception.json"),
         media_type="application/json",
@@ -1284,6 +1293,9 @@ async def get_asset(job_id: str, filename: str):
         target.resolve().relative_to(assets_root)
     except ValueError:
         raise HTTPException(400, "path escapes assets dir")
+    # Multi-hub read-fallback: pull from shared object storage if a
+    # different hub produced this asset (no-op locally / single-hub).
+    await objstore.ensure_local(target)
     if not target.exists() or not target.is_file():
         raise HTTPException(404, f"file not found: {filename}")
     return FileResponse(target)
@@ -2274,6 +2286,9 @@ async def take_job_screenshot(
     except Exception:
         pass
 
+    # Mirror to shared object storage (dormant unless PAPRIKA_S3_ENABLED).
+    await objstore.mirror_file(target_path)
+
     return {
         "ok": True,
         "name": name,
@@ -2399,6 +2414,10 @@ async def upload_asset(
         except Exception:
             pass
 
+    # Multi-hub foundation: mirror to shared object storage (no-op unless
+    # PAPRIKA_S3_ENABLED). Local disk stays the source of truth.
+    await objstore.mirror_file(target)
+
     return {"saved": str(target.resolve()), "size": written, "name": name}
 
 
@@ -2491,6 +2510,9 @@ async def save_asset_from_url(job_id: str, body: dict) -> dict:
     except Exception:
         pass
 
+    # Mirror to shared object storage (dormant unless PAPRIKA_S3_ENABLED).
+    await objstore.mirror_file(target)
+
     return {"status": "saved", "name": name, "size": len(content)}
 
 
@@ -2522,6 +2544,8 @@ async def upload_special(
                 break
             out.write(chunk)
             total += len(chunk)
+    # Mirror to shared object storage (dormant unless PAPRIKA_S3_ENABLED).
+    await objstore.mirror_file(target)
     return {"saved": str(target.resolve()), "size": total}
 
 

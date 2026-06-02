@@ -2,17 +2,34 @@
 #
 # Brings up nginx + 3 hub replicas (hub-a/b/c) sharing one Redis. This
 # is the *foundation* target; do NOT switch production to it until:
-#   1. Hub→Hub forwarding (control-plane phase 3) is implemented, AND
-#   2. assets live on shared object storage (phase 2 / MinIO).
-# Without (1) a /sessions/* request that lands on a non-owner hub fails
-# ("session worker ... is no longer connected"). Without (2) each hub
-# writes assets to its own local disk and the others 404 them.
+#   1. Hub→Hub forwarding (control-plane phase 3) is complete, AND
+#   2. the object-store mirror (phase 2 / MinIO) is turned ON.
+# For (1) the HTTP session surface is DONE: actions, close, status AND
+# noVNC all forward to the owning hub when a request lands elsewhere
+# (actions via POST /internal/sessions/{id}/action; close/status/noVNC
+# reverse-proxy the raw request; the websockify WS bridges operator ⇄
+# this-hub ⇄ owner-hub ⇄ worker, guarded by a ?_fwd=1 marker). The only
+# remaining follow-up is cross-hub GET /sessions aggregation (a listing
+# nicety, not a correctness issue) — see the README. Forward target
+# defaults to http://{hub_id}:8000 (= the
+# service names below); override via PAPRIKA_HUB_INTERNAL_FMT. For (2) the write-
+# through + read-fallback code has landed (server/hub/objstore.py) but
+# ships OFF: set PAPRIKA_S3_ENABLED=1 plus the PAPRIKA_S3_* env on every
+# hub (see deploy/scale/README.md). Until then each hub writes assets to
+# its own local disk and the others 404 them.
 #
 # What already works at the foundation level (this repo, today):
 #   * each replica gets a distinct hub_id (= its env HUB_ID below)
 #   * the registry records WS ownership in Redis (paprika:worker:*:owner)
 #   * the Session Map is mirrored to Redis (paprika:session:*)
 # i.e. the data needed by the forwarding layer is being written.
+#
+# Phase 4 (Redis HA + dead-hub recovery) has ALSO landed but ships OFF:
+#   * the Redis client understands redis+sentinel:// URLs (see the redis
+#     service note) so production can front Redis with Sentinel / managed
+#     Redis with no code change — fixes the single-Redis SPOF.
+#   * job leases (PAPRIKA_JOB_LEASE_ENABLED, below) let a surviving hub
+#     re-dispatch codegen-loop/rerun jobs that a crashed hub was running.
 #
 # Run (when ready):  docker compose -f deploy/scale/docker-compose.scale.yml up -d --build
 #
@@ -29,9 +46,11 @@ x-hub-common: &hub-common
   depends_on: [redis]
   privileged: true
   volumes:
-    - paprika-data:/data/jobs          # NOTE: local volume — replace with
-                                        # shared object storage (phase 2)
-                                        # before multi-hub asset serving.
+    - paprika-data:/data/jobs          # local write-through cache. With
+                                        # PAPRIKA_S3_ENABLED set, assets
+                                        # also mirror to the shared bucket
+                                        # (phase 2) so other hubs can serve
+                                        # them; stays the source of truth.
     - ../../server:/app/server
     - ../../core:/app/core
     - ../../VERSION:/app/VERSION:ro
@@ -49,26 +68,59 @@ services:
   redis:
     image: redis:7-alpine
     restart: unless-stopped
-    # For real 200-worker use, front this with Sentinel / a managed
-    # Redis (control-plane phase 4) — a single redis is the new SPOF.
+    # For real 200-worker use, front this with Sentinel / a managed Redis
+    # (control-plane phase 4) — a single redis is the new SPOF. The code is
+    # already HA-ready: point every hub's --redis-url at a Sentinel pool with
+    #   redis+sentinel://sentinel-a:26379,sentinel-b:26379,sentinel-c:26379/paprika
+    # (last path segment = the Sentinel-monitored master name) and the hub
+    # client follows failover automatically — no code change needed. The
+    # plain redis:// below stays the dev/foundation default.
     volumes:
       - paprika-redis:/data
 
+  # Object-store mirror env (phase 2). Defaults leave it OFF; set these
+  # in the host environment / a .env file to turn it on for ALL hubs.
+  # Keep the access/secret keys OUT of the repo — supply them via env.
   hub-a:
     <<: *hub-common
     environment:
       - PYTHONUNBUFFERED=1
       - HUB_ID=hub-a
+      - PAPRIKA_S3_ENABLED=${PAPRIKA_S3_ENABLED:-}
+      - PAPRIKA_S3_ENDPOINT=${PAPRIKA_S3_ENDPOINT:-}
+      - PAPRIKA_S3_BUCKET=${PAPRIKA_S3_BUCKET:-paprika}
+      - PAPRIKA_S3_PREFIX=${PAPRIKA_S3_PREFIX:-jobs}
+      - PAPRIKA_S3_ACCESS_KEY=${PAPRIKA_S3_ACCESS_KEY:-}
+      - PAPRIKA_S3_SECRET_KEY=${PAPRIKA_S3_SECRET_KEY:-}
+      - PAPRIKA_S3_REGION=${PAPRIKA_S3_REGION:-us-east-1}
+      # Phase 4: dead-hub recovery. Set on EVERY hub to turn it on.
+      - PAPRIKA_JOB_LEASE_ENABLED=${PAPRIKA_JOB_LEASE_ENABLED:-}
   hub-b:
     <<: *hub-common
     environment:
       - PYTHONUNBUFFERED=1
       - HUB_ID=hub-b
+      - PAPRIKA_S3_ENABLED=${PAPRIKA_S3_ENABLED:-}
+      - PAPRIKA_S3_ENDPOINT=${PAPRIKA_S3_ENDPOINT:-}
+      - PAPRIKA_S3_BUCKET=${PAPRIKA_S3_BUCKET:-paprika}
+      - PAPRIKA_S3_PREFIX=${PAPRIKA_S3_PREFIX:-jobs}
+      - PAPRIKA_S3_ACCESS_KEY=${PAPRIKA_S3_ACCESS_KEY:-}
+      - PAPRIKA_S3_SECRET_KEY=${PAPRIKA_S3_SECRET_KEY:-}
+      - PAPRIKA_S3_REGION=${PAPRIKA_S3_REGION:-us-east-1}
+      - PAPRIKA_JOB_LEASE_ENABLED=${PAPRIKA_JOB_LEASE_ENABLED:-}
   hub-c:
     <<: *hub-common
     environment:
       - PYTHONUNBUFFERED=1
       - HUB_ID=hub-c
+      - PAPRIKA_S3_ENABLED=${PAPRIKA_S3_ENABLED:-}
+      - PAPRIKA_S3_ENDPOINT=${PAPRIKA_S3_ENDPOINT:-}
+      - PAPRIKA_S3_BUCKET=${PAPRIKA_S3_BUCKET:-paprika}
+      - PAPRIKA_S3_PREFIX=${PAPRIKA_S3_PREFIX:-jobs}
+      - PAPRIKA_S3_ACCESS_KEY=${PAPRIKA_S3_ACCESS_KEY:-}
+      - PAPRIKA_S3_SECRET_KEY=${PAPRIKA_S3_SECRET_KEY:-}
+      - PAPRIKA_S3_REGION=${PAPRIKA_S3_REGION:-us-east-1}
+      - PAPRIKA_JOB_LEASE_ENABLED=${PAPRIKA_JOB_LEASE_ENABLED:-}
 
   nginx:
     image: nginx:1.27-alpine

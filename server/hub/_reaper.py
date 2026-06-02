@@ -28,7 +28,7 @@ import os
 import re
 from datetime import datetime
 
-from server.hub._state import state
+from server.hub._state import config, state
 from server.protocol import JobStatus
 from server.runner import DONE_SENTINEL
 
@@ -65,6 +65,18 @@ async def _recover_orphan_running_jobs() -> int:
     Returns the count of jobs reclassified.
     """
     assert state.store is not None
+    # Multi-hub phase 4: when job leasing is ON, a "running" job in the store
+    # might belong to a SIBLING hub that's alive and refreshing its lease --
+    # blanket-failing every running job at our startup would wrongly kill
+    # their work. Hand orphan handling to the lease reaper, which only
+    # re-dispatches/fails jobs whose lease has actually expired. Default OFF
+    # (single hub): unchanged -- we still fail orphaned running jobs here.
+    try:
+        from server.hub import _leases as _l
+        if _l.enabled():
+            return 0
+    except Exception:
+        pass
     # state.local_tasks is empty at this point (fresh process), so any
     # in-store "running" job is by definition an orphan.
     try:
@@ -465,3 +477,184 @@ async def _skill_convention_reaper_loop():
                     log.warning(
                         "dedup: merge failed %s %r", kind, keep.slug, exc_info=True
                     )
+
+
+# ----------------------------------------------------------------------------
+# Job-lease loop (multi-hub control-plane phase 4: dead-hub recovery)
+# ----------------------------------------------------------------------------
+# Two responsibilities, both gated behind PAPRIKA_JOB_LEASE_ENABLED (OFF by
+# default -> the loop returns immediately and nothing below runs, so single-
+# hub behaviour is unchanged):
+#
+#   1. REFRESH -- for every hub-orchestrated job this hub is running locally
+#      (state.local_tasks: codegen-loop + rerun), re-write its lease so peers
+#      know it's alive. Finished tasks are pruned and their lease released.
+#
+#   2. REAP -- scan recent store jobs for ones marked ``running`` that this
+#      hub does NOT hold and whose lease has expired (= the owning hub died).
+#      Atomically re-claim (SET NX) and re-dispatch on this hub, bounded by a
+#      durable requeue counter so a poison job can't bounce forever.
+
+# How many recent jobs to scan per reap pass. Running jobs are few and live
+# near the head of the recency index, so a bounded window keeps the Redis cost
+# flat regardless of total job history.
+_LEASE_REAP_SCAN = int(os.environ.get("PAPRIKA_JOB_LEASE_SCAN", "150"))
+
+
+async def _job_lease_loop():
+    """Refresh local job leases + reap orphaned ones. Dormant unless
+    PAPRIKA_JOB_LEASE_ENABLED is set AND a Redis client is available."""
+    from server.hub import _leases as leases
+
+    if not leases.enabled():
+        return  # default: feature off -> loop never runs
+    redis = getattr(state.store, "_r", None)
+    if redis is None:
+        log.info(
+            "job-lease loop: PAPRIKA_JOB_LEASE_ENABLED set but no Redis client "
+            "(store_kind=%s); leasing disabled", state.store_kind,
+        )
+        return
+
+    hub_id = config.hub_id
+    interval = leases.refresh_interval_s()
+    log.info(
+        "job-lease loop: ENABLED (hub=%s ttl=%ds refresh=%.0fs max_requeues=%d)",
+        hub_id, leases.lease_ttl_s(), interval, leases.max_requeues(),
+    )
+    first = True
+    while True:
+        try:
+            # Small initial delay so a freshly dispatched job gets its first
+            # lease written promptly; steady cadence thereafter.
+            await asyncio.sleep(5 if first else interval)
+        except asyncio.CancelledError:
+            return
+        first = False
+
+        # (1) refresh leases for locally-running jobs; prune finished ones.
+        for jid, task in list(state.local_tasks.items()):
+            try:
+                if task.done():
+                    state.local_tasks.pop(jid, None)
+                    await leases.release(redis, jid)
+                    continue
+                cur = await leases.read(redis, jid)
+                rq = int(cur.get("requeues", 0)) if cur else 0
+                await leases.refresh(redis, jid, hub_id, requeues=rq)
+            except Exception:
+                log.debug("job-lease refresh(%s) failed", jid, exc_info=True)
+
+        # (2) reap orphaned running jobs that belong to a dead hub.
+        try:
+            await _reap_orphan_leased_jobs(redis, hub_id)
+        except Exception:
+            log.debug("job-lease reap pass failed", exc_info=True)
+
+
+async def _reap_orphan_leased_jobs(redis, hub_id: str) -> None:
+    """Find ``running`` hub-orchestrated jobs with an expired lease and
+    re-dispatch them on this hub (or fail them out once requeues exhausted).
+    Only one surviving hub wins each job, guaranteed by the atomic SET NX
+    re-claim."""
+    from server.hub import _leases as leases
+
+    store = state.store
+    if store is None:
+        return
+    try:
+        job_ids = await store.list_job_ids(0, _LEASE_REAP_SCAN)
+    except Exception:
+        return
+
+    ttl = leases.lease_ttl_s()
+    maxr = leases.max_requeues()
+    now = datetime.utcnow()
+
+    for jid in job_ids:
+        if jid in state.local_tasks:
+            continue  # we own it locally -> alive, refreshed above
+        try:
+            info = await store.get_job_info(jid)
+        except Exception:
+            continue
+        if info is None or info.status != JobStatus.running:
+            continue
+        mode = (info.options.mode if info.options else None) or "fetch"
+        if mode not in ("codegen-loop", "rerun"):
+            continue  # only hub-orchestrated jobs die with the hub process
+
+        # Grace window: a just-dispatched job on a live peer may not have
+        # written its first lease yet. Skip anything younger than one TTL so
+        # we never steal a job that simply hasn't ticked once.
+        try:
+            age = (now - (info.started_at or info.created_at)).total_seconds()
+        except Exception:
+            age = ttl + 1
+        if age < ttl:
+            continue
+
+        # A live lease means a peer is actively refreshing it -> alive.
+        if await leases.read(redis, jid) is not None:
+            continue
+
+        rq = await leases.get_requeues(redis, jid)
+
+        # Exhausted: don't re-run again, fail it out (once, via the claim).
+        if rq >= maxr:
+            if await leases.acquire(redis, jid, hub_id, requeues=rq):
+                await _fail_orphan_job(
+                    info,
+                    f"orphaned by a dead hub and exceeded max re-dispatches "
+                    f"({rq}/{maxr}); previous attempts preserved under "
+                    f"/jobs/{{id}}/attempts.",
+                )
+                await leases.release(redis, jid)
+            continue
+
+        # Claim atomically; only the winning hub proceeds.
+        if not await leases.acquire(redis, jid, hub_id, requeues=rq + 1):
+            continue
+        await leases.bump_requeues(redis, jid)
+        try:
+            from server.hub._jobrunner import redispatch_orphan_job
+            ok = await redispatch_orphan_job(jid)
+        except Exception:
+            log.warning("job-lease: re-dispatch of %s crashed", jid, exc_info=True)
+            ok = False
+        if ok:
+            log.info(
+                "job-lease: recovered orphaned %s job %s (requeue %d/%d)",
+                mode, jid, rq + 1, maxr,
+            )
+        else:
+            # Couldn't re-run here (e.g. unresolvable rerun source) -> fail
+            # it out and drop our claim so it doesn't sit half-claimed.
+            await _fail_orphan_job(
+                info,
+                "orphaned by a dead hub and could not be re-dispatched on a "
+                "surviving hub; previous attempts preserved.",
+            )
+            await leases.release(redis, jid)
+
+
+async def _fail_orphan_job(info, reason: str) -> None:
+    """Mark an unrecoverable orphaned job failed + close its live-log stream.
+    Best-effort; mirrors _recover_orphan_running_jobs's terminal write."""
+    if state.store is None:
+        return
+    try:
+        info.status = JobStatus.failed
+        info.completed_at = info.completed_at or datetime.utcnow()
+        info.error = reason
+        if info.progress is not None:
+            info.progress.phase = "failed"
+            info.progress.last_log = "[lease recovery] " + reason[:160]
+        await state.store.save_job_info(info)
+        try:
+            await state.store.publish_log(info.job_id, "  !! [lease recovery] " + reason)
+            await state.store.publish_log(info.job_id, DONE_SENTINEL)
+        except Exception:
+            pass
+    except Exception:
+        log.debug("job-lease: fail_orphan_job(%s) failed", getattr(info, "job_id", "?"), exc_info=True)

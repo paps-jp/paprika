@@ -61,6 +61,7 @@ from server.hub.conventions import (
     render_conventions_block,
 )
 from server.hub.iterative_codegen import (
+    resolve_rerun_source,
     run_iterative_codegen,
     run_rerun_job,
 )
@@ -733,6 +734,73 @@ async def _run_codegen_loop_job(request: Request, info: JobInfo) -> None:
         log_fp.close()
     except Exception:
         pass
+
+
+async def redispatch_orphan_job(job_id: str) -> bool:
+    """Re-run a hub-orchestrated job that was orphaned when its hub died —
+    multi-hub control-plane *phase 4*.
+
+    Called by the lease reaper on a surviving hub after it has atomically
+    re-claimed the job's lease (so this never double-runs: only the hub that
+    won the ``SET NX`` claim gets here). Loads the persisted JobInfo and
+    re-spawns the appropriate in-process orchestrator:
+
+      * ``codegen-loop`` -> ``_run_codegen_loop_job`` (request is unused by
+        the body, so we pass None).
+      * ``rerun``        -> ``_run_rerun_loop_job`` (script re-resolved from
+        ``options.rerun_from`` / ``options.code`` via resolve_rerun_source).
+
+    Returns True if a task was spawned, False if the job can't be re-run here
+    (missing/terminal job, unsupported mode, or unresolvable rerun source) so
+    the caller can fail it out instead. Worker-dispatched fetch jobs are NOT
+    re-dispatched here — the worker re-homes to another hub on its own.
+
+    Shared object storage (phase 2 / MinIO) is what makes cross-hub re-run
+    correct: the new hub can read the orphaned job's prior attempts/assets.
+    """
+    if state.store is None:
+        return False
+    info = await state.store.get_job_info(job_id)
+    if info is None:
+        return False
+    # Only resurrect jobs that were actually in flight.
+    if info.status not in (JobStatus.running, JobStatus.queued):
+        return False
+    mode = (info.options.mode if info.options else None) or "fetch"
+
+    if mode == "codegen-loop":
+        if not (info.options.goal or "").strip():
+            return False
+        task = asyncio.create_task(_run_codegen_loop_job(None, info))  # type: ignore[arg-type]
+        state.local_tasks[job_id] = task
+        log.info("[%s] re-dispatched orphaned codegen-loop job on this hub", job_id)
+        return True
+
+    if mode == "rerun":
+        try:
+            script_code, source_label, source_jid = resolve_rerun_source(
+                get_storage_dir(),
+                info.options.rerun_from,
+                info.options.code,
+            )
+        except Exception as e:
+            log.warning("[%s] rerun re-dispatch: source unresolvable: %s", job_id, e)
+            return False
+        copied = 0
+        if source_jid:
+            try:
+                copied = _copy_session_state_dir(source_jid, job_id)
+            except Exception:
+                copied = 0
+        task = asyncio.create_task(
+            _run_rerun_loop_job(info, script_code, source_label, inherited_state_files=copied),
+        )
+        state.local_tasks[job_id] = task
+        log.info("[%s] re-dispatched orphaned rerun job on this hub", job_id)
+        return True
+
+    # fetch / worker-dispatched modes: not hub-orchestrated, out of scope.
+    return False
 
 
 def _final_attempt_judge_ok(job_id: str, attempt_count: int) -> bool:
