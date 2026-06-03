@@ -729,7 +729,7 @@ async def _auto_save_session_cookies(info) -> dict | None:
 
 
 @router.delete("/sessions/{session_id}")
-async def close_session(session_id: str, request: Request) -> dict:
+async def close_session(session_id: str, request: Request = None) -> dict:
     """Release the Lane bound to ``session_id``.
 
     Before sending HubSessionEnd to the worker, the hub dumps the
@@ -743,11 +743,17 @@ async def close_session(session_id: str, request: Request) -> dict:
     # the owning hub, which holds the worker WS + does the cookie-save /
     # video-drain / parent-job cascade. Generous timeout to cover the
     # worker-side drain window (PAPRIKA_VIDEO_DRAIN_HARD_S, default 30m).
-    import os as _os_fwd
-    _close_to = float(_os_fwd.environ.get("PAPRIKA_VIDEO_DRAIN_HARD_S", "1800.0")) + 120.0
-    fwd = await _maybe_forward_session(session_id, request, forward_timeout=_close_to)
-    if fwd is not None:
-        return fwd
+    #
+    # ``request is None`` => an INTERNAL caller (the TTL reaper's
+    # close_session bridge), which only ever closes a session THIS hub
+    # owns locally -- there's nothing to forward, and there's no HTTP
+    # request to forward anyway. Skip straight to the local close.
+    if request is not None:
+        import os as _os_fwd
+        _close_to = float(_os_fwd.environ.get("PAPRIKA_VIDEO_DRAIN_HARD_S", "1800.0")) + 120.0
+        fwd = await _maybe_forward_session(session_id, request, forward_timeout=_close_to)
+        if fwd is not None:
+            return fwd
     _require_session_infra()
     # Mark as closing BEFORE removing from registry so list_sessions
     # mid-close shows the transition state.
