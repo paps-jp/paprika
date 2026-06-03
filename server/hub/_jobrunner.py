@@ -52,6 +52,7 @@ from pathlib import Path
 from fastapi import Request
 
 from core.fetcher import merge_fmp4_fragments
+from server.hub import objstore
 from server.hub._state import config, get_storage_dir, state
 from server.hub.convention_llm import (
     CONVENTION_AUTO_EXTRACT_ENABLED,
@@ -725,6 +726,17 @@ async def _run_codegen_loop_job(request: Request, info: JobInfo) -> None:
     )
     await state.store.save_job_result(job_result)
 
+    # Complete S3-ification: mirror the whole job dir (script.py, plan.json,
+    # actions.json, attempts/*, merged assets) so every /jobs/{id}/* read
+    # survives a deleted job row / dropped NAS copy. Best-effort, no-op when
+    # S3 is off; idempotent vs the per-file mirrors the upload path already did.
+    try:
+        n_mirrored = await objstore.mirror_dir(get_storage_dir() / job_id)
+        if n_mirrored:
+            _log(f"  ☁️  mirrored {n_mirrored} file(s) to object storage")
+    except Exception:
+        pass
+
     # Signal /jobs/{id}/events subscribers that the run is over.
     try:
         await state.store.publish_log(job_id, DONE_SENTINEL)
@@ -1208,6 +1220,14 @@ async def _run_rerun_loop_job(
         error=info.error,
     )
     await state.store.save_job_result(job_result)
+    # Complete S3-ification: mirror the whole job dir so every /jobs/{id}/*
+    # read survives a deleted row / dropped NAS copy (best-effort, S3-off no-op).
+    try:
+        n_mirrored = await objstore.mirror_dir(get_storage_dir() / job_id)
+        if n_mirrored:
+            _log(f"  ☁️  mirrored {n_mirrored} file(s) to object storage")
+    except Exception:
+        pass
     try:
         await state.store.publish_log(job_id, DONE_SENTINEL)
     except Exception:

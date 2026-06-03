@@ -157,6 +157,47 @@ async def mirror_file(local_path: Path | str) -> None:
         pass
 
 
+async def mirror_dir(local_dir: Path | str) -> int:
+    """Best-effort recursive mirror of an entire job dir to the bucket.
+
+    Uploads every file under ``local_dir`` (key per :func:`_key_for`).
+    Returns the count uploaded; 0 (no-op) when disabled / boto3 missing.
+    Never raises. Idempotent -- re-sending a file the per-file mirror
+    already uploaded just overwrites the same key. Called at job completion
+    so artifacts the hub orchestrator writes directly (script.py, plan.json,
+    actions.json, attempts/*) reach S3 too, not only worker-uploaded assets.
+    Blocking IO runs in a worker thread."""
+    if not enabled():
+        return 0
+    root = Path(local_dir)
+
+    def _put_all() -> int:
+        client = _get_client()
+        if client is None:
+            return 0
+        n = 0
+        try:
+            for p in root.rglob("*"):
+                try:
+                    if not p.is_file():
+                        continue
+                    key = _key_for(p)
+                    if key is None:
+                        continue
+                    client.upload_file(str(p), _bucket(), key)
+                    n += 1
+                except Exception:
+                    continue
+        except Exception:
+            return n
+        return n
+
+    try:
+        return await asyncio.to_thread(_put_all)
+    except Exception:
+        return 0
+
+
 async def ensure_local(local_path: Path | str) -> bool:
     """Guarantee ``local_path`` exists locally, pulling from the bucket if
     needed. Returns True when the file is present after the call.
@@ -201,4 +242,188 @@ async def ensure_local(local_path: Path | str) -> bool:
         return False
 
 
-__all__ = ["enabled", "mirror_file", "ensure_local"]
+def _job_prefix(job_id: str, subdir: str = "") -> str:
+    """Object-key prefix (with trailing slash) for a job's dir, or a
+    ``subdir`` within it. Mirrors the layout :func:`_key_for` produces:
+    ``{prefix}/{job_id}/{subdir}/``."""
+    p = _prefix()
+    base = f"{p}/{job_id}" if p else job_id
+    if subdir:
+        base = f"{base}/{subdir.strip('/')}"
+    return base + "/"
+
+
+async def list_dir(job_id: str, subdir: str = "assets") -> list[dict]:
+    """List the immediate files under a job's ``{subdir}`` in the bucket.
+
+    Returns ``[{"name", "size"}]`` for direct children only -- nested dirs
+    (e.g. the ``.meta/`` sidecar dir) are excluded via the ``/`` delimiter,
+    matching the non-recursive ``Path.iterdir()`` the local lister uses.
+    ``[]`` when disabled, boto3 is missing, or on any error (callers fall
+    back to the local listing)."""
+    if not enabled():
+        return []
+    prefix = _job_prefix(job_id, subdir)
+
+    def _list() -> list[dict]:
+        client = _get_client()
+        if client is None:
+            return []
+        out: list[dict] = []
+        try:
+            paginator = client.get_paginator("list_objects_v2")
+            for page in paginator.paginate(
+                Bucket=_bucket(), Prefix=prefix, Delimiter="/"
+            ):
+                for o in page.get("Contents", []):
+                    name = o["Key"][len(prefix):]
+                    if not name or "/" in name:
+                        continue  # directory marker / nested -- skip
+                    out.append({"name": name, "size": int(o.get("Size", 0))})
+        except Exception:
+            return []
+        return out
+
+    try:
+        return await asyncio.to_thread(_list)
+    except Exception:
+        return []
+
+
+async def list_tree(job_id: str, subdir: str = "assets") -> list[dict]:
+    """Recursively list ALL files under a job's ``{subdir}`` in the bucket.
+
+    Returns ``[{"rel", "size", "mtime"}]`` where ``rel`` is the path
+    relative to ``{subdir}`` (forward slashes, may contain ``/``) and
+    ``mtime`` is the object's LastModified as POSIX seconds. Unlike
+    :func:`list_dir` there is no delimiter, so nested dirs are included --
+    needed by the screenshot tab which walks ``assets/<label>/<file>``.
+    ``[]`` when disabled / on error."""
+    if not enabled():
+        return []
+    prefix = _job_prefix(job_id, subdir)
+
+    def _list() -> list[dict]:
+        client = _get_client()
+        if client is None:
+            return []
+        out: list[dict] = []
+        try:
+            paginator = client.get_paginator("list_objects_v2")
+            for page in paginator.paginate(Bucket=_bucket(), Prefix=prefix):
+                for o in page.get("Contents", []):
+                    rel = o["Key"][len(prefix):]
+                    if not rel:
+                        continue
+                    lm = o.get("LastModified")
+                    try:
+                        mtime = lm.timestamp() if lm is not None else 0.0
+                    except Exception:
+                        mtime = 0.0
+                    out.append(
+                        {"rel": rel, "size": int(o.get("Size", 0)), "mtime": mtime}
+                    )
+        except Exception:
+            return []
+        return out
+
+    try:
+        return await asyncio.to_thread(_list)
+    except Exception:
+        return []
+
+
+async def prefix_exists(job_id: str, subdir: str = "") -> bool:
+    """True when the bucket holds at least one object under the job's dir
+    (or ``{subdir}`` within it). Lets the soft-resolve gate accept a job
+    whose local/NAS copy is missing but whose artifacts live in the bucket.
+    False when disabled / on error."""
+    if not enabled():
+        return False
+    prefix = _job_prefix(job_id, subdir)
+
+    def _head() -> bool:
+        client = _get_client()
+        if client is None:
+            return False
+        try:
+            r = client.list_objects_v2(Bucket=_bucket(), Prefix=prefix, MaxKeys=1)
+            return int(r.get("KeyCount", 0) or 0) > 0
+        except Exception:
+            return False
+
+    try:
+        return await asyncio.to_thread(_head)
+    except Exception:
+        return False
+
+
+async def open_object(
+    job_id: str, rel_path: str, range_header: str | None = None
+):
+    """Open a job artifact in the bucket for streaming, honouring an HTTP
+    ``Range`` header so video seeks work without a local copy.
+
+    ``rel_path`` is relative to the job dir, e.g. ``"assets/clip.mp4"``.
+    Returns ``{"status", "headers", "iter"}`` (``iter`` is a 0-arg sync
+    generator yielding byte chunks) or ``None`` when disabled, missing, or
+    on error -- callers then fall back to local disk."""
+    if not enabled():
+        return None
+    key = _job_prefix(job_id).rstrip("/") + "/" + rel_path.lstrip("/")
+
+    def _open():
+        client = _get_client()
+        if client is None:
+            return None
+        kwargs = {"Bucket": _bucket(), "Key": key}
+        if range_header:
+            kwargs["Range"] = range_header
+        try:
+            obj = client.get_object(**kwargs)
+        except Exception:
+            return None
+        body = obj["Body"]
+        content_range = obj.get("ContentRange")
+        headers = {"Accept-Ranges": "bytes"}
+        clen = obj.get("ContentLength")
+        if clen is not None:
+            headers["Content-Length"] = str(clen)
+        if content_range:
+            headers["Content-Range"] = content_range
+
+        def _iter(chunk: int = 262144):
+            try:
+                while True:
+                    data = body.read(chunk)
+                    if not data:
+                        break
+                    yield data
+            finally:
+                try:
+                    body.close()
+                except Exception:
+                    pass
+
+        return {
+            "status": 206 if content_range else 200,
+            "headers": headers,
+            "iter": _iter,
+        }
+
+    try:
+        return await asyncio.to_thread(_open)
+    except Exception:
+        return None
+
+
+__all__ = [
+    "enabled",
+    "mirror_file",
+    "mirror_dir",
+    "ensure_local",
+    "list_dir",
+    "list_tree",
+    "prefix_exists",
+    "open_object",
+]

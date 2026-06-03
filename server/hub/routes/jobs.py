@@ -24,7 +24,7 @@ import logging
 from pathlib import Path
 
 from fastapi import APIRouter, File, Form, HTTPException, Request, UploadFile
-from fastapi.responses import FileResponse, HTMLResponse
+from fastapi.responses import FileResponse, HTMLResponse, StreamingResponse
 
 from server.hub._state import config, get_storage_dir, state
 
@@ -199,6 +199,11 @@ async def get_job_links(job_id: str) -> dict:
     info = await _soft_resolve_job(job_id)
     job_dir = get_storage_dir() / job_id
     current_url = info.url if info is not None else ""
+
+    # S3 fallback: pull the artifacts we parse below if the NAS copy is
+    # gone (deleted job row / CIFS drop) but the mirror still has them.
+    await objstore.ensure_local(job_dir / "page.html")
+    await objstore.ensure_local(job_dir / "links_snapshot.jsonl")
 
     # Preferred source: the rendered HTML dump written by fetcher-style
     # jobs at completion. Keeps the legacy behaviour intact.
@@ -603,9 +608,15 @@ async def _soft_resolve_job(
     check_dir = get_storage_dir() / job_id
     if require_subdir:
         check_dir = check_dir / require_subdir
-    if not check_dir.is_dir():
-        raise HTTPException(404, f"job '{job_id}' not found")
-    return None
+    if check_dir.is_dir():
+        return None
+    # S3-backed fallback: when the local/NAS dir is missing, accept the job
+    # if the object store holds its artifacts (e.g. the NAS write was lost
+    # during a CIFS drop but the S3 mirror succeeded). Keeps the gallery
+    # resolving without a local copy.
+    if objstore.enabled() and await objstore.prefix_exists(job_id, require_subdir):
+        return None
+    raise HTTPException(404, f"job '{job_id}' not found")
 
 
 def _append_network_jsonl(job_dir: Path, entries: list, sid: str) -> int:
@@ -670,6 +681,9 @@ async def upload_session_network(job_id: str, body: dict) -> dict:
     # thread so a slow storage backend (e.g. SMB/CIFS mount) cannot stall
     # the single hub event loop and starve every worker's heartbeat/pong.
     written = await asyncio.to_thread(_append_network_jsonl, job_dir, entries, sid)
+    # Mirror to object storage so GET /jobs/{id}/network reads it back after
+    # the local/NAS copy is gone (deleted job row / CIFS drop).
+    await objstore.mirror_file(job_dir / "network.jsonl")
     return {"ok": True, "job_id": job_id, "session_id": sid, "written": written}
 
 
@@ -681,6 +695,9 @@ async def get_job_network(job_id: str) -> dict:
     await _soft_resolve_job(job_id)
     job_dir = get_storage_dir() / job_id
     log_path = job_dir / "network.jsonl"
+    # S3 fallback: pull the dump if the NAS copy is gone (deleted job row /
+    # CIFS drop) but the mirror has it.
+    await objstore.ensure_local(log_path)
     entries: list[dict] = []
     if log_path.exists():
         try:
@@ -748,6 +765,9 @@ async def upload_session_links_snapshot(job_id: str, body: dict) -> dict:
     # Offload the blocking open()/write() (incl. mkdir/stat) to a worker
     # thread so a slow storage backend cannot stall the hub event loop.
     await asyncio.to_thread(_append_line, job_dir, "links_snapshot.jsonl", line)
+    # Mirror to object storage so GET /jobs/{id}/links reads it back after
+    # the local/NAS copy is gone.
+    await objstore.mirror_file(job_dir / "links_snapshot.jsonl")
     return {"ok": True, "job_id": job_id, "session_id": sid, "count": len(links)}
 
 
@@ -780,6 +800,7 @@ async def get_page_meta(job_id: str) -> dict:
     """
     info = await _require_job_info(job_id)
     page_path = get_storage_dir() / job_id / "page.html"
+    await objstore.ensure_local(page_path)
     if not page_path.exists():
         return {
             "job_id": job_id,
@@ -816,6 +837,7 @@ async def get_log(job_id: str):
 async def get_script(job_id: str):
     """The final generated script for codegen-loop jobs. For fetch jobs
     this 404s unless a template-style .py has been emitted (future)."""
+    await objstore.ensure_local(get_storage_dir() / job_id / "script.py")
     return FileResponse(
         _safe_job_file(job_id, "script.py"),
         media_type="text/x-python",
@@ -832,6 +854,7 @@ async def get_actions_json(job_id: str):
     exists -- the file is always written. 404 when the job itself is
     unknown.
     """
+    await objstore.ensure_local(get_storage_dir() / job_id / "actions.json")
     return FileResponse(
         _safe_job_file(job_id, "actions.json"),
         media_type="application/json",
@@ -853,8 +876,16 @@ async def get_recipe_suggestion(job_id: str) -> dict:
     won't always pick the right segment to wildcard.
     """
     job_dir = get_storage_dir() / job_id
-    if not job_dir.exists():
-        raise HTTPException(404, f"job '{job_id}' not found")
+    # Accept S3-only jobs (deleted row / dropped NAS copy) and pull the
+    # artifacts this aggregator reads below from the bucket when missing.
+    await _soft_resolve_job(job_id)
+    if objstore.enabled():
+        for _name in ("actions.json", "script.py", "outcome.json"):
+            await objstore.ensure_local(job_dir / _name)
+        if not (job_dir / "script.py").exists():
+            for _o in await objstore.list_tree(job_id, "attempts"):
+                if _o["rel"].rsplit("/", 1)[-1] == "script.py":
+                    await objstore.ensure_local(job_dir / "attempts" / _o["rel"])
 
     # Pull JobInfo for the url + goal (codegen-loop options live there).
     info = await state.store.get_job_info(job_id) if state.store else None
@@ -953,6 +984,7 @@ async def get_plan(job_id: str):
     decomposition was framed; the Judge also uses the success
     criterion as the bar for verdict.
     """
+    await objstore.ensure_local(get_storage_dir() / job_id / "plan.json")
     return FileResponse(
         _safe_job_file(job_id, "plan.json"),
         media_type="application/json",
@@ -962,10 +994,15 @@ async def get_plan(job_id: str):
 @router.get("/jobs/{job_id}/attempts")
 async def list_attempts(job_id: str) -> dict:
     """List all codegen-loop attempts for a job (codegen-loop mode only)."""
+    await _soft_resolve_job(job_id)
     job_dir = get_storage_dir() / job_id
-    if not job_dir.exists():
-        raise HTTPException(404, f"job '{job_id}' not found")
     attempts_dir = job_dir / "attempts"
+    # S3-back: when the local attempts tree is gone (deleted row / dropped NAS
+    # copy), pull the files this lister reads so the walk below still works.
+    if objstore.enabled() and not attempts_dir.exists():
+        for _o in await objstore.list_tree(job_id, "attempts"):
+            if _o["rel"].rsplit("/", 1)[-1] in ("result.json", "llm_meta.json", "prompt.txt"):
+                await objstore.ensure_local(attempts_dir / _o["rel"])
     if not attempts_dir.exists():
         return {"job_id": job_id, "count": 0, "attempts": []}
     rows: list[dict] = []
@@ -1271,34 +1308,61 @@ async def get_job_perception(job_id: str):
 
 
 @router.get("/jobs/{job_id}/assets/{filename:path}")
-async def get_asset(job_id: str, filename: str):
+async def get_asset(job_id: str, filename: str, request: Request):
     """Serve an asset file. ``filename`` may include forward slashes for
     nested paths (e.g. ``post_verification/post_verification.png`` from
-    ``page.capture(label=...)`` output). Path traversal is blocked via
-    resolve+relative_to against the job's assets/ root."""
+    ``page.capture(label=...)`` output).
+
+    Path traversal is blocked by rejecting ``.`` / ``..`` / empty segments
+    up front, so the file resolves within the job's ``assets/`` dir without
+    needing that dir to exist on disk.
+
+    Source order: the local copy first (fast, Range handled by
+    FileResponse), then a direct stream from the object store when the
+    local/NAS copy is missing -- no SMB write needed, which is the case a
+    dropped CIFS mount leaves behind. Falls back to the legacy
+    ensure_local pull last."""
     if not filename or "\\" in filename or filename.startswith("/"):
         raise HTTPException(400, "invalid path")
-    # Reject any segment that's empty / "." / ".." so the resolve check
-    # below has well-formed input.
+    # Reject any segment that's empty / "." / ".." -- with these gone the
+    # filename cannot escape the assets/ dir (local) or its key prefix (S3).
     parts = filename.split("/")
     for seg in parts:
         if seg in ("", ".", ".."):
             raise HTTPException(400, "invalid path component")
-    job_dir = get_storage_dir() / job_id
-    if not job_dir.exists():
-        raise HTTPException(404, f"job '{job_id}' not found")
-    assets_root = (job_dir / "assets").resolve()
-    target = (job_dir / "assets" / filename)
-    try:
-        target.resolve().relative_to(assets_root)
-    except ValueError:
-        raise HTTPException(400, "path escapes assets dir")
-    # Multi-hub read-fallback: pull from shared object storage if a
-    # different hub produced this asset (no-op locally / single-hub).
+    target = get_storage_dir() / job_id / "assets" / filename
+    # 1) Local fast path -- serve straight off disk. Belt-and-braces
+    #    traversal guard against the resolved assets root.
+    if target.exists() and target.is_file():
+        assets_root = (get_storage_dir() / job_id / "assets").resolve()
+        try:
+            target.resolve().relative_to(assets_root)
+        except ValueError:
+            raise HTTPException(400, "path escapes assets dir")
+        return FileResponse(target)
+    # 2) Object store -- stream directly, honouring Range, without touching
+    #    the (possibly-absent) NAS mount.
+    if objstore.enabled():
+        obj = await objstore.open_object(
+            job_id, f"assets/{filename}", request.headers.get("range")
+        )
+        if obj is not None:
+            import mimetypes
+
+            media_type = (
+                mimetypes.guess_type(filename)[0] or "application/octet-stream"
+            )
+            return StreamingResponse(
+                obj["iter"](),
+                status_code=obj["status"],
+                headers=obj["headers"],
+                media_type=media_type,
+            )
+    # 3) Last resort: pull into the local cache then serve (legacy path).
     await objstore.ensure_local(target)
-    if not target.exists() or not target.is_file():
-        raise HTTPException(404, f"file not found: {filename}")
-    return FileResponse(target)
+    if target.exists() and target.is_file():
+        return FileResponse(target)
+    raise HTTPException(404, f"file not found: {filename}")
 
 
 # ----------------------------------------------------------------------------
@@ -1347,6 +1411,38 @@ def _asset_href(job_id: str, filename: str) -> str:
     return f"/jobs/{quote(job_id, safe='')}/assets/{quote(filename, safe='/')}"
 
 
+async def _gather_assets(job_id: str) -> list[dict]:
+    """The job's top-level assets as ``[{"name", "size"}]``, sourced from
+    the object store *unioned* with any local copy -- so the gallery
+    populates whether the files live on the NAS, in S3, or both. This is
+    what makes the gallery survive a dropped CIFS mount: when the local
+    dir is gone the S3 listing still supplies every asset.
+
+    Excludes ``screenshot-*`` (those belong to the Screenshot tab) and the
+    nested ``.meta/`` sidecar dir. Sorted case-insensitively by name. When
+    S3 is disabled this is exactly the old local-only listing."""
+    by_name: dict[str, int] = {}
+    assets_dir = get_storage_dir() / job_id / "assets"
+    if assets_dir.exists():
+        for p in assets_dir.iterdir():
+            if not p.is_file() or p.name.lower().startswith("screenshot-"):
+                continue
+            try:
+                by_name[p.name] = p.stat().st_size
+            except OSError:
+                continue
+    if objstore.enabled():
+        for o in await objstore.list_dir(job_id, "assets"):
+            n = o.get("name") or ""
+            if not n or n.lower().startswith("screenshot-"):
+                continue
+            by_name.setdefault(n, int(o.get("size") or 0))  # local size wins
+    return [
+        {"name": n, "size": s}
+        for n, s in sorted(by_name.items(), key=lambda kv: kv[0].lower())
+    ]
+
+
 @router.get("/jobs/{job_id}/assets.json")
 async def job_assets_json(job_id: str) -> dict:
     """JSON view of captured assets -- powers the inline live panel's
@@ -1361,58 +1457,49 @@ async def job_assets_json(job_id: str) -> dict:
     below for older integrations -- prefer ``assets.json`` going forward.
     """
     await _soft_resolve_job(job_id, require_subdir="assets")
-    assets_dir = get_storage_dir() / job_id / "assets"
-    meta_dir = assets_dir / ".meta"
+    meta_dir = get_storage_dir() / job_id / "assets" / ".meta"
     items: list[dict] = []
-    if assets_dir.exists():
-        for p in sorted(assets_dir.iterdir(), key=lambda p: p.name.lower()):
-            if not p.is_file():
-                continue
-            # Skip "screenshot-*" entries -- those are intentional
-            # captures (manual Screenshot button) and live exclusively
-            # in the Screenshot tab via /jobs/{id}/screenshots.json.
-            # Operator preference: don't duplicate them into the asset
-            # gallery. Page-downloaded images (logo.png etc) without the
-            # prefix continue to show here.
-            if p.name.lower().startswith("screenshot-"):
-                continue
-            ext = p.suffix.lower().lstrip(".")
-            kind = "other"
-            if ext in _IMG_EXTS:
-                kind = "image"
-            elif ext in _VIDEO_EXTS:
-                kind = "video"
-            elif ext in _AUDIO_EXTS:
-                kind = "audio"
-            sz = p.stat().st_size
-            # Pull sidecar metadata if it exists. The fetch path saves
-            # source URLs straight onto the asset row; session captures
-            # use the .meta/ sidecar minted by upload_asset above.
-            source_url = None
-            mime = None
-            page_url = None
-            meta_path = meta_dir / f"{p.name}.json"
-            if meta_path.exists():
-                try:
-                    meta = json.loads(meta_path.read_text(encoding="utf-8"))
-                    source_url = meta.get("source_url")
-                    mime = meta.get("mime")
-                    page_url = meta.get("page_url")
-                except Exception:
-                    pass
-            items.append(
-                {
-                    "name": p.name,
-                    "href": _asset_href(job_id, p.name),
-                    "size": sz,
-                    "size_h": _human_size(sz),
-                    "ext": ext,
-                    "kind": kind,
-                    "source_url": source_url,
-                    "page_url": page_url,
-                    "mime": mime,
-                }
-            )
+    for a in await _gather_assets(job_id):
+        name = a["name"]
+        sz = a["size"]
+        ext = Path(name).suffix.lower().lstrip(".")
+        kind = "other"
+        if ext in _IMG_EXTS:
+            kind = "image"
+        elif ext in _VIDEO_EXTS:
+            kind = "video"
+        elif ext in _AUDIO_EXTS:
+            kind = "audio"
+        # Pull sidecar metadata if it exists. The fetch path saves source
+        # URLs straight onto the asset row; session captures use the
+        # .meta/ sidecar minted by upload_asset. Read from the local copy
+        # only (best effort) -- absent for S3-only jobs, so source_url is
+        # simply null there; the asset itself still lists.
+        source_url = None
+        mime = None
+        page_url = None
+        meta_path = meta_dir / f"{name}.json"
+        if meta_path.exists():
+            try:
+                meta = json.loads(meta_path.read_text(encoding="utf-8"))
+                source_url = meta.get("source_url")
+                mime = meta.get("mime")
+                page_url = meta.get("page_url")
+            except Exception:
+                pass
+        items.append(
+            {
+                "name": name,
+                "href": _asset_href(job_id, name),
+                "size": sz,
+                "size_h": _human_size(sz),
+                "ext": ext,
+                "kind": kind,
+                "source_url": source_url,
+                "page_url": page_url,
+                "mime": mime,
+            }
+        )
     return {"job_id": job_id, "count": len(items), "items": items}
 
 
@@ -1455,7 +1542,26 @@ async def job_screenshots_json(job_id: str) -> dict:
     """
     await _soft_resolve_job(job_id, require_subdir="assets")
     assets_dir = get_storage_dir() / job_id / "assets"
-    items: list[dict] = []
+    # rel-path -> {size, mtime}; local wins on dup. Sourced from the local
+    # tree UNIONed with the S3 mirror (recursive list_tree), so the
+    # screenshot stream survives a deleted job row / dropped NAS copy.
+    by_rel: dict[str, dict] = {}
+    if assets_dir.exists():
+        for p in assets_dir.rglob("*"):
+            if not p.is_file():
+                continue
+            try:
+                rel = p.relative_to(assets_dir).as_posix()
+            except Exception:
+                rel = p.name
+            try:
+                st = p.stat()
+            except Exception:
+                continue
+            by_rel[rel] = {"size": st.st_size, "mtime": st.st_mtime}
+    if objstore.enabled():
+        for o in await objstore.list_tree(job_id, "assets"):
+            by_rel.setdefault(o["rel"], {"size": o["size"], "mtime": o["mtime"]})
     # Classify which image files are "screenshots" (taken intentionally
     # by API / client / AI / operator) vs "page assets" (downloaded by
     # the browser as part of the crawled page itself, e.g. logo.png,
@@ -1470,36 +1576,26 @@ async def job_screenshots_json(job_id: str) -> dict:
     #     under attempts/N/. INCLUDE.
     #   * Other top-level images (no "screenshot-" prefix) -- assumed
     #     page-downloaded asset. EXCLUDE.
-    if assets_dir.exists():
-        for p in assets_dir.rglob("*"):
-            if not p.is_file():
-                continue
-            ext = p.suffix.lower().lstrip(".")
-            if ext not in _IMG_EXTS:
-                continue
-            try:
-                rel = p.relative_to(assets_dir).as_posix()
-            except Exception:
-                rel = p.name
-            in_subdir = "/" in rel
-            is_named_screenshot = rel.lower().startswith("screenshot-")
-            if not (in_subdir or is_named_screenshot):
-                continue  # page-downloaded asset, not a screenshot
-            try:
-                st = p.stat()
-            except Exception:
-                continue
-            label = rel.rsplit("/", 1)[0] if "/" in rel else ""
-            items.append({
-                "name": p.name,
-                "path": rel,
-                "href": _asset_href(job_id, rel),
-                "size": st.st_size,
-                "size_h": _human_size(st.st_size),
-                "ext": ext,
-                "mtime": st.st_mtime,
-                "label": label,
-            })
+    items: list[dict] = []
+    for rel, meta in by_rel.items():
+        ext = rel.rsplit(".", 1)[-1].lower() if "." in rel else ""
+        if ext not in _IMG_EXTS:
+            continue
+        in_subdir = "/" in rel
+        is_named_screenshot = rel.lower().startswith("screenshot-")
+        if not (in_subdir or is_named_screenshot):
+            continue  # page-downloaded asset, not a screenshot
+        label = rel.rsplit("/", 1)[0] if "/" in rel else ""
+        items.append({
+            "name": rel.rsplit("/", 1)[-1],
+            "path": rel,
+            "href": _asset_href(job_id, rel),
+            "size": meta["size"],
+            "size_h": _human_size(meta["size"]),
+            "ext": ext,
+            "mtime": meta["mtime"],
+            "label": label,
+        })
     items.sort(key=lambda d: (d["mtime"], d["path"]))
     return {"job_id": job_id, "count": len(items), "items": items}
 
@@ -1525,27 +1621,18 @@ async def job_assets(job_id: str) -> str:
         _info_status = info.status.value if (info is not None and info.status is not None) else "?"
     except Exception:
         _info_status = "?"
-    assets_dir = get_storage_dir() / job_id / "assets"
-
-    files: list[Path] = []
-    if assets_dir.exists():
-        files = sorted(
-            (p for p in assets_dir.iterdir() if p.is_file()),
-            key=lambda p: (p.suffix.lower(), p.name.lower()),
-        )
-
+    # File list comes from the object store unioned with any local copy
+    # (see _gather_assets) -- so the gallery renders even when the NAS copy
+    # is gone. screenshot-* and the .meta/ dir are already filtered there.
     buckets = {"images": [], "videos": [], "audios": [], "others": []}
-    for p in files:
-        # Skip manual Capture-button outputs -- they belong to the
-        # Screenshot tab only (see assets_json filter above).
-        if p.name.lower().startswith("screenshot-"):
-            continue
-        ext = p.suffix.lower().lstrip(".")
+    for a in await _gather_assets(job_id):
+        name = a["name"]
+        ext = Path(name).suffix.lower().lstrip(".")
         info_d = {
-            "name": p.name,
-            "href": _asset_href(job_id, p.name),
-            "size": p.stat().st_size,
-            "size_h": _human_size(p.stat().st_size),
+            "name": name,
+            "href": _asset_href(job_id, name),
+            "size": a["size"],
+            "size_h": _human_size(a["size"]),
             "ext": ext,
         }
         if ext in _IMG_EXTS:
