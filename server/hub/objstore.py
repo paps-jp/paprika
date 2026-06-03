@@ -447,10 +447,53 @@ async def open_object(
         return None
 
 
+async def reachable() -> tuple[bool, str]:
+    """Liveness probe for the admin Settings status banner: ``head_bucket``
+    on the configured bucket with a short timeout. Returns ``(ok, reason)``
+    -- ``(True, "")`` when reachable, ``(False, "<ExceptionName>")`` on
+    failure, ``(False, "disabled")`` when the mirror is off. Uses a fresh
+    short-timeout client (NOT the cached transfer client, whose long
+    timeouts would let a dead endpoint hang the /settings load)."""
+    if not enabled():
+        return (False, "disabled")
+
+    def _check() -> tuple[bool, str]:
+        try:
+            import boto3
+            from botocore.config import Config as _BotoConfig
+        except Exception:
+            return (False, "boto3 unavailable")
+        try:
+            client = boto3.client(
+                "s3",
+                endpoint_url=_s3cfg("s3_endpoint", "PAPRIKA_S3_ENDPOINT") or None,
+                aws_access_key_id=_s3cfg("s3_access_key", "PAPRIKA_S3_ACCESS_KEY") or None,
+                aws_secret_access_key=_s3cfg("s3_secret_key", "PAPRIKA_S3_SECRET_KEY") or None,
+                region_name=_s3cfg("s3_region", "PAPRIKA_S3_REGION", "us-east-1"),
+                config=_BotoConfig(
+                    signature_version="s3v4",
+                    s3={"addressing_style": "path"},
+                    retries={"max_attempts": 1, "mode": "standard"},
+                    connect_timeout=3,
+                    read_timeout=3,
+                ),
+            )
+            client.head_bucket(Bucket=_bucket())
+            return (True, "")
+        except Exception as e:
+            return (False, type(e).__name__)
+
+    try:
+        return await asyncio.to_thread(_check)
+    except Exception as e:
+        return (False, type(e).__name__)
+
+
 __all__ = [
     "enabled",
     "mirror_file",
     "mirror_dir",
+    "reachable",
     "ensure_local",
     "list_dir",
     "list_tree",

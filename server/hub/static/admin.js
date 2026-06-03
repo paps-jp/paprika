@@ -11650,6 +11650,7 @@ async function loadSettingsPanel() {
       _setVal('setS3Region', hub.s3_region || 'us-east-1');
       _setVal('setS3AccessKey', hub.s3_access_key);
       _setSecretPw('setS3SecretKey', !!_secretsSet.s3_secret_key);
+      _updateS3StatusBanner(d.s3_status || {});
 
       const sys = d.system || {};
       const tbody = document.getElementById('setSystemInfoBody');
@@ -11876,6 +11877,34 @@ function _updateMariadbStatusBanner(st) {
     banner.style.color = '#7a5a14';
     banner.innerHTML = '<iconify-icon icon="lucide:alert-circle" style="font-size:1.2em;"></iconify-icon>'
       + ' <strong>未接続</strong>: MariaDB に接続できません。Redis / ファイルで動作中。';
+  }
+}
+
+function _updateS3StatusBanner(st) {
+  const banner = document.getElementById('s3StatusBanner');
+  if (!banner) return;
+  // Hidden entirely when the S3 mirror is disabled (= local disk only).
+  if (!st || !st.enabled) {
+    banner.style.display = 'none';
+    return;
+  }
+  banner.style.display = 'flex';
+  if (st.connected) {
+    banner.style.background = '#e6f7e9';
+    banner.style.border = '1px solid #7ab68a';
+    banner.style.color = '#196b2c';
+    banner.innerHTML = '<iconify-icon icon="lucide:check-circle" style="font-size:1.2em;"></iconify-icon>'
+      + ' <strong>接続中</strong>: '
+      + esc(st.endpoint || '(既定エンドポイント)')
+      + ' <span style="margin-left:8px; padding:2px 8px; border-radius:4px; background:#d4edda; font-size:.85em;">bucket=' + esc(st.bucket || '') + '</span>'
+      + ' <span style="margin-left:6px; padding:2px 8px; border-radius:4px; background:#cce5ff; color:#004085; font-size:.85em;">prefix=' + esc(st.prefix || '') + '</span>';
+  } else {
+    banner.style.background = '#fdecea';
+    banner.style.border = '1px solid #e0a3a0';
+    banner.style.color = '#a3261f';
+    banner.innerHTML = '<iconify-icon icon="lucide:alert-circle" style="font-size:1.2em;"></iconify-icon>'
+      + ' <strong>未接続</strong>: S3 / MinIO に接続できません'
+      + (st.error ? ' (' + esc(st.error) + ')' : '') + '。設定を確認してください。';
   }
 }
 

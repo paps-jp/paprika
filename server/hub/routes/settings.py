@@ -96,11 +96,17 @@ async def get_settings() -> dict:
     # S3 / object storage status (config-only; reachability is on-demand
     # via POST /settings/s3/test to keep this GET cheap).
     from server.hub import objstore as _objstore
+    _s3_enabled = _objstore.enabled()
+    # Live reachability probe (head_bucket, short timeout) so the Settings
+    # banner can show 接続中 / 未接続 -- same idea as mariadb_status above.
+    _s3_connected, _s3_err = (await _objstore.reachable()) if _s3_enabled else (False, "")
     s3_status = {
-        "enabled": _objstore.enabled(),
+        "enabled": _s3_enabled,
+        "connected": _s3_connected,
         "endpoint": reg.get("s3_endpoint", ""),
         "bucket": reg.get("s3_bucket", "paprika"),
         "prefix": reg.get("s3_prefix", "jobs"),
+        "error": _s3_err,
     }
 
     # Never ship secret values to the browser. GET /settings is

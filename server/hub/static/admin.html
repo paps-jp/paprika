@@ -3948,6 +3948,10 @@ table.aitbl code { font-size:0.95em; }
     <p style="margin:4px 0 8px; color:#666; font-size:.88em;">
       ジョブ成果物 (assets / page.html / script.py 等) のミラー兼読み取り元。有効時、NAS のローカルコピーが無くても S3 から配信・復元します。未設定ならローカルディスクのみ。<code>PAPRIKA_S3_*</code> 環境変数があればそれを既定値に使用。
     </p>
+
+    <div id="s3StatusBanner" style="display:none; padding:8px 14px; border-radius:6px; margin-bottom:10px; font-size:.9em; align-items:center; gap:8px;">
+    </div>
+
     <div style="display:grid; grid-template-columns: 200px 1fr; gap:8px 12px; align-items:center; padding:8px 4px;">
       <label for="setS3Enabled" title="S3 ミラーの有効/無効">有効化:</label>
       <div><label style="font-weight:normal;"><input type="checkbox" id="setS3Enabled"> S3 / MinIO を使用する</label></div>
