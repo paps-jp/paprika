@@ -252,7 +252,7 @@ const I18N_RESOURCES = {
     "ljp.vnc.go.title":       "URL へ移動",
     "ljp.vnc.popups":         "popup",
     "ljp.vnc.popups.title":   "広告などのポップアップ・別タブを閉じる (記録)",
-    "ljp.vnc.screenshot.title":"現在のフレームを保存",
+    "ljp.vnc.screenshot.title":"スクリーンショット撮影",
     "ljp.vnc.fit":            "fit",
     "ljp.vnc.fit.title":      "Chrome のウィンドウサイズを現在の zoom 設定に再同期する",
     "ljp.vnc.open":           "open",
@@ -650,7 +650,7 @@ const I18N_RESOURCES = {
     "ljp.vnc.go.title":       "Go to URL",
     "ljp.vnc.popups":         "popup",
     "ljp.vnc.popups.title":   "Close ad popups / extra tabs (recorded)",
-    "ljp.vnc.screenshot.title":"Save the current frame",
+    "ljp.vnc.screenshot.title":"Take screenshot",
     "ljp.vnc.fit":            "fit",
     "ljp.vnc.fit.title":      "Re-sync Chrome window size to the current zoom",
     "ljp.vnc.open":           "open",
@@ -5325,14 +5325,51 @@ async function ljpRefreshStatus() {
     // worker really has torn the lane down and the bridge is gone.
     const _statusTerminal = info.status === 'completed' || info.status === 'failed'
       || info.status === 'cancelled' || info.status === 'succeeded';
-    if (_vncLive && !LJP.vncIframes.has('__job__')) {
+    // Prefer JobInfo.session_id (set by keep_session fetch / codegen-loop
+    // / Code mode at dispatch time) as the iframe key over the synthetic
+    // ``__job__`` placeholder. The real session_id key activates the
+    // full operator UI: editable URL input, Go button, back/forward,
+    // popup-close, AND the URL auto-refresh from /sessions/{sid}/pages.
+    // The ``__job__`` placeholder shows only a read-only <code> URL.
+    // ljpRefreshSessions also tries to discover sessions via
+    // /jobs/{id}/sessions, but that requires SessionInfo.job_id ==
+    // job_id which is only set for codegen-loop -- keep_session fetch
+    // sessions wouldn't show up there. Using info.session_id covers
+    // both paths.
+    const _jobSid = info.session_id && _vncLive ? info.session_id : null;
+    if (_vncLive && _jobSid && !LJP.vncIframes.has(_jobSid)) {
+      // If we already have the placeholder up, ljpMountVncFrame's own
+      // dedup logic will swap it out for the session_id-keyed version
+      // (same canonical URL match path).
+      ljpMountVncFrame(_jobSid, {
+        novnc_url: info.novnc_url,
+        novnc_url_autoconnect: ljpAutoconnect(info.novnc_url),
+        label: _jobSid,
+        initial_url: info.url || '',
+      });
+    } else if (_vncLive && !_jobSid && !LJP.vncIframes.has('__job__')) {
+      // No session_id on JobInfo -- fall back to the synthetic key
+      // (read-only display; ad-hoc fetch jobs go here).
       ljpMountVncFrame('__job__', {
         novnc_url: info.novnc_url,
         novnc_url_autoconnect: ljpAutoconnect(info.novnc_url),
         label: 'job ' + LJP.jobId.slice(0, 12),
       });
-    } else if (_statusTerminal && LJP.vncIframes.has('__job__')) {
-      ljpRemoveVncFrame('__job__', 'セッションは終了しました（noVNC は利用できません）');
+    } else if (_statusTerminal) {
+      // Tear down whichever variant got mounted.
+      if (LJP.vncIframes.has('__job__')) {
+        ljpRemoveVncFrame('__job__', 'セッションは終了しました（noVNC は利用できません）');
+      }
+      if (_jobSid && LJP.vncIframes.has(_jobSid)) {
+        ljpRemoveVncFrame(_jobSid, 'セッションは終了しました（noVNC は利用できません）');
+      }
+    }
+    // Keep the session-keyed iframe's URL input in sync with the actual
+    // current page URL (the polling done by ljpRefreshSessions ONLY
+    // covers sessions that show up in /jobs/{id}/sessions; for
+    // JobInfo.session_id-only paths we drive it from here).
+    if (_jobSid && !_statusTerminal && LJP.vncIframes.has(_jobSid)) {
+      try { ljpRefreshSessionUrl(_jobSid).catch(() => {}); } catch (_) {}
     }
     // Refresh the thumbnail strip past the queued phase -- but event-driven
     // now: only re-fetch when an asset actually landed (LJP._galleryDirty,
@@ -5923,7 +5960,7 @@ function ljpMountVncFrame(key, s) {
   // / fit / open follow the LJP top-header button structure with both
   // iconify-icon + <span data-i18n>.
   const shotBtn =
-    `<button class="pill ljp-vnc-screenshot" data-i18n-title="ljp.vnc.screenshot.title" title="現在のフレームを保存" style="${_shotAccent}"><iconify-icon icon="lucide:camera"></iconify-icon></button>`;
+    `<button class="pill ljp-vnc-screenshot" data-i18n-title="ljp.vnc.screenshot.title" title="スクリーンショット撮影" style="${_shotAccent}"><iconify-icon icon="lucide:camera"></iconify-icon></button>`;
   const popupBtn = _opSid ?
     `<button class="pill ljp-op-popups" data-i18n-title="ljp.vnc.popups.title" title="広告などのポップアップ・別タブを閉じる (記録)" style="${_popupAccent}"><iconify-icon icon="lucide:x"></iconify-icon> <span data-i18n="ljp.vnc.popups">popup</span></button>` :
     '';
