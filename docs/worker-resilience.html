@@ -2,10 +2,10 @@
 <html lang="ja">
 <head>
 <meta charset="utf-8">
-<title>Worker 自己回復 — 自動サイジング / 自滅再起動 / 定期リサイクル / stale 自動掃除</title>
+<title>Worker 自己回復 — 自動サイジング / その場再接続 / 定期リサイクル / stale 自動掃除</title>
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <link rel="stylesheet" href="style.css">
-<meta name="description" content="Paprika worker の自己回復（self-healing）設計。起動時にCPUコアへレーン数を自動調整、hub 再接続に失敗したら自滅→docker 再起動、N ジョブごとに drain して自動リサイクル、hub 側は心拍の途絶えた worker を自動 reap。worker のライフサイクル図と設定一覧。">
+<meta name="description" content="Paprika worker の自己回復（self-healing）設計。起動時にCPUコアへレーン数を自動調整、hub 接続が切れてもその場で無期限に再接続（自滅しない）、N ジョブごとに drain して自動リサイクル、hub 側は心拍の途絶えた worker を自動 reap。worker のライフサイクル図と設定一覧。">
 <link rel="canonical" href="https://paps-jp.github.io/paprika/worker-resilience.html">
 </head>
 <body>
@@ -53,7 +53,7 @@
       <li><a href="#lifecycle">ライフサイクル図</a></li>
       <li><a href="#states">状態の意味</a></li>
       <li><a href="#autosize">① 自動サイジング</a></li>
-      <li><a href="#selfheal">② 自滅→再起動</a></li>
+      <li><a href="#selfheal">② 接続断は再接続で耐える</a></li>
       <li><a href="#recycle">③ 定期リサイクル</a></li>
       <li><a href="#reap">④ stale 自動掃除</a></li>
       <li><a href="#config">設定一覧</a></li>
@@ -66,14 +66,15 @@
   <h1>Worker 自己回復（self-healing）</h1>
   <p class="lead">
     各 worker は「壊れたら自分で気づいて作り直す」自己回復ループを持つ。
-    <strong>起動時に CPU コアへレーン数を自動調整</strong>し、<strong>hub への再接続に失敗し続けたら自滅して再起動</strong>、
+    <strong>起動時に CPU コアへレーン数を自動調整</strong>し、<strong>hub との接続が切れてもその場で再接続し続け</strong>、
     <strong>一定ジョブ数ごとに drain して自動リサイクル</strong>、さらに <strong>hub 側が応答の途絶えた worker を自動で掃除</strong>する。
     手動の再起動・登録削除は不要。
   </p>
 
   <!-- ============================================================= -->
   <h2 id="lifecycle">ライフサイクル図</h2>
-  <p>起動 → 登録 → 実行 のメイン経路と、3つの終了トリガ（再接続断念／リサイクル／drain）から <code>EXIT</code> を経て docker が作り直す循環。</p>
+  <p>起動 → 登録 → 実行 のメイン経路。WS が切れても <code>RECONNECTING</code> で<strong>無期限に再接続</strong>（自滅はしない）。
+  終了は <strong>N ジョブ後の drain リサイクル</strong>のみで、<code>EXIT</code> を経て docker が作り直す循環。</p>
 
   <svg viewBox="0 0 940 470" role="img" aria-label="Worker ライフサイクル図" style="display:block;margin:18px auto;max-width:100%;height:auto;font-family:ui-monospace,Consolas,monospace;">
     <defs>
@@ -115,7 +116,7 @@
     <!-- branch boxes -->
     <rect x="555" y="226" width="220" height="46" rx="9" fill="#fff8e6" stroke="#f5d77a"/>
     <text x="665" y="245" text-anchor="middle" font-size="11.5">RECONNECTING</text>
-    <text x="665" y="262" text-anchor="middle" font-size="10" fill="#7a5">WS 断 → バックオフ再接続</text>
+    <text x="665" y="262" text-anchor="middle" font-size="10" fill="#7a5">WS 断 → 無期限に再接続（自滅しない）</text>
 
     <rect x="555" y="300" width="220" height="46" rx="9" fill="#fff8e6" stroke="#f5d77a"/>
     <text x="665" y="319" text-anchor="middle" font-size="11.5">DRAINING</text>
@@ -136,9 +137,7 @@
     <path d="M 845 178 Q 845 290 778 323" fill="none" stroke="#0969da" stroke-width="1.5" marker-end="url(#ahb)"/>
     <text x="848" y="230" font-size="10" fill="#0969da">jobs≥N / 停止指示</text>
 
-    <!-- RECONNECTING -> EXIT (giveup) -->
-    <path d="M 775 256 Q 805 262 822 274" fill="none" stroke="#b35900" stroke-width="1.6" marker-end="url(#ahr)"/>
-    <text x="780" y="246" font-size="10" fill="#b35900">再接続を断念（&gt;120s）</text>
+    <!-- (RECONNECTING never exits to EXIT: reconnect-in-place, no self-exit) -->
 
     <!-- DRAINING -> EXIT -->
     <path d="M 775 318 Q 805 312 822 300" fill="none" stroke="#b35900" stroke-width="1.6" marker-end="url(#ahr)"/>
@@ -164,11 +163,11 @@
   <table>
     <tr><th>状態</th><th>意味</th><th>抜け方</th></tr>
     <tr><td><code>STARTING</code></td><td>起動。CPU コア数を見てレーン数を決め、各レーンの Chrome を立ち上げる。</td><td>→ REGISTER</td></tr>
-    <tr><td><code>REGISTER</code></td><td>hub へ WebSocket 接続し、capacity（=レーン数）を登録。心拍を開始。</td><td>→ RUNNING ／ 失敗継続で → EXIT</td></tr>
+    <tr><td><code>REGISTER</code></td><td>hub へ WebSocket 接続し、capacity（=レーン数）を登録。心拍を開始。</td><td>→ RUNNING（失敗時はバックオフで再接続を継続）</td></tr>
     <tr><td><code>RUNNING</code></td><td>接続中。ジョブを受けて lane で実行、15s ごとに心拍、完了数を計数。</td><td>WS断→RECONNECTING ／ N到達→DRAINING</td></tr>
-    <tr><td><code>RECONNECTING</code></td><td>hub との WS が切れ、バックオフで再接続を試行。</td><td>復帰→RUNNING ／ 断念→EXIT</td></tr>
+    <tr><td><code>RECONNECTING</code></td><td>hub との WS が切れ、バックオフで再接続を試行。</td><td>復帰→RUNNING（<strong>無期限に再接続・自滅しない</strong>）</td></tr>
     <tr><td><code>DRAINING</code></td><td>新規ジョブの受付を止め（capacity=0）、実行中のジョブだけ完了させる。</td><td>→ EXIT</td></tr>
-    <tr><td><code>EXIT</code></td><td>プロセスを終了。docker の <code>restart: unless-stopped</code> が新しいプロセスとして作り直す。</td><td>→ docker → STARTING</td></tr>
+    <tr><td><code>EXIT</code></td><td>リサイクル（drain 完了後）にプロセスを終了。docker の <code>restart: unless-stopped</code> が新しいプロセスとして作り直す。</td><td>→ docker → STARTING</td></tr>
   </table>
 
   <!-- ============================================================= -->
@@ -195,17 +194,20 @@
   </p>
 
   <!-- ============================================================= -->
-  <h2 id="selfheal">② 接続失敗時は自滅 → 再起動</h2>
+  <h2 id="selfheal">② 接続断は「その場で再接続」で耐える</h2>
   <p>
-    hub との WS が切れると worker はバックオフで再接続を試みる（<code>RECONNECTING</code>）。
-    ただし <strong>その場で永久に再接続し続けない</strong>。<code>WORKER_RECONNECT_GIVEUP_S</code>（既定 120 秒）を超えて復帰できなければ、
-    worker は<strong>自らプロセスを終了</strong>する。docker の再起動ポリシーが<strong>新しいプロセスとして起動し直し、まっさらな状態で再登録</strong>する。
+    hub との WS が切れると worker はバックオフ（最大15s）で<strong>無期限に再接続を試み続ける</strong>（<code>RECONNECTING</code>）。
+    復帰すれば in-flight を畳んで <code>RUNNING</code> に戻る。<strong>プロセスは自滅しない。</strong>
+    残ったゴースト登録は hub 側の <a href="#reap">④ reaper</a> が自動で掃除するため、その場再接続でも登録は溜まらない。
   </p>
-  <ul>
-    <li>その場での無限再接続が生む「半死・ゴースト登録・詰まり」を断ち切る。</li>
-    <li>新規プロセス＝Chrome もレーンも作り直しなので、溜まった不整合がリセットされる。</li>
-    <li>hub 側は古い登録を ④ reaper が自動で掃除するため、ゴーストが残らない。</li>
-  </ul>
+  <p class="callout warn">
+    <strong>「接続失敗で自滅→再起動」（Selenium の SHUTDOWN_ON_FAILURE 相当）は意図的に採用していません。</strong>
+    試験導入したところ、<strong>重い動画DLでイベントループが一時的に飢餓</strong>になり心拍が数十秒途絶えただけの「生きている worker」まで
+    “接続失敗”と誤判定して落とし、しかも全台一斉デプロイと噛んで<strong>再起動ストーム</strong>を起こした。
+    そのため<strong>その場再接続（reconnect-in-place）を既定</strong>に戻している。
+    将来再導入するなら、心拍遅延ではなく <strong>「一度も登録できていない＝真の接続失敗」だけ</strong>を条件にすること
+    （<code>WORKER_RECONNECT_GIVEUP_S</code> は将来用に予約。現在は無効）。
+  </p>
 
   <!-- ============================================================= -->
   <h2 id="recycle">③ N ジョブごとに自動リサイクル</h2>
@@ -240,7 +242,7 @@
     <tr><td><code>WORKER_CPU_BUDGET</code></td><td><code>nproc</code></td><td>自動サイジングに使う「この worker の実効コア数」。共有ホストでは公平取り分を設定。</td></tr>
     <tr><td><code>WORKER_LANE_CORES</code></td><td><code>4</code></td><td>1 レーンが要するコア目安。</td></tr>
     <tr><td><code>WORKER_MAX_LANES</code></td><td><code>2</code></td><td>自動サイジングの上限（既定は現状維持の 2。余力があれば上げる）。</td></tr>
-    <tr><td><code>WORKER_RECONNECT_GIVEUP_S</code></td><td><code>120</code></td><td>WS 再接続をこの秒数失敗し続けたら自滅→再起動。</td></tr>
+    <tr><td><code>WORKER_RECONNECT_GIVEUP_S</code></td><td>—（無効）</td><td>将来用に予約。現在は<strong>未使用</strong>（自滅は不採用 → <a href="#selfheal">②</a> 参照）。</td></tr>
     <tr><td><code>WORKER_RECYCLE_AFTER_JOBS</code></td><td><code>200</code></td><td>完了ジョブ数がこれに達したら drain→自滅→再起動。<code>0</code> で無効。</td></tr>
   </table>
   <h3>Hub 側</h3>
