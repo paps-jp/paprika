@@ -39,7 +39,7 @@ router = APIRouter(tags=["Settings"])
 # endpoint is unauthenticated on the LAN). Redacted to "" in the GET
 # payload; the UI uses the companion ``secrets_set`` map to show whether
 # one is stored. PUT still accepts the real value to (re)set it.
-_SECRET_KEYS = frozenset({"smb_password", "mariadb_password"})
+_SECRET_KEYS = frozenset({"smb_password", "mariadb_password", "s3_secret_key"})
 
 
 def _require_settings() -> SettingsRegistry:
@@ -93,6 +93,16 @@ async def get_settings() -> dict:
         except Exception:
             mdb_status = {"connected": False}
 
+    # S3 / object storage status (config-only; reachability is on-demand
+    # via POST /settings/s3/test to keep this GET cheap).
+    from server.hub import objstore as _objstore
+    s3_status = {
+        "enabled": _objstore.enabled(),
+        "endpoint": reg.get("s3_endpoint", ""),
+        "bucket": reg.get("s3_bucket", "paprika"),
+        "prefix": reg.get("s3_prefix", "jobs"),
+    }
+
     # Never ship secret values to the browser. GET /settings is
     # unauthenticated on the LAN, so returning smb_password /
     # mariadb_password in cleartext (as reg.all() does) would leak the
@@ -127,6 +137,7 @@ async def get_settings() -> dict:
             "mount_point": smb_mp,
         },
         "mariadb_status": mdb_status,
+        "s3_status": s3_status,
     }
 
 
@@ -137,6 +148,14 @@ async def put_settings(body: dict) -> dict:
     reg = _require_settings()
     body = body or {}
     reg.update(body)
+    # S3 connection changed -> drop the cached boto3 client so the new
+    # endpoint / credentials take effect on the next object-store call.
+    if any(str(k).startswith("s3_") for k in body):
+        try:
+            from server.hub import objstore
+            objstore.reset_client()
+        except Exception:
+            pass
     return await get_settings()
 
 
@@ -262,6 +281,58 @@ async def smb_status() -> dict:
 # -------------------------------------------------------------------
 # MariaDB connection test
 # -------------------------------------------------------------------
+
+@router.post("/settings/s3/test")
+async def s3_test(body: dict | None = None) -> dict:
+    """Test S3 / MinIO connectivity. Uses body values (endpoint, bucket,
+    access_key, secret_key, region) when provided -- so the operator can
+    verify before saving -- else the saved settings. A blank secret_key in
+    the body falls back to the stored one. Does head_bucket + a 1-key list."""
+    import asyncio
+
+    reg = _require_settings()
+    b = body or {}
+    endpoint = (b.get("endpoint") or reg.get("s3_endpoint", "")).strip()
+    bucket = (b.get("bucket") or reg.get("s3_bucket", "paprika")).strip()
+    region = (b.get("region") or reg.get("s3_region", "us-east-1")).strip() or "us-east-1"
+    access_key = (b.get("access_key") or reg.get("s3_access_key", "")).strip()
+    secret_key = b.get("secret_key") or reg.get("s3_secret_key", "")
+
+    if not bucket:
+        return {"ok": False, "message": "バケット名が未設定です"}
+
+    def _test() -> dict:
+        try:
+            import boto3
+            from botocore.config import Config as _BotoConfig
+        except ImportError:
+            return {"ok": False, "message": "boto3 がインストールされていません"}
+        try:
+            client = boto3.client(
+                "s3",
+                endpoint_url=endpoint or None,
+                aws_access_key_id=access_key or None,
+                aws_secret_access_key=secret_key or None,
+                region_name=region,
+                config=_BotoConfig(
+                    signature_version="s3v4",
+                    s3={"addressing_style": "path"},
+                    retries={"max_attempts": 1, "mode": "standard"},
+                    connect_timeout=5,
+                    read_timeout=5,
+                ),
+            )
+            client.head_bucket(Bucket=bucket)
+            r = client.list_objects_v2(Bucket=bucket, MaxKeys=1)
+            return {
+                "ok": True,
+                "message": f"接続成功 (bucket={bucket}, objects≧{r.get('KeyCount', 0)})",
+            }
+        except Exception as e:
+            return {"ok": False, "message": f"{type(e).__name__}: {e}"}
+
+    return await asyncio.to_thread(_test)
+
 
 @router.post("/settings/mariadb/test")
 async def mariadb_test(body: dict | None = None) -> dict:

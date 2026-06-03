@@ -45,25 +45,55 @@ import os
 import threading
 from pathlib import Path
 
-from server.hub._state import get_storage_dir
+from server.hub._state import get_storage_dir, state
 
 
 def _env_flag(name: str) -> bool:
     return (os.environ.get(name) or "").strip().lower() in ("1", "true", "yes", "on")
 
 
+def _s3cfg(key: str, env_name: str, default: str = "") -> str:
+    """Resolve an S3 string config: the live Settings registry first
+    (SettingsRegistry.get already falls back to the PAPRIKA_S3_* env var
+    through its schema), then the env directly when settings aren't bound
+    yet (tests / early boot), then ``default``."""
+    try:
+        if state.settings is not None:
+            v = state.settings.get(key, None)
+            if v is not None and str(v).strip() != "":
+                return str(v).strip()
+    except Exception:
+        pass
+    return (os.environ.get(env_name) or default).strip()
+
+
 def enabled() -> bool:
-    """True when the operator has switched on the object-store mirror."""
+    """True when the operator has switched on the object-store mirror --
+    via the admin Settings tab (``s3_enabled``) or PAPRIKA_S3_ENABLED env."""
+    try:
+        if state.settings is not None:
+            return bool(state.settings.get("s3_enabled", False))
+    except Exception:
+        pass
     return _env_flag("PAPRIKA_S3_ENABLED")
 
 
 def _bucket() -> str:
-    return os.environ.get("PAPRIKA_S3_BUCKET") or "paprika"
+    return _s3cfg("s3_bucket", "PAPRIKA_S3_BUCKET", "paprika") or "paprika"
 
 
 def _prefix() -> str:
     # Strip leading/trailing slashes so key joins stay clean.
-    return (os.environ.get("PAPRIKA_S3_PREFIX") or "jobs").strip("/")
+    return _s3cfg("s3_prefix", "PAPRIKA_S3_PREFIX", "jobs").strip("/")
+
+
+def reset_client() -> None:
+    """Drop the cached boto3 client so the next call rebuilds it from the
+    current Settings/env config. Called after the operator saves S3
+    settings so endpoint / credential changes take effect immediately."""
+    global _client
+    with _client_lock:
+        _client = None
 
 
 # --- lazy boto3 client (created once, on first use) -------------------------
@@ -90,10 +120,10 @@ def _get_client():
 
             _client = boto3.client(
                 "s3",
-                endpoint_url=os.environ.get("PAPRIKA_S3_ENDPOINT") or None,
-                aws_access_key_id=os.environ.get("PAPRIKA_S3_ACCESS_KEY") or None,
-                aws_secret_access_key=os.environ.get("PAPRIKA_S3_SECRET_KEY") or None,
-                region_name=os.environ.get("PAPRIKA_S3_REGION") or "us-east-1",
+                endpoint_url=_s3cfg("s3_endpoint", "PAPRIKA_S3_ENDPOINT") or None,
+                aws_access_key_id=_s3cfg("s3_access_key", "PAPRIKA_S3_ACCESS_KEY") or None,
+                aws_secret_access_key=_s3cfg("s3_secret_key", "PAPRIKA_S3_SECRET_KEY") or None,
+                region_name=_s3cfg("s3_region", "PAPRIKA_S3_REGION", "us-east-1"),
                 config=_BotoConfig(
                     signature_version="s3v4",
                     s3={"addressing_style": "path"},  # MinIO wants path-style

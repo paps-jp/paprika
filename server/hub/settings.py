@@ -143,6 +143,21 @@ _SCHEMA: dict[str, tuple[Any, str]] = {
     "mariadb_database": ("paprika", "str"),
     "mariadb_username": ("", "str"),
     "mariadb_password": ("", "str"),
+    # ---- Object storage: S3 / MinIO -------------------------------------
+    # S3-compatible object store (MinIO etc.) used as the durable mirror +
+    # read source for job artifacts. When enabled, the gallery and every
+    # /jobs/{id}/* read fall back to the bucket if the local/NAS copy is
+    # gone, and completed jobs mirror their whole dir here. Disabled
+    # (default) = local disk only. Each key falls back to the matching
+    # PAPRIKA_S3_* env var via _env_default. The secret key is stored in
+    # settings.json and redacted from GET /settings.
+    "s3_enabled": (False, "bool"),
+    "s3_endpoint": ("", "str"),            # e.g. http://10.10.50.16:9100
+    "s3_bucket": ("paprika", "str"),
+    "s3_prefix": ("jobs", "str"),
+    "s3_access_key": ("", "str"),
+    "s3_secret_key": ("", "str"),
+    "s3_region": ("us-east-1", "str"),
     # ---- Windows portable: Chrome headless ------------------------------
     # When True, the bundled Chromium starts with ``--headless=new`` so
     # the operator's physical desktop isn't taken over by paprika's job
@@ -193,6 +208,14 @@ def _env_default(key: str, fallback: Any) -> Any:
         "mariadb_database": ("PAPRIKA_MARIADB_DATABASE", "str"),
         "mariadb_username": ("PAPRIKA_MARIADB_USERNAME", "str"),
         "mariadb_password": ("PAPRIKA_MARIADB_PASSWORD", "str"),
+        # S3 / MinIO: settings.json -> env vars -> static default.
+        "s3_enabled": ("PAPRIKA_S3_ENABLED", "bool"),
+        "s3_endpoint": ("PAPRIKA_S3_ENDPOINT", "str"),
+        "s3_bucket": ("PAPRIKA_S3_BUCKET", "str"),
+        "s3_prefix": ("PAPRIKA_S3_PREFIX", "str"),
+        "s3_access_key": ("PAPRIKA_S3_ACCESS_KEY", "str"),
+        "s3_secret_key": ("PAPRIKA_S3_SECRET_KEY", "str"),
+        "s3_region": ("PAPRIKA_S3_REGION", "str"),
     }
     info = env_map.get(key)
     if not info:

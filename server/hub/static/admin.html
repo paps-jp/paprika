@@ -3943,6 +3943,44 @@ table.aitbl code { font-size:0.95em; }
       <div id="mdbTableCounts" style="display:none; margin-top:10px; padding:8px 12px; background:#fff; border:1px solid #dde; border-radius:6px; font-size:.85em;"></div>
     </div>
 
+    <!-- B8. Object storage: S3 / MinIO -->
+    <h3 style="margin-top:1.2rem; font-size:.95rem; color:#444; border-bottom:1px solid #eee; padding-bottom:.3rem;">☁ オブジェクトストレージ (S3 / MinIO)</h3>
+    <p style="margin:4px 0 8px; color:#666; font-size:.88em;">
+      ジョブ成果物 (assets / page.html / script.py 等) のミラー兼読み取り元。有効時、NAS のローカルコピーが無くても S3 から配信・復元します。未設定ならローカルディスクのみ。<code>PAPRIKA_S3_*</code> 環境変数があればそれを既定値に使用。
+    </p>
+    <div style="display:grid; grid-template-columns: 200px 1fr; gap:8px 12px; align-items:center; padding:8px 4px;">
+      <label for="setS3Enabled" title="S3 ミラーの有効/無効">有効化:</label>
+      <div><label style="font-weight:normal;"><input type="checkbox" id="setS3Enabled"> S3 / MinIO を使用する</label></div>
+
+      <label for="setS3Endpoint" title="S3 互換エンドポイント URL">エンドポイント:</label>
+      <div><input type="text" id="setS3Endpoint" placeholder="例: http://10.10.50.16:9100" style="width:280px; padding:4px 8px;"></div>
+
+      <label for="setS3Bucket" title="バケット名">バケット:</label>
+      <div><input type="text" id="setS3Bucket" placeholder="paprika" style="width:240px; padding:4px 8px;"></div>
+
+      <label for="setS3Prefix" title="バケット内のキープレフィックス">プレフィックス:</label>
+      <div><input type="text" id="setS3Prefix" placeholder="jobs" style="width:240px; padding:4px 8px;"></div>
+
+      <label for="setS3Region" title="リージョン名 (MinIO は任意)">リージョン:</label>
+      <div><input type="text" id="setS3Region" placeholder="us-east-1" style="width:160px; padding:4px 8px;"></div>
+
+      <label for="setS3AccessKey" title="アクセスキー ID">アクセスキー:</label>
+      <div><input type="text" id="setS3AccessKey" placeholder="" style="width:280px; padding:4px 8px;" autocomplete="off"></div>
+
+      <label for="setS3SecretKey" title="シークレットキー">シークレットキー:</label>
+      <div>
+        <input type="password" id="setS3SecretKey" placeholder="" style="width:280px; padding:4px 8px;" autocomplete="off">
+        <button type="button" id="setS3SecretToggle" class="pill" style="padding:2px 8px; font-size:.8em; margin-left:4px; background:#f5f5fa; border-color:#ccd; color:#555;" title="表示/非表示">👁</button>
+      </div>
+
+      <div></div>
+      <div style="display:flex; gap:8px; align-items:center; flex-wrap:wrap; margin-top:4px;">
+        <button id="setSaveS3Btn" class="pill" style="background:#eef8ee; border-color:#7ab68a; color:#196b2c;"><iconify-icon icon="lucide:save"></iconify-icon> 接続設定を保存</button>
+        <button id="setS3TestBtn" class="pill" style="background:#e8f0ff; border-color:#6a8ec7; color:#2a4a8a;"><iconify-icon icon="lucide:plug"></iconify-icon> 接続テスト</button>
+        <span id="setS3Status" style="font-size:.9em; margin-left:4px;"></span>
+      </div>
+    </div>
+
     <!-- C. System info (read-only) -->
     <h3 style="margin-top:1.2rem; font-size:.95rem; color:#444; border-bottom:1px solid #eee; padding-bottom:.3rem;">ℹ System info
       <small style="font-weight:normal; color:#888;">— 環境変数依存、再デプロイで変更</small>

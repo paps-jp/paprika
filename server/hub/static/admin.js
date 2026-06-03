@@ -11565,6 +11565,16 @@ async function loadSettingsPanel() {
         }
       }
 
+      // ---- S3 / MinIO ----
+      const _s3en = document.getElementById('setS3Enabled');
+      if (_s3en) _s3en.checked = !!hub.s3_enabled;
+      _setVal('setS3Endpoint', hub.s3_endpoint);
+      _setVal('setS3Bucket', hub.s3_bucket || 'paprika');
+      _setVal('setS3Prefix', hub.s3_prefix || 'jobs');
+      _setVal('setS3Region', hub.s3_region || 'us-east-1');
+      _setVal('setS3AccessKey', hub.s3_access_key);
+      _setSecretPw('setS3SecretKey', !!_secretsSet.s3_secret_key);
+
       const sys = d.system || {};
       const tbody = document.getElementById('setSystemInfoBody');
       if (tbody) {
@@ -12034,6 +12044,72 @@ async function testMariadbConnection() {
   }
 }
 
+// ---- S3 / MinIO ----
+async function saveSettingsS3() {
+  const statusEl = document.getElementById('setS3Status');
+  if (statusEl) statusEl.textContent = '';
+  const body = {
+    s3_enabled: !!document.getElementById('setS3Enabled')?.checked,
+    s3_endpoint: (document.getElementById('setS3Endpoint')?.value || '').trim(),
+    s3_bucket: (document.getElementById('setS3Bucket')?.value || 'paprika').trim(),
+    s3_prefix: (document.getElementById('setS3Prefix')?.value || 'jobs').trim(),
+    s3_region: (document.getElementById('setS3Region')?.value || 'us-east-1').trim(),
+    s3_access_key: (document.getElementById('setS3AccessKey')?.value || '').trim(),
+  };
+  // Blank secret field => keep the stored one (redacted from GET, never
+  // re-populated, so omit from the PUT).
+  const _sk = document.getElementById('setS3SecretKey')?.value || '';
+  if (_sk) body.s3_secret_key = _sk;
+  try {
+    const r = await fetch(SETTINGS_URL, {
+      method: 'PUT',
+      headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify(body),
+    });
+    if (r.ok) {
+      if (statusEl) { statusEl.style.color = '#196b2c'; statusEl.textContent = '保存しました'; setTimeout(() => statusEl.textContent = '', 3000); }
+    } else {
+      if (statusEl) { statusEl.style.color = '#a00'; statusEl.textContent = `エラー: ${r.status}`; }
+    }
+  } catch (e) {
+    if (statusEl) { statusEl.style.color = '#a00'; statusEl.textContent = String(e); }
+  }
+}
+
+async function testS3Connection() {
+  const statusEl = document.getElementById('setS3Status');
+  const btn = document.getElementById('setS3TestBtn');
+  const origLabel = btn ? btn.innerHTML : '';
+  if (btn) btn.innerHTML = '<iconify-icon icon="lucide:loader-2" class="spin"></iconify-icon> テスト中…';
+  if (statusEl) { statusEl.style.color = '#888'; statusEl.textContent = ''; }
+  const body = {
+    endpoint: (document.getElementById('setS3Endpoint')?.value || '').trim(),
+    bucket: (document.getElementById('setS3Bucket')?.value || 'paprika').trim(),
+    prefix: (document.getElementById('setS3Prefix')?.value || 'jobs').trim(),
+    region: (document.getElementById('setS3Region')?.value || 'us-east-1').trim(),
+    access_key: (document.getElementById('setS3AccessKey')?.value || '').trim(),
+    secret_key: document.getElementById('setS3SecretKey')?.value || '',
+  };
+  try {
+    const r = await fetch('/settings/s3/test', {
+      method: 'POST',
+      headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify(body),
+    });
+    let d;
+    try { d = await r.json(); } catch { d = { message: await r.text().catch(() => r.statusText) }; }
+    if (d.ok) {
+      if (statusEl) { statusEl.style.color = '#196b2c'; statusEl.textContent = `✓ ${d.message}`; }
+    } else {
+      if (statusEl) { statusEl.style.color = '#a00'; statusEl.textContent = `✗ ${d.message}`; }
+    }
+  } catch (e) {
+    if (statusEl) { statusEl.style.color = '#a00'; statusEl.textContent = '接続失敗: ' + e.message; }
+  } finally {
+    if (btn) btn.innerHTML = origLabel;
+  }
+}
+
 // ---- MariaDB Data Migration ----
 
 async function mdbCreateSchema() {
@@ -12142,6 +12218,16 @@ async function mdbRefreshTableCounts() {
   if (saveMdb) saveMdb.addEventListener('click', saveSettingsMariadb);
   const testMdb = document.getElementById('setMariadbTestBtn');
   if (testMdb) testMdb.addEventListener('click', testMariadbConnection);
+  // S3 / MinIO
+  const saveS3 = document.getElementById('setSaveS3Btn');
+  if (saveS3) saveS3.addEventListener('click', saveSettingsS3);
+  const testS3 = document.getElementById('setS3TestBtn');
+  if (testS3) testS3.addEventListener('click', testS3Connection);
+  const s3SecToggle = document.getElementById('setS3SecretToggle');
+  if (s3SecToggle) s3SecToggle.addEventListener('click', () => {
+    const sk = document.getElementById('setS3SecretKey');
+    if (sk) sk.type = sk.type === 'password' ? 'text' : 'password';
+  });
   // MariaDB Migration
   const mdbSchema = document.getElementById('mdbSchemaBtn');
   if (mdbSchema) mdbSchema.addEventListener('click', mdbCreateSchema);
