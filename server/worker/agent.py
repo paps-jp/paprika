@@ -23,6 +23,7 @@ from typing import Any, Optional
 from urllib.parse import urlsplit, urlunsplit
 
 import httpx
+from core.httpclient import make_async_client
 import websockets
 from websockets.exceptions import ConnectionClosed, WebSocketException
 
@@ -190,8 +191,6 @@ async def _translate_to_english(
     GUI models actually understand. Falls back to the original ``text``
     on any error -- we'd rather lose translation than block the agent.
     """
-    import httpx as _httpx
-
     if not text:
         return text
     prompt = (
@@ -216,7 +215,7 @@ async def _translate_to_english(
         "max_tokens": 256,
     }
     try:
-        async with _httpx.AsyncClient(timeout=timeout_s) as client:
+        async with make_async_client(timeout=timeout_s) as client:
             r = await client.post(
                 f"{agent_llm_url.rstrip('/')}/v1/chat/completions",
                 json=body,
@@ -729,7 +728,7 @@ def _make_video_downloader(
         mime: str | None = None
         total_written: int = 0
         last_err: str | None = None
-        async with _httpx.AsyncClient(
+        async with make_async_client(
             timeout=_httpx.Timeout(connect=15, read=None, write=30, pool=10),
             follow_redirects=True,
         ) as dl_client:
@@ -1619,7 +1618,7 @@ async def _check_github_release_once(*, log_prefix: str = "[worker]") -> None:
 
     url = f"https://api.github.com/repos/{repo}/releases/latest"
     try:
-        async with httpx.AsyncClient(timeout=15.0) as client:
+        async with make_async_client(timeout=15.0) as client:
             r = await client.get(url, headers=headers)
             r.raise_for_status()
             data = r.json()
@@ -1754,7 +1753,7 @@ async def _fetch_and_apply_source_from_hub(
 
     url = f"{hub_http_url.rstrip('/')}/worker-source.tar.gz"
     try:
-        async with httpx.AsyncClient(timeout=120.0) as client:
+        async with make_async_client(timeout=120.0) as client:
             r = await client.get(url)
             r.raise_for_status()
             body = r.content
@@ -1890,7 +1889,7 @@ async def _fetch_worker_plugins_from_hub(
 
     url = f"{hub_http_url.rstrip('/')}/worker-plugins.tar.gz"
     try:
-        async with httpx.AsyncClient(timeout=120.0) as client:
+        async with make_async_client(timeout=120.0) as client:
             r = await client.get(url)
             if r.status_code == 404:
                 # Hub doesn't advertise plugins yet (older hub) -- silently OK.
@@ -2369,7 +2368,7 @@ class WorkerAgent:
         # Seed the link-alive clock so the shutdown-on-failure window
         # covers the very first connect attempts too.
         self._last_link_ok = time.monotonic()
-        async with httpx.AsyncClient(timeout=60.0) as http:
+        async with make_async_client(timeout=60.0) as http:
             self._http = http
             while True:
                 # Recomputed each iteration: a clone-collision reassignment
@@ -2800,7 +2799,7 @@ class WorkerAgent:
         import httpx
 
         base = f"http://localhost:{lane.chrome_port}"
-        async with httpx.AsyncClient(timeout=5.0) as cli:
+        async with make_async_client(timeout=5.0) as cli:
             try:
                 r = await cli.get(f"{base}/json/list")
                 r.raise_for_status()
@@ -3029,7 +3028,7 @@ class WorkerAgent:
         hub_base = m.group(1)
         url = f"{hub_base}/hosts/{host}/cookies.txt"
         try:
-            async with httpx.AsyncClient(timeout=10.0) as cli:
+            async with make_async_client(timeout=10.0) as cli:
                 r = await cli.get(url)
                 if r.status_code != 200:
                     return None
@@ -4352,7 +4351,7 @@ class WorkerAgent:
 
         async with state.lock:
             try:
-                async with httpx.AsyncClient(timeout=agent_timeout_s) as client:
+                async with make_async_client(timeout=agent_timeout_s) as client:
                     for step in range(1, max(1, msg.max_steps) + 1):
                         # ---- observe ---------------------------------
                         try:
@@ -4679,7 +4678,7 @@ class WorkerAgent:
             )
             return
         try:
-            async with httpx.AsyncClient(timeout=30.0) as client:
+            async with make_async_client(timeout=30.0) as client:
                 r = await client.get(f"{base}/extensions")
                 if r.status_code != 200:
                     _logger.info(
@@ -4737,7 +4736,7 @@ class WorkerAgent:
             # Download the tarball + extract atomically (extract to
             # a sibling .new dir, then rename into place).
             try:
-                async with httpx.AsyncClient(timeout=120.0) as client:
+                async with make_async_client(timeout=120.0) as client:
                     async with client.stream(
                         "GET",
                         f"{base}/extensions/{slug}/download",
@@ -4971,7 +4970,7 @@ class WorkerAgent:
         tar_path = scratch / "profile.tar.gz"
         extract_dir = scratch / "User Data"
         try:
-            async with httpx.AsyncClient(timeout=60.0) as cli:
+            async with make_async_client(timeout=60.0) as cli:
                 async with cli.stream("GET", profile_url) as r:
                     r.raise_for_status()
                     with open(tar_path, "wb") as f:
@@ -6003,7 +6002,7 @@ class WorkerAgent:
             existing_cookies: list[dict] = []
             existed = False
             try:
-                async with httpx.AsyncClient(timeout=10.0) as cli:
+                async with make_async_client(timeout=10.0) as cli:
                     g = await cli.get(url)
                     if g.status_code == 200:
                         rec = g.json() or {}
@@ -6040,7 +6039,7 @@ class WorkerAgent:
                 notes = f"auto-saved by fetch job {assign.job_id}"
 
             try:
-                async with httpx.AsyncClient(timeout=15.0) as cli:
+                async with make_async_client(timeout=15.0) as cli:
                     r = await cli.put(
                         url,
                         json={
