@@ -1,0 +1,31 @@
+# nginx upstream auto-reconciler -- run on the router host (10.10.50.34).
+#
+# Watches the Redis hub-presence registry (paprika:hubs:*) and keeps nginx's
+# `hubs` / `hubs_sticky` upstreams in sync, so a cloned / newly-booted hub VM
+# auto-joins the load balancer with no manual nginx edit -- the hub-side
+# mirror of how workers auto-join a hub via Redis. See
+# scripts/nginx_reconciler.py for the (safe: validate + rollback, in-place
+# write, TTL grace, never-wipe) logic.
+#
+#   docker compose -p reconciler -f docker-compose.reconciler.yml up -d
+#
+# Reuses the paprika-hub image (python + redis-py + docker CLI already inside).
+# The Docker socket is needed to `docker exec <nginx> nginx -t / -s reload`;
+# LAN-trusted, same trust level as the hub's own socket mount.
+services:
+  reconciler:
+    image: paprika-hub:latest
+    restart: unless-stopped
+    command: ["python", "/reconciler.py"]
+    environment:
+      - PYTHONUNBUFFERED=1
+      - RECONCILER_REDIS_URL=redis://10.10.50.34:6379
+      - RECONCILER_NGINX_CONF=/deploy/nginx.conf
+      - RECONCILER_NGINX_CONTAINER=paprika-nginx-1
+      - RECONCILER_HUB_PORT=8100
+      - RECONCILER_HUB_SUBNET=10.10.50
+      - RECONCILER_INTERVAL_S=20
+    volumes:
+      - ./scripts/nginx_reconciler.py:/reconciler.py:ro
+      - ./deploy:/deploy
+      - /var/run/docker.sock:/var/run/docker.sock
