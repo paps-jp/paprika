@@ -150,6 +150,15 @@ async def _session_reaper_loop():
             return
         if state.sessions is None:
             continue
+        # Keep the cross-hub session owner-map (Redis) fresh for every live
+        # session: add() writes each entry once with a short fetch-tied TTL
+        # that lapses on long-lived / keepalive sessions, after which a
+        # non-owner hub can't forward session actions to the owner (-> 404).
+        # Cheap SET per live session every few seconds.
+        try:
+            await state.sessions.touch_redis_map()
+        except Exception:
+            pass
         now = datetime.utcnow()
         for s in list(state.sessions.all()):
             if s.state == "closing":

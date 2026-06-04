@@ -174,6 +174,20 @@ class SessionRegistry:
         except Exception:
             return None
 
+    async def touch_redis_map(self, ttl: int = 120) -> None:
+        """Re-put every live session's owner-map entry so it never expires
+        while the session is alive. ``add()`` writes the entry once with a TTL
+        tied to the fetch's ``absolute_ttl_s``; on a long-lived / keepalive
+        session that TTL lapses while the session is still up, leaving
+        cross-hub session-action forwarding unable to resolve the owner hub
+        (-> a non-owner hub returns 404 'session not found'). The session
+        reaper calls this every few seconds to keep the map fresh -- mirrors
+        how the worker-owner lease is refreshed on heartbeat. No-op w/o redis."""
+        if self._r is None:
+            return
+        for info in list(self._sessions.values()):
+            await self._redis_put(info.session_id, info.worker_id, ttl)
+
     def add(self, info: SessionInfo) -> None:
         self._sessions[info.session_id] = info
         # Mirror to Redis with a TTL a bit beyond the session's absolute
