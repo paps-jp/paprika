@@ -253,17 +253,28 @@ async function refresh() {
     } else if (!workers.workers || workers.workers.length === 0) {
       ntbody.innerHTML = '<tr><td colspan=8 class="empty">no workers connected</td></tr>';
     } else {
-      // Sort: alive first, then by recency. Historical (disconnected)
-      // workers fall to the bottom so the operator's live fleet stays
-      // up top.
+      // Sort: alive first (live fleet stays on top, historical workers fall
+      // to the bottom), then by IP ADDRESS in numeric-octet order so
+      // .9 < .11 < .140 (a plain string sort would put .140 before .9).
+      // worker_id breaks ties when two workers share a host IP (2 lanes).
+      const _ipKey = (s) => {
+        const m = /^(\d+)\.(\d+)\.(\d+)\.(\d+)/.exec(s || '');
+        return m ? ((((+m[1]) * 256 + (+m[2])) * 256 + (+m[3])) * 256 + (+m[4])) : -1;
+      };
       const sortedWorkers = [...workers.workers].sort((a, b) => {
         if (!!b.alive - !!a.alive) return !!b.alive - !!a.alive;
-        return (b.last_heartbeat || 0) - (a.last_heartbeat || 0);
+        const ka = _ipKey(a.address), kb = _ipKey(b.address);
+        if (ka !== kb) return ka - kb;
+        return (a.worker_id || '').localeCompare(b.worker_id || '');
       });
       ntbody.innerHTML = sortedWorkers.map(w => {
         const status = w.status || 'active';
         const wid = esc(w.worker_id);
         const alive = !!w.alive;
+        // Which hub this worker's control-WS is connected to (multi-hub deploy).
+        const hubBadge = w.hub_id
+          ? ` <span class="badge" style="background:#e8f0fe; color:#1a56c4; border-color:#c2d6fb; font-size:.8em;" title="connected to hub ${esc(w.hub_id)}">${esc(w.hub_id)}</span>`
+          : '';
         // Historical workers render in greyed-out rows with no
         // status-toggle (the worker isn't here to honour it). Selecting
         // a new status posts to a 404'd /workers/{id}/status -- the UI
@@ -368,7 +379,7 @@ async function refresh() {
           : `<button class="danger" onclick="window.deleteWorker('${wid}')">${ico('trash')} forget worker</button>`;
         return `
         <tr${rowStyle}>
-          <td><code>${wid}</code>${ageHint}</td>
+          <td><code>${wid}</code>${hubBadge}${ageHint}</td>
           <td>${address}</td>
           <td>
             <span class="wstat">

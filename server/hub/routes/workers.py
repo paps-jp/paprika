@@ -17,7 +17,7 @@ import tarfile
 import time
 from pathlib import Path
 
-from fastapi import APIRouter, HTTPException, Response
+from fastapi import APIRouter, HTTPException, Request, Response
 
 from server.hub._state import state
 from server.scheduler import ALLOWED_STATUSES, WORKER_TTL
@@ -417,6 +417,7 @@ def _ffmpeg_q_from_quality_pct(pct: int) -> int:
 async def worker_lane_preview(
     worker_id: str,
     lane_idx: int,
+    request: Request,
     width: int = 320,
     quality: int = 30,
 ):
@@ -445,6 +446,18 @@ async def worker_lane_preview(
         raise HTTPException(503, "registry not ready")
     worker = state.registry.connections.get(worker_id)
     if worker is None:
+        # Multi-hub: the admin UI is served by whichever hub nginx picked, but
+        # this worker's control WS (and thus its screenshot capability) may live
+        # on a PEER hub. Forward there -- one hop; a request that already carries
+        # the forward marker is handled locally (loop guard).
+        from server.hub.routes.sessions import _FWD_MARK, _proxy_request_to_hub
+        if not request.headers.get(_FWD_MARK):
+            try:
+                owner = await state.registry.owner_of(worker_id)
+            except Exception:
+                owner = None
+            if owner and owner != config.hub_id:
+                return await _proxy_request_to_hub(owner, request, 8.0)
         raise HTTPException(404, f"worker '{worker_id}' not connected")
     ffmpeg_q = _ffmpeg_q_from_quality_pct(quality)
     try:
@@ -486,6 +499,7 @@ async def worker_lane_preview(
 async def worker_lane_preview_legacy(
     worker_id: str,
     lane_idx: int,
+    request: Request,
     width: int = 320,
     quality: int = 30,
 ):
@@ -500,6 +514,7 @@ async def worker_lane_preview_legacy(
     return await worker_lane_preview(
         worker_id=worker_id,
         lane_idx=lane_idx,
+        request=request,
         width=width,
         quality=quality,
     )
@@ -556,7 +571,34 @@ def _preview_semaphore():
     return _preview_sem
 
 
-async def _do_capture_frame(key):
+async def _capture_via_owner(owner_hub, wid, lane, width, quality_pct):
+    """Multi-hub: fetch one lane preview from the PEER hub that owns the
+    worker's control WS (this hub can't capture a worker it doesn't hold).
+    Returns (jpeg_b64, error) like _do_capture_frame. One hop -- the peer's
+    single-preview endpoint runs locally (its _FWD_MARK guard stops a bounce)."""
+    import base64
+
+    import httpx
+    from server.hub.routes.sessions import _FWD_MARK, _hub_internal_url
+    url = _hub_internal_url(owner_hub, f"/workers/{wid}/lanes/{lane}/preview")
+    headers = {_FWD_MARK: config.hub_id or "1"}
+    if getattr(config, "worker_secret", ""):
+        headers["X-Paprika-Worker-Secret"] = config.worker_secret
+    try:
+        async with httpx.AsyncClient(timeout=_PREVIEW_RPC_TIMEOUT + 2.0) as client:
+            r = await client.get(
+                url,
+                params={"width": width, "quality": quality_pct},
+                headers=headers,
+            )
+    except Exception as e:
+        return None, f"peer {owner_hub}: {type(e).__name__}"
+    if r.status_code != 200:
+        return None, f"peer {owner_hub} HTTP {r.status_code}"
+    return base64.b64encode(r.content).decode("ascii"), None
+
+
+async def _do_capture_frame(key, quality_pct=30):
     """Actually capture one lane frame. Returns (jpeg_b64, error_str) with
     exactly one non-None. Never raises -- a single bad lane must not tear
     down the whole batch stream. Result is cached on success."""
@@ -565,6 +607,13 @@ async def _do_capture_frame(key):
         return None, "registry not ready"
     worker = state.registry.connections.get(wid)
     if worker is None:
+        # Multi-hub: capture on the hub that owns this worker's control WS.
+        try:
+            owner = await state.registry.owner_of(wid)
+        except Exception:
+            owner = None
+        if owner and owner != config.hub_id:
+            return await _capture_via_owner(owner, wid, lane, width, quality_pct)
         return None, "worker not connected"
     async with _preview_semaphore():
         try:
@@ -586,14 +635,14 @@ async def _do_capture_frame(key):
     return b64, None
 
 
-async def _capture_one_frame(key):
+async def _capture_one_frame(key, quality_pct=30):
     """Cache-first, coalescing wrapper around _do_capture_frame."""
     hit = _PREVIEW_FRAME_CACHE.get(key)
     if hit is not None and (time.monotonic() - hit[0]) <= _PREVIEW_CACHE_TTL:
         return hit[1], None
     task = _PREVIEW_INFLIGHT.get(key)
     if task is None:
-        task = asyncio.ensure_future(_do_capture_frame(key))
+        task = asyncio.ensure_future(_do_capture_frame(key, quality_pct))
         _PREVIEW_INFLIGHT[key] = task
         task.add_done_callback(lambda t, k=key: _PREVIEW_INFLIGHT.pop(k, None))
     # shield: if THIS request's client disconnects, our awaiter is cancelled
@@ -602,9 +651,9 @@ async def _capture_one_frame(key):
     return await asyncio.shield(task)
 
 
-async def _preview_line(wid, lane, width, ffmpeg_q):
+async def _preview_line(wid, lane, width, ffmpeg_q, quality_pct=30):
     """Produce one NDJSON line for a lane (capture + serialize)."""
-    b64, err = await _capture_one_frame((wid, lane, width, ffmpeg_q))
+    b64, err = await _capture_one_frame((wid, lane, width, ffmpeg_q), quality_pct)
     rec = {"wid": wid, "lane": lane}
     if err:
         rec["error"] = err
@@ -674,7 +723,7 @@ async def workers_previews_batch(request: _Request):
         # bounds how many actually hit workers concurrently. as_completed
         # yields each as soon as it resolves -> progressive, no head-of-line.
         tasks = [
-            asyncio.ensure_future(_preview_line(wid, lane, width, ffmpeg_q))
+            asyncio.ensure_future(_preview_line(wid, lane, width, ffmpeg_q, quality_pct))
             for (wid, lane) in targets
         ]
         try:

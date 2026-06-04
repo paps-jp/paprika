@@ -660,6 +660,10 @@ class WorkerRegistry:
                     "version": w.capabilities.version or "",
                     "status": w.status,
                     "address": w.client_address or "",
+                    # Which hub owns this worker's control WS. A live
+                    # connection in THIS process is owned by THIS hub, so the
+                    # admin can show which hub each worker is connected to.
+                    "hub_id": self._hub_id or "",
                     # Rolling-update state. None unless the worker has
                     # signalled WorkerDraining; the admin UI shows this
                     # as a "draining (→ vX)" badge so operators can see
@@ -694,6 +698,7 @@ class WorkerRegistry:
             try:
                 row = await self._r.get(_k_worker(wid))
                 last_ts = await self._r.zscore(_k_index(), wid)
+                owner = await self._r.get(_k_owner(wid))
             except Exception:
                 continue
             if not row:
@@ -736,6 +741,11 @@ class WorkerRegistry:
                 # Empty string when this worker has never heartbeated
                 # against the current redis schema (= pre-fix legacy row).
                 "address": str(data.get("address") or ""),
+                # Owning hub (control-WS) so the admin shows which hub each
+                # worker is connected to in a multi-hub deploy.
+                "hub_id": (
+                    owner.decode() if isinstance(owner, bytes) else str(owner)
+                ) if owner else "",
             })
         return out
 
