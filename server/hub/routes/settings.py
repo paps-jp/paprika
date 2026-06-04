@@ -162,6 +162,16 @@ async def put_settings(body: dict) -> dict:
             objstore.reset_client()
         except Exception:
             pass
+    # Phase B: write the changed values through to MariaDB + broadcast to peer
+    # hubs so a settings edit on any hub propagates with no restart (excludes
+    # the mariadb_* DSN keys, kept per-hub). Best-effort.
+    try:
+        from server.hub._invalidate import share_settings
+        _effective = reg.all()
+        _changed = {k: _effective[k] for k in body if k in _effective}
+        await share_settings(_changed)
+    except Exception:
+        log.debug("settings write-through/publish failed", exc_info=True)
     return await get_settings()
 
 

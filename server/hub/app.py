@@ -215,6 +215,29 @@ async def lifespan(app: FastAPI):
                 except Exception as e:
                     log.warning("MariaDB registry restore failed: %s", e)
 
+                # Settings overlay (Phase B): pull shared settings from MariaDB
+                # into the local registry BEFORE the SMB mount + first object-
+                # store use below, so a value changed on another hub is in
+                # effect here without waiting for a live pub/sub event. Excludes
+                # the mariadb_* DSN keys (bootstrap, kept per-hub).
+                try:
+                    from server.hub._invalidate import _BOOTSTRAP_KEYS
+                    from server.hub.mariadb import load_settings
+
+                    _loaded = await load_settings(_mdb_pool)
+                    _overlay = {
+                        k: v for k, v in _loaded.items()
+                        if k not in _BOOTSTRAP_KEYS
+                    }
+                    if _overlay and state.settings is not None:
+                        state.settings.update(_overlay)
+                        log.info(
+                            "settings: overlaid %d shared value(s) from MariaDB",
+                            len(_overlay),
+                        )
+                except Exception as e:
+                    log.warning("settings: MariaDB overlay failed: %s", e)
+
                 # 2. Migrate: files → MariaDB (INSERT IGNORE).
                 #    Catches first-time-connect and engines created while
                 #    MariaDB was unreachable. After step 1, files are

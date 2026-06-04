@@ -52,6 +52,15 @@ _STATE_ATTR = {
     "hosts": "hosts",
 }
 
+# Settings keys that must NOT be shared cross-hub: the MariaDB DSN itself is
+# bootstrap config (each hub needs its own to connect at all), so propagating
+# it would be circular and could lock a hub out. Everything else (S3, SMB,
+# toggles, fetch defaults) is shared.
+_BOOTSTRAP_KEYS = frozenset({
+    "mariadb_host", "mariadb_port", "mariadb_database",
+    "mariadb_username", "mariadb_password",
+})
+
 
 def _registry(kind: str):
     attr = _STATE_ATTR.get(kind)
@@ -122,11 +131,44 @@ async def share_delete(kind: str, key: str) -> None:
     })
 
 
+async def share_settings(changed: dict) -> None:
+    """Write changed hub settings through to MariaDB and broadcast them to peer
+    hubs. The mariadb_* DSN keys are dropped (bootstrap, per-hub). Best-effort;
+    call AFTER the local ``reg.update(...)``."""
+    shareable = {
+        k: v for k, v in (changed or {}).items() if k not in _BOOTSTRAP_KEYS
+    }
+    if not shareable:
+        return
+    pool = state.mariadb_pool
+    if pool is not None:
+        try:
+            import server.hub.mariadb as _m
+            await _m.upsert_settings(pool, shareable)
+        except Exception:
+            log.warning("registry-share: mariadb settings upsert failed", exc_info=True)
+    await _publish({
+        "origin": config.hub_id,
+        "kind": "settings",
+        "action": "update",
+        "values": shareable,
+    })
+
+
 def _apply_event(evt: dict) -> None:
     """Replay one peer event onto the local file registry. Runs inside the
     subscriber loop (sync registry file ops; small + quick)."""
     kind = evt.get("kind")
     action = evt.get("action")
+    if kind == "settings":
+        reg = getattr(state, "settings", None)
+        if (
+            reg is not None
+            and action == "update"
+            and isinstance(evt.get("values"), dict)
+        ):
+            reg.update(evt["values"])
+        return
     reg = _registry(kind)
     if reg is None:
         return

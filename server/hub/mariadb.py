@@ -231,6 +231,16 @@ _TABLES: list[tuple[str, str]] = [
         ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci
         """,
     ),
+    (
+        "settings",
+        """
+        CREATE TABLE IF NOT EXISTS settings (
+            k           VARCHAR(190)  PRIMARY KEY,
+            v           TEXT,
+            updated_at  DATETIME(3)
+        ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci
+        """,
+    ),
 ]
 
 
@@ -1772,6 +1782,56 @@ async def delete_host_row(pool: Any, host: str) -> None:
     async with pool.acquire() as conn:
         async with conn.cursor() as cur:
             await cur.execute("DELETE FROM hosts WHERE host=%s", (host,))
+
+
+# ---------------------------------------------------------------------------
+# Hub settings write-through + restore (Phase B)
+#
+# The settings registry is a flat key/value dict (server/hub/settings.py). Each
+# value is JSON-encoded so its type (bool/int/float/str) round-trips. The table
+# is self-created (idempotent) so these don't depend on ensure_schema having run
+# at boot. The mariadb_* DSN keys are EXCLUDED by the caller (_invalidate.py) --
+# they are bootstrap config and must stay per-hub.
+# ---------------------------------------------------------------------------
+
+_SETTINGS_DDL = (
+    "CREATE TABLE IF NOT EXISTS settings ("
+    "k VARCHAR(190) PRIMARY KEY, v TEXT, updated_at DATETIME(3)"
+    ") ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci"
+)
+
+
+async def upsert_settings(pool: Any, mapping: dict) -> None:
+    """Write a dict of hub settings through to MariaDB (JSON-encoded values)."""
+    if not mapping:
+        return
+    async with pool.acquire() as conn:
+        async with conn.cursor() as cur:
+            await cur.execute(_SETTINGS_DDL)
+            for k, v in mapping.items():
+                await cur.execute(
+                    "INSERT INTO settings (k, v, updated_at) "
+                    "VALUES (%s, %s, UTC_TIMESTAMP(3)) "
+                    "ON DUPLICATE KEY UPDATE v=VALUES(v), updated_at=VALUES(updated_at)",
+                    (str(k), _json_dumps(v)),
+                )
+
+
+async def load_settings(pool: Any) -> dict:
+    """Load all hub settings from MariaDB (JSON-decoded). Returns {} when the
+    table is empty or unreadable."""
+    out: dict = {}
+    async with pool.acquire() as conn:
+        async with conn.cursor() as cur:
+            await cur.execute(_SETTINGS_DDL)
+            await cur.execute("SELECT k, v FROM settings")
+            for row in await cur.fetchall():
+                k, v = row[0], row[1]
+                try:
+                    out[str(k)] = json.loads(v) if v is not None else None
+                except Exception:
+                    out[str(k)] = v
+    return out
 
 
 async def restore_presets(pool: Any, preset_registry: Any) -> int:
