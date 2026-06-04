@@ -475,6 +475,9 @@ class WorkerRegistry:
                         "worker_id": worker_id,
                         "capabilities": caps.model_dump(),
                         "in_flight": 0,
+                        # Owning hub from the start, so the admin "which hub"
+                        # badge is populated before the first heartbeat too.
+                        "hub_id": self._hub_id,
                     }
                 ),
             )
@@ -530,17 +533,29 @@ class WorkerRegistry:
                 # register() returns -- doing it here catches the value
                 # on the first heartbeat at the latest.
                 addr = (worker.client_address or "").strip()
-                if addr:
-                    raw = await self._r.get(_k_worker(worker_id))
-                    if raw:
-                        try:
-                            d = json.loads(
-                                raw.decode() if isinstance(raw, bytes) else raw
-                            )
-                        except Exception:
-                            d = None
-                        if isinstance(d, dict) and d.get("address") != addr:
+                raw = await self._r.get(_k_worker(worker_id))
+                if raw:
+                    try:
+                        d = json.loads(
+                            raw.decode() if isinstance(raw, bytes) else raw
+                        )
+                    except Exception:
+                        d = None
+                    if isinstance(d, dict):
+                        changed = False
+                        if addr and d.get("address") != addr:
                             d["address"] = addr
+                            changed = True
+                        # Stamp the owning hub_id into the row too, so the admin
+                        # "which hub" badge stays STABLE for a worker that's
+                        # mid-reconnect: a non-owner hub reads it from here
+                        # (refreshed every heartbeat) instead of the _k_owner
+                        # lease, which a disconnect can briefly clear -> the
+                        # badge flickered between hubs as nginx round-robined.
+                        if d.get("hub_id") != self._hub_id:
+                            d["hub_id"] = self._hub_id
+                            changed = True
+                        if changed:
                             await self._r.set(
                                 _k_worker(worker_id), json.dumps(d),
                             )
@@ -742,10 +757,12 @@ class WorkerRegistry:
                 # against the current redis schema (= pre-fix legacy row).
                 "address": str(data.get("address") or ""),
                 # Owning hub (control-WS) so the admin shows which hub each
-                # worker is connected to in a multi-hub deploy.
-                "hub_id": (
-                    owner.decode() if isinstance(owner, bytes) else str(owner)
-                ) if owner else "",
+                # worker is connected to. Prefer the heartbeat-stamped row value
+                # (stable across reconnects); fall back to the _k_owner lease.
+                "hub_id": str(data.get("hub_id") or "") or (
+                    (owner.decode() if isinstance(owner, bytes) else str(owner))
+                    if owner else ""
+                ),
             })
         return out
 
