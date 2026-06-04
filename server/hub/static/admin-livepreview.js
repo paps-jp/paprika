@@ -132,9 +132,14 @@ let _ssVisibleKeys = null;   // null = pre-init (poll all on the very first tick
 function ssKey(workerId, lane) { return workerId + '/' + lane; }
 
 function buildTile(workerId, laneIdx, novncUrl) {
-  // Use an <a> when we have a click-through URL, plain <div> otherwise.
+  // ALWAYS an <a> so a RUNNING tile can deep-link to its in-app Live Job
+  // Panel (#live/<job>) even when the worker advertises no noVNC URL --
+  // syncScreenshotBusyState sets the #live href on busy tiles regardless of
+  // noVNC. (Previously a worker without a lane noVNC URL got a plain <div>, so
+  // clicking its running preview navigated nowhere.) An idle tile with no
+  // noVNC simply carries no href (not a link), which is fine.
   // The "↗ open" badge on the top-right hints that the tile is clickable.
-  const wrap = document.createElement(novncUrl ? 'a' : 'div');
+  const wrap = document.createElement('a');
   // Start in 'loading' state -- the first /preview round-trip can be
   // 1-2 seconds when the worker's lane just woke up and ffmpeg hasn't
   // primed Xvfb's frame buffer yet. The CSS overlay (.ssitem.loading)
@@ -353,6 +358,10 @@ function syncScreenshotBusyState(jobs, sessions) {
         // an idle tile see the worker's fluxbox desktop directly.
         if (tile.wrap.dataset.directUrl) {
           tile.wrap.href = tile.wrap.dataset.directUrl;
+        } else {
+          // Idle + no noVNC URL -> not a link. Clear any stale #live href
+          // left over from when this lane had a running job.
+          tile.wrap.removeAttribute('href');
         }
         // Re-enable new-tab popup behaviour for the idle noVNC path
         // (the busy/job_id branch above strips target/rel to keep the
