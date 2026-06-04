@@ -45,8 +45,19 @@ def _compute_hub_source_version() -> str:
             for p in sorted(root.rglob("*.py")):
                 if not p.is_file():
                     continue
+                rel_posix = p.relative_to("/app").as_posix()
+                # Worker self-update tracks ONLY code the worker actually runs.
+                # Skip hub-only modules (server/hub/** routes/UI/registry, and
+                # server/scheduler.py) so editing them never churns the fleet --
+                # workers would otherwise self-update for code they don't import.
+                # (The worker reads only HEARTBEAT_INTERVAL from scheduler.py; it
+                # changes ~never and rides the next real worker-code update.)
+                # MUST stay byte-identical to the skip in
+                # server/worker/agent.py:_compute_source_version().
+                if rel_posix.startswith("server/hub/") or rel_posix == "server/scheduler.py":
+                    continue
                 try:
-                    rel = p.relative_to("/app").as_posix().encode("utf-8")
+                    rel = rel_posix.encode("utf-8")
                     h.update(rel)
                     h.update(b"\0")
                     h.update(p.read_bytes())
