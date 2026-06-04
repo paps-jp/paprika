@@ -120,6 +120,15 @@ async function bulkDelete() {
 const ssTiles = new Map();
 let ssTimer = null;
 
+// --- #screens pager (20 tiles / page) -----------------------------------
+// Paging the live-preview grid does double duty under the push model: only the
+// CURRENT page's tiles are polled, so only those ~20 workers get marked watched
+// and self-capture + push -- the rest quiesce. _ssVisibleKeys (set by
+// applyScreenshotPaging) is exactly the lane set refreshScreenshots fans out to.
+const SS_PAGE_SIZE = 20;
+let _ssPage = 0;
+let _ssVisibleKeys = null;   // null = pre-init (poll all on the very first tick)
+
 function ssKey(workerId, lane) { return workerId + '/' + lane; }
 
 function buildTile(workerId, laneIdx, novncUrl) {
@@ -133,6 +142,7 @@ function buildTile(workerId, laneIdx, novncUrl) {
   // instead of "broken / black". Cleared on the first img 'load' or
   // 'error' event below.
   wrap.className = 'ssitem idle loading';
+  wrap.dataset.sskey = ssKey(workerId, laneIdx);   // pager maps tile -> lane key
   if (novncUrl) {
     let url = novncUrl;
     if (!url.includes('autoconnect')) {
@@ -363,43 +373,113 @@ function syncScreenshotBusyState(jobs, sessions) {
 // Mutates only DOM order; ssTiles Map stays intact.
 function sortScreenshotGrid() {
   const grid = document.getElementById('ssGrid');
-  if (!grid || ssTiles.size === 0) return;
+  if (!grid) return;
   const mode = (document.getElementById('ssSort') || {}).value || 'default';
-  if (mode === 'default') return;           // insertion order, nothing to do
-
-  // Build a sortable array of [key, tile, sortVal].
-  const statusRank = (tile) => {
-    if (tile.wrap.classList.contains('busy')) {
-      // running (red) = 0, keepalive (orange) = 1
-      return tile.badge.classList.contains('keepalive') ? 1 : 0;
+  if (ssTiles.size > 0 && mode !== 'default') {
+    // Build a sortable array of [key, tile, sortVal].
+    const statusRank = (tile) => {
+      if (tile.wrap.classList.contains('busy')) {
+        // running (red) = 0, keepalive (orange) = 1
+        return tile.badge.classList.contains('keepalive') ? 1 : 0;
+      }
+      return 2; // idle
+    };
+    const entries = [...ssTiles.entries()].map(([key, tile]) => {
+      const [wid, lane] = key.split('/');
+      return { key, tile, wid, lane: parseInt(lane, 10) || 0, status: statusRank(tile) };
+    });
+    if (mode === 'status') {
+      // Running → Keepalive → Idle ; within same status: worker → lane
+      entries.sort((a, b) =>
+        (a.status - b.status)
+        || a.wid.localeCompare(b.wid)
+        || (a.lane - b.lane)
+      );
+    } else if (mode === 'worker') {
+      entries.sort((a, b) =>
+        a.wid.localeCompare(b.wid) || (a.lane - b.lane)
+      );
+    } else if (mode === 'worker-desc') {
+      entries.sort((a, b) =>
+        b.wid.localeCompare(a.wid) || (b.lane - a.lane)
+      );
     }
-    return 2; // idle
-  };
-
-  const entries = [...ssTiles.entries()].map(([key, tile]) => {
-    const [wid, lane] = key.split('/');
-    return { key, tile, wid, lane: parseInt(lane, 10) || 0, status: statusRank(tile) };
-  });
-
-  if (mode === 'status') {
-    // Running → Keepalive → Idle ; within same status: worker → lane
-    entries.sort((a, b) =>
-      (a.status - b.status)
-      || a.wid.localeCompare(b.wid)
-      || (a.lane - b.lane)
-    );
-  } else if (mode === 'worker') {
-    entries.sort((a, b) =>
-      a.wid.localeCompare(b.wid) || (a.lane - b.lane)
-    );
-  } else if (mode === 'worker-desc') {
-    entries.sort((a, b) =>
-      b.wid.localeCompare(a.wid) || (b.lane - a.lane)
-    );
+    // Re-append in sorted order (moves existing DOM nodes, doesn't clone).
+    for (const e of entries) grid.appendChild(e.tile.wrap);
   }
+  // Slice the (now-sorted) grid into pages of SS_PAGE_SIZE.
+  applyScreenshotPaging();
+}
 
-  // Re-append in sorted order (moves existing DOM nodes, doesn't clone).
-  for (const e of entries) grid.appendChild(e.tile.wrap);
+// Lazily build the pager bar (‹前 / "m–n / total 件" / 次›) above the grid.
+function ssEnsurePager() {
+  let pager = document.getElementById('ssPager');
+  if (pager) return pager;
+  const grid = document.getElementById('ssGrid');
+  if (!grid || !grid.parentNode) return null;
+  pager = document.createElement('div');
+  pager.id = 'ssPager';
+  pager.style.cssText =
+    'display:none; align-items:center; gap:12px; justify-content:center;'
+    + 'margin:8px 0; flex-wrap:wrap; font-size:13px;';
+  const mkBtn = (id, txt) => {
+    const b = document.createElement('button');
+    b.id = id; b.type = 'button'; b.textContent = txt;
+    b.style.cssText =
+      'padding:4px 12px; border:1px solid #ccc; border-radius:6px;'
+      + 'background:#f6f6f6; cursor:pointer;';
+    return b;
+  };
+  const prev = mkBtn('ssPagerPrev', '‹ 前');
+  const next = mkBtn('ssPagerNext', '次 ›');
+  const label = document.createElement('span');
+  label.id = 'ssPagerLabel';
+  label.style.cssText = 'min-width:210px; text-align:center; color:#555;';
+  pager.appendChild(prev); pager.appendChild(label); pager.appendChild(next);
+  grid.parentNode.insertBefore(pager, grid);
+  prev.addEventListener('click', () => {
+    if (_ssPage > 0) { _ssPage--; applyScreenshotPaging(); refreshScreenshots(); }
+  });
+  next.addEventListener('click', () => {
+    _ssPage++; applyScreenshotPaging(); refreshScreenshots();
+  });
+  return pager;
+}
+
+// Show only the current page's tiles (display:none on the rest) and record
+// their keys in _ssVisibleKeys so the poll fans out to THIS page only.
+function applyScreenshotPaging() {
+  const grid = document.getElementById('ssGrid');
+  if (!grid) return;
+  const tiles = [...grid.querySelectorAll('.ssitem')];   // current (sorted) order
+  const total = tiles.length;
+  const pages = Math.max(1, Math.ceil(total / SS_PAGE_SIZE));
+  if (_ssPage > pages - 1) _ssPage = pages - 1;
+  if (_ssPage < 0) _ssPage = 0;
+  const start = _ssPage * SS_PAGE_SIZE;
+  const end = start + SS_PAGE_SIZE;
+  const visible = new Set();
+  tiles.forEach((el, idx) => {
+    const show = idx >= start && idx < end;
+    el.style.display = show ? '' : 'none';
+    if (show && el.dataset.sskey) visible.add(el.dataset.sskey);
+  });
+  _ssVisibleKeys = visible;
+  // Pager UI.
+  ssEnsurePager();
+  const label = document.getElementById('ssPagerLabel');
+  const prev = document.getElementById('ssPagerPrev');
+  const next = document.getElementById('ssPagerNext');
+  const pager = document.getElementById('ssPager');
+  if (label) {
+    label.textContent = total === 0
+      ? '0 件'
+      : (start + 1) + '–' + Math.min(total, end) + ' / ' + total + ' 件'
+        + '  (ページ ' + (_ssPage + 1) + '/' + pages + ')';
+  }
+  if (prev) { prev.disabled = _ssPage <= 0; prev.style.opacity = prev.disabled ? '0.45' : ''; }
+  if (next) { next.disabled = _ssPage >= pages - 1; next.style.opacity = next.disabled ? '0.45' : ''; }
+  if (pager) pager.style.display = pages <= 1 ? 'none' : 'flex';
 }
 
 // Resolve the operator's chosen tile size (width × quality) from the
@@ -478,7 +558,12 @@ async function refreshScreenshots() {
   if (_ssInFlight) return;
   const { width, quality } = ssCurrentSize();
   const lanes = [];
-  for (const key of ssTiles.keys()) {
+  // Push model + pager: poll ONLY the current page's tiles, so only those ~20
+  // workers are marked watched -> only they self-capture + push (the rest
+  // quiesce). _ssVisibleKeys is set by applyScreenshotPaging; null on the very
+  // first tick -> poll all so the grid fills immediately.
+  const keys = _ssVisibleKeys || ssTiles.keys();
+  for (const key of keys) {
     const i = key.lastIndexOf('/');
     if (i < 0) continue;
     lanes.push({ wid: key.slice(0, i), lane: parseInt(key.slice(i + 1), 10) || 0 });
@@ -554,7 +639,9 @@ document.getElementById('ssCols').addEventListener('change', applyCols);
   } catch (_) {}
   el.addEventListener('change', () => {
     try { localStorage.setItem('paprika.ssSort', el.value); } catch (_) {}
+    _ssPage = 0;              // jump back to page 1 on a sort change
     sortScreenshotGrid();
+    refreshScreenshots();     // poll the new page-1 tiles immediately
   });
 })();
 // Size change: trigger an immediate re-render so the operator sees
