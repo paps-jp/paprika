@@ -22,6 +22,7 @@ active: why-paprika
 - **分散フリート**: 複数ホストの Chrome（**Lane**）を Hub が束ね、ジョブを **WebSocket でディスパッチ**。1 台でも、100 台でも同じ API。
 - **AI コード生成**（`codegen-loop`）: URL と自然言語の **`goal` だけ**渡せば、LLM がスクリプトを生成・実行・失敗時に再生成。成功したスクリプトは **そのまま `mode: rerun` で再利用**できる（次回からは LLM 不要・決定的）。
 - **収集に最適化**: スクロール・ネットワークトレース・**`yt-dlp` 連携**で動画も画像と同じ感覚で取得（[動画の仕組み](video.html)）。
+- **二度取りしない**: **ブラウザが実際に読み込んだレスポンス**をそのまま回収（CDP `Network.responseReceived` を passive にサブスクライブ）。`<img src=>` を見て **URL から再取得しない**ので、(a) 帯域・サーバ負荷が半分、(b) **Cookie / Referer / 認証ヘッダーが必要な画像**もそのまま取れる、(c) **JS で動的に差し込まれた画像・lazy-load・CSS `background-image`・iframe 内**もまとめて拾えます。
 - **ライブ可観測性**: 各 Chrome に **noVNC ライブ画面**が紐づき、管理画面で何が起きているか目で確認できる。
 - **検出されにくい起動**: `nodriver` を採用し、`navigator.webdriver` などの典型的なシグナルを出さない。
 
@@ -36,6 +37,7 @@ active: why-paprika
 | **AI 駆動** | **`codegen-loop`（生成→実行→再生成）** | なし | なし |
 | **動画取得** | **`yt-dlp` + 通信トレース統合** | 手作業で連携 | 手作業で連携 |
 | **画像/アセット収集** | **既定機能**（min size / scroll / lazy 対応） | 自分で書く | 自分で書く |
+| **取得方式** | **ブラウザが読み込んだものを passive 回収**（再 GET なし） | URL を取り出して再 GET | URL を取り出して再 GET |
 | **ライブ可観測性** | **noVNC + 管理画面** | デバッガ / 録画 | スクリーンショット |
 | **ログイン継続** | **Bridge 拡張 / `use_profile` / Host レシピ** | 自前で Cookie / storage 注入 | 同左 |
 | **検出回避** | **`nodriver`**（webdriver シグナルを抑える） | パッチが必要 | パッチが必要 |

@@ -54,6 +54,24 @@ Lane の Chrome に対して、**操作（自動化）** と **ライブ閲覧**
 - **操作** は CDP（Chrome DevTools Protocol、nodriver 経由）。ナビゲーション・クリック・スクロール・DOM 取得・通信トレースなど。
 - **閲覧** は noVNC。管理画面の Live パネルや `#screens` で、いま Chrome に映っているものをそのまま見られます（[VNC 埋め込み](vnc-embed.html)）。Hub は worker の LAN IP を隠すため、noVNC をハブ経由のプロキシ URL に書き換えて配信します。
 
+## アセットの取り方（passive network capture）
+
+Paprika は HTML をパースして `<img src=>` を読み、その URL に**再リクエスト**する方式ではありません。CDP の `Network.responseReceived` イベントを **passive にサブスクライブ**して、**ブラウザが実際にダウンロードしたレスポンス本体**をそのまま回収します。
+
+```text
+通常のスクレイパ:  ページ取得 → HTML パース → <img src> から URL 取り出し → 改めてその URL に GET
+Paprika:           ページ取得 → Chrome が画像をロード → CDP イベントで Paprika がレスポンスを横取り
+```
+
+この方式の利点:
+
+- **帯域・サーバ負荷が半分** — 同じバイトを 2 回ダウンロードしない。
+- **認証・Referer 必須の画像も取れる** — ブラウザがすでに正しい Cookie / Referer / セッションヘッダー付きで取得済みなので、別途リクエストして 403 / 401 になる事故が無い。
+- **JS で動的に差し込まれた画像・lazy-load・CSS の `background-image`・`<iframe>`/ネスト iframe の内部通信**もすべて拾えます（HTML パースでは見つからない領域）。
+- **動画ストリーム**（HLS の `.m3u8` セグメント、DASH の `.m4s`）も同じ仕組みで検出 → `yt-dlp` で連結（[動画の仕組み](video.html)）。
+
+しきい値（`min_asset_size_bytes`）はこの passive リスナー段で適用されるので、アイコンやスペーサーの 100 byte 画像は最初から記録に上がりません（[JobOptions](job-options.html)）。
+
 ## ジョブとセッション
 
 | | Lane の使い方 |
