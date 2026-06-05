@@ -13,6 +13,18 @@ kramdown:
   input: GFM                 # GitHub-flavored Markdown (fenced code, tables, ...)
   syntax_highlighter: rouge  # server-side code highlighting for dev docs
 
+# GitHub Pages-allowlisted plugins. jekyll-sitemap auto-generates
+# /sitemap.xml covering every page with a `title:` in front matter
+# (replacing the old hand-written 9-URL list that drifted out of sync).
+plugins:
+  - jekyll-sitemap
+
+# jekyll-sitemap uses these defaults to set <lastmod> / <priority>.
+defaults:
+  - scope: { path: "" }
+    values:
+      sitemap: true
+
 # Keep the output lean: never emit repo/internal cruft as site pages.
 exclude:
   - README.md

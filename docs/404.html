@@ -1,0 +1,59 @@
+---
+permalink: /404.html
+sitemap: false
+title: ページが見つかりません
+description: お探しのページは見つかりませんでした。サイト内検索やトップページからお探しのコンテンツへどうぞ。
+---
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+<meta charset="utf-8">
+<title>404 — ページが見つかりません — Paprika</title>
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<link rel="stylesheet" href="{{ '/style.css' | relative_url }}">
+{% include favicon.html %}
+<script src="https://code.iconify.design/iconify-icon/2.1.0/iconify-icon.min.js"></script>
+<meta name="description" content="お探しのページは見つかりませんでした。サイト内検索やトップページからお探しのコンテンツへどうぞ。">
+<meta name="robots" content="noindex">
+<style>
+  .not-found { max-width: 720px; margin: 0 auto; padding: 56px 24px 80px; text-align: center; }
+  .not-found .code { font-size: 5rem; font-weight: 800; color: var(--accent); line-height: 1; margin: 0 0 8px; letter-spacing: -2px; }
+  .not-found h1 { font-size: 1.6rem; margin: 0 0 18px; }
+  .not-found p { color: var(--fg-muted); margin: 0 0 24px; }
+  .not-found .actions { display: flex; flex-wrap: wrap; gap: 10px; justify-content: center; margin: 24px 0 36px; }
+  .not-found .actions .btn { min-width: 140px; }
+  .not-found .quick { text-align: left; background: var(--bg-soft); border: 1px solid var(--border-soft); border-radius: 10px; padding: 18px 22px; margin-top: 12px; }
+  .not-found .quick h2 { font-size: 1rem; margin: 0 0 10px; }
+  .not-found .quick ul { margin: 0; padding-left: 20px; line-height: 1.9; }
+</style>
+</head>
+<body>
+
+{% include header.html %}
+
+<div class="not-found">
+  <p class="code">404</p>
+  <h1>ページが見つかりません</h1>
+  <p>お探しのページは移動・削除された可能性があります。</p>
+
+  <div class="actions">
+    <a class="btn" href="{{ '/' | relative_url }}">🏠 トップへ</a>
+    <a class="btn ghost" href="{{ '/search.html' | relative_url }}">🔍 サイト内検索</a>
+    <a class="btn ghost" href="https://github.com/paps-jp/paprika/issues" target="_blank" rel="noopener">🐞 不具合を報告</a>
+  </div>
+
+  <div class="quick">
+    <h2>よく見られているページ</h2>
+    <ul>
+      <li><a href="{{ '/intro.html' | relative_url }}">Client インストール</a> — SDK のセットアップから最初のスクリプトまで 5 分</li>
+      <li><a href="{{ '/quickstart.html' | relative_url }}">Server インストール</a> — Hub・Worker のセルフホスト</li>
+      <li><a href="{{ '/api.html' | relative_url }}">API リファレンス</a> — paprika-client 全関数仕様</li>
+      <li><a href="{{ '/admin.html' | relative_url }}">管理画面ガイド</a> — Web UI でブラウザ自動化を実行</li>
+      <li><a href="{{ '/faq.html' | relative_url }}">FAQ / トラブルシューティング</a></li>
+    </ul>
+  </div>
+</div>
+
+{% include footer.html %}
+</body>
+</html>

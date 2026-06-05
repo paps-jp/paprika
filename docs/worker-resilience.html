@@ -1,4 +1,7 @@
 ---
+title: Worker 自己回復(self-healing)
+description: "Paprika worker の自己回復（self-healing）設計。起動時にCPUコアへレーン数を自動調整、hub 接続が切れてもその場で無期限に再接続（自滅しない）、N ジョブごとに drain して自動リサイクル、hub 側は心拍の途絶えた worker を自動 reap。worker のライフサイクル図と設定一覧。"
+active: worker-resilience
 ---
 <!DOCTYPE html>
 <html lang="ja">
