@@ -338,12 +338,21 @@ class SessionRegistry:
         return [s for s in self._sessions.values() if s.worker_id == worker_id]
 
     def drop_by_worker(self, worker_id: str) -> list[str]:
-        """Remove every session bound to a worker (e.g. on disconnect).
-        Returns the list of session_ids that were dropped."""
+        """Drop every session bound to a worker from the IN-MEMORY registry
+        (e.g. on a worker WS-drop). Returns the dropped session_ids.
+
+        P2: we deliberately do NOT delete the Redis owner-map entry here. On a
+        HUB restart every worker briefly disconnects then reconnects, and the
+        restarted hub must reconstruct those sessions from Redis
+        (reconstruct_owned_sessions); deleting the entry here races that
+        recovery away -- the symptom is a live session that vanishes after a
+        hub restart. A genuinely dead worker's entry self-heals instead: once
+        it's gone from ``_sessions`` the reaper's touch_redis_map stops
+        refreshing it, so the key TTLs out within ~120s. Explicit end-of-
+        session still goes through remove(), which DOES delete Redis at once."""
         dropped: list[str] = []
         for sid, info in list(self._sessions.items()):
             if info.worker_id == worker_id:
                 self._sessions.pop(sid, None)
-                self._schedule(self._redis_del(sid))
                 dropped.append(sid)
         return dropped
