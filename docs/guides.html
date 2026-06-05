@@ -149,7 +149,8 @@ await cli.download_job_assets(job.job_id, "out/videos", kind="video")</code></pr
     <p class="see-also">→ <a href="examples.html#video">詳細はこちら（サンプル集: 動画をダウンロード）</a></p>
 
     <h2 id="login">ログイン必須サイト</h2>
-    <p>一度ログインして Cookie を Host レジストリに保存すれば、以後は自動で再利用されます。</p>
+    <p>一度ログインして Cookie を Host レジストリに保存すれば、以後は自動で再利用されます。
+    継続運用の選択肢は <a href="bridge-extension.html">Bridge 拡張</a>（手動 push）／<a href="profile.html"><code>use_profile</code></a>（フルプロファイル）／<a href="host-recipe.html">Host レシピ</a>（自動再ログイン）の 3 通りです。</p>
     <pre><code># 1) セッションでログイン（手動 noVNC でも page 操作でも）
 async with cli.session("https://market.example.com/login",
                        parent_job_id="login") as page:
@@ -178,7 +179,8 @@ await cli.download_job_assets(job.job_id, "out/item")</code></pre>
     <p class="see-also">→ <a href="examples.html#session-basics">詳細はこちら（サンプル集: セッションを開く / 閉じる）</a></p>
 
     <h2 id="dom">DOM 取得・待機・入力</h2>
-    <p><code>page.evaluate()</code> を土台に、Playwright スタイルの取得・待機・入力デバイスが使えます。</p>
+    <p><code>page.evaluate()</code> を土台に、Playwright スタイルの取得・待機・入力デバイスが使えます。
+    <code>Locator</code>（<code>page.locator(...)</code> / <code>get_by_*</code>）の完全な API は <a href="locator.html">Locator リファレンス</a> を参照。</p>
     <pre><code># JS 実行
 title = await page.evaluate("document.title")
 
@@ -212,7 +214,8 @@ await page.get_by_text("ログイン").click()</code></pre>
 
     <h2 id="crawl">サイトを巡回（walk）</h2>
     <p>「このサイトを N 件たどって各ページの画像を保存」のようなクロールは、<code>walk()</code> に任せると
-    キュー・重複除去・ドメイン/パス制限・オフスコープ redirect 対応まで対応しています。</p>
+    キュー・重複除去・ドメイン/パス制限・オフスコープ redirect 対応まで対応しています。
+    全オプション（15 項目）と <code>Visit</code> フィールドの完全リファレンスは <a href="walk.html">walk リファレンス</a> を参照。</p>
     <pre><code>from paprika_client import async_paprika, walk
 
 async def main():

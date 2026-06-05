@@ -62,7 +62,7 @@
 
     <!-- 1. PATTERNS ---------------------------------------------------- -->
     <h2 id="patterns">3 つの構成パターン</h2>
-    <p>サーバーをどう配置するか。用途に合わせて選びます（後で組み替えも可能、例: A → B にスケールアップ）。</p>
+    <p>サーバーをどう配置するか。用途に合わせて選びます（後で組み替えも可能、例: A → B にスケールアップ）。さらに大きく載せるとき（複数 Hub での水平スケール）は <a href="scaling.html">Hub スケーリング</a> を参照。最短で立ち上げたい場合は <a href="quickstart.html">Server インストール</a>（5 分）から。</p>
 
     <div class="cards">
       <a class="card" href="#install-a">
@@ -252,7 +252,7 @@ cd /opt/paprika && git pull && docker compose restart hub</code></pre>
 
     <!-- 6. ARCH (details, late) ---------------------------------------- -->
     <h2 id="arch">アーキテクチャ（詳細）</h2>
-    <p>中央集権型です。<strong>Operator / SDK → Hub → Worker（Lane = Chrome）</strong>。収集物は Hub に集約され、worker は通り道です。</p>
+    <p>中央集権型です。<strong>Operator / SDK → Hub → Worker（Lane = Chrome）</strong>。収集物は Hub に集約され、worker は通り道です。図解と各コンポーネントの解説は <a href="architecture.html">アーキテクチャ概要</a> ／ <a href="architecture-hub.html">Hub の仕組み</a> ／ <a href="architecture-worker.html">Worker・Lane・Chrome の仕組み</a> に集約しました。</p>
     <table>
       <thead><tr><th>コンポーネント</th><th>役割</th><th>規模</th></tr></thead>
       <tbody>
@@ -268,7 +268,7 @@ cd /opt/paprika && git pull && docker compose restart hub</code></pre>
 
     <!-- 7. HTTP API ---------------------------------------------------- -->
     <h2 id="http">HTTP API</h2>
-    <p>全エンドポイントはフラット（<code>/api/</code> prefix なし）、<strong>認証なし（LAN 内信頼前提）</strong>。インタラクティブな一覧は Swagger UI <a href="https://paprika.lan/docs">/docs</a>。SDK 経由が基本ですが、未ラップのレジストリ系は <code>await cli._json("GET", "/hosts")</code> でも叩けます。</p>
+    <p>全エンドポイントはフラット（<code>/api/</code> prefix なし）、<strong>認証なし（LAN 内信頼前提）</strong>。インタラクティブな一覧は Swagger UI <a href="https://paprika.lan/docs">/docs</a>。SDK 経由が基本ですが、未ラップのレジストリ系は <code>await cli._json("GET", "/hosts")</code> でも叩けます。任意の言語から叩く解説は <a href="http-api.html">HTTP API（任意の言語から）</a>、<code>options</code> の全フィールドは <a href="job-options.html">JobOptions</a>、エラーコードの意味は <a href="errors.html">エラー一覧</a> を参照。</p>
     <table>
       <thead><tr><th>グループ</th><th>主なエンドポイント</th></tr></thead>
       <tbody>

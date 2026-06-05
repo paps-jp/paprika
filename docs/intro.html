@@ -62,7 +62,7 @@
     <table>
       <thead><tr><th></th><th>これは何</th><th>どう用意する</th></tr></thead>
       <tbody>
-        <tr><td><strong>本体</strong></td><td>Hub・Worker・管理画面（ブラウザを動かすサーバ群）</td><td><strong>Docker / CLI で起動</strong> → <a href="operations.html#patterns">サーバー → 3つの構成パターン</a></td></tr>
+        <tr><td><strong>本体</strong></td><td>Hub・Worker・管理画面（ブラウザを動かすサーバ群）</td><td><strong>Docker で起動</strong> → <a href="quickstart.html">Server インストール</a>（5 分） / 構成パターンは <a href="operations.html#patterns">サーバー構成</a></td></tr>
         <tr><td><strong>SDK</strong></td><td>paprika-client（本体を操作する Python / PHP ライブラリ）</td><td><strong>このページ</strong>（<code>pip install</code> / <code>composer require</code>）</td></tr>
       </tbody>
     </table>
@@ -168,8 +168,9 @@ echo "status: {$job['status']}\n";
 foreach ($cli-&gt;jobImages($job['job_id']) as $url) {
     echo $url, "\n";
 }</code></pre>
-    <p>PHP SDK は現在 <strong>Phase 1</strong>（Job API + Session ライフサイクル）。
-    Page 操作は Phase 2 で対応予定です。詳しくは <a href="api.html#php">API → PHP SDK</a>。</p>
+    <p>PHP SDK は現時点で <strong>Phase 1</strong>（Job API ＋ Session ライフサイクル）に対応しています。
+    Page 操作（<code>$page-&gt;goto()</code>・<code>$page-&gt;click()</code>・Locator チェーン等）は <strong>Phase 2</strong>、<code>walk</code> は <strong>Phase 3</strong> での対応予定です。
+    詳細は <a href="api.html#php">API リファレンス → PHP SDK</a>。</p>
     </div>
     <div class="ex-async">
     <div class="callout tip"><strong>async が苦手なら同期版</strong>
@@ -190,7 +191,7 @@ foreach ($cli-&gt;jobImages($job['job_id']) as $url) {
     </table>
 
     <h2 id="modes">ジョブモード</h2>
-    <p>ジョブ投入時に <code>mode</code> を選びます。</p>
+    <p>ジョブ投入時に <code>mode</code> を選びます。<code>options</code> の全フィールド・既定値・制約は <a href="job-options.html">JobOptions リファレンス</a> を参照してください。</p>
     <table>
       <thead><tr><th>mode</th><th>用途</th></tr></thead>
       <tbody>
@@ -213,9 +214,11 @@ foreach ($cli-&gt;jobImages($job['job_id']) as $url) {
     <h2 id="next">次のステップ</h2>
     <div class="cards">
       <a class="card" href="guides.html"><h3>ガイド →</h3><p>画像/動画の取得、ログイン、ブラウザ操作、LLM の使い分け。</p></a>
+      <a class="card" href="usecases.html"><h3>ユースケース →</h3><p>目的別の End-to-End 例（商品画像・動画・サイトアーカイブ・ログイン）。</p></a>
       <a class="card" href="api.html"><h3>API リファレンス →</h3><p>SDK の全関数：引数・戻り値・例。</p></a>
+      <a class="card" href="job-options.html"><h3>JobOptions →</h3><p><code>options</code> の全フィールド・既定値・制約。</p></a>
       <a class="card" href="admin.html"><h3>管理画面 →</h3><p>コードを書かずに UI から投げる・観察する。</p></a>
-      <a class="card" href="operations.html"><h3>サーバー →</h3><p>本体（Hub/Worker）を Docker / CLI で立ち上げる。3つの構成パターン解説。</p></a>
+      <a class="card" href="quickstart.html"><h3>Server インストール →</h3><p>自分の環境で動かす（5 分）。</p></a>
     </div>
 
     <div class="pager">
