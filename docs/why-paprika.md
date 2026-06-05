@@ -1,13 +1,13 @@
 ---
 layout: doc
-title: なぜ Paprika? — Playwright / Selenium との違い
+title: なぜ Paprika? — Playwright との違い
 description: Playwright スタイルの API で書きやすく、分散ワーカー上の Chrome を AI とともに動かして画像・動画・リンクを集める。Paprika と Playwright・Selenium の違いを、シナリオ別に比較。
 active: why-paprika
 ---
 
 **Playwright と書き味は同じまま、フリート（複数ホストの Chrome）と AI で動かす**。Paprika は「ブラウザ自動化のフレームワーク」ではなく、**収集ワークロードを丸ごと面倒見るプラットフォーム**です。
 
-<video class="shot" autoplay loop muted playsinline preload="metadata" aria-label="Paprika 管理画面で複数の Chrome Lane が同時にページを取得している様子">
+<video class="shot" width="1096" height="664" autoplay loop muted playsinline preload="metadata" aria-label="Paprika 管理画面で複数の Chrome Lane が同時にページを取得している様子">
   <source src="img/admin-live.webm" type="video/webm">
   <source src="img/admin-live.mp4" type="video/mp4">
   <img src="img/admin-live.gif" alt="Paprika 管理画面で複数の Chrome Lane が同時にページを取得している様子">
