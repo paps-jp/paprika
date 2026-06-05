@@ -724,7 +724,7 @@ data  = page.evaluate("fetch('/api').then(r=>r.json())", await_promise=True)</co
       <h3><code>page.ask(question, *, engine="auto")</code> <span class="pw-ret">&rarr; bool</span></h3>
       <p>LLM に yes/no を問います。</p>
       <div class="pw-label">Usage</div>
-      <pre><code>if await page.ask("年齢確認のダイアログが出ている?"):
+      <pre><code>if await page.ask("認証ダイアログが出ている?"):
     ...</code></pre>
       <div class="pw-label">Arguments</div>
       <ul class="pw-args">
@@ -739,7 +739,7 @@ data  = page.evaluate("fetch('/api').then(r=>r.json())", await_promise=True)</co
       <h3><code>page.agent(goal, *, max_steps=5, engine="auto")</code> <span class="pw-ret">&rarr; dict</span></h3>
       <p>vision / LLM エージェントにゴールを委譲します。</p>
       <div class="pw-label">Usage</div>
-      <pre><code>await page.agent("年齢確認をクリアして", max_steps=3)</code></pre>
+      <pre><code>await page.agent("認証画面をクリアして", max_steps=3)</code></pre>
       <div class="pw-label">Arguments</div>
       <ul class="pw-args">
         <li><code class="arg">goal</code> <span class="pw-type">str</span> &mdash; 達成目標</li>

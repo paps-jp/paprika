@@ -265,7 +265,7 @@
         <tr><td><strong>N ホスト</strong></td><td>学習済みホストの総数</td></tr>
         <tr><td><strong>high / medium / low</strong></td><td>信頼度別のホスト数。high = 成功率が高く安定、low = 未検証または成功率が低い</td></tr>
         <tr><td><strong>stale</strong></td><td>長期間更新がないホスト</td></tr>
-        <tr><td><strong>barriers 学習済</strong></td><td>アクセス障壁（Cloudflare / 年齢確認等）が検出・記録されたホスト数</td></tr>
+        <tr><td><strong>barriers 学習済</strong></td><td>アクセス障壁（Cloudflare / 認証画面等）が検出・記録されたホスト数</td></tr>
         <tr><td><strong>extractions 学習済</strong></td><td>抽出手法（CSS セレクタ / XPath 等）が記録されたホスト数</td></tr>
       </tbody>
     </table>
@@ -287,7 +287,7 @@
         <tr><td><strong>信頼度</strong></td><td>tier バッジ（<span class="badge" style="background:#d4edda;color:#155724;">high</span> / <span class="badge" style="background:#fff3cd;color:#856404;">medium</span> / <span class="badge" style="background:#f8d7da;color:#721c24;">low</span>）</td></tr>
         <tr><td><strong>ジョブ数</strong></td><td>このホストへの累計ジョブ実行回数</td></tr>
         <tr><td><strong>成功率</strong></td><td>ジョブの成功率（%）</td></tr>
-        <tr><td><strong>barriers</strong></td><td>検出されたアクセス障壁のタグ（<code>cloudflare_challenge</code> / <code>age_gate</code> / <code>login_wall</code> 等）</td></tr>
+        <tr><td><strong>barriers</strong></td><td>検出されたアクセス障壁のタグ（<code>cloudflare_challenge</code> / <code>login_wall</code> 等）</td></tr>
         <tr><td><strong>extractions</strong></td><td>学習済みの抽出ルール（CSS / XPath / カスタムロジック）</td></tr>
         <tr><td><strong>最終更新</strong></td><td>知識が最後に更新された相対時刻</td></tr>
         <tr><td><strong>更新元</strong></td><td>知識の生成元（<code>distiller-light</code> = 軽量自動蒸留 / <code>distiller-r1</code> = R1 による深い分析）</td></tr>

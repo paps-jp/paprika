@@ -295,8 +295,8 @@ asyncio.run(main())</code></pre>
     </table>
     <pre><code># スクリプト内で 1 ステップだけ LLM に任せる
 async with cli.session("https://example.com") as page:
-    if await page.ask("年齢確認ダイアログが出ている?"):
-        await page.agent("年齢確認の「はい」を押す", max_steps=3)
+    if await page.ask("認証ダイアログが出ている?"):
+        await page.agent("確認画面の「はい」を押す", max_steps=3)
     await page.capture("after-gate")</code></pre>
     <p class="see-also">→ <a href="examples.html#llm">詳細はこちら（サンプル集: LLM (ask / observe / agent)）</a></p>
 
