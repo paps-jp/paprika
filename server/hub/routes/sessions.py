@@ -923,13 +923,64 @@ async def close_session(session_id: str, request: Request = None) -> dict:
     }
 
 
+async def _fetch_peer_sessions(owner_hub: str) -> list[dict]:
+    """GET a peer hub's LOCAL session list for the cross-hub /sessions merge.
+    The _FWD_MARK header makes the peer return only its own sessions (it skips
+    its own fan-out) so there's no recursion. Best-effort: any failure yields
+    [] so one slow / down peer never breaks the merge."""
+    headers = {_FWD_MARK: config.hub_id or "1"}
+    if config.worker_secret:
+        headers["X-Paprika-Worker-Secret"] = config.worker_secret
+    try:
+        async with httpx.AsyncClient(timeout=3.0) as client:
+            r = await client.get(
+                _hub_internal_url(owner_hub, "/sessions"), headers=headers
+            )
+        if r.status_code == 200:
+            return r.json().get("sessions") or []
+    except Exception:
+        pass
+    return []
+
+
 @router.get("/sessions")
-async def list_sessions() -> dict:
-    """List active sessions on this hub. ``novnc_url`` is rewritten to
-    the session-rooted hub proxy URL so admin UI tiles open via the
-    hub (worker LAN IPs stay private)."""
+async def list_sessions(request: Request) -> dict:
+    """List active sessions across the fleet. ``novnc_url`` is rewritten to
+    the session-rooted hub proxy URL so admin UI tiles open via the hub
+    (worker LAN IPs stay private).
+
+    Multi-hub: the in-memory registry holds only THIS hub's sessions, so
+    behind nginx a bare local list flickers in/out as the admin polls
+    different hubs (sessions appear/disappear; live-preview tiles flip
+    RUNNING/keepalive). Unless this call is already a forwarded hop, fan out
+    to every live peer hub and merge (deduped by session_id) so any hub
+    returns the same fleet-wide set."""
     _require_session_infra()
     items = [_proxy_session_dict(s.to_json()) for s in state.sessions.all()]
+    if not request.headers.get(_FWD_MARK) and state.hubs is not None:
+        try:
+            hubs = await state.hubs.list_all()
+        except Exception:
+            hubs = []
+        peers = [
+            h.get("hub_id")
+            for h in hubs
+            if h.get("alive") and h.get("hub_id") and h.get("hub_id") != config.hub_id
+        ]
+        if peers:
+            results = await asyncio.gather(
+                *[_fetch_peer_sessions(hid) for hid in peers],
+                return_exceptions=True,
+            )
+            seen = {it.get("session_id") for it in items}
+            for res in results:
+                if not isinstance(res, list):
+                    continue
+                for it in res:
+                    sid = it.get("session_id")
+                    if sid and sid not in seen:
+                        seen.add(sid)
+                        items.append(it)
     return {"count": len(items), "sessions": items}
 
 
