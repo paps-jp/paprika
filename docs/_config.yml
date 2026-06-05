@@ -1,0 +1,21 @@
+# GitHub Pages (source = /docs). Jekyll builds this folder and serves _site/.
+# Files WITHOUT YAML front matter are copied verbatim (so existing static
+# pages / images / .md notes are untouched); only pages that opt in with a
+# `---` front-matter block are processed as Liquid + (for .md) Markdown.
+title: Paprika
+description: "Paprika — Playwright スタイルの Python・PHP SDK と AI で分散ワーカー上の Chrome を操作し、画像・動画・リンクを一括収集する OSS ブラウザ自動化プラットフォーム。"
+url: "https://paps-jp.github.io"
+baseurl: "/paprika"
+lang: ja
+
+markdown: kramdown
+kramdown:
+  input: GFM                 # GitHub-flavored Markdown (fenced code, tables, ...)
+  syntax_highlighter: rouge  # server-side code highlighting for dev docs
+
+# Keep the output lean: never emit repo/internal cruft as site pages.
+exclude:
+  - README.md
+  - Gemfile
+  - Gemfile.lock
+  - vendor

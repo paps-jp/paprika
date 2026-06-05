@@ -1,0 +1,30 @@
+<!DOCTYPE html>
+<html lang="{{ site.lang | default: 'ja' }}">
+<head>
+<meta charset="utf-8">
+<title>{{ page.title }} — Paprika</title>
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<link rel="stylesheet" href="{{ '/style.css' | relative_url }}">
+<script src="https://code.iconify.design/iconify-icon/2.1.0/iconify-icon.min.js"></script>
+{% if page.description %}<meta name="description" content="{{ page.description }}">{% endif %}
+<link rel="canonical" href="{{ page.url | absolute_url }}">
+<meta property="og:type" content="article">
+<meta property="og:site_name" content="Paprika">
+<meta property="og:title" content="{{ page.title }} — Paprika">
+{% if page.description %}<meta property="og:description" content="{{ page.description }}">{% endif %}
+<meta property="og:url" content="{{ page.url | absolute_url }}">
+<meta property="og:locale" content="ja_JP">
+</head>
+<body>
+{% comment %} Shared site header. `active` (home/learn/reference/ops) comes
+   from the page's front matter and lights the matching nav item. {% endcomment %}
+{% include header.html active=page.active %}
+<div class="layout">
+  <main class="content">
+    <h1>{{ page.title }}</h1>
+    {% if page.description %}<p class="lead">{{ page.description }}</p>{% endif %}
+    {{ content }}
+  </main>
+</div>
+</body>
+</html>

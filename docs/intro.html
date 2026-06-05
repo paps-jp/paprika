@@ -1,3 +1,5 @@
+---
+---
 <!DOCTYPE html>
 <html lang="ja">
 <head>
@@ -34,39 +36,7 @@
 </head>
 <body>
 
-<nav class="topnav">
-  <a class="brand" href="index.html"><span class="logo"><img src="icon.svg" alt=""></span> Paprika</a>
-  <span class="links">
-    <a href="index.html">Home</a>
-    <span class="dropdown">
-      <a class="dropdown-toggle active" href="intro.html">学ぶ ▾</a>
-      <span class="dropdown-menu">
-        <a href="intro.html" class="active">はじめに</a>
-        <a href="guides.html">ガイド</a>
-        <a href="examples.html">サンプル</a>
-      </span>
-    </span>
-    <span class="dropdown">
-      <a class="dropdown-toggle" href="api.html">リファレンス ▾</a>
-      <span class="dropdown-menu">
-        <a href="api.html">API</a>
-        <a href="admin.html">管理画面</a>
-      </span>
-    </span>
-    <span class="dropdown">
-      <a class="dropdown-toggle" href="operations.html">運用・設計 ▾</a>
-      <span class="dropdown-menu">
-        <a href="operations.html">サーバー構成</a>
-        <a href="engine-setup.html">エンジン設定</a>
-        <a href="scaling.html">Hub スケーリング</a>
-        <a href="vision-mouse.html">Vision AI とマウス</a>
-        <a href="worker-autodeploy.html">ワーカー自動デプロイ</a>
-        <a href="vnc-embed.html">VNC 埋め込み</a>
-      </span>
-    </span>
-  </span>
-  <a class="gh" href="https://github.com/paps-jp/paprika">GitHub ↗</a>
-</nav>
+{% include header.html active="intro" %}
 
 <div class="layout">
   <aside class="sidebar">

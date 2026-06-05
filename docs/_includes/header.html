@@ -1,0 +1,33 @@
+<nav class="topnav">
+  <a class="brand" href="index.html"><span class="logo"><img src="icon.svg" alt=""></span> Paprika</a>
+  <span class="links">
+    <a href="index.html"{% if include.active == "home" %} class="active"{% endif %}>Home</a>
+    <span class="dropdown">
+      <a class="dropdown-toggle{% if include.active == "intro" or include.active == "guides" or include.active == "examples" %} active{% endif %}" href="intro.html">学ぶ ▾</a>
+      <span class="dropdown-menu">
+        <a href="intro.html"{% if include.active == "intro" %} class="active"{% endif %}>はじめに</a>
+        <a href="guides.html"{% if include.active == "guides" %} class="active"{% endif %}>ガイド</a>
+        <a href="examples.html"{% if include.active == "examples" %} class="active"{% endif %}>サンプル</a>
+      </span>
+    </span>
+    <span class="dropdown">
+      <a class="dropdown-toggle{% if include.active == "api" or include.active == "admin" %} active{% endif %}" href="api.html">リファレンス ▾</a>
+      <span class="dropdown-menu">
+        <a href="api.html"{% if include.active == "api" %} class="active"{% endif %}>API</a>
+        <a href="admin.html"{% if include.active == "admin" %} class="active"{% endif %}>管理画面</a>
+      </span>
+    </span>
+    <span class="dropdown">
+      <a class="dropdown-toggle{% if include.active == "operations" or include.active == "engine-setup" or include.active == "scaling" or include.active == "vision-mouse" or include.active == "worker-autodeploy" or include.active == "vnc-embed" or include.active == "worker-resilience" %} active{% endif %}" href="operations.html">運用・設計 ▾</a>
+      <span class="dropdown-menu">
+        <a href="operations.html"{% if include.active == "operations" %} class="active"{% endif %}>サーバー構成</a>
+        <a href="engine-setup.html"{% if include.active == "engine-setup" %} class="active"{% endif %}>エンジン設定</a>
+        <a href="scaling.html"{% if include.active == "scaling" %} class="active"{% endif %}>Hub スケーリング</a>
+        <a href="vision-mouse.html"{% if include.active == "vision-mouse" %} class="active"{% endif %}>Vision AI とマウス</a>
+        <a href="worker-autodeploy.html"{% if include.active == "worker-autodeploy" %} class="active"{% endif %}>ワーカー自動デプロイ</a>
+        <a href="vnc-embed.html"{% if include.active == "vnc-embed" %} class="active"{% endif %}>VNC 埋め込み</a>
+      </span>
+    </span>
+  </span>
+  <a class="gh" href="https://github.com/paps-jp/paprika">GitHub ↗</a>
+</nav>
