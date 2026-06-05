@@ -1099,8 +1099,14 @@ async function refreshHubsTable() {
     const forgetBtn = (!h.alive && !h.local)
       ? `<button class="pill" style="--la-bg:#fee; --la-bd:#c88; --la-fg:#933; padding:2px 8px; font-size:.85em;" onclick="forgetHub('${esc(h.hub_id)}')"><iconify-icon icon="lucide:trash-2"></iconify-icon> forget</button>`
       : '';
+    // Same per-hub colour as the Workers tab's hub badge (_wkrTagStyle is a
+    // global from admin-dashboard.js, loaded earlier) so a hub reads as the
+    // same colour in both places.
+    const hubIdCell = h.hub_id
+      ? `<span class="badge" style="${_wkrTagStyle(h.hub_id)} font-size:.9em;">${esc(h.hub_id)}</span>`
+      : '<span class="empty">—</span>';
     return `<tr>
-      <td><code>${esc(h.hub_id || '')}</code>${localBadge}</td>
+      <td>${hubIdCell}${localBadge}</td>
       <td>${aliveDot}${esc(statusText)}</td>
       <td>${pubBase}</td>
       <td>${ver}</td>
