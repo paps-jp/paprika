@@ -259,6 +259,55 @@ class SessionRegistry:
         for info in list(self._sessions.values()):
             await self._redis_put(info, ttl)
 
+    async def reconstruct_owned_sessions(self) -> int:
+        """On hub startup, rebuild this hub's OWN live sessions from Redis (P2).
+
+        The in-memory registry is empty after a restart, but the full
+        SessionInfo survives in the Redis session map (see _redis_put), so we
+        re-hydrate every entry whose ``hub`` == us. A session created before
+        the restart then keeps working once its worker reconnects -- the worker
+        holds its Chrome tab across the WS drop -- and cross-hub forwarding can
+        still resolve us as the owner. Sessions whose worker never returns
+        become zombies the reaper clears on idle/absolute TTL. We insert
+        straight into ``_sessions`` (NOT add(), which would needlessly re-write
+        the entry we just read). No-op without redis (single-hub / tests)."""
+        if self._r is None:
+            return 0
+        n = 0
+        try:
+            cur = 0
+            while True:
+                cur, keys = await self._r.scan(
+                    cur, match="paprika:session:*", count=500,
+                )
+                for k in keys:
+                    try:
+                        raw = await self._r.get(k)
+                        if not raw:
+                            continue
+                        d = json.loads(raw)
+                        if not isinstance(d, dict):
+                            continue
+                        if (d.get("hub") or "") != self._hub_id:
+                            continue
+                        sid = d.get("session_id") or ""
+                        if not sid or sid in self._sessions:
+                            continue
+                        info = session_from_json(d)
+                        # Fresh idle window so the reaper doesn't immediately
+                        # reap a session that just survived the restart; the
+                        # absolute TTL (created_at-based) still caps lifetime.
+                        info.last_active_at = datetime.utcnow()
+                        self._sessions[sid] = info
+                        n += 1
+                    except Exception:
+                        continue
+                if cur == 0:
+                    break
+        except Exception:
+            return n
+        return n
+
     def add(self, info: SessionInfo) -> None:
         self._sessions[info.session_id] = info
         # Mirror the FULL session to Redis with a TTL a bit beyond the

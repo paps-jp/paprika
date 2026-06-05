@@ -347,10 +347,24 @@ async def lifespan(app: FastAPI):
             )
             config.hub_id = _derived
     state.registry = WorkerRegistry(redis_client=redis_client, hub_id=config.hub_id)
-    # Mirror the Session Map (sid -> worker/hub) to the same Redis so a
-    # future Hub→Hub forwarding layer can route session actions across
-    # replicas. Writes only; nothing reads it back yet.
+    # Mirror the FULL session state (to_json + hub) to the same Redis so the
+    # Hub→Hub forwarding layer can route session actions across replicas AND a
+    # restarted hub can reconstruct its live sessions (P2). Bind first, then
+    # re-hydrate this hub's own sessions: the in-memory registry is empty after
+    # a restart, but the session map survived and workers keep their Chrome tabs
+    # across the WS drop, so a session created before the restart keeps working
+    # once its worker reconnects.
     state.sessions.bind_redis(redis_client, config.hub_id)
+    try:
+        _recovered = await state.sessions.reconstruct_owned_sessions()
+        if _recovered:
+            log.info(
+                "session-recovery: rehydrated %d session(s) from Redis "
+                "after restart",
+                _recovered,
+            )
+    except Exception:
+        log.warning("session-recovery failed", exc_info=True)
 
     # Hub-presence registry: write a TTL'd row under
     # ``paprika:hubs:{hub_id}`` every 30 s so multi-hub deploys can
