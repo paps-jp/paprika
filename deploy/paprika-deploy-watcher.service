@@ -1,0 +1,30 @@
+# paprika deploy-watcher — Phase 2 of the .34-as-SoT deploy model.
+# Install on the .34 control host:
+#   cp /opt/paprika/deploy/paprika-deploy-watcher.service /etc/systemd/system/
+#   systemctl daemon-reload
+#   systemctl enable --now paprika-deploy-watcher     # GO LIVE (auto-deploy)
+#   systemctl stop  paprika-deploy-watcher            # pause -> back to manual
+#   journalctl -u paprika-deploy-watcher -f           # watch
+#
+# WARNING: once enabled, ANY content change to /opt/paprika/{server,core} on
+# .34 auto-propagates to the 3 hubs (+ worker converge) after DEBOUNCE_S. Do
+# NOT enable while anyone still edits the hubs directly — the watcher would
+# revert their changes every cycle (the "two-writers" footgun). Adopt
+# "edit on .34 only" FIRST.
+[Unit]
+Description=paprika deploy-watcher (auto-propagate .34 source -> 3 hubs + workers)
+After=network-online.target docker.service
+Wants=network-online.target
+
+[Service]
+Type=simple
+ExecStart=/opt/paprika/scripts/deploy-watcher.sh
+Restart=always
+RestartSec=10
+# tune cadence/debounce if desired:
+# Environment=INTERVAL_S=15 DEBOUNCE_S=30
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target
