@@ -7,6 +7,8 @@ active: profile
 
 `use_profile` は、自分の **Chrome の User Data フォルダ（プロファイル）をアップロード**して、そのログイン状態を含むまま Paprika のジョブに使う仕組みです。Cookie だけでなく **autofill / 保存パスワード / 拡張機能 / 設定**まで丸ごと持ち込めます。
 
+> **uBlock Origin / Bitwarden / MetaMask など普段使っている Chrome 拡張**もそのまま動きます。広告ブロック付きで収集、保存パスワードで自動ログイン、Web3 サインなど、**手元の Chrome と同じ環境**でジョブが走らせられます。
+
 > 軽い用途（Cookie だけ）なら [Bridge 拡張](bridge-extension.html) のほうが手軽です。期限切れの自動更新は [Host レシピ](host-recipe.html) を参照。
 
 ## いつ使うか

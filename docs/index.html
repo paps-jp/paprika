@@ -149,6 +149,21 @@
         <h3>分散フリート</h3>
         <p>多数のワーカーが並列実行。1 台で複数の独立ブラウザ（Lane）を保持。<a href="scaling.html">複数 Hub に水平スケール</a> も可能。</p>
       </div>
+      <div class="card">
+        <iconify-icon class="card-icon" icon="lucide:syringe"></iconify-icon>
+        <h3>Chrome 拡張で JS 注入</h3>
+        <p>同梱の <code>paprika-agent</code> 拡張（<code>userScripts</code> 権限）で、CDP では届かない領域（リクエストヘッダ書き換え、Content Settings、Proxy、Privacy）まで操作。<strong>任意の JS を全ページに常駐注入</strong>できます。</p>
+      </div>
+      <div class="card">
+        <iconify-icon class="card-icon" icon="lucide:puzzle"></iconify-icon>
+        <h3>既存 Chrome 拡張を利用可能</h3>
+        <p>普段使いの拡張（uBlock Origin / Bitwarden / MetaMask 等）を <strong>そのままワーカーに持ち込める</strong>（<code>--load-extension</code>）。広告抜きで収集、保存パスワードで自動ログイン、Web3 サインなど。</p>
+      </div>
+      <div class="card">
+        <iconify-icon class="card-icon" icon="lucide:user-cog"></iconify-icon>
+        <h3>Chrome プロファイル流用</h3>
+        <p>普段使いの Chrome の <strong>User Data フォルダをアップロード</strong>するだけ。Cookie / 保存パスワード / autofill / 拡張機能まで一式持ち込み、認証必須サイトもそのまま開けます（<a href="profile.html"><code>use_profile</code></a>）。</p>
+      </div>
     </div>
 
     <h2 id="example">最短の例</h2>
