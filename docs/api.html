@@ -618,7 +618,7 @@ data  = page.evaluate("fetch('/api').then(r=>r.json())", await_promise=True)</co
         <tr><td><code>page.locator(selector)</code> → Locator</td><td>CSS セレクタ</td></tr>
         <tr><td><code>page.get_by_text(text)</code> → Locator</td><td>可視テキスト一致</td></tr>
         <tr><td><code>page.get_by_role(role, *, name=None)</code> → Locator</td><td><code>[role=]</code></td></tr>
-        <tr><td><code>page.get_by_test_id / get_by_placeholder / get_by_title / get_by_alt_text (text)</code> → Locator</td><td>属性セレクタ</td></tr>
+        <tr><td><code>page.get_by_test_id(id) / get_by_placeholder(text) / get_by_title(text) / get_by_alt_text(text)</code> → Locator</td><td>属性セレクタ。詳細は <a href="locator.html">Locator リファレンス</a> を参照</td></tr>
       </tbody>
     </table>
 
@@ -1196,18 +1196,8 @@ print(items[0]["state"], items[0]["bytesReceived"])</code></pre>
     <div class="callout warn"><strong>注意</strong> popup を閉じるのに <code>await sess[-1].close()</code> は使わないこと（セッション全体を殺すことがある）。<code>sess.close_popups()</code> を使う。</div>
 
     <h2 id="locator">Locator</h2>
-    <p><code>page.locator(sel)</code> / <code>get_by_*()</code> が返す。<strong>解決はアクション時</strong>。</p>
-    <table>
-      <thead><tr><th>メソッド</th><th>説明</th></tr></thead>
-      <tbody>
-        <tr><td><code>loc.click() / fill(v) / press(k) / type(t)</code></td><td>操作</td></tr>
-        <tr><td><code>loc.hover() / dblclick() / focus() / check() / uncheck() / select_option(v) / set_input_files(f) / scroll_into_view_if_needed()</code></td><td>入力デバイス</td></tr>
-        <tr><td><code>loc.text_content() / inner_text() / inner_html() / input_value() / get_attribute(name)</code></td><td>取得</td></tr>
-        <tr><td><code>loc.is_visible() / is_checked() / is_enabled() / is_disabled() / is_editable()</code> → bool</td><td>状態</td></tr>
-        <tr><td><code>loc.nth(i) / first / last / count() / all()</code></td><td>チェーン</td></tr>
-        <tr><td><code>loc.wait_for(*, state="visible", timeout=30.0)</code> → bool</td><td>この要素が state になるまで待つ</td></tr>
-      </tbody>
-    </table>
+    <p><code>page.locator(sel)</code> / <code>get_by_*()</code> が返す要素参照。<strong>解決はアクション時</strong>です（<code>click()</code> や <code>wait_for()</code> を呼んだ時点で初めて DOM を探します）。</p>
+    <p>全メソッド（クリック・入力・取得・状態判定・チェーン・待機）と用例は <strong><a href="locator.html">Locator リファレンス</a></strong> に集約しました。</p>
     <div class="ex-async"><pre><code>rows = page.locator(".item")
 for r in await rows.all():
     print(await r.get_attribute("data-id"))
