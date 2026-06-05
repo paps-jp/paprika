@@ -14,13 +14,16 @@
       </span>
     </span>
     <span class="dropdown">
-      <a class="dropdown-toggle{% if include.active == "api" or include.active == "http-api" or include.active == "walk" or include.active == "locator" or include.active == "ws-events" or include.active == "admin" %} active{% endif %}" href="api.html">リファレンス ▾</a>
+      <a class="dropdown-toggle{% if include.active == "api" or include.active == "http-api" or include.active == "walk" or include.active == "locator" or include.active == "ws-events" or include.active == "bridge-extension" or include.active == "profile" or include.active == "host-recipe" or include.active == "admin" %} active{% endif %}" href="api.html">リファレンス ▾</a>
       <span class="dropdown-menu">
         <a href="api.html"{% if include.active == "api" %} class="active"{% endif %}>API</a>
         <a href="http-api.html"{% if include.active == "http-api" %} class="active"{% endif %}>HTTP API</a>
         <a href="walk.html"{% if include.active == "walk" %} class="active"{% endif %}>walk（巡回）</a>
         <a href="locator.html"{% if include.active == "locator" %} class="active"{% endif %}>Locator（要素指定）</a>
         <a href="ws-events.html"{% if include.active == "ws-events" %} class="active"{% endif %}>WebSocket（ライブログ）</a>
+        <a href="bridge-extension.html"{% if include.active == "bridge-extension" %} class="active"{% endif %}>Bridge 拡張</a>
+        <a href="profile.html"{% if include.active == "profile" %} class="active"{% endif %}>use_profile</a>
+        <a href="host-recipe.html"{% if include.active == "host-recipe" %} class="active"{% endif %}>Host レシピ</a>
         <a href="admin.html"{% if include.active == "admin" %} class="active"{% endif %}>管理画面</a>
       </span>
     </span>
