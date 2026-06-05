@@ -21,8 +21,11 @@
       </span>
     </span>
     <span class="dropdown">
-      <a class="dropdown-toggle{% if include.active == "operations" or include.active == "engine-setup" or include.active == "scaling" or include.active == "vision-mouse" or include.active == "worker-autodeploy" or include.active == "vnc-embed" or include.active == "worker-resilience" %} active{% endif %}" href="operations.html">運用・設計 ▾</a>
+      <a class="dropdown-toggle{% if include.active == "architecture" or include.active == "architecture-hub" or include.active == "architecture-worker" or include.active == "operations" or include.active == "engine-setup" or include.active == "scaling" or include.active == "vision-mouse" or include.active == "worker-autodeploy" or include.active == "vnc-embed" or include.active == "worker-resilience" %} active{% endif %}" href="operations.html">運用・設計 ▾</a>
       <span class="dropdown-menu">
+        <a href="architecture.html"{% if include.active == "architecture" %} class="active"{% endif %}>アーキテクチャ概要</a>
+        <a href="architecture-hub.html"{% if include.active == "architecture-hub" %} class="active"{% endif %}>Hub の仕組み</a>
+        <a href="architecture-worker.html"{% if include.active == "architecture-worker" %} class="active"{% endif %}>Worker の仕組み</a>
         <a href="operations.html"{% if include.active == "operations" %} class="active"{% endif %}>サーバー構成</a>
         <a href="engine-setup.html"{% if include.active == "engine-setup" %} class="active"{% endif %}>エンジン設定</a>
         <a href="scaling.html"{% if include.active == "scaling" %} class="active"{% endif %}>Hub スケーリング</a>
