@@ -1115,6 +1115,36 @@ def _mint_unique_worker_id(registry: WorkerRegistry, hint: str) -> str:
     return f"{base}-{uuid.uuid4().hex[:8]}"
 
 
+def _ip_derived_worker_id(ip: str | None, registry) -> str | None:
+    """Deterministic, STABLE worker_id pinned to the worker's LAN IP.
+
+    A worker's persisted id file (/root/.paprika/worker_id) may not survive a
+    self-update, and cloned hosts share a base hostname, so a worker could
+    otherwise pick up a fresh random id on every update -- churning admin
+    history AND the consistent-hash worker-WS routing (re-homing / hub
+    imbalance). The IP is stable, so we pin the id to it: same IP -> same id.
+
+    Format ``w<3rd><4th>`` (e.g. 10.10.50.150 -> ``w50150``). If that short form
+    is already held by a DIFFERENT, still-alive IP (only possible across /16s,
+    e.g. 10.10.5.150 vs 10.10.51.50), fall back to the full IP
+    ``w<1>-<2>-<3>-<4>``. Returns None when ``ip`` isn't a usable IPv4 (the
+    caller then keeps the worker's current id). Assumes one worker per IP
+    (true for the LXC fleet)."""
+    if not ip:
+        return None
+    octs = ip.split(".")
+    if len(octs) != 4 or not all(o.isdigit() and 0 <= int(o) <= 255 for o in octs):
+        return None
+    short = f"w{octs[2]}{octs[3]}"
+    held = registry.connections.get(short)
+    if held is not None:
+        held_ip = getattr(held, "client_address", None)
+        held_alive = (time.time() - held.last_heartbeat) < WORKER_TTL
+        if held_alive and held_ip and held_ip != ip:
+            return f"w{octs[0]}-{octs[1]}-{octs[2]}-{octs[3]}"
+    return short
+
+
 @router.websocket("/workers/{worker_id}/link")
 async def worker_link(ws: WebSocket, worker_id: str):
     """Bidirectional control channel for a worker.
@@ -1150,52 +1180,41 @@ async def worker_link(ws: WebSocket, worker_id: str):
         await ws.close(code=1008, reason="bad worker secret")
         return
 
-    # Clone-collision detection. If a different host (different client IP)
-    # is presenting the same worker_id and the original WS is still alive,
-    # this is almost certainly a copy of the worker host that brought the
-    # persisted /root/.paprika/worker_id along (LXC clone, Proxmox copy,
-    # VMware copy, dd, container volume copy, ...). Mint a fresh ID and
-    # hand it back via HubRegistered.assigned_worker_id so the worker can
-    # adopt it, persist it, and reconnect.
-    # Derive the worker's REAL LAN IP the same way client_address is set
-    # below (X-Real-IP, else first X-Forwarded-For hop) -- NOT the raw socket
-    # peer. Behind the multi-hub nginx front ws.client.host is the front's IP
-    # (e.g. 10.10.50.34) for EVERY worker, so comparing it against the
-    # header-derived existing_ip below false-positives a clone collision on
-    # every reconnect-while-alive and flaps the whole fleet. existing_ip is
-    # header-derived, so new_ip MUST be too (apples-to-apples).
+    # Stable, deterministic worker_id pinned to the worker's LAN IP. The
+    # persisted id file may not survive a self-update and clones share a base
+    # hostname, so a worker could otherwise pick up a fresh random id on every
+    # update -- churning admin history + the consistent-hash worker-WS routing
+    # (re-homing / hub imbalance). Same IP -> same id, forever. This ALSO
+    # subsumes clone-collision handling: two hosts presenting the same persisted
+    # id get DIFFERENT ids because their IPs differ. Source the real IP from
+    # X-Real-IP / first X-Forwarded-For hop -- behind the nginx front
+    # ws.client.host is the proxy IP (e.g. 10.10.50.34) for EVERY worker.
     _new_real_ip = (
         ws.headers.get("x-real-ip")
         or (ws.headers.get("x-forwarded-for") or "").split(",")[0]
     ).strip()
     new_ip = _new_real_ip or (ws.client.host if ws.client else None)
-    existing = state.registry.connections.get(worker_id)
-    if existing is not None:
-        existing_alive = (time.time() - existing.last_heartbeat) < WORKER_TTL
-        existing_ip = getattr(existing, "client_address", None)
-        if existing_alive and existing_ip and new_ip and existing_ip != new_ip:
-            new_id = _mint_unique_worker_id(state.registry, worker_id)
-            log.warning(
-                "worker_id collision: %s already held by %s; new "
-                "connection from %s reassigned to %s",
-                worker_id,
-                existing_ip,
-                new_ip,
-                new_id,
-            )
-            try:
-                await ws.send_text(
-                    encode_msg(
-                        HubRegistered(
-                            worker_id=worker_id,
-                            assigned_worker_id=new_id,
-                        )
+    desired_id = _ip_derived_worker_id(new_ip, state.registry)
+    if desired_id and desired_id != worker_id:
+        log.info(
+            "worker %s reassigned to stable IP-derived id %s (ip=%s)",
+            worker_id,
+            desired_id,
+            new_ip,
+        )
+        try:
+            await ws.send_text(
+                encode_msg(
+                    HubRegistered(
+                        worker_id=worker_id,
+                        assigned_worker_id=desired_id,
                     )
                 )
-            except Exception:
-                pass
-            await ws.close(code=1000, reason="worker_id collision; reassigned")
-            return
+            )
+        except Exception:
+            pass
+        await ws.close(code=1000, reason="assigned stable IP-derived worker_id")
+        return
 
     worker = await state.registry.register(worker_id, ws, msg.capabilities)
     # Remember which address this worker reached us through. Subsequent
