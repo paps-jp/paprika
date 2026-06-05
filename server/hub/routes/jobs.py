@@ -2536,6 +2536,7 @@ def _ffmpeg_q_from_quality_pct(pct: int) -> int:
 @router.post("/jobs/{job_id}/screenshot")
 async def take_job_screenshot(
     job_id: str,
+    request: Request,
     width: int = 1280,
     quality: int = 85,
 ) -> dict:
@@ -2574,6 +2575,13 @@ async def take_job_screenshot(
         )
     if state.registry is None:
         raise HTTPException(503, "registry not ready")
+    # Multi-hub: the screenshot RPC needs the worker's WS, which lives on
+    # its owner hub. Forward there when nginx routed this POST to a peer
+    # (worker_id comes from the shared JobInfo, so it resolves on any hub).
+    from server.hub.routes.workers import _maybe_forward_worker
+    fwd = await _maybe_forward_worker(worker_id, request)
+    if fwd is not None:
+        return fwd
     worker = state.registry.connections.get(worker_id)
     if worker is None:
         raise HTTPException(
@@ -2659,10 +2667,13 @@ async def take_job_screenshot(
 )
 async def take_job_screenshot_legacy(
     job_id: str,
+    request: Request,
     width: int = 1280,
     quality: int = 85,
 ) -> dict:
-    return await take_job_screenshot(job_id=job_id, width=width, quality=quality)
+    return await take_job_screenshot(
+        job_id=job_id, request=request, width=width, quality=quality,
+    )
 
 
 # ----------------------------------------------------------------------------
@@ -3330,6 +3341,34 @@ def _spawn_queued_timeout_guard(job_id: str) -> None:
         pass  # no running loop (shouldn't happen in request context)
 
 
+async def _peer_hub_with_spare_capacity() -> str | None:
+    """P1 cross-hub dispatch: return the peer hub_id (not us) with the MOST
+    spare active-worker lane capacity per the shared cross-hub worker view,
+    or None if no peer has a free lane. Job dispatch is otherwise per-hub, so
+    a hub whose LOCAL workers are full 503s even while peers sit idle; this
+    lets it forward the job to an idle peer instead."""
+    if state.registry is None or state.hubs is None:
+        return None
+    me = state.hubs.hub_id or ""
+    try:
+        snap = await state.registry.stats_async()
+    except Exception:
+        return None
+    spare: dict[str, int] = {}
+    for w in snap.get("workers", []):
+        if not w.get("alive") or w.get("status") != "active":
+            continue
+        h = w.get("hub_id") or ""
+        if not h or h == me:
+            continue
+        avail = (w.get("capacity") or 0) - (w.get("in_flight") or 0)
+        if avail > 0:
+            spare[h] = spare.get(h, 0) + avail
+    if not spare:
+        return None
+    return max(spare, key=spare.get)
+
+
 @router.post("/jobs", response_model=JobInfo)
 async def create_job(req: JobRequest, request: Request) -> JobInfo:
     if not req.url:
@@ -3895,6 +3934,29 @@ async def create_job(req: JobRequest, request: Request) -> JobInfo:
                 pass
             info.session_id = None
         log.info(f"!! failed to send job to worker {worker.worker_id}")
+
+    # P1 cross-hub dispatch: local dispatch did NOT place the job (no free
+    # local worker, or the local send failed). Before rejecting, forward the
+    # whole /jobs POST to a peer hub that has spare active capacity and return
+    # its result -- so the fleet's lanes are used fleet-wide instead of 503-ing
+    # while peers sit idle. ``info`` is not persisted until the 503 / success
+    # paths below, so there's no orphan to clean up. _FWD_MARK makes the
+    # forwarded hop dispatch locally only (one hop, no inter-hub bounce loop).
+    from server.hub.routes.sessions import _FWD_MARK, _proxy_request_to_hub
+    if not request.headers.get(_FWD_MARK) and state.hubs is not None:
+        _peer = await _peer_hub_with_spare_capacity()
+        if _peer:
+            try:
+                _resp = await _proxy_request_to_hub(_peer, request, 60.0)
+            except Exception:
+                _resp = None
+            if _resp is not None and getattr(_resp, "status_code", 503) != 503:
+                log.info(
+                    f"[hub] job {job_id}: no free local worker -> forwarded to "
+                    f"peer hub {_peer} (cross-hub dispatch)"
+                )
+                return _resp
+            # peer also full / unreachable -> fall through to the local 503.
 
     # 2) No worker available -- reject with 503. The hub used to run an
     # in-process nodriver fallback here, but the hub container has no
