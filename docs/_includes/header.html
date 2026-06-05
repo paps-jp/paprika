@@ -3,17 +3,19 @@
   <span class="links">
     <a href="index.html"{% if include.active == "home" %} class="active"{% endif %}>Home</a>
     <span class="dropdown">
-      <a class="dropdown-toggle{% if include.active == "intro" or include.active == "guides" or include.active == "examples" %} active{% endif %}" href="intro.html">学ぶ ▾</a>
+      <a class="dropdown-toggle{% if include.active == "intro" or include.active == "guides" or include.active == "examples" or include.active == "faq" %} active{% endif %}" href="intro.html">学ぶ ▾</a>
       <span class="dropdown-menu">
         <a href="intro.html"{% if include.active == "intro" %} class="active"{% endif %}>はじめに</a>
         <a href="guides.html"{% if include.active == "guides" %} class="active"{% endif %}>ガイド</a>
         <a href="examples.html"{% if include.active == "examples" %} class="active"{% endif %}>サンプル</a>
+        <a href="faq.html"{% if include.active == "faq" %} class="active"{% endif %}>FAQ</a>
       </span>
     </span>
     <span class="dropdown">
-      <a class="dropdown-toggle{% if include.active == "api" or include.active == "admin" %} active{% endif %}" href="api.html">リファレンス ▾</a>
+      <a class="dropdown-toggle{% if include.active == "api" or include.active == "http-api" or include.active == "admin" %} active{% endif %}" href="api.html">リファレンス ▾</a>
       <span class="dropdown-menu">
         <a href="api.html"{% if include.active == "api" %} class="active"{% endif %}>API</a>
+        <a href="http-api.html"{% if include.active == "http-api" %} class="active"{% endif %}>HTTP API</a>
         <a href="admin.html"{% if include.active == "admin" %} class="active"{% endif %}>管理画面</a>
       </span>
     </span>
