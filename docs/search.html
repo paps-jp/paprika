@@ -1,0 +1,130 @@
+---
+title: サイト内検索
+description: Paprika ドキュメント全文検索 — lunr.js でクライアントサイドにインデックスを構築し、入力に応じて該当ページを即時表示。
+active: search
+permalink: /search.html
+---
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+<meta charset="utf-8">
+<title>サイト内検索 — Paprika</title>
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<link rel="stylesheet" href="{{ '/style.css' | relative_url }}">
+<script src="https://code.iconify.design/iconify-icon/2.1.0/iconify-icon.min.js"></script>
+<meta name="description" content="Paprika ドキュメント全文検索（lunr.js）。">
+<style>
+  .search-shell { max-width: 820px; margin: 0 auto; padding: 24px 18px 80px; }
+  .search-box   { display: flex; gap: 8px; align-items: center; }
+  .search-box input {
+    flex: 1; padding: 10px 14px; font-size: 1rem; border: 1px solid var(--border);
+    border-radius: 8px;
+  }
+  .search-box input:focus { outline: 2px solid var(--accent); outline-offset: 2px; }
+  .search-meta { color: var(--fg-muted); font-size: .9rem; margin: 12px 0; }
+  .result-list { list-style: none; padding: 0; margin: 16px 0 0; }
+  .result      { padding: 14px 0; border-bottom: 1px solid var(--border-soft); }
+  .result a    { font-weight: 600; font-size: 1.05rem; color: var(--accent); text-decoration: none; }
+  .result a:hover { text-decoration: underline; }
+  .result-desc { color: var(--fg-muted); font-size: .9rem; margin: 4px 0 0; line-height: 1.55; }
+  .result mark { background: #fff3a3; color: inherit; padding: 0 2px; border-radius: 2px; }
+  .empty       { color: var(--fg-muted); padding: 30px 0; text-align: center; }
+</style>
+</head>
+<body>
+{% include header.html active="search" %}
+<div class="search-shell">
+  <h1 style="margin:0 0 14px;">サイト内検索</h1>
+  <div class="search-box">
+    <iconify-icon icon="lucide:search" style="font-size:1.3rem; color:var(--fg-muted);"></iconify-icon>
+    <input type="search" id="q" placeholder="例: walk, codegen-loop, 503, Cookie, use_profile" autofocus>
+  </div>
+  <div class="search-meta" id="meta">インデックスを読み込み中…</div>
+  <ul class="result-list" id="results"></ul>
+</div>
+
+<script src="https://unpkg.com/lunr@2.3.9/lunr.min.js"></script>
+<script src="https://unpkg.com/lunr-languages@1.14.0/lunr.stemmer.support.js"></script>
+<script src="https://unpkg.com/lunr-languages@1.14.0/tinyseg.js"></script>
+<script src="https://unpkg.com/lunr-languages@1.14.0/lunr.ja.js"></script>
+<script>
+(function () {
+  const $q = document.getElementById('q');
+  const $r = document.getElementById('results');
+  const $m = document.getElementById('meta');
+  let idx = null, docs = [];
+
+  function esc(s) { return (s || '').replace(/[&<>"]/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c])); }
+  function snippet(text, query, max = 180) {
+    if (!text) return '';
+    const i = text.toLowerCase().indexOf(query.toLowerCase());
+    if (i < 0) return esc(text.slice(0, max)) + (text.length > max ? '…' : '');
+    const start = Math.max(0, i - 60);
+    const end = Math.min(text.length, i + query.length + 120);
+    let frag = text.slice(start, end);
+    if (start > 0) frag = '…' + frag;
+    if (end < text.length) frag = frag + '…';
+    const rx = new RegExp(query.replace(/[.*+?^${}()|[\]\\]/g, '\\$&'), 'ig');
+    return esc(frag).replace(rx, m => '<mark>' + esc(m) + '</mark>');
+  }
+
+  function render(query, hits) {
+    $r.innerHTML = '';
+    if (!hits.length) { $r.innerHTML = '<li class="empty">該当するページがありません。</li>'; return; }
+    for (const h of hits) {
+      const doc = docs.find(d => d.url === h.ref);
+      if (!doc) continue;
+      const li = document.createElement('li');
+      li.className = 'result';
+      li.innerHTML =
+        '<a href="' + esc(doc.url) + '">' + esc(doc.title) + '</a>' +
+        '<p class="result-desc">' + snippet(doc.description || doc.content, query) + '</p>';
+      $r.appendChild(li);
+    }
+  }
+
+  function build(documents) {
+    docs = documents;
+    idx = lunr(function () {
+      this.use(lunr.ja);
+      this.ref('url');
+      this.field('title', { boost: 6 });
+      this.field('description', { boost: 3 });
+      this.field('content');
+      documents.forEach(d => this.add(d));
+    });
+    $m.textContent = documents.length + ' ページがインデックス済み。';
+  }
+
+  function doSearch() {
+    const q = $q.value.trim();
+    if (!q) { $r.innerHTML = ''; $m.textContent = docs.length + ' ページがインデックス済み。'; return; }
+    if (!idx) return;
+    let hits = [];
+    try {
+      // 1) ふつうの query
+      hits = idx.search(q);
+      // 2) 全 hit ゼロなら、ワイルドカードで再試行（日本語の部分一致を救う）
+      if (!hits.length) {
+        const wild = q.split(/\s+/).map(t => t + '*').join(' ');
+        hits = idx.search(wild);
+      }
+    } catch (_) { hits = []; }
+    $m.textContent = hits.length + ' 件ヒット' + (hits.length === docs.length ? '（全件）' : '');
+    render(q, hits);
+  }
+
+  fetch('{{ "/search.json" | relative_url }}')
+    .then(r => r.json())
+    .then(build)
+    .then(() => {
+      $q.addEventListener('input', doSearch);
+      // ?q=... があれば初期検索
+      const initial = new URL(location.href).searchParams.get('q');
+      if (initial) { $q.value = initial; doSearch(); }
+    })
+    .catch(e => { $m.textContent = 'インデックスの読み込みに失敗しました: ' + e; });
+})();
+</script>
+</body>
+</html>

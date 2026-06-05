@@ -7,6 +7,9 @@ active: changelog
 
 主な変更だけ抜粋して時期別にまとめます。すべての変更は [GitHub のコミット履歴](https://github.com/paps-jp/paprika/commits/main) を参照してください。
 
+<img class="shot" src="img/cap-modes.png" alt="管理画面の実行モード — Fetch / AI / Script / Macro の選択 UI">
+<p class="shot-cap">実行モードの UI（<strong>Fetch / AI / Script / Macro</strong>）— Paprika のジョブモデルそのものを反映した管理画面の入口。</p>
+
 ---
 
 ## 2026-06

@@ -7,6 +7,9 @@ active: host-recipe
 
 **Host レシピ** は、特定のホスト（サイト）にアクセスしたとき「ナビゲーション後に決まった操作を実行する」**プレイブック**です。クリック・入力・待機・スクロールといった**決定的な手順**を登録しておくと、`fetch` モードが**LLM 不要**で同じことを毎回安定して再現できます。
 
+<img class="shot" src="img/cap-knowledge.png" alt="管理画面の AI Knowledge / Hosts タブ — ホスト固有設定の管理">
+<p class="shot-cap">登録されたレシピや Cookie、ログイン手順は管理画面の <strong>AI Knowledge</strong> / <strong>Hosts</strong> タブから確認・編集できます。</p>
+
 > ログイン継続の他の選択肢: [Bridge 拡張](bridge-extension.html)（Cookie 手動 push）、[`use_profile`](profile.html)（フルプロファイル）。
 
 ## 何ができるか

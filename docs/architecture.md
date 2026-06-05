@@ -7,6 +7,9 @@ active: architecture
 
 Paprika は「**分散したワーカー上の Chrome を、API / SDK / AI から動かしてページの画像・動画・リンクを集める**」プラットフォームです。構成要素は 5 つだけです。
 
+<img class="shot" src="img/admin-submit.png" alt="管理画面の Submit タブ — Client の入口の 1 つ">
+<p class="shot-cap">クライアント面（管理画面の <strong>実行</strong> タブ）。ここから投入されたジョブが、下の図の Hub → Worker → Lane を経て返ってきます。</p>
+
 <svg viewBox="0 0 860 380" role="img" aria-label="Paprika 全体構成図" style="display:block;max-width:100%;height:auto;margin:18px auto;font-family:ui-monospace,Consolas,monospace;">
   <defs>
     <marker id="ah" markerWidth="9" markerHeight="9" refX="7" refY="3" orient="auto"><path d="M0,0 L7,3 L0,6 Z" fill="#59636e"/></marker>

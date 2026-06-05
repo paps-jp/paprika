@@ -7,6 +7,9 @@ active: architecture-hub
 
 Hub は司令塔です。**Chrome は持ちません** — クライアント API・Worker の WebSocket・管理画面を束ね、ジョブを Worker に割り当て、結果をストアに保存します。全体像は [アーキテクチャ概要](architecture.html) を参照。
 
+<img class="shot" src="img/cap-jobs.png" alt="管理画面のジョブ一覧 — Hub が受け付けたジョブの状態が一覧表示">
+<p class="shot-cap">Hub が受け付けたジョブは <strong>最近のジョブ</strong> タブで一覧できます。状態・ワーカー・所要時間・取得物数を一目で確認。</p>
+
 ## ジョブのディスパッチ
 
 ```text
