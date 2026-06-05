@@ -20,10 +20,11 @@
       </span>
     </span>
     <span class="dropdown">
-      <a class="dropdown-toggle{% if include.active == "api" or include.active == "http-api" or include.active == "job-options" or include.active == "walk" or include.active == "locator" or include.active == "ws-events" or include.active == "errors" or include.active == "bridge-extension" or include.active == "profile" or include.active == "host-recipe" or include.active == "admin" %} active{% endif %}" href="api.html">リファレンス ▾</a>
+      <a class="dropdown-toggle{% if include.active == "api" or include.active == "http-api" or include.active == "job-options" or include.active == "walk" or include.active == "locator" or include.active == "ws-events" or include.active == "errors" or include.active == "cli" or include.active == "bridge-extension" or include.active == "profile" or include.active == "host-recipe" or include.active == "admin" %} active{% endif %}" href="api.html">リファレンス ▾</a>
       <span class="dropdown-menu">
         <a href="api.html"{% if include.active == "api" %} class="active"{% endif %}>API</a>
         <a href="http-api.html"{% if include.active == "http-api" %} class="active"{% endif %}>HTTP API</a>
+        <a href="cli.html"{% if include.active == "cli" %} class="active"{% endif %}>CLI</a>
         <a href="job-options.html"{% if include.active == "job-options" %} class="active"{% endif %}>JobOptions</a>
         <a href="walk.html"{% if include.active == "walk" %} class="active"{% endif %}>walk（巡回）</a>
         <a href="locator.html"{% if include.active == "locator" %} class="active"{% endif %}>Locator（要素指定）</a>

@@ -7,6 +7,9 @@ active: architecture-worker
 
 Worker は実際にブラウザを動かすホストです。自律的に動き、`--hub-url` を渡すだけで **自分を登録 → 心拍 → 割り当てジョブを実行 → 完了報告**まで行います。全体像は [アーキテクチャ概要](architecture.html)。
 
+<img class="shot" src="img/cap-workers.png" alt="管理画面のワーカー一覧 — 接続中のワーカーと各 Lane の状態が一覧表示">
+<p class="shot-cap">管理画面の <strong>ワーカー</strong> タブ。各ワーカーの Lane 数・状態・バージョン・所属 Hub が一目で分かります。</p>
+
 ## Lane プール
 
 Worker は起動時に **N 本の「Lane」を先に立ち上げて常駐**させます（プール）。Lane は空のスロットではなく、**長命でステートを持つブラウザ**です。

@@ -7,6 +7,9 @@ active: usecases
 
 「**目的**」から逆引きで使い方を見せます。**完成スクリプト**と**得られる結果**のセットで載せました。準備は [クイックスタート](quickstart.html) と [HTTP API](http-api.html) を、API の細目は [リファレンス](api.html) を参照してください。
 
+<img class="shot" src="img/cap-gallery.png" alt="管理画面のギャラリータブ — 取得したアセットがサムネイル一覧で表示される">
+<p class="shot-cap">取得が終わると、画像・動画は管理画面の <strong>ギャラリー</strong>と <code>/jobs/{id}/assets.json</code> から取り出せます。</p>
+
 ## ① 1 ページの画像を一括で集める
 
 ECサイトの商品ページや記事ページから、表示されている画像（lazy-load も含む）をまとめて回収します。

@@ -7,6 +7,9 @@ active: faq
 
 使う側でよく出る質問とハマりどころをまとめました。基本の使い方は [はじめに](intro.html) / [ガイド](guides.html)、API は [HTTP API](http-api.html) / [API リファレンス](api.html) を参照してください。
 
+<img class="shot" src="img/admin-live.gif" alt="管理画面の Live パネル — ジョブの実行ログとブラウザ画面がリアルタイムに表示される">
+<p class="shot-cap">うまく動かないときの一次情報は管理画面の <strong>Live パネル</strong>（実行ログ＋ noVNC ライブ画面）です。</p>
+
 ## `503 fleet at capacity` が返る
 
 フリート（ワーカー）が全レーン埋まっているときの **正常な背圧** です。Hub は満杯時に在庫待ちせず即 `503` を返すので、**クライアント側で指数バックオフ再試行**してください（1, 2, 4, 8 秒…）。SDK は自動でリトライします。素の HTTP で叩く場合の実装例は [HTTP API の 503 リトライ](http-api.html#retry-503) を参照。
