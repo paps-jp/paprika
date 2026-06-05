@@ -9,10 +9,10 @@ layout: null
       search results because they're long with many keyword hits, but they're
       not public-user content. Excluded explicitly by URL.
     {% endcomment %}
-    {% if page.url == "/search.json" or page.url == "/404.html" %}{% continue %}{% endif %}
-    {% if page.url == "/admin-service-plan.html" %}{% continue %}{% endif %}
-    {% if page.url == "/architecture/hub-multiprocess.html" %}{% continue %}{% endif %}
-    {% if page.url == "/deploy.html" %}{% continue %}{% endif %}
+    {% if page.path == "search.json" or page.path == "404.html" %}{% continue %}{% endif %}
+    {% if page.path == "admin-service-plan.md" %}{% continue %}{% endif %}
+    {% if page.path == "architecture/hub-multiprocess.md" %}{% continue %}{% endif %}
+    {% if page.path == "deploy.md" %}{% continue %}{% endif %}
     {% if page.search == false %}{% continue %}{% endif %}
     {% if page.title %}
     {
