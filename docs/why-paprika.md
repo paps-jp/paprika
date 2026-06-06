@@ -34,7 +34,7 @@ active: why-paprika
 - **収集に最適化**: スクロール・ネットワークトレース・**`yt-dlp` 連携**で動画も画像と同じ感覚で取得（[動画の仕組み](guides.html#video-mechanism)）。
 - **二度取りしない**: **ブラウザが実際に読み込んだレスポンス**をそのまま回収（CDP `Network.responseReceived` を passive にサブスクライブ）。`<img src= loading="lazy">` を見て **URL から再取得しない**ので、(a) 帯域・サーバ負荷が半分、(b) **Cookie / Referer / 認証ヘッダーが必要な画像**もそのまま取れる、(c) **JS で動的に差し込まれた画像・lazy-load・CSS `background-image`・iframe 内**もまとめて拾えます。
 - **Chrome 拡張で JS 注入**: 同梱の `paprika-agent` 拡張（`userScripts` 権限）で **任意の JS を全ページに常駐注入**。CDP 単独では届かない領域（リクエストヘッダ書き換え・Content Settings・Proxy・downloads）まで操作できます。
-- **普段使いの Chrome 拡張をそのまま持ち込み**: `--load-extension` で **既存の拡張（uBlock Origin / Bitwarden / MetaMask 等）が動く**。広告抜きで収集、Bitwarden で自動ログイン、Web3 サインなど、**手作業の Chrome と同じ環境**でジョブが動かせます。
+- **普段使いの Chrome 拡張をそのまま持ち込み**: `--load-extension` で **既存の拡張（uBlock Origin / Bitwarden 等）が動く**。広告抜きで収集、Bitwarden で自動ログインなど、**手作業の Chrome と同じ環境**でジョブが動かせます。
 - **既存の Chrome プロファイル流用**: 普段使いの Chrome の **User Data フォルダをそのままアップロード**（[`use_profile`](auth.html#use-profile)）。Cookie / 保存パスワード / autofill / 拡張機能まで一式持ち込めるので、**ログイン済みの状態でいきなり収集を始められます**。
 - **ライブ可観測性**: 各 Chrome に **noVNC ライブ画面**が紐づき、管理画面で何が起きているか目で確認できる。
 - **検出されにくい起動**: `nodriver` を採用し、`navigator.webdriver` などの典型的なシグナルを出さない。
@@ -53,7 +53,7 @@ active: why-paprika
 | **取得方式** | **ブラウザが読み込んだものを passive 回収**（再 GET なし） | URL を取り出して再 GET | URL を取り出して再 GET |
 | **ライブ可観測性** | **noVNC + 管理画面** | デバッガ / 録画 | スクリーンショット |
 | **ログイン継続** | **Bridge 拡張 / `use_profile` / Host レシピ** | 自前で Cookie / storage 注入 | 同左 |
-| **既存 Chrome 拡張**（uBlock / Bitwarden / MetaMask 等） | **そのまま動く**（`--load-extension`） | 自前でビルドして読込 | 自前でビルドして読込 |
+| **既存 Chrome 拡張**（uBlock / Bitwarden 等） | **そのまま動く**（`--load-extension`） | 自前でビルドして読込 | 自前でビルドして読込 |
 | **Chrome プロファイル流用**（Cookie / autofill / 拡張ごと） | **アップロードして直に使う** | 別途エクスポート＆注入 | 別途エクスポート＆注入 |
 | **JS 注入の範囲** | **拡張権限まで使える**（userScripts / declarativeNetRequest） | `addInitScript`(=ページコンテキスト) のみ | `execute_script` のみ |
 | **検出回避** | **`nodriver`**（webdriver シグナルを抑える） | パッチが必要 | パッチが必要 |

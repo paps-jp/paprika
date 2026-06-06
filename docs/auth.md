@@ -117,7 +117,7 @@ curl -X POST "$PAPRIKA_HUB/jobs" -H 'Content-Type: application/json' -d '{
 
 `use_profile` は、自分の **Chrome の User Data フォルダ（プロファイル）をアップロード**して、そのログイン状態を含むまま Paprika のジョブに使う仕組みです。Cookie だけでなく **autofill / 保存パスワード / 拡張機能 / 設定**まで丸ごと持ち込めます。
 
-> **uBlock Origin / Bitwarden / MetaMask など普段使っている Chrome 拡張**もそのまま動きます。広告ブロック付きで収集、保存パスワードで自動ログイン、Web3 サインなど、**手元の Chrome と同じ環境**でジョブが走らせられます。
+> **uBlock Origin / Bitwarden など普段使っている Chrome 拡張**もそのまま動きます。広告ブロック付きで収集、保存パスワードで自動ログインなど、**手元の Chrome と同じ環境**でジョブが走らせられます。
 
 ### アップロードする中身
 
