@@ -102,63 +102,63 @@ active: home
     ログインが必要・JavaScript で描画される、といった「機械的な巡回が難しいサイト」でも安定して動くことを目指した基盤です。</p>
 
     <figure class="arch-diagram" aria-label="Paprika 全体構成図">
-      <svg viewBox="0 0 880 240" xmlns="http://www.w3.org/2000/svg" role="img" aria-label="Client SDK / 管理画面 / HTTP API が Hub に接続し、Hub が WebSocket で 複数の Worker (Chrome × N Lane) を束ねる図" font-family="ui-monospace, monospace">
+      <svg viewBox="0 0 920 290" xmlns="http://www.w3.org/2000/svg" role="img" aria-label="Client SDK / 管理画面 / HTTP API が Hub に接続し、Hub が WebSocket で 複数の Worker (Chrome × N Lane) を束ねる図" font-family="ui-monospace, monospace">
         <defs>
           <marker id="arr" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto"><path d="M0,0 L10,5 L0,10 Z" fill="#8a96a3"/></marker>
         </defs>
         <!-- Clients (左) — 全て neutral gray, 区別は label のみ -->
-        <g font-size="12" fill="#1f2328">
-          <rect x="12" y="14"  width="160" height="40" rx="8" fill="#fff" stroke="#d1d9e0"/>
-          <text x="92" y="32" text-anchor="middle" font-weight="700">paprika-client SDK</text>
-          <text x="92" y="48" text-anchor="middle" fill="#59636e">Python / PHP</text>
+        <g font-size="15" fill="#1f2328">
+          <rect x="12" y="14"  width="190" height="54" rx="9" fill="#fff" stroke="#d1d9e0"/>
+          <text x="107" y="37" text-anchor="middle" font-weight="700">paprika-client SDK</text>
+          <text x="107" y="57" text-anchor="middle" fill="#59636e" font-size="13">Python / PHP</text>
 
-          <rect x="12" y="68"  width="160" height="40" rx="8" fill="#fff" stroke="#d1d9e0"/>
-          <text x="92" y="86" text-anchor="middle" font-weight="700">管理画面</text>
-          <text x="92" y="102" text-anchor="middle" fill="#59636e">ブラウザだけ・コード不要</text>
+          <rect x="12" y="84"  width="190" height="54" rx="9" fill="#fff" stroke="#d1d9e0"/>
+          <text x="107" y="107" text-anchor="middle" font-weight="700">管理画面</text>
+          <text x="107" y="127" text-anchor="middle" fill="#59636e" font-size="13">ブラウザだけ・コード不要</text>
 
-          <rect x="12" y="122" width="160" height="40" rx="8" fill="#fff" stroke="#d1d9e0"/>
-          <text x="92" y="140" text-anchor="middle" font-weight="700">HTTP API</text>
-          <text x="92" y="156" text-anchor="middle" fill="#59636e">curl / 任意言語</text>
+          <rect x="12" y="154" width="190" height="54" rx="9" fill="#fff" stroke="#d1d9e0"/>
+          <text x="107" y="177" text-anchor="middle" font-weight="700">HTTP API</text>
+          <text x="107" y="197" text-anchor="middle" fill="#59636e" font-size="13">curl / 任意言語</text>
         </g>
 
         <!-- Client → Hub -->
-        <g stroke="#8a96a3" stroke-width="1.4" fill="none" marker-end="url(#arr)">
-          <line x1="172" y1="34"  x2="305" y2="102"/>
-          <line x1="172" y1="88"  x2="305" y2="115"/>
-          <line x1="172" y1="142" x2="305" y2="128"/>
+        <g stroke="#8a96a3" stroke-width="1.5" fill="none" marker-end="url(#arr)">
+          <line x1="202" y1="41"  x2="320" y2="116"/>
+          <line x1="202" y1="111" x2="320" y2="135"/>
+          <line x1="202" y1="181" x2="320" y2="154"/>
         </g>
-        <text x="238" y="180" font-size="11" fill="#8a96a3" text-anchor="middle">HTTP / WS</text>
+        <text x="265" y="232" font-size="13" fill="#8a96a3" text-anchor="middle">HTTP / WS</text>
 
         <!-- Hub (中央) — 唯一の brand-red 強調 -->
-        <g font-size="13" fill="#1f2328">
-          <rect x="305" y="78" width="170" height="74" rx="10" fill="#fff" stroke="#c0392b" stroke-width="1.8"/>
-          <text x="390" y="100" text-anchor="middle" font-weight="700" font-size="15" fill="#c0392b">Hub</text>
-          <text x="390" y="120" text-anchor="middle" fill="#59636e" font-size="11">ジョブ受付・分配</text>
-          <text x="390" y="135" text-anchor="middle" fill="#59636e" font-size="11">管理画面 / API / WS</text>
-          <text x="390" y="148" text-anchor="middle" fill="#59636e" font-size="11">localhost:8000</text>
+        <g fill="#1f2328">
+          <rect x="320" y="84" width="190" height="100" rx="11" fill="#fff" stroke="#c0392b" stroke-width="2"/>
+          <text x="415" y="113" text-anchor="middle" font-weight="700" font-size="20" fill="#c0392b">Hub</text>
+          <text x="415" y="137" text-anchor="middle" fill="#59636e" font-size="13">ジョブ受付・分配</text>
+          <text x="415" y="155" text-anchor="middle" fill="#59636e" font-size="13">管理画面 / API / WS</text>
+          <text x="415" y="173" text-anchor="middle" fill="#59636e" font-size="13">localhost:8000</text>
         </g>
 
         <!-- Hub → Workers -->
-        <g stroke="#8a96a3" stroke-width="1.4" fill="none" marker-end="url(#arr)">
-          <line x1="475" y1="100" x2="600" y2="50"/>
-          <line x1="475" y1="115" x2="600" y2="115"/>
-          <line x1="475" y1="128" x2="600" y2="180"/>
+        <g stroke="#8a96a3" stroke-width="1.5" fill="none" marker-end="url(#arr)">
+          <line x1="510" y1="110" x2="640" y2="58"/>
+          <line x1="510" y1="134" x2="640" y2="135"/>
+          <line x1="510" y1="158" x2="640" y2="213"/>
         </g>
-        <text x="538" y="200" font-size="11" fill="#8a96a3" text-anchor="middle">WebSocket</text>
+        <text x="585" y="255" font-size="13" fill="#8a96a3" text-anchor="middle">WebSocket</text>
 
         <!-- Workers (右) -->
-        <g font-size="12" fill="#1f2328">
-          <rect x="600" y="30"  width="260" height="40" rx="8" fill="#fff" stroke="#d1d9e0"/>
-          <text x="616" y="48" font-weight="700">Worker #1</text>
-          <text x="616" y="62" fill="#59636e">Chrome × N Lanes</text>
+        <g font-size="15" fill="#1f2328">
+          <rect x="640" y="30"  width="270" height="54" rx="9" fill="#fff" stroke="#d1d9e0"/>
+          <text x="660" y="54" font-weight="700">Worker #1</text>
+          <text x="660" y="72" fill="#59636e" font-size="13">Chrome × N Lanes</text>
 
-          <rect x="600" y="95"  width="260" height="40" rx="8" fill="#fff" stroke="#d1d9e0"/>
-          <text x="616" y="113" font-weight="700">Worker #2</text>
-          <text x="616" y="127" fill="#59636e">Chrome × N Lanes</text>
+          <rect x="640" y="108" width="270" height="54" rx="9" fill="#fff" stroke="#d1d9e0"/>
+          <text x="660" y="132" font-weight="700">Worker #2</text>
+          <text x="660" y="150" fill="#59636e" font-size="13">Chrome × N Lanes</text>
 
-          <rect x="600" y="160" width="260" height="40" rx="8" fill="#fff" stroke="#d1d9e0"/>
-          <text x="616" y="178" font-weight="700">Worker #N</text>
-          <text x="616" y="192" fill="#59636e">…台数だけ並列度が上がる</text>
+          <rect x="640" y="186" width="270" height="54" rx="9" fill="#fff" stroke="#d1d9e0"/>
+          <text x="660" y="210" font-weight="700">Worker #N</text>
+          <text x="660" y="228" fill="#59636e" font-size="13">…台数だけ並列度が上がる</text>
         </g>
       </svg>
       <figcaption class="arch-diagram-cap">クライアント (SDK / 管理画面 / HTTP API) → Hub → 複数 Worker のフリート。各 Worker は複数 Lane (独立 Chrome) を持ち、合計 N×M の並列度。</figcaption>
