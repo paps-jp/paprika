@@ -269,6 +269,7 @@ Worker の制御 WebSocket（`/workers/{id}/link`）だけは **worker_id のハ
 
 | ページ | 内容 |
 |---|---|
+| [ジョブ分配と負荷分散](dispatch.html) | `pick_worker` のアルゴリズム、redrive ループ、stale reconciler、multi-hub での sticky 設計 |
 | [Vision AI とマウス](vision-mouse.html) | 視覚エージェント（CogAgent / Qwen-VL）がスクリーンショットを見てピクセル座標でクリック・操作するしくみ |
 | [VNC 埋め込み](vnc-embed.html) | hub-proxy の noVNC ライブ画面を、自前の Web ページに `iframe` で埋め込む実装 |
 | [Hub スケーリング](scaling.html) | 複数 Hub に水平スケールするときの考え方とルーティング |
