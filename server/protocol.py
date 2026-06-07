@@ -213,6 +213,28 @@ class JobOptions(BaseModel):
         "POST /jobs/{id}/refresh. End the session "
         "explicitly via DELETE /sessions/{sid} when done.",
     )
+    # ---- Auto-escalation lineage (failed fetch → AI codegen-loop) -------
+    # Set by the hub's escalation hook (server/hub/_escalate.py), NOT by
+    # API callers. When a worker ``fetch`` job FAILS on a recoverable
+    # barrier (video-download failure / auth / age gate), the hub may
+    # auto-spawn a ``codegen-loop`` retry that the AI agent drives. These
+    # two fields record the lineage so the admin UI can link the pair and
+    # the hook never escalates the same job twice:
+    #   * escalated_from -- on the NEW codegen-loop job: the failed fetch
+    #                       job_id that triggered it.
+    #   * escalated_to   -- on the ORIGINAL fetch job: the codegen-loop
+    #                       job_id it was escalated into (also the dedup
+    #                       "already handled" marker).
+    escalated_from: str | None = Field(
+        None,
+        description="Hub-set. On an auto-escalated codegen-loop job: the "
+        "failed fetch job_id that triggered the escalation.",
+    )
+    escalated_to: str | None = Field(
+        None,
+        description="Hub-set. On a failed fetch job: the codegen-loop "
+        "job_id it was auto-escalated into (dedup marker).",
+    )
 
     @model_validator(mode="after")
     def _force_capture_assets_when_download_video(self) -> "JobOptions":

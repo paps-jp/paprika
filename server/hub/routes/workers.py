@@ -1938,6 +1938,21 @@ async def _handle_worker_message(worker, msg) -> None:
         # jobs are still "running" so the live log stream stays open.
         if not keep_session_active:
             await state.store.publish_log(msg.job_id, DONE_SENTINEL)
+        # Auto-escalate fetch jobs that COMPLETED but didn't deliver
+        # (login page captured / video detected-but-not-downloaded) into
+        # the AI codegen-loop. Most real "認証画面" / "動画DL失敗" outcomes
+        # land HERE, not in the failed path -- the worker returns a
+        # FetchResult rather than raising. keep_session jobs aren't done
+        # yet -> skip. Best-effort + backgrounded; the escalator self-gates
+        # (OFF by default + conservative completed-classifier, _escalate.py).
+        if info is not None and not keep_session_active:
+            try:
+                from server.hub._escalate import maybe_escalate_completed_fetch
+                asyncio.create_task(
+                    maybe_escalate_completed_fetch(info, msg.result)
+                )
+            except Exception:
+                pass
         return
 
     if isinstance(msg, WorkerJobFailed):
@@ -2014,6 +2029,19 @@ async def _handle_worker_message(worker, msg) -> None:
                     type(e).__name__,
                     e,
                 )
+            # Auto-escalate recoverable fetch failures (video-dl / auth
+            # gate) into the AI codegen-loop, when enabled + the GPU is
+            # idle. This is the WORKER-reported failure path, so restart-
+            # orphans (settled by the reaper) never reach here -- exactly
+            # "失敗を再起動以外で AI に回す". Best-effort + backgrounded;
+            # the escalator self-gates (OFF by default, see _escalate.py).
+            try:
+                from server.hub._escalate import maybe_escalate_failed_fetch
+                asyncio.create_task(
+                    maybe_escalate_failed_fetch(info, msg.error or "")
+                )
+            except Exception:
+                pass
         return
 
     if isinstance(msg, WorkerScreenshotReply):

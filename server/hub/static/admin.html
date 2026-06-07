@@ -2480,6 +2480,12 @@ table.aitbl code { font-size:0.95em; }
         failure→success diff から convention を自動抽出 (attempts ≥ 2 のとき)
       </label>
 
+      <label>失敗→AI 自動再挑戦:</label>
+      <label style="font-weight:normal;">
+        <input type="checkbox" id="setAutoEscalate">
+        fetch が「認証/年齢ゲート」や「動画DL失敗」で落ちたら AI(codegen-loop) で自動再挑戦（GPU アイドル時のみ・既定OFF）
+      </label>
+
       <label for="setSkillTopK">Skill retrieval top-K:</label>
       <input type="number" id="setSkillTopK" min="0" max="10" style="width:80px; padding:4px 8px;">
 

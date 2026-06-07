@@ -38,6 +38,15 @@ _SCHEMA: dict[str, tuple[Any, str]] = {
     # default -> the reaper only dry-run-logs candidates for review.
     "auto_retire_enabled": (False, "bool"),
     "auto_dedup_enabled": (False, "bool"),
+    # Auto-escalation: when a worker `fetch` job FAILS on a recoverable
+    # barrier (video-download failure / auth / age gate), auto-spawn an AI
+    # `codegen-loop` retry that drives past the barrier -- which also feeds
+    # the distillers, so the #ai learning loop finally gets exercised by
+    # the failures it should be learning from. OFF by default. Only fires
+    # while the GPU is idle (see server/hub/_escalate.py). The categories
+    # knob is a CSV subset of {video_dl, auth_gate}; empty = both.
+    "auto_escalate_enabled": (False, "bool"),
+    "auto_escalate_categories": ("video_dl,auth_gate", "str"),
     # How many skills the retriever picks per new job before injection.
     "skill_retrieval_top_k": (3, "int"),
     # Minimum byte size for a captured asset. Anything smaller than

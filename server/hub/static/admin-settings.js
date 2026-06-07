@@ -85,6 +85,8 @@ async function loadSettingsPanel() {
       const hub = d.values || {};
       document.getElementById('setSkillAutoExtract').checked      = !!hub.skill_auto_extract_enabled;
       document.getElementById('setConventionAutoExtract').checked = !!hub.convention_auto_extract_enabled;
+      const _aeEl = document.getElementById('setAutoEscalate');
+      if (_aeEl) _aeEl.checked = !!hub.auto_escalate_enabled;
       document.getElementById('setSkillTopK').value               = hub.skill_retrieval_top_k ?? 3;
       document.getElementById('setMinAssetSize').value            = hub.min_asset_size_bytes ?? 0;
       // V: URL blacklist textarea
@@ -216,6 +218,7 @@ async function saveSettingsHub() {
   const body = {
     skill_auto_extract_enabled:      document.getElementById('setSkillAutoExtract').checked,
     convention_auto_extract_enabled: document.getElementById('setConventionAutoExtract').checked,
+    auto_escalate_enabled:           document.getElementById('setAutoEscalate')?.checked ?? false,
     skill_retrieval_top_k:           parseInt(document.getElementById('setSkillTopK').value, 10) || 3,
   };
   try {
