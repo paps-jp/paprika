@@ -159,10 +159,53 @@ def url_block_reason(url: str) -> str | None:
     return None if ok else reason
 
 
+# Schemes that reach the LOCAL filesystem / non-web transports — always blocked
+# for an in-session navigation (local file read is the worker-side SSRF/exfil
+# risk; Chrome supports file://, the rest are belt-and-suspenders).
+_NAV_BLOCKED_SCHEMES = frozenset(("file", "filesystem", "ftp"))
+
+
+def navigation_block_reason(url: str) -> str | None:
+    """SSRF gate for a WORKER in-session navigation (page.goto / agent / macro
+    nav), which the hub never validated — only the INITIAL job/session URL is
+    checked hub-side, so an in-session ``page.goto("http://169.254.169.254/")``
+    would otherwise slip straight through to Chrome. Returns a reason to BLOCK,
+    or ``None`` to allow.
+
+    Deliberately MORE permissive than :func:`validate_public_url` (which is for
+    operator-submitted URLs and whitelists http/https only): here we only block
+    the genuinely dangerous cases —
+
+      * ``file://`` / ``filesystem:`` / ``ftp:``  → local/non-web access
+      * ``http(s)://`` whose host resolves to a private / loopback / link-local
+        / cloud-metadata address (reuses :func:`validate_public_url`)
+
+    and we ALLOW no-network schemes (``about:`` / ``data:`` / ``blob:`` /
+    ``chrome:`` / ``chrome-extension:`` / unknown) so legitimate in-session
+    navigations (e.g. ``about:blank``, inline ``data:`` renders) keep working.
+    Bypassed entirely by ``PAPRIKA_ALLOW_PRIVATE_URLS=1`` (LAN fleets)."""
+    if allow_private_enabled():
+        return None
+    if not url:
+        return None
+    u = url.strip()
+    try:
+        scheme = (urlparse(u).scheme or "").lower()
+    except Exception:
+        return None  # unparseable -> let the navigate call surface its own error
+    if scheme in _NAV_BLOCKED_SCHEMES:
+        return f"scheme {scheme!r} blocked in-session (local/file access not allowed)"
+    if scheme in ("http", "https"):
+        return url_block_reason(u)
+    # about: / data: / blob: / chrome: / unknown -> no SSRF surface, allow.
+    return None
+
+
 __all__ = [
     "allow_private_enabled",
     "classify_ip",
     "resolve_all",
     "validate_public_url",
     "url_block_reason",
+    "navigation_block_reason",
 ]

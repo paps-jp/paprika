@@ -81,6 +81,18 @@ async def navigate(tab, url: str, log: LogFn) -> str:
     """
     if not url:
         return "ERR: empty url"
+    # Phase 3 SSRF (authoritative worker-side check): in-session navigations
+    # (page.goto / agent / macro) are NOT validated hub-side -- only the
+    # initial job/session URL is -- so an in-session goto to a private /
+    # loopback / cloud-metadata address (or file://) would otherwise reach
+    # Chrome directly. Re-validate here, the point of actual connection, to
+    # close the hub->worker DNS-rebind/TOCTOU gap. No-op for public URLs and
+    # when PAPRIKA_ALLOW_PRIVATE_URLS=1 (LAN fleets).
+    from core.ssrf_guard import navigation_block_reason
+    _ssrf = navigation_block_reason(url)
+    if _ssrf:
+        log(f"  [agent] navigate {url!r}: BLOCKED by SSRF guard: {_ssrf}")
+        return f"ERR: blocked by SSRF guard: {_ssrf}"
     try:
         await tab.send(cdp.page.navigate(url))
     except Exception as e:
