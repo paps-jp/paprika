@@ -223,6 +223,60 @@ async def _backfill_source_urls_from_log(job_id: str, items: list[dict]) -> None
             it["mime"] = pick["mime"]
 
 
+async def _backfill_source_urls_from_result(job_id: str, items: list[dict]) -> None:
+    """Fill ``source_url`` (+ ``page_url`` / ``mime``) for assets whose
+    ``.meta`` sidecar is missing, from the DURABLE job result.
+
+    The worker reports every captured asset's source URL in the final
+    ``JobResult.assets[].url`` (persisted to ``job_results`` in MariaDB), so this
+    recovers ``source_url`` even when the local sidecar was never written or was
+    cache-evicted -- the common reason ``assets.json`` showed ``source_url:
+    null`` while the result had the URL all along. More reliable than the
+    netcap-marker backfill (which only covers fetch-mode ``saved=true`` network
+    events), so it runs FIRST. No-op when every item already has ``source_url``
+    or the result is unavailable. Never raises."""
+    if not items or all(it.get("source_url") for it in items):
+        return
+    try:
+        result = await state.store.get_job_result(job_id)
+    except Exception:
+        result = None
+    if result is None:
+        return
+    from urllib.parse import unquote
+
+    def _f(a, k):
+        return a.get(k) if isinstance(a, dict) else getattr(a, k, None)
+
+    by_name: dict = {}
+    for a in (getattr(result, "assets", None) or []):
+        nm = _f(a, "name")
+        if nm and _f(a, "url"):
+            by_name[nm] = a
+    if not by_name:
+        return
+    for it in items:
+        if it.get("source_url"):
+            continue
+        nm = it.get("name") or ""
+        # assets.json names can be URL-encoded (e.g. Japanese filenames) while
+        # the result stores the decoded name -- try both.
+        a = by_name.get(nm) or by_name.get(unquote(nm))
+        if a is None:
+            continue
+        url = _f(a, "url")
+        if url:
+            it["source_url"] = url
+        if not it.get("page_url"):
+            pu = _f(a, "page_url")
+            if pu:
+                it["page_url"] = pu
+        if not it.get("mime"):
+            mm = _f(a, "mime")
+            if mm:
+                it["mime"] = mm
+
+
 @router.get("/jobs/{job_id}/assets.json")
 async def job_assets_json(job_id: str) -> dict:
     """JSON view of captured assets -- powers the inline live panel's
@@ -280,10 +334,12 @@ async def job_assets_json(job_id: str) -> dict:
                 "mime": mime,
             }
         )
-    # Recovery pass: fill in source_url for items whose sidecar was
-    # missing (older jobs, regressed upload paths) by parsing the
-    # fetcher's network-event markers out of log.txt. No-op for items
-    # that already have a source_url.
+    # Recovery pass 1 (durable, primary): fill source_url from the job result's
+    # assets[].url for items whose .meta sidecar was missing/evicted.
+    await _backfill_source_urls_from_result(job_id, items)
+    # Recovery pass 2 (fallback): parse the fetcher's network-event markers out
+    # of log.txt for anything the result didn't cover. No-op for items that
+    # already have a source_url.
     await _backfill_source_urls_from_log(job_id, items)
     return {"job_id": job_id, "count": len(items), "items": items}
 
