@@ -24,7 +24,20 @@
 set -uo pipefail
 
 SRC=/opt/paprika
-HUBS=(10.10.50.35 10.10.50.36 10.10.50.37)
+# Deploy targets: AUTO-DISCOVERED from the Redis hub-presence registry
+# (paprika:hubs:*, TTL-refreshed by each hub's _hubs.py -- the SAME source of
+# truth the nginx upstream reconciler uses), UNION the static core. So a hub
+# that auto-joins nginx ALSO auto-receives deploys, and a Redis blip can never
+# drop a core hub or deploy to zero. Excludes .34 (SoT/router -- it appears in
+# the presence payload's public_base, NOT as a hub ip). sort -u => HUBS[0] is a
+# stable, low-numbered, in-sync hub for the classify reference below.
+_disc_hubs() {
+  docker exec paprika-redis-1 redis-cli --scan --pattern 'paprika:hubs:*' 2>/dev/null | grep -vE ':index$' | while read -r _k; do
+    docker exec paprika-redis-1 redis-cli GET "$_k" 2>/dev/null | grep -oE '"ip"[[:space:]]*:[[:space:]]*"10\.10\.50\.[0-9]+"' | grep -oE '10\.10\.50\.[0-9]+'
+  done
+}
+HUBS=($(printf '%s\n' 10.10.50.35 10.10.50.36 10.10.50.37 $(_disc_hubs) | grep -E '^10\.10\.50\.[0-9]+$' | grep -vx 10.10.50.34 | sort -u))
+[ "${#HUBS[@]}" -eq 0 ] && HUBS=(10.10.50.35 10.10.50.36 10.10.50.37)
 HUB_CONTAINER=hub-hub-a-1
 FRONT=http://127.0.0.1:8000
 SSHO=(-o BatchMode=yes -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o ConnectTimeout=10)
@@ -93,7 +106,18 @@ else
 fi
 
 # -- 4) converge + rebalance workers (rolling, batched)
-need_workers=0; [ "$worker_needed" = 1 ] && need_workers=1; [ "$hubs_restarted" = 1 ] && need_workers=1
+# Worker-code-only changes (worker_needed=1, no hub restart) NO LONGER force a
+# hard `docker restart` here -- that SIGKILLs workers mid-job and kills any
+# in-flight fetch/session ("worker disconnected before the job finished"). The
+# hub picks up the new worker source within ~30s (_hub_version mtime-TTL) and
+# advertises it via HubExpectedVersion on heartbeat; each worker then runs its
+# GRACEFUL rolling drain+self-update (drains in-flight up to
+# PAPRIKA_DRAIN_DEADLINE_S=600s, then exit 42 -> supervisor relaunch). We only
+# hard-restart workers to REBALANCE after a hub restart (hubs_restarted=1).
+# Escape hatch: FORCE_WORKER_RESTART=1 restores the old immediate hard restart.
+need_workers=0
+[ "$hubs_restarted" = 1 ] && need_workers=1
+[ -n "${FORCE_WORKER_RESTART:-}" ] && [ "$worker_needed" = 1 ] && need_workers=1
 if [ "$need_workers" = 1 ] && [ -z "${SKIP_WORKERS:-}" ]; then
   say "==> [4] rolling-restart workers (converge + rebalance), batch=$BATCH gap=${BATCH_GAP}s"
   sleep 8
@@ -106,6 +130,8 @@ if [ "$need_workers" = 1 ] && [ -z "${SKIP_WORKERS:-}" ]; then
   done
   wait
   say "    all $n workers restarted; waiting 100s for reconnect + lane respawn"; sleep 100
+elif [ "$worker_needed" = 1 ]; then
+  say "==> [4] worker code changed -> NO hard restart; graceful heartbeat self-update drains in-flight + converges in ~10min (FORCE_WORKER_RESTART=1 to override)"
 else
   say "==> [4] no worker convergence/rebalance needed"
 fi
