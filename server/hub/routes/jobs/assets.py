@@ -7,7 +7,9 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import re
 from pathlib import Path
+from urllib.parse import urlparse
 from fastapi import APIRouter, File, Form, HTTPException, Request, UploadFile
 from fastapi.responses import FileResponse, HTMLResponse, StreamingResponse
 from server.hub._state import config, get_storage_dir, state
@@ -105,6 +107,122 @@ async def get_asset(job_id: str, filename: str, request: Request):
     raise HTTPException(404, f"file not found: {filename}")
 
 
+# Filename-sanitisation pattern mirrors core/fetcher.py:_filename_from.
+# Keep them in sync so the recovery lookup below produces the same
+# basename shape the on-disk asset names use.
+_FNAME_SANITIZE_RE = re.compile(r'[<>:"/\\|?*]')
+# Matches the '_<N>' uniqueness suffix _unique_path appends when two
+# captured resources collide on their derived filename.
+_UNIQ_SUFFIX_RE = re.compile(r"^(.+)_\d+$")
+
+
+async def _backfill_source_urls_from_log(job_id: str, items: list[dict]) -> None:
+    """Recover ``source_url`` for assets whose ``.meta/<name>.json``
+    sidecar is missing, by parsing the fetcher's ``[[paprika:netcap]]``
+    markers in ``log.txt``.
+
+    The sidecar can go missing for several reasons:
+      - the asset was uploaded by an older worker build that pre-dated
+        the source_url Form parameter,
+      - the worker upload succeeded but the hub silent-failed the
+        sidecar write (the streaming-write regression we already fixed
+        in upload_asset, but which left a tail of un-meta'd jobs), or
+      - the asset came via a yt-dlp / late-stragglers path that doesn't
+        carry a per-asset URL.
+
+    The netcap markers (emitted by the fetcher's network-log poll loop)
+    record every captured network event with its URL, size, mime, and
+    ``saved`` flag. We index entries that landed on disk by their
+    URL-derived basename and confirm matches by size, so two images
+    saved as e.g. ``cat.jpg`` + ``cat_1.jpg`` resolve back to their
+    respective source URLs without crossing wires.
+
+    Best-effort: never raises. Items whose source_url is already
+    populated are left untouched. If the log isn't parseable or the
+    file isn't available, just returns and the caller sees the
+    original null values."""
+    # Cheap precondition: skip the I/O entirely if every item already
+    # has source_url filled in (the common case for jobs that ran
+    # against a current worker + current hub).
+    if not items or all(it.get("source_url") for it in items):
+        return
+
+    log_path = get_storage_dir() / job_id / "log.txt"
+    try:
+        await objstore.ensure_local(log_path)
+    except Exception:
+        pass
+    if not log_path.exists():
+        return
+
+    marker = "[[paprika:netcap]] "
+    # basename (with fetcher's sanitization applied) -> [{url, size, mime}, ...]
+    by_basename: dict[str, list[dict]] = {}
+    try:
+        with open(log_path, "r", encoding="utf-8", errors="replace") as f:
+            for line in f:
+                idx = line.find(marker)
+                if idx < 0:
+                    continue
+                try:
+                    payload = json.loads(line[idx + len(marker):])
+                except Exception:
+                    continue
+                for ent in payload.get("net", []) or []:
+                    if not ent.get("saved"):
+                        continue
+                    url = ent.get("url")
+                    sz = ent.get("size")
+                    if not url or sz is None:
+                        continue
+                    try:
+                        bn = Path(urlparse(url).path).name
+                    except Exception:
+                        continue
+                    if not bn:
+                        continue
+                    # Mirror _filename_from's sanitization + 180-char trim.
+                    bn = _FNAME_SANITIZE_RE.sub("_", bn)[:180]
+                    by_basename.setdefault(bn, []).append({
+                        "url": url,
+                        "size": int(sz),
+                        "mime": ent.get("mime") or None,
+                    })
+    except Exception:
+        return
+
+    if not by_basename:
+        return
+
+    for it in items:
+        if it.get("source_url"):
+            continue
+        name = it.get("name") or ""
+        if not name:
+            continue
+        size = int(it.get("size") or 0)
+        # Try the on-disk name first (handles the no-collision case).
+        cands = by_basename.get(name)
+        if not cands:
+            # _unique_path appended '_N' to dedupe: peel it off and try
+            # the original URL-derived basename.
+            stem = Path(name).stem
+            suffix = Path(name).suffix
+            m = _UNIQ_SUFFIX_RE.match(stem)
+            if m:
+                cands = by_basename.get(m.group(1) + suffix)
+        if not cands:
+            continue
+        # Size confirms when multiple URLs share a basename. Fall back
+        # to the first candidate when no size matches (e.g. fetcher
+        # logged a size of 0 / null for a chunked response).
+        sized = [c for c in cands if c["size"] == size]
+        pick = sized[0] if sized else cands[0]
+        it["source_url"] = pick["url"]
+        if not it.get("mime") and pick.get("mime"):
+            it["mime"] = pick["mime"]
+
+
 @router.get("/jobs/{job_id}/assets.json")
 async def job_assets_json(job_id: str) -> dict:
     """JSON view of captured assets -- powers the inline live panel's
@@ -162,6 +280,11 @@ async def job_assets_json(job_id: str) -> dict:
                 "mime": mime,
             }
         )
+    # Recovery pass: fill in source_url for items whose sidecar was
+    # missing (older jobs, regressed upload paths) by parsing the
+    # fetcher's network-event markers out of log.txt. No-op for items
+    # that already have a source_url.
+    await _backfill_source_urls_from_log(job_id, items)
     return {"job_id": job_id, "count": len(items), "items": items}
 
 
