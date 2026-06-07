@@ -4,21 +4,44 @@
 <meta charset="utf-8">
 <title>Paprika</title>
 <link rel="icon" type="image/svg+xml" href="/icon.svg">
-<!-- Iconify Web Component. Renders icons from the Iconify CDN
-     (Lucide set: https://icones.js.org/collection/lucide). Each
-     icon is ~1KB, cached after first fetch. Use <iconify-icon
-     icon="lucide:name" inline></iconify-icon> in HTML. -->
-<script src="https://code.iconify.design/iconify-icon/2.1.0/iconify-icon.min.js"></script>
-<!-- i18next: client-side i18n. The library loads from a CDN once and
-     caches in the browser. The actual translation resources are
-     inlined into the HTML below as a regular JS object, so no extra
-     JSON fetches at startup. -->
-<script src="https://unpkg.com/i18next@23/i18next.min.js"></script>
-<!-- Chart.js (UMD bundle, ~60 KB gzip). Used by the AI engines tab to
-     show 14-day token + cost-in-yen history per engine. Loading at
-     <head> time is OK because no other module depends on the order. -->
-<script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.1/dist/chart.umd.min.js"></script>
+<!-- Iconify web component + Lucide icon set, SELF-HOSTED (offline).
+     The CDN versions (code.iconify.design + runtime api.iconify.design
+     icon fetches) hung ~5-15s on the isolated prod LAN and blocked the
+     whole page render. vendor/lucide-icons.js preloads the full Lucide
+     set via addCollection() so NO external request is ever made. Use
+     <iconify-icon icon="lucide:name" inline></iconify-icon> in HTML.
+     To refresh the icon set see the header of vendor/lucide-icons.js. -->
+<script src="/static/vendor/iconify-icon.min.js?v=@@PAPRIKA_VERSION@@"></script>
+<script src="/static/vendor/lucide-icons.js?v=@@PAPRIKA_VERSION@@"></script>
+<!-- i18next: client-side i18n, self-hosted. Translation resources are
+     inlined into the HTML below as a JS object (no extra JSON fetches). -->
+<script src="/static/vendor/i18next.min.js?v=@@PAPRIKA_VERSION@@"></script>
+<!-- Chart.js (UMD bundle), self-hosted. AI-engines tab 14-day token +
+     cost history. <head>-time load is OK; no module depends on order. -->
+<script src="/static/vendor/chart.umd.min.js?v=@@PAPRIKA_VERSION@@"></script>
 <link rel="stylesheet" href="/static/admin.css?v=@@PAPRIKA_VERSION@@">
+<!-- Auth (LAN-trust → multi-user hardening): under auth_mode=enforce the hub
+     returns 401 for unauthenticated API calls. Wrap fetch() to redirect to the
+     login page so the admin UI degrades gracefully. No-op when auth is off (no
+     401s ever fire). Inline + first in <head> so every later fetch is wrapped. -->
+<script>
+(function () {
+  var _f = window.fetch;
+  window.fetch = function () {
+    return _f.apply(this, arguments).then(function (r) {
+      if (r && r.status === 401) {
+        try {
+          if (location.pathname.indexOf('/login') !== 0) {
+            location.href = '/login?next=' +
+              encodeURIComponent(location.pathname + location.search);
+          }
+        } catch (e) {}
+      }
+      return r;
+    });
+  };
+})();
+</script>
 </head>
 <body>
 <header>
@@ -487,7 +510,7 @@ asyncio.run(main())"
        auto-close the outer form and detach the submit button. -->
   <dialog id="recipeSaveModal" style="border:1px solid #ccc; border-radius:8px; padding:0; width:min(720px, 92vw); max-height:90vh; overflow:auto;">
     <form method="dialog" id="recipeSaveForm" style="padding:16px;">
-      <h3 style="margin:0 0 12px;"><iconify-icon icon="lucide:bento"></iconify-icon> recipe として保存</h3>
+      <h3 style="margin:0 0 12px;"><iconify-icon icon="lucide:bookmark-plus"></iconify-icon> recipe として保存</h3>
       <div id="recipeSaveBody" style="display:grid; gap:8px;">
         <label style="display:grid; gap:2px;">
           <span style="font-size:.85em; color:#666;">host (例: example.com)</span>
@@ -612,7 +635,7 @@ asyncio.run(main())"
       <span class="ljp-actions-group">
         <button id="ljpStop" class="pill" disabled data-i18n-title="ljp.pause.title" title="ジョブを一時停止する" style="--la-bg:#fde6e6; --la-bd:#d68080; --la-fg:#8a1d1d;"><iconify-icon icon="lucide:pause"></iconify-icon> <span data-i18n="ljp.pause">pause</span></button>
         <button id="ljpResume" class="pill" disabled data-i18n-title="ljp.resume.title" title="直前のスクリプトで再実行する" style="--la-bg:#e6f7e9; --la-bd:#7ab68a; --la-fg:#196b2c;"><iconify-icon icon="lucide:play"></iconify-icon> <span data-i18n="ljp.resume">resume</span></button>
-        <button id="ljpSaveRecipe" class="pill" style="display:none; --la-bg:#fff7e6; --la-bd:#e8c97a; --la-fg:#7a5a14;" title="この job を HostRegistry のレシピとして登録"><iconify-icon icon="lucide:bento"></iconify-icon> <span data-i18n="ljp.saverecipe">レシピとして保存</span></button>
+        <button id="ljpSaveRecipe" class="pill" style="display:none; --la-bg:#fff7e6; --la-bd:#e8c97a; --la-fg:#7a5a14;" title="この job を HostRegistry のレシピとして登録"><iconify-icon icon="lucide:bookmark-plus"></iconify-icon> <span data-i18n="ljp.saverecipe">レシピとして保存</span></button>
         <span class="ljp-more-wrap" id="ljpMoreWrap">
           <button id="ljpMore" class="pill" data-i18n-title="ljp.more.title" title="その他の操作" aria-haspopup="true" aria-expanded="false" style="--la-bg:#eceaf6; --la-bd:#cfcbe6; --la-fg:#38306a;"><iconify-icon icon="lucide:ellipsis"></iconify-icon> <span data-i18n="ljp.more">その他</span> <iconify-icon icon="lucide:chevron-down" class="ljp-more-caret"></iconify-icon></button>
           <div id="ljpMoreMenu" class="ljp-more-menu" role="menu">
@@ -1050,12 +1073,14 @@ asyncio.run(main())"
           <th data-i18n="workers.th.address">address</th>
           <th data-i18n="workers.th.status">status</th>
           <th data-i18n="workers.th.load">load</th>
+          <th data-i18n="workers.th.cpu" title="LXC ホスト (Proxmox ノード) の CPU 使用率">CPU</th>
+          <th data-i18n="workers.th.mem" title="CT のメモリ使用率 (cgroup 制限内)">Mem</th>
+          <th data-i18n="workers.th.disk" title="CT のディスク使用率。90% を超えると新規 job を受け付けず、temp/download を自動削除">Disk</th>
           <th data-i18n="workers.th.profiles" title="Chrome profiles prefetched on this worker (from /profiles registry)">profiles</th>
           <th data-i18n="workers.th.version">version</th>
-          <th data-i18n="workers.th.labels">labels</th>
           <th data-i18n="workers.th.actions">actions</th>
         </tr>
-      </thead><tbody><tr><td colspan=8 class="empty" data-i18n="workers.empty">no workers connected</td></tr></tbody></table>
+      </thead><tbody><tr><td colspan=10 class="empty" data-i18n="workers.empty">no workers connected</td></tr></tbody></table>
     </div>
 
     <!-- Hubs sub-pane: multi-hub presence list. Each hub heartbeats
@@ -1129,7 +1154,7 @@ asyncio.run(main())"
           <button id="jobsColsBtn" class="pill" style="--la-bg:#eef0ff; --la-bd:#6a8ec7; --la-fg:#3a5ca8;" title="表示する列を選ぶ"><iconify-icon icon="lucide:columns-3"></iconify-icon> <span data-i18n="jobs.cols">columns</span> <span class="caret">▾</span></button>
           <div id="jobsColsMenu" class="menu" style="min-width:180px;"></div>
         </span>
-        <button id="bulkCleanup" class="pill" style="--la-bg:#fff5e6; --la-bd:#e0a060; --la-fg:#7a4500;" title="Delete old completed jobs (kept last 10 always)"><iconify-icon icon="lucide:broom"></iconify-icon> <span data-i18n="jobs.cleanup">cleanup old…</span></button>
+        <button id="bulkCleanup" class="pill" style="--la-bg:#fff5e6; --la-bd:#e0a060; --la-fg:#7a4500;" title="Delete old completed jobs (kept last 10 always)"><iconify-icon icon="lucide:eraser"></iconify-icon> <span data-i18n="jobs.cleanup">cleanup old…</span></button>
         <button id="bulkDelete" class="pill" style="--la-bg:#fee; --la-bd:#c88; --la-fg:#933;"><iconify-icon icon="lucide:trash-2"></iconify-icon> <span data-i18n="jobs.deleteall">delete all</span></button>
       </span>
     </h2>

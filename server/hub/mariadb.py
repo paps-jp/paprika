@@ -281,6 +281,66 @@ _TABLES: list[tuple[str, str]] = [
 
 
 # ---------------------------------------------------------------------------
+# Auth tables (users + api_keys)
+# ---------------------------------------------------------------------------
+#
+# Added by the "LAN-trust → multi-user / public" hardening. Kept in their
+# own list so AuthStore can ensure JUST these (``ensure_auth_tables``)
+# on first use, independent of whether the operator has run the full
+# ``ensure_schema``. Also appended to ``_TABLES`` so the normal schema
+# create + ``table_counts`` cover them too.
+
+_AUTH_TABLES: list[tuple[str, str]] = [
+    (
+        "users",
+        """
+        CREATE TABLE IF NOT EXISTS users (
+            id          VARCHAR(64)   PRIMARY KEY,
+            email       VARCHAR(255)  NOT NULL,
+            pw_hash     VARCHAR(255)  NOT NULL,
+            role        VARCHAR(20)   NOT NULL DEFAULT 'user',
+            disabled    TINYINT(1)    DEFAULT 0,
+            created_at  DATETIME(3),
+            UNIQUE KEY uk_email (email)
+        ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci
+        """,
+    ),
+    (
+        "api_keys",
+        """
+        CREATE TABLE IF NOT EXISTS api_keys (
+            id           VARCHAR(64)   PRIMARY KEY,
+            prefix       VARCHAR(32)   NOT NULL,
+            secret_hash  VARCHAR(128)  NOT NULL,
+            user_id      VARCHAR(64)   NOT NULL,
+            name         VARCHAR(255)  DEFAULT '',
+            scopes       JSON,
+            created_at   DATETIME(3),
+            last_used_at DATETIME(3),
+            expires_at   DATETIME(3),
+            revoked      TINYINT(1)    DEFAULT 0,
+            UNIQUE KEY uk_prefix (prefix),
+            INDEX idx_user (user_id)
+        ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci
+        """,
+    ),
+]
+_TABLES.extend(_AUTH_TABLES)
+
+
+async def ensure_auth_tables(pool: Any) -> None:
+    """Idempotently create just the auth tables.
+
+    Called by :class:`server.hub.auth.AuthStore` on first MariaDB use so
+    login / API keys work even before the operator triggers the full
+    ``ensure_schema``. Each statement is ``CREATE TABLE IF NOT EXISTS``."""
+    async with pool.acquire() as conn:
+        async with conn.cursor() as cur:
+            for _name, ddl in _AUTH_TABLES:
+                await cur.execute(ddl)
+
+
+# ---------------------------------------------------------------------------
 # Pool helpers
 # ---------------------------------------------------------------------------
 

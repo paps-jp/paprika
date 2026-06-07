@@ -201,6 +201,20 @@ class PaprikaClient:
                 or "http://localhost:8000"
             )
         self._base_url = base_url.rstrip("/")
+        # Resolve the bearer token in the same spirit as base_url:
+        #   1. explicit token argument
+        #   2. PAPRIKA_API_KEY / PAPRIKA_TOKEN environment variable
+        #   3. None (anonymous — works against hubs in auth_mode off/optional)
+        # So a script / runner sandbox / CLI invocation picks up a key from
+        # the env automatically and keeps working once a hub flips to
+        # auth_mode=enforce, without any code change. The token is sent as
+        # ``Authorization: Bearer <token>`` (see __aenter__).
+        if token is None:
+            token = (
+                os.environ.get("PAPRIKA_API_KEY")
+                or os.environ.get("PAPRIKA_TOKEN")
+                or None
+            )
         self._token = token
         self._timeout = timeout
         self._http: Optional[httpx.AsyncClient] = None

@@ -297,6 +297,31 @@ async def lifespan(app: FastAPI):
     except Exception as _e:
         log.warning("engines: default pricing seed crashed: %s: %s", type(_e).__name__, _e)
 
+    # ---- Auth store (LAN-trust → multi-user / public hardening) ----
+    # Initialised AFTER the MariaDB pool so it picks the durable, shared
+    # backend in prod (file fallback in dev / single-hub). Bootstraps an
+    # initial admin from env on an EMPTY store so we can never lock
+    # ourselves out. Enforcement is gated by config.auth_mode (default
+    # "off" = non-breaking); see the auth middleware further down.
+    try:
+        import os as _os
+
+        from server.hub.auth import AuthStore, current_mode
+
+        state.auth = AuthStore(config.data_dir)
+        _boot_email = (_os.environ.get("PAPRIKA_BOOTSTRAP_ADMIN_EMAIL") or "").strip()
+        _boot_pw = _os.environ.get("PAPRIKA_BOOTSTRAP_ADMIN_PASSWORD") or ""
+        # Admin-role is a read-only management service; it must never write
+        # into the shared store (mirrors the auto-migrate skip above).
+        if _boot_email and _boot_pw and not _ADMIN_MODE:
+            try:
+                await state.auth.bootstrap_admin(_boot_email, _boot_pw)
+            except Exception as e:
+                log.warning("auth: bootstrap admin failed: %s", e)
+        log.info("auth: store ready (mode=%s)", current_mode())
+    except Exception as e:
+        log.warning("auth: store init failed: %s", e)
+
     state.store, state.store_kind = await make_store(
         config.redis_url,
         mariadb_pool=_mdb_pool,
@@ -405,6 +430,7 @@ async def lifespan(app: FastAPI):
     # delete records, prune the registry, or re-dispatch jobs.
     reaper_task = retire_task = dead_worker_task = job_lease_task = None
     preview_sub_task = cache_evict_task = stale_reconcile_task = None
+    redrive_task = None
     if not _ADMIN_MODE:
         reaper_task = asyncio.create_task(_session_reaper_loop())
         retire_task = asyncio.create_task(_skill_convention_reaper_loop())
@@ -423,6 +449,17 @@ async def lifespan(app: FastAPI):
         from server.hub._reaper import _stale_job_reconciler_loop
 
         stale_reconcile_task = asyncio.create_task(_stale_job_reconciler_loop())
+
+        # Queued-job redrive: place queued worker-dispatched jobs (fetch /
+        # vision-agent) onto free lanes as they open up, instead of letting them
+        # rot in the queue until the 180s reaper kills them. POST /jobs only
+        # tries ONCE; this turns the queue into a real work-queue. Cross-hub
+        # safe via a store CAS claim; kill-switch PAPRIKA_QUEUE_REDRIVE_DISABLE.
+        # See _redrive.py (incident 2026-06-06: 80% of failures were queued
+        # fetch jobs timing out while lanes sat idle).
+        from server.hub._redrive import _queued_redrive_loop
+
+        redrive_task = asyncio.create_task(_queued_redrive_loop())
 
         # Local job-store cache eviction (MinIO-as-SoT mode). Bounds the local
         # cache disk by deleting oldest job dirs that are confirmed durable in
@@ -497,7 +534,7 @@ async def lifespan(app: FastAPI):
 
     for _t in (reaper_task, retire_task, dead_worker_task, job_lease_task,
                invalidate_task, preview_sub_task, cache_evict_task,
-               stale_reconcile_task):
+               stale_reconcile_task, redrive_task):
         if _t is not None:
             _t.cancel()
     # Stop hub heartbeat + drop the registry row so peers see us as
@@ -634,6 +671,170 @@ from fastapi.staticfiles import StaticFiles
 _STATIC_DIR = Path(__file__).resolve().parent / "static"
 if _STATIC_DIR.is_dir():
     app.mount("/static", StaticFiles(directory=str(_STATIC_DIR)), name="static")
+
+
+# ============================================================================
+# Authentication & authorization (LAN-trust → multi-user / public hardening)
+# ============================================================================
+# A single HTTP middleware resolves ``request.state.principal`` for EVERY
+# request (API key → session cookie → worker_secret → anonymous/system) and,
+# ONLY in `enforce` mode, rejects anonymous callers on non-exempt paths. The
+# `off` (default) and `optional` modes never block — so shipping this is a
+# behavioural no-op for the live fleet / existing clients until auth_mode is
+# deliberately raised (see server/hub/auth.py + PAPRIKA_AUTH_MODE).
+#
+# Why enforcement lives HERE and not as per-router Depends: several routers
+# (jobs, engines, sessions) MIX user-facing routes with worker/hub callbacks
+# that authenticate via ``worker_secret`` carried in a header / query / form /
+# JSON body the dependency layer can't uniformly read. A blanket router dep
+# would 401 those worker callbacks (and /health). The middleware instead
+# resolves identity centrally and exempts the worker-callback surface. Admin-
+# vs-user AUTHORIZATION (role checks, data ownership) is Phase 2 — it needs a
+# per-route worker-vs-user audit + the owner_id model — so this round only
+# establishes AUTHENTICATION. ``require_user`` / ``require_admin`` are exported
+# for Phase 2 to attach per-route.
+from fastapi import Request as _Request
+from fastapi.responses import (
+    JSONResponse as _JSONResponse,
+    RedirectResponse as _RedirectResponse,
+)
+
+# Reachable without any credential, even in enforce mode.
+_AUTH_PUBLIC_PREFIXES = (
+    "/static/", "/login", "/logout", "/auth/login", "/auth/logout",
+    "/health", "/info", "/icon.svg", "/favicon.ico",
+    "/openapi.json", "/docs", "/redoc",
+)
+
+
+def _auth_is_worker_callback(path: str, method: str) -> bool:
+    """Worker / hub→hub callbacks that authenticate themselves via
+    ``worker_secret`` (in a header / query / form / JSON body). Exempt from the
+    user-principal gate; their own secret check still applies. KEEP IN SYNC with
+    the worker-facing routes before flipping prod to enforce."""
+    if method not in ("POST", "PUT", "DELETE"):
+        return False
+    if path.startswith("/internal/"):
+        return True
+    if path.startswith("/jobs/") and (path.endswith("/assets") or "/files/" in path):
+        return True
+    if path.startswith("/engines/") and "/resolve" in path:
+        return True
+    return False
+
+
+def _auth_exempt(request: "_Request") -> bool:
+    path = request.url.path
+    if any(path == p or path.startswith(p) for p in _AUTH_PUBLIC_PREFIXES):
+        return True
+    if _auth_is_worker_callback(path, request.method):
+        return True
+    # A worker_secret the middleware CAN read (header / query) authenticates
+    # fleet + hub→hub callbacks without consuming the request body.
+    if config.worker_secret:
+        import hmac as _hmac
+        presented = (
+            request.headers.get("x-paprika-worker-secret")
+            or request.query_params.get("secret")
+            or ""
+        )
+        if presented and _hmac.compare_digest(presented, config.worker_secret):
+            return True
+    return False
+
+
+@app.middleware("http")
+async def _auth_middleware(request: "_Request", call_next):
+    from server.hub.auth import (
+        ANONYMOUS,
+        SESSION_COOKIE,
+        SYSTEM,
+        AuthMode,
+        Principal,
+        current_mode,
+        verify_session,
+    )
+
+    mode = current_mode()
+    # off → every request is SYSTEM (today's behaviour). otherwise start ANON.
+    principal = SYSTEM if mode == AuthMode.OFF else ANONYMOUS
+
+    if mode != AuthMode.OFF and state.auth is not None:
+        authz = request.headers.get("authorization", "")
+        if authz[:7].lower() == "bearer ":
+            try:
+                p = await state.auth.resolve_api_key(authz[7:].strip())
+            except Exception:
+                p = None
+            if p is not None:
+                principal = p
+        if principal is ANONYMOUS:
+            cookie = request.cookies.get(SESSION_COOKIE)
+            if cookie:
+                payload = verify_session(cookie)
+                if payload:
+                    principal = Principal(
+                        kind="user",
+                        id=str(payload.get("uid", "")),
+                        email=str(payload.get("email", "")),
+                        role=str(payload.get("role", "user")),
+                    )
+        if principal is ANONYMOUS and config.worker_secret:
+            import hmac as _hmac
+            presented = (
+                request.headers.get("x-paprika-worker-secret")
+                or request.query_params.get("secret")
+                or ""
+            )
+            if presented and _hmac.compare_digest(presented, config.worker_secret):
+                principal = Principal(kind="worker", id="worker")
+
+    request.state.principal = principal
+
+    if (
+        mode == AuthMode.ENFORCE
+        and not principal.is_authenticated
+        and not _auth_exempt(request)
+    ):
+        from urllib.parse import quote
+
+        accept = request.headers.get("accept", "")
+        if request.method == "GET" and "text/html" in accept:
+            return _RedirectResponse(
+                url="/login?next=" + quote(request.url.path), status_code=302,
+            )
+        return _JSONResponse({"detail": "authentication required"}, status_code=401)
+
+    return await call_next(request)
+
+
+def require_user(request: "_Request") -> None:
+    """FastAPI dependency: require an authenticated principal. No-op unless
+    ``auth_mode == enforce`` (off/optional stay non-breaking). Exported for
+    Phase 2 per-route use; the middleware already enforces authentication."""
+    from server.hub.auth import AuthMode, current_mode
+
+    if current_mode() != AuthMode.ENFORCE:
+        return
+    p = getattr(request.state, "principal", None)
+    if p is None or not p.is_authenticated:
+        from fastapi import HTTPException
+        raise HTTPException(401, "authentication required")
+
+
+def require_admin(request: "_Request") -> None:
+    """FastAPI dependency: require an admin principal. No-op unless
+    ``auth_mode == enforce``. Exported for Phase 2 per-route use."""
+    from server.hub.auth import AuthMode, current_mode
+
+    if current_mode() != AuthMode.ENFORCE:
+        return
+    p = getattr(request.state, "principal", None)
+    from fastapi import HTTPException
+    if p is None or not p.is_authenticated:
+        raise HTTPException(401, "authentication required")
+    if not p.is_admin:
+        raise HTTPException(403, "admin privilege required")
 
 
 # ---- Codegen-loop + rerun orchestrators -- moved to _jobrunner.py ------
@@ -975,6 +1176,11 @@ app.include_router(_novnc_router)
 from server.hub.routes.system import router as _system_router
 
 app.include_router(_system_router)
+
+# ---- Auth: login + API-key / user management (LAN-trust → multi-user) -----
+from server.hub.routes.auth import router as _auth_router
+
+app.include_router(_auth_router)
 
 
 # ---- Admin UI shell (/) -- moved to routes/system.py (#2B-G3-partial)

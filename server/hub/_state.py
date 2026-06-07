@@ -46,6 +46,15 @@ class HubConfig:
     redis_url: str | None = None
     public_base_url: str | None = None  # how workers reach this hub
     worker_secret: str | None = None  # shared secret for worker auth
+    # Client/admin API auth mode: "off" | "optional" | "enforce".
+    #   off      -- today's behaviour: every request is the SYSTEM principal.
+    #   optional -- attribute a principal when a credential is present, else
+    #               ANONYMOUS; never blocks (transition / observation mode).
+    #   enforce  -- a valid principal is required; anonymous is rejected.
+    # Ramped via PAPRIKA_AUTH_MODE so flipping it on doesn't break the live
+    # fleet / existing clients until we deliberately move to enforce. See
+    # server/hub/auth.py + the auth middleware in app.py.
+    auth_mode: str = (os.environ.get("PAPRIKA_AUTH_MODE") or "off").strip().lower()
     # Stable identifier for THIS hub process / replica. Records which
     # hub owns a worker's control WebSocket and tags the Redis Session
     # Map — the foundation for multi-hub (nginx + Hub×N) routing.
@@ -152,6 +161,11 @@ class AppState:
     # Redis isn't wired (single-host in-memory deploys); list_all()
     # then returns a one-element synthetic local view. See _hubs.py.
     hubs: object | None = None  # HubRegistry | None (lazy)
+    # Auth store: users + API keys, MariaDB-or-file backed with an
+    # in-memory cache. Initialised in the lifespan AFTER the MariaDB pool
+    # so it picks the durable shared backend in prod (file fallback in
+    # dev / single-hub). None until then. See server/hub/auth.py.
+    auth: object | None = None  # AuthStore | None
 
 
 state = AppState()

@@ -124,6 +124,23 @@ services:
       # hub can re-dispatch codegen-loop/rerun jobs that a crashed hub was
       # running. See server/hub/_leases.py + deploy/scale/README.md.
       - PAPRIKA_JOB_LEASE_ENABLED=${PAPRIKA_JOB_LEASE_ENABLED:-}
+      # ----- Auth / multi-user (LAN-trust → public hardening) -------------
+      # All default OFF/empty so the stack behaves exactly as before until
+      # you deliberately ramp it. See server/hub/auth.py + docs.
+      #   PAPRIKA_AUTH_MODE          off (default) | optional | enforce
+      #   PAPRIKA_WORKER_SECRET      shared worker<->hub secret (ALSO set on workers,
+      #                              workers-first, before enforcing on the hub)
+      #   PAPRIKA_SESSION_SECRET     HMAC key for login cookies — set the SAME value
+      #                              on every hub (else a cookie minted on hub A is
+      #                              rejected on hub B). Unset = ephemeral per-hub key.
+      #   PAPRIKA_BOOTSTRAP_ADMIN_*  first admin, created only on an EMPTY auth store
+      #   PAPRIKA_COOKIE_SECURE      1 when the hub is fronted by HTTPS
+      - PAPRIKA_AUTH_MODE=${PAPRIKA_AUTH_MODE:-off}
+      - PAPRIKA_WORKER_SECRET=${PAPRIKA_WORKER_SECRET:-}
+      - PAPRIKA_SESSION_SECRET=${PAPRIKA_SESSION_SECRET:-}
+      - PAPRIKA_BOOTSTRAP_ADMIN_EMAIL=${PAPRIKA_BOOTSTRAP_ADMIN_EMAIL:-}
+      - PAPRIKA_BOOTSTRAP_ADMIN_PASSWORD=${PAPRIKA_BOOTSTRAP_ADMIN_PASSWORD:-}
+      - PAPRIKA_COOKIE_SECURE=${PAPRIKA_COOKIE_SECURE:-}
     # Docker socket: the hub spawns ephemeral runner containers per
     # codegen attempt. LAN-trusted deployment; the hub already executes
     # arbitrary CDP commands and writes to disk, so a privileged
@@ -210,6 +227,19 @@ services:
     # init). See docker-compose-worker.yml worker.init comment.
     init: true
     shm_size: "2gb"
+    # Defence-in-depth fd ceiling. A worker drives N lanes of Chrome +
+    # Xvfb + x11vnc plus per-job /tmp/paprika-* scratch; steady-state
+    # usage is well under 1k fds, but the default container soft limit
+    # (often 1024) turned a slow per-job fd leak into a hard
+    # "[Errno 24] Too many open files" crash that took in-flight jobs
+    # down with it. 65536 gives headroom so any future leak degrades and
+    # is caught by monitoring instead of crashing mid-job. (The actual
+    # leak -- an un-closed per-job log_fp -- is fixed in
+    # server/worker/agent/_mix_jobexec.py; this is belt-and-braces.)
+    ulimits:
+      nofile:
+        soft: 65536
+        hard: 65536
     # NET_ADMIN lets entrypoint-egress-firewall.sh install iptables
     # OUTPUT rules. The script is a no-op unless
     # PAPRIKA_WORKER_EGRESS_FIREWALL=1, so adding the capability is
@@ -222,6 +252,10 @@ services:
       - "6080-6081:6080-6081"
     environment:
       - HUB_URL=ws://hub:8000
+      # Worker<->hub shared secret. MUST match the hub's PAPRIKA_WORKER_SECRET.
+      # Empty (default) keeps the handshake check OFF. Roll this to ALL workers
+      # BEFORE setting it on the hub, or the hub rejects the whole fleet.
+      - PAPRIKA_WORKER_SECRET=${PAPRIKA_WORKER_SECRET:-}
       # Worker egress firewall (SSRF deep defence). Opt-in.
       # When 1: iptables OUTPUT drops every private IP destination
       # except hub / agent / DNS / operator-listed allows. See

@@ -18,6 +18,7 @@ from __future__ import annotations
 import argparse
 import asyncio
 import logging
+import os
 import sys
 from pathlib import Path
 
@@ -171,7 +172,12 @@ def _run_hub_only(args) -> int:
     hub_app_module.config.max_concurrent_jobs = args.max_concurrent
     hub_app_module.config.redis_url = args.redis_url
     hub_app_module.config.public_base_url = args.public_base_url
-    hub_app_module.config.worker_secret = args.worker_secret
+    # Worker<->hub shared secret. CLI flag wins; otherwise fall back to
+    # PAPRIKA_WORKER_SECRET so compose / .34 deploy env can enable it
+    # fleet-wide without a flag. None (both unset) keeps the check OFF.
+    hub_app_module.config.worker_secret = (
+        args.worker_secret or os.environ.get("PAPRIKA_WORKER_SECRET") or None
+    )
 
     log.info(
         "mode=hub  http://%s:%d  data=%s  redis=%s",
@@ -253,7 +259,7 @@ def _run_worker(args) -> int:
         labels=labels,
         chrome_host=args.chrome_host,
         chrome_port=args.chrome_port,
-        worker_secret=args.worker_secret,
+        worker_secret=args.worker_secret or os.environ.get("PAPRIKA_WORKER_SECRET"),
         novnc_url=args.novnc_url,
         lane_pool=lane_pool,
     )
@@ -290,4 +296,15 @@ def main() -> int:
 
 
 if __name__ == "__main__":
-    sys.exit(main())
+    rc = main()
+    # os._exit bypasses interpreter shutdown (atexit / executor-thread join /
+    # daemon-thread cleanup). Worker mode spawns chrome/xvfb/x11vnc subprocesses
+    # and asyncio's default ThreadPoolExecutor; a job that exits abnormally can
+    # leave one of those threads in a state where Python's shutdown sequence
+    # logs "executor did not finishing joining its threads within 300 seconds"
+    # and never returns -- the process is alive to PID-1 but never reconnects
+    # to the hub. Four fleet workers stayed wedged like that across a 75c93db
+    # version bump (2026-06-06) because docker's restart policy only fires on
+    # exit, and the python interpreter never exited. Hard-exit forecloses that
+    # failure class so the supervisor always sees a clean death and relaunches.
+    os._exit(rc if isinstance(rc, int) else 0)

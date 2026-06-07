@@ -56,6 +56,18 @@ def _resolve_hub(explicit: Optional[str]) -> str:
     ).rstrip("/")
 
 
+def _auth_headers(args: argparse.Namespace) -> dict:
+    """Bearer auth header from ``--token`` or $PAPRIKA_API_KEY/$PAPRIKA_TOKEN,
+    or ``{}`` when none is set. Needed once a hub runs auth_mode=enforce; a
+    no-op (anonymous) against off/optional hubs."""
+    tok = (
+        getattr(args, "token", None)
+        or os.environ.get("PAPRIKA_API_KEY")
+        or os.environ.get("PAPRIKA_TOKEN")
+    )
+    return {"Authorization": f"Bearer {tok}"} if tok else {}
+
+
 def _machine_label() -> str:
     """Short string the hub can show as 'uploaded from' info."""
     try:
@@ -305,6 +317,62 @@ def _cmd_delete_profile(args: argparse.Namespace) -> int:
     return 0
 
 
+# ---------------------------------------------------------------- auth
+
+def _cmd_auth_whoami(args: argparse.Namespace) -> int:
+    import httpx  # lazy so --help stays fast
+    hub = _resolve_hub(args.hub)
+    r = httpx.get(f"{hub}/auth/me", headers=_auth_headers(args), timeout=30)
+    print(r.text)
+    return 0 if r.status_code == 200 else 1
+
+
+def _cmd_auth_key_create(args: argparse.Namespace) -> int:
+    import httpx
+    hub = _resolve_hub(args.hub)
+    body: dict = {"name": args.name or ""}
+    if args.user_id:
+        body["user_id"] = args.user_id
+    r = httpx.post(
+        f"{hub}/auth/keys", json=body, headers=_auth_headers(args), timeout=30,
+    )
+    if r.status_code != 200:
+        print(f"error {r.status_code}: {r.text}", file=sys.stderr)
+        return 1
+    data = r.json()
+    key = data.get("key", {})
+    # The full plaintext key — printed to STDOUT so it can be piped/captured.
+    # It is shown exactly once and is NOT retrievable later.
+    print(data.get("secret", ""))
+    print(
+        f"created key id={key.get('id')} prefix={key.get('prefix')} "
+        "— store the line above (printed to stdout); it cannot be shown again.",
+        file=sys.stderr,
+    )
+    return 0
+
+
+def _cmd_auth_key_list(args: argparse.Namespace) -> int:
+    import httpx
+    hub = _resolve_hub(args.hub)
+    r = httpx.get(f"{hub}/auth/keys", headers=_auth_headers(args), timeout=30)
+    print(r.text)
+    return 0 if r.status_code == 200 else 1
+
+
+def _cmd_auth_key_revoke(args: argparse.Namespace) -> int:
+    import httpx
+    hub = _resolve_hub(args.hub)
+    r = httpx.delete(
+        f"{hub}/auth/keys/{args.id}", headers=_auth_headers(args), timeout=30,
+    )
+    if r.status_code != 200:
+        print(f"error {r.status_code}: {r.text}", file=sys.stderr)
+        return 1
+    print(f"revoked {args.id}", file=sys.stderr)
+    return 0
+
+
 # ---------------------------------------------------------------- main
 
 def main(argv: Optional[list[str]] = None) -> int:
@@ -315,6 +383,11 @@ def main(argv: Optional[list[str]] = None) -> int:
     p.add_argument(
         "--hub", default=None,
         help="Hub base URL (default: $PAPRIKA_HUB or http://localhost:8000)",
+    )
+    p.add_argument(
+        "--token", default=None,
+        help="API key / bearer token (default: $PAPRIKA_API_KEY or "
+             "$PAPRIKA_TOKEN). Required once the hub runs auth_mode=enforce.",
     )
     sub = p.add_subparsers(dest="cmd", required=True)
 
@@ -381,6 +454,33 @@ def main(argv: Optional[list[str]] = None) -> int:
              "current default.",
     )
     sd.set_defaults(func=_cmd_set_default_profile)
+
+    # ---- auth: identity + API-key management (LAN-trust → multi-user) ----
+    wa = sub.add_parser(
+        "auth-whoami",
+        help="Show the caller's resolved principal (GET /auth/me)",
+    )
+    wa.set_defaults(func=_cmd_auth_whoami)
+
+    kc = sub.add_parser(
+        "auth-key-create",
+        help="Mint an API key; prints the secret ONCE to stdout",
+    )
+    kc.add_argument("--name", default=None, help="Human label for the key")
+    kc.add_argument(
+        "--user-id", default=None,
+        help="Owner user id (admin/off only; defaults to the calling user)",
+    )
+    kc.set_defaults(func=_cmd_auth_key_create)
+
+    kl = sub.add_parser(
+        "auth-key-list", help="List API keys (own; admin sees all)",
+    )
+    kl.set_defaults(func=_cmd_auth_key_list)
+
+    kr = sub.add_parser("auth-key-revoke", help="Revoke an API key by id")
+    kr.add_argument("id", help="Key id (key_...) to revoke")
+    kr.set_defaults(func=_cmd_auth_key_revoke)
 
     args = p.parse_args(argv)
     return args.func(args)
