@@ -157,6 +157,8 @@ async def take_job_screenshot(
             ),
             encoding="utf-8",
         )
+        # Mirror the .meta sidecar to MinIO too (metadata durability).
+        await objstore.mirror_file(meta_dir / f"{name}.json")
     except Exception:
         pass
 
@@ -280,6 +282,8 @@ async def upload_asset(
                 ),
                 encoding="utf-8",
             )
+            # Mirror the .meta sidecar to MinIO too (metadata durability).
+            await objstore.mirror_file(meta_dir / f"{name}.json")
         except Exception:
             pass
 
@@ -376,6 +380,8 @@ async def save_asset_from_url(job_id: str, body: dict) -> dict:
             ),
             encoding="utf-8",
         )
+        # Mirror the .meta sidecar to MinIO too (metadata durability).
+        await objstore.mirror_file(meta_dir / f"{name}.json")
     except Exception:
         pass
 

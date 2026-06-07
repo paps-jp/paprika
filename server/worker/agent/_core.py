@@ -192,6 +192,13 @@ class WorkerAgent(
         except (TypeError, ValueError):
             self._reconnect_giveup_s = 120.0
         self._last_link_ok = 0.0
+        # Most recent (cpu_pct, mem_pct, disk_pct, disk_free_gb, load1)
+        # sample captured by the heartbeat loop. Read by the per-job disk
+        # preflight in _mix_jobexec without re-walking /proc, and reset
+        # to all-zeros until the first heartbeat fires.
+        self._last_resources: tuple[float, float, float, float, float] = (
+            0.0, 0.0, 0.0, 0.0, 0.0,
+        )
         # Robust hung-event-loop watchdog ("worker self-diagnosis, done right").
         # An off-loop daemon thread pokes the event loop via call_soon_threadsafe;
         # if the loop fails to run the poke for _wd_threshold_s it is GENUINELY

@@ -240,6 +240,22 @@
 
   code { font-family: ui-monospace, Consolas, monospace; font-size: .82rem; background: #f4f4f4; padding: 1px 4px; border-radius: 3px; }
   .empty { color: #999; font-style: italic; padding: .5rem; }
+  /* "still loading" placeholder row (e.g. Recent Jobs initial fetch).
+     A small spinner + non-italic dimmed text so the load gap reads as
+     "loading", distinct from .empty alone (= a successful 0-row fetch,
+     "no jobs yet"). Reuses the ljp-spin keyframe defined below. */
+  .empty.loading-row { color: #888; font-style: normal; }
+  .empty.loading-row::before {
+    content: "";
+    display: inline-block;
+    width: 11px; height: 11px;
+    border: 2px solid #ccc;
+    border-top-color: #c0392b;
+    border-radius: 50%;
+    animation: ljp-spin 0.8s linear infinite;
+    vertical-align: -2px;
+    margin-right: 7px;
+  }
   .help { font-size: .85rem; color: #777; margin-top: .4rem; }
   .help code { background: #efe7df; }
 

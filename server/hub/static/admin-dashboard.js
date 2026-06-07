@@ -234,10 +234,16 @@ async function refresh() {
       // slow path at most once per tick. Cache fallback `null` keeps
       // the rest of refresh() going if the summary call hiccups.
       const [pageRes, summaryRes] = await Promise.all([
-        _refreshJson('/jobs' + _q, { total: 0, jobs: [] }),
+        _refreshJson('/jobs' + _q, { total: 0, jobs: [], __fetchFailed: true }),
         _refreshJson('/jobs/summary', null),
       ]);
       jobs = pageRes;
+      // Mark the list as having loaded at least once so the table can tell
+      // "still loading" (→ spinner) apart from "loaded, 0 rows" (→ empty
+      // state). A failed/timed-out page carries __fetchFailed and is NOT
+      // counted as a load, so a slow/wedged hub keeps showing "Loading…"
+      // instead of flashing "no jobs yet".
+      if (jobs && !jobs.__fetchFailed) _jobsEverLoaded = true;
       if (summaryRes && summaryRes.by_status) {
         const _bs = summaryRes.by_status;
         const _setCnt = (id, n) => {
@@ -386,6 +392,11 @@ async function refresh() {
         // workers so the operator can tell at a glance which entries
         // are alive vs remembered.
         let statusBadge;
+        // When `updating`, the operator-controlled active/drain select
+        // is meaningless (the worker is mid self-update and will exit
+        // shortly anyway). Hide it so the row is less noisy and the
+        // operator doesn't accidentally try to override the update.
+        let hideStatusSelect = false;
         if (!alive) {
           statusBadge = `<span class="badge" style="background:#eee; color:#888; border-color:#ccc;">offline</span>`;
         } else if (w.pending_update_to) {
@@ -401,9 +412,30 @@ async function refresh() {
             + `style="background:#fff0c4; color:#8a5a00; border-color:#f5d77a;" `
             + `title="self-updating to ${esc(w.pending_update_to)}">`
             + `updating → ${esc(target)}</span>`;
+          hideStatusSelect = true;
         } else {
           statusBadge = `<span class="badge ${esc(status)}">${esc(status)}</span>`;
         }
+        // Resource cell formatter. Empty (0 from a pre-2026-06-06 worker)
+        // renders "—"; live values get a colour band keyed off the same
+        // thresholds the disk-pressure dispatcher uses (>=90% triggers
+        // pick_worker skip + worker-side job-fail + auto cleanup).
+        const _fmtPct = (v, opts) => {
+          opts = opts || {};
+          const warn = opts.warn != null ? opts.warn : 70;
+          const crit = opts.crit != null ? opts.crit : 90;
+          if (v == null || v <= 0) return '<span class="empty">—</span>';
+          const c = v >= crit ? '#c00' : (v >= warn ? '#a04a00' : '#444');
+          const bg = v >= crit ? '#fde7e7' : (v >= warn ? '#fff4d9' : 'transparent');
+          const title = opts.title ? ` title="${esc(opts.title)}"` : '';
+          return `<span${title} style="color:${c};background:${bg};padding:1px 5px;border-radius:3px;font-variant-numeric:tabular-nums;">${Math.round(v)}%</span>`;
+        };
+        const cpuCell = _fmtPct(w.cpu_pct);
+        const memCell = _fmtPct(w.mem_pct);
+        const diskTitle = (w.disk_free_gb != null && w.disk_free_gb > 0)
+          ? `${w.disk_free_gb.toFixed(1)} GB free`
+          : '';
+        const diskCell = _fmtPct(w.disk_pct, { title: diskTitle });
         const ageHint = (!alive && w.last_heartbeat)
           ? ` <small style="color:#aaa;" title="last seen ${esc(new Date(w.last_heartbeat*1000).toISOString())}">${esc(fmtAgoOrNever(new Date(w.last_heartbeat*1000).toISOString()))}</small>`
           : '';
@@ -414,20 +446,31 @@ async function refresh() {
         const deleteItem = alive
           ? `<button onclick="window.alert('Drain and disconnect this worker first.')" disabled title="worker still connected — drain it first">${ico('trash')} delete</button>`
           : `<button class="danger" onclick="window.deleteWorker('${wid}')">${ico('trash')} forget worker</button>`;
+        // worker_id is now an IP-derived w50<3-digit> (≤ 8 chars) per
+        // [[stable-worker-id]]; the old column width was set for the
+        // legacy hash-based ids and looked wide-empty. Tabular-nums +
+        // a compact size keeps it readable but narrow.
+        const widCell = `<code style="font-size:.88em;font-variant-numeric:tabular-nums;letter-spacing:-.02em;white-space:nowrap;">${wid}</code>`;
+        // When mid self-update, hide the active/drain selector entirely
+        // (just the badge stays) so the operator can't fight the rollout.
+        const statusInner = hideStatusSelect
+          ? statusBadge
+          : `${statusBadge}<select onchange="setWorkerStatus('${wid}', this.value)" ${selectDisabled}>${opts}</select>`;
         return `
         <tr${rowStyle}>
-          <td><code>${wid}</code>${hubBadge}${ageHint}</td>
+          <td>${widCell}${hubBadge}${ageHint}</td>
           <td>${address}</td>
           <td>
             <span class="wstat">
-              ${statusBadge}
-              <select onchange="setWorkerStatus('${wid}', this.value)" ${selectDisabled}>${opts}</select>
+              ${statusInner}
             </span>
           </td>
           <td>${w.in_flight} / ${w.capacity}</td>
+          <td>${cpuCell}</td>
+          <td>${memCell}</td>
+          <td>${diskCell}</td>
           <td>${profilesCell}</td>
           <td>${version}</td>
-          <td>${esc(Object.entries(w.labels || {}).map(([k,v]) => `${k}=${v}`).join(', '))}</td>
           <td>
             <div class="menu-wrap">
               <button class="action-btn" onclick="window.toggleWorkerMenu(this, '${wid}')" title="worker actions">${ICONS.moreV}</button>
@@ -460,12 +503,21 @@ async function refresh() {
     // SessionInfo records which (worker, lane) is in use.
     // Normalise jobs response: API now returns {jobs:[...], total, ...}
     // but keep compat with the legacy bare-array response.
-    // When not on the Jobs tab we only fetched ?limit=1 (header count),
-    // so skip the table/chip work entirely -- the panel is hidden anyway
-    // and the next refresh after switching to #jobs repopulates it.
-    const jobList = jobsTabActive
-      ? (Array.isArray(jobs) ? jobs : (jobs.jobs || []))
-      : [];
+    // On the Jobs tab we already fetched the full page. On #screens the
+    // jobs TABLE is hidden, but the GRID still needs the running jobs to
+    // flip each lane's RUNNING / KEEPALIVE / IDLE badge (it maps by
+    // worker_id + lane_idx). /overview only carries a job COUNT, so fetch
+    // the small running set here -- otherwise every tile reads IDLE even
+    // while lanes are busy. Other tabs need neither, so stay empty.
+    let jobList = [];
+    if (jobsTabActive) {
+      jobList = Array.isArray(jobs) ? jobs : (jobs.jobs || []);
+    } else if (_tab === 'screens') {
+      try {
+        const rj = await _refreshJson('/jobs?status=running&limit=1000', { jobs: [] });
+        jobList = Array.isArray(rj) ? rj : (rj.jobs || []);
+      } catch (_) { jobList = []; }
+    }
     syncScreenshotBusyState(jobList, sessions.sessions || []);
     sortScreenshotGrid();
 
@@ -526,8 +578,29 @@ async function refresh() {
       // either, so the next clean tick re-renders even if the user closed
       // the menu while the data was changing.
     } else if (sorted.length === 0) {
-      if (_jobsLastSig !== '__empty__') {
-        jtbody.innerHTML = '<tr><td colspan=10 class="empty">no jobs yet</td></tr>';
+      // Three distinct zero-row situations -- don't lump them into one
+      // misleading "no jobs yet":
+      //   • first page hasn't arrived yet, or it failed/timed-out and we
+      //     never had data        → "Loading…" spinner
+      //   • fetch failed this tick but we HAD rows before (transient hub
+      //     hiccup / wedged hub)  → keep the last rows, don't flash empty
+      //   • fetch OK, genuinely 0 → "no jobs yet"
+      const _tr = (k, fb) => (window.i18next && window.i18next.t)
+        ? window.i18next.t(k, { defaultValue: fb }) : fb;
+      const fetchFailed = !!(jobs && jobs.__fetchFailed);
+      if (fetchFailed && _jobsEverLoaded) {
+        // transient miss after a good load: leave existing rows untouched
+        // and DON'T restamp _jobsLastSig, so the next good tick redraws.
+      } else if (!_jobsEverLoaded) {
+        if (_jobsLastSig !== '__loading__') {
+          jtbody.innerHTML = '<tr><td colspan=10 class="empty loading-row" data-i18n="jobs.loading">'
+            + _tr('jobs.loading', 'Loading…') + '</td></tr>';
+          _jobsLastSig = '__loading__';
+          didStructuralUpdate = true;
+        }
+      } else if (_jobsLastSig !== '__empty__') {
+        jtbody.innerHTML = '<tr><td colspan=10 class="empty" data-i18n="jobs.empty">'
+          + _tr('jobs.empty', 'no jobs yet') + '</td></tr>';
         _jobsLastSig = '__empty__';
         didStructuralUpdate = true;
       }
@@ -664,6 +737,10 @@ let _jobsPage = 0;
 // 800-job operator on a 2 s poll: ~50× fewer DOM teardown/rebuild
 // cycles on a steady-state page where nothing structurally changed.
 let _jobsLastSig = '';
+// True once the Recent Jobs page has come back successfully at least once.
+// Until then (or while a fetch is failing on first load) the empty table
+// shows a "Loading…" spinner instead of the misleading "no jobs yet".
+let _jobsEverLoaded = false;
 // W: status filter for the Recent Jobs table. One of:
 //   'all' | 'completed' | 'failed' | 'running'
 // Always defaults to "全部" (all) on page load -- operators expect

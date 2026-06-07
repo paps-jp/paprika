@@ -62,6 +62,7 @@ from .nav import (  # noqa: F401
     forward,
     history_first,
     navigate,
+    wait_for_load,
 )
 from .response import (  # noqa: F401
     _VAR_PLACEHOLDER_RE,

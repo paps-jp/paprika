@@ -17,6 +17,58 @@ from nodriver import cdp
 from ._base import *  # noqa: F401,F403
 from ._base import LogFn, NAVIGATION_SETTLE_S, short_error
 
+# Ceiling for how long a navigation waits for the document to finish
+# parsing before proceeding anyway. Kept comfortably under the hub's 60s
+# start_session timeout so a session open (which waits for load too) never
+# trips it. Env-overridable for slow / ad-heavy fleets.
+NAV_LOAD_TIMEOUT_S = float(os.environ.get("AGENT_NAV_LOAD_TIMEOUT_S", "20.0"))
+
+
+async def wait_for_load(tab, log: Optional[LogFn] = None, *, timeout_s: Optional[float] = None) -> None:
+    """Block until the tab's document has finished parsing
+    (``document.readyState`` is ``interactive`` or ``complete``) or
+    ``timeout_s`` elapses.
+
+    This is what makes a navigation actually WAIT: ``page.goto`` / a
+    session's ``initial_url`` used to fire ``cdp.page.navigate`` and return
+    after a fixed sleep, so ``page.click(...)`` ran against a page that was
+    still loading (selector ``NO_MATCH``). Polling readyState here means the
+    nav returns only once the DOM is queryable.
+
+    Best-effort: returns (never raises) on timeout so a slow / ad-heavy page
+    still proceeds. Uses ``tab.evaluate`` (NOT ``tab.get()``) so the
+    network.* listeners installed for session asset capture stay bound --
+    the whole reason the low-level ``cdp.page.navigate`` is used. Mirrors the
+    readyState poll on the fetch path (core/fetcher.py).
+    """
+    if timeout_s is None:
+        timeout_s = NAV_LOAD_TIMEOUT_S
+    # Small lead so we don't read the OUTGOING document's stale readyState
+    # (about:blank / the previous page can still report 'complete' for a
+    # tick after page.navigate() before the new load commits).
+    try:
+        await asyncio.sleep(0.15)
+    except Exception:
+        pass
+    deadline = time.monotonic() + max(0.0, timeout_s)
+    while time.monotonic() < deadline:
+        try:
+            ready = await tab.evaluate("document.readyState")
+        except Exception as e:
+            # -32000 "Inspected target navigated or closed" fires WHILE the
+            # navigation is committing -- the page IS loading, keep polling.
+            m = str(e).lower()
+            if "-32000" in m or "navigat" in m or "closed" in m or "detached" in m:
+                await asyncio.sleep(0.1)
+                continue
+            return  # unexpected eval error -> let the caller proceed
+        if ready in ("interactive", "complete"):
+            return
+        await asyncio.sleep(0.1)
+    if log:
+        log(f"  [agent] wait_for_load: document not ready after {timeout_s:.0f}s; proceeding")
+
+
 async def navigate(tab, url: str, log: LogFn) -> str:
     """Load ``url`` in the current tab. Returns ``"OK"`` once the
     initial response arrives and ``NAVIGATION_SETTLE_S`` has elapsed.

@@ -1,0 +1,394 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+<meta charset="utf-8">
+<title>管理画面ガイド — Paprika の Web UI でブラウザ自動化を実行</title>
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<link rel="stylesheet" href="style.css">
+<meta name="description" content="Paprika 管理画面（Web UI）の使い方。コードを書かずに URL を投げ、ライブパネルで Log / noVNC / ギャラリーを確認。実行モード（Fetch / Script / AI）、ワーカー一覧、Live preview をスクショ付きで解説。">
+<link rel="canonical" href="https://paps-jp.github.io/paprika/admin.html">
+<meta property="og:type" content="website">
+<meta property="og:site_name" content="Paprika">
+<meta property="og:title" content="管理画面ガイド — Paprika の Web UI でブラウザ自動化を実行">
+<meta property="og:description" content="Paprika 管理画面（Web UI）の使い方。コードを書かずに URL を投げ、ライブパネルで Log / noVNC / ギャラリーを確認。実行モード（Fetch / Script / AI）、ワーカー一覧、Live preview をスクショ付きで解説。">
+<meta property="og:url" content="https://paps-jp.github.io/paprika/admin.html">
+<meta property="og:image" content="https://paps-jp.github.io/paprika/img/admin-submit.png">
+<meta property="og:locale" content="ja_JP">
+<meta name="twitter:card" content="summary_large_image">
+<meta name="twitter:title" content="管理画面ガイド — Paprika の Web UI でブラウザ自動化を実行">
+<meta name="twitter:description" content="Paprika 管理画面（Web UI）の使い方。コードを書かずに URL を投げ、ライブパネルで Log / noVNC / ギャラリーを確認。実行モード（Fetch / Script / AI）、ワーカー一覧、Live preview をスクショ付きで解説。">
+<meta name="twitter:image" content="https://paps-jp.github.io/paprika/img/admin-submit.png">
+<script type="application/ld+json">{
+  "@context": "https://schema.org",
+  "@type": "Organization",
+  "name": "特定非営利活動法人ぱっぷす",
+  "alternateName": ["paps", "PAPS", "ぱっぷす"],
+  "url": "https://www.paps.jp",
+  "logo": "https://paps-jp.github.io/paprika/icon.svg",
+  "sameAs": [
+    "https://github.com/paps-jp",
+    "https://paps-jp.github.io/paprika/"
+  ]
+}</script>
+</head>
+<body>
+
+<nav class="topnav">
+  <a class="brand" href="index.html"><span class="logo"><img src="icon.svg" alt=""></span> Paprika</a>
+  <span class="links">
+    <span class="dropdown">
+      <a class="dropdown-toggle" href="why-paprika.html">はじめに ▾</a>
+      <span class="dropdown-menu">
+        <a href="why-paprika.html">なぜ Paprika?</a>
+        <a href="intro.html">Client インストール</a>
+        <a href="quickstart.html">Server インストール</a>
+      </span>
+    </span>
+    <span class="dropdown">
+      <a class="dropdown-toggle" href="guides.html">学ぶ ▾</a>
+      <span class="dropdown-menu">
+        <a href="guides.html">ガイド</a>
+        <a href="examples.html">サンプル</a>
+        <a href="usecases.html">ユースケース</a>
+        <a href="video.html">動画</a>
+        <a href="faq.html">FAQ</a>
+      </span>
+    </span>
+    <span class="dropdown">
+      <a class="dropdown-toggle active" href="api.html">リファレンス ▾</a>
+      <span class="dropdown-menu">
+        <a href="api.html">API</a>
+        <a href="http-api.html">HTTP API</a>
+        <a href="cli.html">CLI</a>
+        <a href="job-options.html">JobOptions</a>
+        <a href="walk.html">walk（巡回）</a>
+        <a href="locator.html">Locator（要素指定）</a>
+        <a href="ws-events.html">WebSocket（ライブログ）</a>
+        <a href="errors.html">エラー一覧</a>
+        <a href="bridge-extension.html">Bridge 拡張</a>
+        <a href="profile.html">use_profile</a>
+        <a href="host-recipe.html">Host レシピ</a>
+        <a href="admin.html" class="active">管理画面</a>
+      </span>
+    </span>
+    <a href="operations.html">運用</a>
+    <a href="architecture.html">設計</a>
+  </span>
+  <a class="gh" href="search.html" title="サイト内検索" aria-label="サイト内検索" style="padding:5px 10px; margin-right:6px;"><iconify-icon icon="lucide:search" style="font-size:1.05rem; vertical-align:-3px;"></iconify-icon></a>
+  <a class="gh" href="https://github.com/paps-jp/paprika">GitHub ↗</a>
+</nav>
+
+
+<div class="layout">
+  <aside class="sidebar">
+    <h4>管理画面ガイド</h4>
+    <ul>
+      <li><a href="#access">開く</a></li>
+      <li><a href="#header">ヘッダー</a></li>
+      <li><a href="#tabs">タブ一覧</a></li>
+      <li><a href="#submit">Submit（送信）</a></li>
+      <li><a href="#live">Live パネル</a></li>
+      <li><a href="#jobs">Recent jobs</a></li>
+      <li><a href="#workers">Workers</a></li>
+      <li><a href="#screens">Live preview</a></li>
+      <li><a href="#registries">レジストリ各種</a></li>
+      <li><a href="#knowledge">AI Knowledge</a></li>
+      <li><a href="#plugins">Plugins</a></li>
+      <li><a href="#settings">Settings</a></li>
+    </ul>
+  </aside>
+
+  <main class="content">
+    <h1>管理画面ガイド</h1>
+    <p class="lead">ブラウザだけで Paprika を操作できる管理 UI の使い方。コードを書かずに URL を投げ、進行をライブで見て、収集物を確認できます。</p>
+
+    <img class="shot" src="img/admin-submit.png" alt="Paprika 管理画面の実行（Submit）タブ">
+    <p class="shot-cap">実行（Submit）タブ。上の赤いヘッダー＋タブが管理画面。</p>
+
+    <!-- ================================================================ -->
+    <h2 id="access">開く</h2>
+    <p>ブラウザで <strong><code>http://&lt;hub&gt;:8000</code></strong> を開きます。
+    赤いヘッダーと、その下のタブが管理画面です。右上の言語切替で日本語 / English を切り替えられます。</p>
+    <div class="callout info"><strong>3 つの操作経路</strong>
+    管理画面（このページ）/ <a href="api.html">HTTP API・SDK</a> / Swagger（<code>/docs</code>）はどれも同じハブを操作します。まずは管理画面が手軽です。</div>
+
+    <!-- ================================================================ -->
+    <h2 id="header">ヘッダー</h2>
+    <p>画面上部に固定される赤いバー。</p>
+    <img class="shot" src="img/cap-header.png" alt="管理画面ヘッダー">
+    <table>
+      <thead><tr><th>要素</th><th>意味</th></tr></thead>
+      <tbody>
+        <tr><td><strong>Paprika</strong></td><td>ロゴ。クリックで Submit へ戻る</td></tr>
+        <tr><td>ステータス</td><td>ハブとの接続状態（store / workers / jobs / sessions 数）</td></tr>
+        <tr><td>Manual</td><td>このマニュアル（GitHub Pages）を新規タブで開く</td></tr>
+        <tr><td>言語切替</td><td>日本語 / English</td></tr>
+      </tbody>
+    </table>
+
+    <!-- ================================================================ -->
+    <h2 id="tabs">タブ一覧</h2>
+    <p>ヘッダー直下のタブで画面を切り替えます。各タブはURL の <code>#hash</code> に対応（例 <code>/#jobs</code>）し、ブックマーク・直リンク可能。数字バッジは件数。</p>
+    <img class="shot" src="img/cap-tabs.png" alt="管理画面のタブバー">
+
+    <h3>常時表示タブ</h3>
+    <table>
+      <thead><tr><th>タブ</th><th>何ができるか</th></tr></thead>
+      <tbody>
+        <tr><td><strong>実行</strong>（Submit）</td><td>URL とモードを指定してジョブを投入。既定の入口</td></tr>
+        <tr><td><strong>ワーカー</strong>（Workers）</td><td>接続中ワーカーの一覧・状態・レーン使用状況</td></tr>
+        <tr><td><strong>最近のジョブ</strong>（Recent jobs）</td><td>投入済みジョブの一覧・状態・成果物への導線</td></tr>
+        <tr><td><strong>定義済みジョブ</strong>（Presets）</td><td>よく使う実行設定を保存して再投入（名前・カテゴリで検索可）</td></tr>
+        <tr><td><strong>ライブプレビュー</strong>（Live preview）</td><td>全レーンのライブ画面をタイル表示</td></tr>
+      </tbody>
+    </table>
+
+    <h3>「…その他」メニュー内</h3>
+    <table>
+      <thead><tr><th>タブ</th><th>何ができるか</th></tr></thead>
+      <tbody>
+        <tr><td>Sessions</td><td>生きているセッション（対話的ブラウザ）一覧・操作</td></tr>
+        <tr><td>Hosts</td><td>ホスト別の Cookie / ログイン情報 / レシピの管理</td></tr>
+        <tr><td>Chrome Settings（Profiles）</td><td>アップロード済み Chrome プロファイル</td></tr>
+        <tr><td>Chrome Extensions</td><td>ワーカー Chrome に入れる拡張</td></tr>
+        <tr><td>AI Engines</td><td>LLM / VLM バックエンドの登録</td></tr>
+        <tr><td>AI Knowledge</td><td>ホスト別の学習知識（バリア検出・抽出手法・信頼度）</td></tr>
+        <tr><td>Plugins</td><td>インストール済みプラグインの一覧・呼び出し履歴</td></tr>
+        <tr><td>Settings</td><td>ハブ全体の設定（最小ファイルサイズ等）</td></tr>
+      </tbody>
+    </table>
+
+    <!-- ================================================================ -->
+    <h2 id="submit">実行（Submit）</h2>
+    <p>URL を入れて <strong>実行モード</strong>を選び <strong>実行</strong>。投入すると下に Live パネルが開きます。モードは 3 つ：</p>
+    <img class="shot" src="img/cap-modes.png" alt="実行モードの選択（Fetch / Script / AI）">
+    <p class="shot-cap">実行モードのカード。クリックで切り替えできます。</p>
+    <table>
+      <thead><tr><th>モード</th><th>内部 mode</th><th>用途</th></tr></thead>
+      <tbody>
+        <tr><td><strong>Fetch</strong></td><td><code>fetch</code></td><td>単発ページ取得。URL を開いて画像・動画・HTML を収集（LLM 不要・最速）。スクロール / 動画ダウンロード / Cookie 注入などのオプションあり</td></tr>
+        <tr><td><strong>Script</strong></td><td><code>rerun</code></td><td>2 つのサブモードを持つ：<br>
+          <strong>Code</strong> — paprika-client の Python を直接貼り付けて 1 回実行（過去ジョブの再実行も）<br>
+          <strong>Macro</strong> — UI でアクション（クリック / 入力 / スクロール等）を順に並べる簡易マクロ。LLM 不要で即実行</td></tr>
+        <tr><td><strong>AI</strong></td><td><code>codegen-loop</code></td><td>自然言語のゴールを渡すと LLM がスクリプト生成 → sandbox 実行 → Judge 判定 → 失敗時リトライ</td></tr>
+      </tbody>
+    </table>
+    <p>CSS セレクタが効かない画面を「見て」操作させたいときは、AI モードで生成されるスクリプト内から <code>page.agent("…を探してクリック")</code>（VLM ビジョンエンジン）を呼べます。</p>
+    <div class="callout tip"><strong>Fetch のレシピ再生</strong>
+    HostRegistry にレシピ（actions）が登録されたホストの場合、Fetch は自動的にレシピのアクションを再生します（Cookie 同意ダイアログのクリックなど）。Raw（レシピ無視）/ Recipe（レシピ適用）をラジオで切り替え可能。</div>
+    <div class="callout tip"><strong>最小ファイルサイズ</strong>
+    小さなアイコン等を除外したいときは Fetch オプション（または Settings の既定値）でバイト数を指定。<code>0</code> = フィルタ無効。</div>
+
+    <!-- ================================================================ -->
+    <h2 id="live">Live パネル</h2>
+    <p>ジョブ投入直後や「watch live」から開く、実行中のジョブを観察するパネル。上部に LIVE バッジ・ジョブID・ステータス・収集数が表示され、その下のタブで見方を切り替えます。</p>
+    <img class="shot" src="img/cap-gallery.png" alt="Live パネルのギャラリータブ（収集画像のサムネイル）">
+    <p class="shot-cap">Live パネルの「ギャラリー」タブ。収集した画像のサムネイルが並ぶ。</p>
+    <table>
+      <thead><tr><th>タブ</th><th>内容</th></tr></thead>
+      <tbody>
+        <tr><td><strong>ログ</strong>（Log）</td><td>ライブログ（<code>tail -f</code> 相当）。paprika-client の各操作と結果が 1 行にまとまって流れる</td></tr>
+        <tr><td><strong>noVNC</strong></td><td>実行中の実ブラウザをそのまま表示・手動操作も可能（複数セッション時はタブ切替）</td></tr>
+        <tr><td><strong>スクリーンショット</strong>（Screenshot）</td><td>各ステップで撮られたスクショ一覧</td></tr>
+        <tr><td><strong>リンク</strong>（Links）</td><td>ページから抽出した <code>&lt;a href&gt;</code> 一覧</td></tr>
+        <tr><td><strong>ネットワーク</strong>（Network）</td><td>読み込んだメディアのネットワークログ（URL / MIME / サイズ）</td></tr>
+        <tr><td><strong>コード</strong>（Code）</td><td>codegen が生成した script.py / 各 attempt（プロンプト・LLM応答・Judge判定も閲覧可）</td></tr>
+        <tr><td><strong>ギャラリー</strong>（Gallery）</td><td>収集された画像・動画・音声のサムネイル</td></tr>
+      </tbody>
+    </table>
+    <p>Live パネルのアクションボタン：</p>
+    <ul>
+      <li><strong>Screenshot</strong> — 実行中のブラウザの現在画面をスクリーンショット撮影</li>
+      <li><strong>Download video</strong> — yt-dlp で現在ページの動画をダウンロード</li>
+      <li><strong>Refresh</strong> — keep_session 中のブラウザから最新の HTML / アセットを再取得</li>
+    </ul>
+
+    <!-- ================================================================ -->
+    <h2 id="jobs">最近のジョブ（Recent jobs）</h2>
+    <p>投入済みジョブの一覧。ページネーション対応の API から取得（<code>GET /jobs?offset=0&amp;limit=50</code>）。</p>
+    <img class="shot" src="img/cap-jobs.png" alt="最近のジョブ一覧">
+    <p class="shot-cap">最近のジョブ。</p>
+
+    <h3>カラムトグル</h3>
+    <p><strong>columns</strong> ボタンで表示する列を選択できます。選択状態はブラウザに保存されます。</p>
+    <table>
+      <thead><tr><th>列</th><th>内容</th></tr></thead>
+      <tbody>
+        <tr><td>id</td><td>ジョブ ID（短縮表示）</td></tr>
+        <tr><td>mode</td><td>実行モード（fetch / codegen-loop / rerun）</td></tr>
+        <tr><td>status</td><td>状態（queued / running / completed / failed / cancelled）</td></tr>
+        <tr><td>URL</td><td>対象 URL</td></tr>
+        <tr><td>assets</td><td>収集したアセット数</td></tr>
+        <tr><td>worker</td><td>実行ワーカー / レーン番号</td></tr>
+        <tr><td>started</td><td>開始日時</td></tr>
+        <tr><td>ended</td><td>終了日時</td></tr>
+        <tr><td>duration</td><td>所要時間（デフォルト非表示）</td></tr>
+        <tr><td>actions</td><td>操作メニュー</td></tr>
+      </tbody>
+    </table>
+
+    <h3>行の actions メニュー</h3>
+    <p>各行の「…」ボタンから開く操作メニュー：</p>
+    <ul>
+      <li><strong>watch live</strong> — Submit タブの Live パネルをこのジョブに接続（Log / noVNC / Code / Gallery）</li>
+      <li><strong>live log (tail -f)</strong> — ライブログを新規タブで表示</li>
+      <li><strong>screenshots</strong> — アセットギャラリーを新規タブで表示</li>
+      <li><strong>raw log file</strong> — 生ログファイルを表示</li>
+      <li><strong>result JSON</strong> — JobResult JSON を表示</li>
+      <li><strong>save cookies → host</strong> — 実行中 Fetch のブラウザ Cookie を HostRegistry に保存（セッション存在時のみ表示）</li>
+      <li><strong>recipe として保存</strong> — このジョブのアクション履歴を HostRegistry のレシピとして登録</li>
+      <li><strong>rerun</strong> — 同じ設定でジョブを再実行</li>
+      <li><strong>attach next job here</strong> — 次のジョブでこのレーンを再利用（keep_session 時）</li>
+      <li><strong>delete</strong> — ジョブとデータを削除</li>
+    </ul>
+
+    <h3>一括操作</h3>
+    <ul>
+      <li><strong>cleanup old…</strong> — 古い完了ジョブを一括削除（最新 10 件は常に保持、日数・サイズでフィルタ可、dry run 対応）</li>
+      <li><strong>delete all</strong> — 全ジョブを削除</li>
+    </ul>
+
+    <!-- ================================================================ -->
+    <h2 id="workers">ワーカー（Workers）</h2>
+    <p>接続中のワーカー一覧。各ワーカーのレーン数・実行中ジョブ数・状態が見えます。切断済みワーカーはグレーアウトして下に表示されます。</p>
+    <img class="shot" src="img/cap-workers.png" alt="ワーカー一覧">
+
+    <h3>状態切替</h3>
+    <p>各ワーカーの状態をドロップダウンで切り替え：</p>
+    <ul>
+      <li><strong>active</strong> — 新規ジョブを受け付ける</li>
+      <li><strong>drain</strong> — 実行中のジョブは完了させるが、新規は受け付けない（安全な更新時に使用）</li>
+      <li><strong>standby</strong> — 待機（ジョブを受け付けない）</li>
+    </ul>
+
+    <h3>詳細モーダル</h3>
+    <p>各行の「…」→「詳細」で、ワーカーの詳細情報モーダルが開きます。</p>
+    <ul>
+      <li><strong>基本情報</strong> — ワーカー ID / 状態 / アドレス / 負荷 / バージョン / プロファイル / ラベル</li>
+      <li><strong>アクティビティログ</strong> — 最近の操作履歴（タイムスタンプ・ログレベル別に色分け表示）</li>
+      <li><strong>共有リンク</strong> — ブックマーク可能な URL（<code>#workers/&lt;worker_id&gt;</code>）をコピー</li>
+    </ul>
+    <p>切断済みワーカーは「forget worker」で一覧から削除できます。</p>
+    <p>レーンが空いているワーカーがいないと新規ジョブは 503（混雑時）になります。詳しくは <a href="operations.html#update">サーバー → 更新・フリート運用</a>。</p>
+
+    <!-- ================================================================ -->
+    <h2 id="screens">ライブプレビュー（Live preview）</h2>
+    <p>フリート全レーンのライブ画面をタイル表示。グリッドのカラム数を選択可能。状態は 3 色：</p>
+    <ul>
+      <li><span class="badge" style="color:#c0392b;">● RUNNING</span> — スクリプト操作 / noVNC 操作が進行中</li>
+      <li><span class="badge" style="color:#a07000;">● KEEPALIVE</span> — 生きているが誰も触っていない（セッション保持中）</li>
+      <li><span class="badge">IDLE</span> — 閉じられ回収済み（レーン解放）</li>
+    </ul>
+
+    <!-- ================================================================ -->
+    <h2 id="registries">レジストリ各種</h2>
+    <table>
+      <thead><tr><th>タブ</th><th>使いどころ</th></tr></thead>
+      <tbody>
+        <tr><td><strong>Sessions</strong></td><td>生きているセッション一覧。セッション ID / ワーカー / 作成時刻 / 最終アクティブ / TTL を表示。手動で閉じることも可能</td></tr>
+        <tr><td><strong>Hosts</strong></td><td>会員サイトのログイン後 Cookie を保存。以後の収集で <code>cookies_from</code> 指定すれば自動再利用。ホスト名で検索可能。レシピ（actions）の登録・管理も</td></tr>
+        <tr><td><strong>Profiles</strong></td><td>ログイン済み Chrome プロファイルをアップロードし <code>use_profile</code> で利用。デフォルトプロファイルの設定も</td></tr>
+        <tr><td><strong>Extensions</strong></td><td>uBlock 等の拡張をワーカー Chrome に配布</td></tr>
+        <tr><td><strong>AI Engines</strong></td><td>codegen / vision に使う LLM・VLM の接続先を登録（OpenAI 互換 / Anthropic / ローカル等）</td></tr>
+      </tbody>
+    </table>
+
+    <!-- ================================================================ -->
+    <h2 id="knowledge">AI Knowledge</h2>
+    <p>「…その他」メニューから開く。ホストごとに蓄積された AI の学習知識を閲覧・管理するタブ。Paprika が過去のジョブ実行から自動的に学習した「各サイトの攻略情報」をまとめたデータベースです。</p>
+    <img class="shot" src="img/cap-knowledge.png" alt="AI Knowledge タブ（ホスト別の信頼度・バリア・抽出手法一覧）">
+    <p class="shot-cap">AI Knowledge タブ。ホストごとの信頼度・バリア・抽出手法が一覧で確認できる。</p>
+
+    <h3>サマリーバッジ</h3>
+    <p>画面上部に全体の統計バッジが並びます：</p>
+    <table>
+      <thead><tr><th>バッジ</th><th>内容</th></tr></thead>
+      <tbody>
+        <tr><td><strong>N ホスト</strong></td><td>学習済みホストの総数</td></tr>
+        <tr><td><strong>high / medium / low</strong></td><td>信頼度別のホスト数。high = 成功率が高く安定、low = 未検証または成功率が低い</td></tr>
+        <tr><td><strong>stale</strong></td><td>長期間更新がないホスト</td></tr>
+        <tr><td><strong>barriers 学習済</strong></td><td>アクセス障壁（Cloudflare / 認証画面等）が検出・記録されたホスト数</td></tr>
+        <tr><td><strong>extractions 学習済</strong></td><td>抽出手法（CSS セレクタ / XPath 等）が記録されたホスト数</td></tr>
+      </tbody>
+    </table>
+
+    <h3>AI Insights パネル</h3>
+    <p>バッジ下に表示される 4 枚のカード。Shadow Judge（Phase 3-6）と R1 Distiller の動作状態を表示：</p>
+    <ul>
+      <li><strong>JUDGE 判定ペア数</strong> — shadow モードで旧 Judge / R1 Judge の両方が判定したペア数</li>
+      <li><strong>一致率</strong> — 旧 Judge と R1 の判定一致率（高いほど R1 への切替が安全）</li>
+      <li><strong>R1 DISTILLER の最近の更新</strong> — 直近 24h で Distiller が更新した知識エントリ数</li>
+      <li><strong>R1 が学習に貢献したホスト</strong> — Distiller が知識を生成したユニークホスト数</li>
+    </ul>
+
+    <h3>ホスト一覧テーブル</h3>
+    <table>
+      <thead><tr><th>列</th><th>内容</th></tr></thead>
+      <tbody>
+        <tr><td><strong>ホスト</strong></td><td>対象サイトのドメイン名</td></tr>
+        <tr><td><strong>信頼度</strong></td><td>tier バッジ（<span class="badge" style="background:#d4edda;color:#155724;">high</span> / <span class="badge" style="background:#fff3cd;color:#856404;">medium</span> / <span class="badge" style="background:#f8d7da;color:#721c24;">low</span>）</td></tr>
+        <tr><td><strong>ジョブ数</strong></td><td>このホストへの累計ジョブ実行回数</td></tr>
+        <tr><td><strong>成功率</strong></td><td>ジョブの成功率（%）</td></tr>
+        <tr><td><strong>barriers</strong></td><td>検出されたアクセス障壁のタグ（<code>cloudflare_challenge</code> / <code>login_wall</code> 等）</td></tr>
+        <tr><td><strong>extractions</strong></td><td>学習済みの抽出ルール（CSS / XPath / カスタムロジック）</td></tr>
+        <tr><td><strong>最終更新</strong></td><td>知識が最後に更新された相対時刻</td></tr>
+        <tr><td><strong>更新元</strong></td><td>知識の生成元（<code>distiller-light</code> = 軽量自動蒸留 / <code>distiller-r1</code> = R1 による深い分析）</td></tr>
+      </tbody>
+    </table>
+    <p>ホスト名フィルタと信頼度ソートで絞り込み可能。以前の「Skills / Conventions」タブはこの Knowledge に統合され、R1 Distiller によって自動メンテナンスされます。</p>
+
+    <!-- ================================================================ -->
+    <h2 id="plugins">Plugins</h2>
+    <p>「…その他」メニューから開く。インストール済みプラグインの一覧と呼び出し履歴を管理するタブ。プラグインはジョブ実行時に capability ベースで自動起動されます。</p>
+    <img class="shot" src="img/cap-plugins.png" alt="Plugins タブ（プラグイン一覧と呼び出し履歴）">
+    <p class="shot-cap">Plugins タブ。インストール済みプラグインの capability・呼び出し履歴が確認できる。</p>
+
+    <h3>サマリーバッジ</h3>
+    <table>
+      <thead><tr><th>バッジ</th><th>内容</th></tr></thead>
+      <tbody>
+        <tr><td><strong>N インストール済</strong></td><td>有効なプラグイン数</td></tr>
+        <tr><td><strong>N カタログ登録</strong></td><td>カタログ（<code>data/tools/catalog.json</code>）に登録されたプラグイン数</td></tr>
+        <tr><td><strong>N 呼び出し記録</strong></td><td>累計の呼び出し回数</td></tr>
+        <tr><td><strong>成功率</strong></td><td>呼び出しの成功率</td></tr>
+      </tbody>
+    </table>
+
+    <h3>自動起動の仕組み</h3>
+    <div class="callout info"><strong>capability ベースのマッチング</strong>
+    ジョブ投入時、Hub は対象ホストの AI Knowledge（barriers）を参照し、<code>per_page.barriers.&lt;kind&gt;.suggested_tool</code> に設定された capability を持つプラグインを pre-flight で呼び出します。例えば <code>cloudflare_challenge</code> バリアが検出されたホストでは、その capability を持つプラグインが自動的に起動します。</div>
+
+    <h3>プラグイン一覧テーブル</h3>
+    <table>
+      <thead><tr><th>列</th><th>内容</th></tr></thead>
+      <tbody>
+        <tr><td><strong>状態</strong></td><td>インストール状態（✓ インストール済 / カタログのみ）</td></tr>
+        <tr><td><strong>名前</strong></td><td>プラグイン名とバージョン</td></tr>
+        <tr><td><strong>カテゴリ</strong></td><td>プラグインの分類（<code>cloudflare_bypass</code> / <code>video_extraction</code> 等）</td></tr>
+        <tr><td><strong>説明</strong></td><td>プラグインの機能説明</td></tr>
+        <tr><td><strong>機能（capabilities）</strong></td><td>提供する capability タグ一覧。Hub はこのタグでマッチングする</td></tr>
+        <tr><td><strong>最終呼び出し / 直近成功</strong></td><td>最後に呼び出された日時と直近の成功日時</td></tr>
+        <tr><td><strong>詳細</strong></td><td>設定ファイル・依存関係・詳細ログを確認</td></tr>
+      </tbody>
+    </table>
+
+    <h3>呼び出し履歴</h3>
+    <p>ページ下部に pre-flight / 手動 / ジョブ起動すべての呼び出し記録が表示されます。時刻 / プラグイン名 / アクション / 結果 / 所要時間 / 対象ホスト・ジョブ / 呼び出し元を確認できます。</p>
+
+    <!-- ================================================================ -->
+    <h2 id="settings">Settings</h2>
+    <p>「…その他」メニューから開く。ハブ全体のデフォルト設定。</p>
+    <img class="shot" src="img/cap-settings.png" alt="Settings タブ（Submit デフォルト / 学習動作）">
+    <p class="shot-cap">Settings タブ。Submit のデフォルトや codegen の動作を設定できます。</p>
+    <ul>
+      <li>Submit のデフォルトオプション（最小ファイルサイズ / スクロール / 待機秒数等）</li>
+      <li>codegen の学習動作設定</li>
+      <li>デフォルトプロファイル</li>
+    </ul>
+
+    <div class="callout info"><strong>同じことを自動化したい</strong>
+    管理画面でできる「URL を投げて画像を取得する」「ログインして Cookie を保存」などは、すべて <a href="api.html">SDK / API</a> から実行できます。手順が固まったらスクリプト化を。MCP サーバ経由で Claude Code からも全 API を操作可能です。</div>
+  </main>
+</div>
+</body>
+</html>

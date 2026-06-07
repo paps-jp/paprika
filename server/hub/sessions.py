@@ -129,6 +129,19 @@ def session_from_json(d: dict) -> SessionInfo:
     )
 
 
+async def _disconnect_novnc_for(session_id: str) -> None:
+    """Force-close any open noVNC viewer bridges for a session being removed, so
+    a viewer doesn't linger on the (reused) lane and end up showing the NEXT
+    job. Lazy import avoids a module cycle (novnc → _state → sessions).
+    Best-effort + idempotent: close_session already disconnects on its own path,
+    and closing already-closed bridges is a no-op."""
+    try:
+        from server.hub.routes.novnc import _disconnect_session_novnc_clients
+        await _disconnect_session_novnc_clients(session_id)
+    except Exception:
+        pass
+
+
 class SessionRegistry:
     """In-process map of active Sessions on this hub.
 
@@ -308,6 +321,20 @@ class SessionRegistry:
         info = self._sessions.pop(session_id, None)
         if info is not None:
             self._schedule(self._redis_del(session_id))
+            # Tear down any open noVNC viewer bridges so an operator watching
+            # this session doesn't linger on the lane (Chrome is reused across
+            # jobs) and see the NEXT job. THE chokepoint: job-completion /
+            # worker-done teardowns (workers.py, lifecycle.py, _redrive.py,
+            # _jobrunner.py) all call remove() directly, bypassing
+            # close_session's own disconnect. NB: NOT via _schedule() — that
+            # no-ops when redis is unbound, but the noVNC disconnect is local
+            # and must fire regardless of redis. Fire-and-forget on the loop;
+            # cleanly skipped when there's no running loop (sync tests).
+            _nc = _disconnect_novnc_for(session_id)
+            try:
+                asyncio.get_running_loop().create_task(_nc)
+            except RuntimeError:
+                _nc.close()
         return info
 
     def all(self) -> list[SessionInfo]:

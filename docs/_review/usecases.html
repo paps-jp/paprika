@@ -1,0 +1,334 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+<meta charset="utf-8">
+<title>ユースケース集（End-to-End） — Paprika</title>
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<link rel="stylesheet" href="/paprika/style.css">
+<script src="https://code.iconify.design/iconify-icon/2.1.0/iconify-icon.min.js"></script>
+<meta name="description" content="Paprika の使いどころを目的別の通しで — 商品ページの画像を一括収集、動画ページのダウンロード、サイトをアーカイブ、ニュースサイトの新着リンク収集。完成スクリプトと得られる結果のセットで紹介。">
+<link rel="canonical" href="https://paps-jp.github.io/paprika/usecases.html">
+<meta property="og:type" content="article">
+<meta property="og:site_name" content="Paprika">
+<meta property="og:title" content="ユースケース集（End-to-End） — Paprika">
+<meta property="og:description" content="Paprika の使いどころを目的別の通しで — 商品ページの画像を一括収集、動画ページのダウンロード、サイトをアーカイブ、ニュースサイトの新着リンク収集。完成スクリプトと得られる結果のセットで紹介。">
+<meta property="og:url" content="https://paps-jp.github.io/paprika/usecases.html">
+<meta property="og:locale" content="ja_JP">
+</head>
+<body>
+
+<nav class="topnav">
+  <a class="brand" href="index.html"><span class="logo"><img src="icon.svg" alt=""></span> Paprika</a>
+  <span class="links">
+    <span class="dropdown">
+      <a class="dropdown-toggle" href="why-paprika.html">はじめに ▾</a>
+      <span class="dropdown-menu">
+        <a href="why-paprika.html">なぜ Paprika?</a>
+        <a href="intro.html">Client インストール</a>
+        <a href="quickstart.html">Server インストール</a>
+      </span>
+    </span>
+    <span class="dropdown">
+      <a class="dropdown-toggle active" href="guides.html">学ぶ ▾</a>
+      <span class="dropdown-menu">
+        <a href="guides.html">ガイド</a>
+        <a href="examples.html">サンプル</a>
+        <a href="usecases.html" class="active">ユースケース</a>
+        <a href="video.html">動画</a>
+        <a href="faq.html">FAQ</a>
+      </span>
+    </span>
+    <span class="dropdown">
+      <a class="dropdown-toggle" href="api.html">リファレンス ▾</a>
+      <span class="dropdown-menu">
+        <a href="api.html">API</a>
+        <a href="http-api.html">HTTP API</a>
+        <a href="cli.html">CLI</a>
+        <a href="job-options.html">JobOptions</a>
+        <a href="walk.html">walk（巡回）</a>
+        <a href="locator.html">Locator（要素指定）</a>
+        <a href="ws-events.html">WebSocket（ライブログ）</a>
+        <a href="errors.html">エラー一覧</a>
+        <a href="bridge-extension.html">Bridge 拡張</a>
+        <a href="profile.html">use_profile</a>
+        <a href="host-recipe.html">Host レシピ</a>
+        <a href="admin.html">管理画面</a>
+      </span>
+    </span>
+    <a href="operations.html">運用</a>
+    <a href="architecture.html">設計</a>
+  </span>
+  <a class="gh" href="search.html" title="サイト内検索" aria-label="サイト内検索" style="padding:5px 10px; margin-right:6px;"><iconify-icon icon="lucide:search" style="font-size:1.05rem; vertical-align:-3px;"></iconify-icon></a>
+  <a class="gh" href="https://github.com/paps-jp/paprika">GitHub ↗</a>
+</nav>
+
+<div class="layout">
+  <aside class="sidebar">
+    <h4>このページ</h4>
+    <ul id="doc-toc"></ul>
+  </aside>
+  <main class="content">
+    <h1>ユースケース集（End-to-End）</h1>
+    <p class="lead">Paprika の使いどころを目的別の通しで — 商品ページの画像を一括収集、動画ページのダウンロード、サイトをアーカイブ、ニュースサイトの新着リンク収集。完成スクリプトと得られる結果のセットで紹介。</p>
+    <p>「<strong>目的</strong>」から逆引きで使い方を見せます。<strong>完成スクリプト</strong>と<strong>得られる結果</strong>のセットで載せました。準備は <a href="quickstart.html">Server インストール</a> と <a href="http-api.html">HTTP API</a> を、API の細目は <a href="/paprika/api.html">リファレンス</a> を参照してください。</p>
+
+<p><img class="shot" src="img/cap-gallery.png" alt="管理画面のギャラリータブ — 取得したアセットがサムネイル一覧で表示される" /></p>
+<p class="shot-cap">取得が終わると、画像・動画は管理画面の <strong>ギャラリー</strong>と <code>/jobs/{id}/assets.json</code> から取り出せます。</p>
+
+<h2 id="-1-ページの画像を一括で集める">① 1 ページの画像を一括で集める</h2>
+
+<p>ECサイトの商品ページや記事ページから、表示されている画像（lazy-load も含む）をまとめて回収します。</p>
+
+<div class="language-python highlighter-rouge"><div class="highlight"><pre class="highlight"><code><span class="kn">import</span> <span class="nn">asyncio</span>
+<span class="kn">from</span> <span class="nn">paprika_client</span> <span class="kn">import</span> <span class="n">paprika</span>
+
+<span class="k">async</span> <span class="k">def</span> <span class="nf">main</span><span class="p">():</span>
+    <span class="k">async</span> <span class="k">with</span> <span class="n">paprika</span><span class="p">()</span> <span class="k">as</span> <span class="n">cli</span><span class="p">:</span>
+        <span class="n">job</span> <span class="o">=</span> <span class="k">await</span> <span class="n">cli</span><span class="p">.</span><span class="n">fetch</span><span class="p">(</span>
+            <span class="s">"https://example.com/items/12345"</span><span class="p">,</span>
+            <span class="n">scroll</span><span class="o">=</span><span class="bp">True</span><span class="p">,</span>                    <span class="c1"># 最後までスクロール → lazy-load も拾う
+</span>            <span class="n">capture_assets</span><span class="o">=</span><span class="bp">True</span><span class="p">,</span>
+            <span class="n">min_asset_size_bytes</span><span class="o">=</span><span class="mi">2048</span><span class="p">,</span>      <span class="c1"># ノイズ（小さいアイコン類）を除外
+</span>        <span class="p">)</span>
+        <span class="k">for</span> <span class="n">a</span> <span class="ow">in</span> <span class="n">job</span><span class="p">.</span><span class="n">assets</span><span class="p">:</span>
+            <span class="k">print</span><span class="p">(</span><span class="n">a</span><span class="p">.</span><span class="n">kind</span><span class="p">,</span> <span class="n">a</span><span class="p">.</span><span class="n">size</span><span class="p">,</span> <span class="n">a</span><span class="p">.</span><span class="n">href</span><span class="p">)</span>   <span class="c1"># /jobs/{id}/assets/&lt;name&gt;
+</span>
+<span class="n">asyncio</span><span class="p">.</span><span class="n">run</span><span class="p">(</span><span class="n">main</span><span class="p">())</span>
+</code></pre></div></div>
+
+<p>得られるもの: <code class="language-plaintext highlighter-rouge">job.assets</code>（<code class="language-plaintext highlighter-rouge">image</code> / <code class="language-plaintext highlighter-rouge">video</code> / <code class="language-plaintext highlighter-rouge">other</code>、<code class="language-plaintext highlighter-rouge">href</code> は Hub からのダウンロード URL）+ <code class="language-plaintext highlighter-rouge">page.html</code>（取得時の HTML）。</p>
+
+<blockquote>
+  <p>詳細は <a href="/paprika/guides.html">ガイド: 画像を一括で取得</a> / <a href="http-api.html">HTTP API: ダウンロード</a>。</p>
+</blockquote>
+
+<h2 id="-動画ページから動画をダウンロード">② 動画ページから動画をダウンロード</h2>
+
+<p>動画配信は HLS/DASH の場合があり、<strong>再生を発火</strong>しないと URL が出ません。<code class="language-plaintext highlighter-rouge">page.agent()</code> で再生 → <code class="language-plaintext highlighter-rouge">page.download_video()</code> で取得します。</p>
+
+<div class="language-python highlighter-rouge"><div class="highlight"><pre class="highlight"><code><span class="kn">import</span> <span class="nn">asyncio</span>
+<span class="kn">from</span> <span class="nn">paprika_client</span> <span class="kn">import</span> <span class="n">paprika</span>
+
+<span class="k">async</span> <span class="k">def</span> <span class="nf">main</span><span class="p">():</span>
+    <span class="k">async</span> <span class="k">with</span> <span class="n">paprika</span><span class="p">()</span> <span class="k">as</span> <span class="n">cli</span><span class="p">:</span>
+        <span class="k">async</span> <span class="k">with</span> <span class="n">cli</span><span class="p">.</span><span class="n">session</span><span class="p">(</span><span class="s">"https://video.example/watch/abc"</span><span class="p">)</span> <span class="k">as</span> <span class="n">page</span><span class="p">:</span>
+            <span class="c1"># 再生ボタンを LLM に任せて押す（CSS が効かない画面でも OK）
+</span>            <span class="k">await</span> <span class="n">page</span><span class="p">.</span><span class="n">agent</span><span class="p">(</span><span class="s">"メイン動画を再生して"</span><span class="p">,</span> <span class="n">max_steps</span><span class="o">=</span><span class="mi">3</span><span class="p">)</span>
+            <span class="c1"># 通信トレース上の m3u8 / mp4 を yt-dlp で取得・連結
+</span>            <span class="n">video</span> <span class="o">=</span> <span class="k">await</span> <span class="n">page</span><span class="p">.</span><span class="n">download_video</span><span class="p">()</span>
+            <span class="k">print</span><span class="p">(</span><span class="n">video</span><span class="p">.</span><span class="n">href</span><span class="p">)</span>
+
+<span class="n">asyncio</span><span class="p">.</span><span class="n">run</span><span class="p">(</span><span class="n">main</span><span class="p">())</span>
+</code></pre></div></div>
+
+<p>得られるもの: 1 本の動画ファイル（コンテナへ連結済み）。動画は <strong>画像と同じアセット扱い</strong>で <code class="language-plaintext highlighter-rouge">assets.json</code> の <code class="language-plaintext highlighter-rouge">kind: "video"</code> に並びます（<a href="video.html">動画の仕組み</a>）。</p>
+
+<blockquote>
+  <p>DRM 配信は取得不可です。</p>
+</blockquote>
+
+<h2 id="-サイト全体をアーカイブwalk-で-bfs-クロール">③ サイト全体をアーカイブ（walk で BFS クロール）</h2>
+
+<p>トップから辿れるページを順に巡回して、各ページの HTML と画像を保存します。<code class="language-plaintext highlighter-rouge">walk()</code> が dedup・depth 制御・dead-end フィルタを内部で処理します。</p>
+
+<div class="language-python highlighter-rouge"><div class="highlight"><pre class="highlight"><code><span class="kn">import</span> <span class="nn">asyncio</span>
+<span class="kn">from</span> <span class="nn">paprika_client</span> <span class="kn">import</span> <span class="n">paprika</span><span class="p">,</span> <span class="n">walk</span>
+
+<span class="k">async</span> <span class="k">def</span> <span class="nf">main</span><span class="p">():</span>
+    <span class="k">async</span> <span class="k">with</span> <span class="n">paprika</span><span class="p">()</span> <span class="k">as</span> <span class="n">cli</span><span class="p">:</span>
+        <span class="k">async</span> <span class="k">with</span> <span class="n">cli</span><span class="p">.</span><span class="n">session</span><span class="p">(</span><span class="s">"https://example.com"</span><span class="p">)</span> <span class="k">as</span> <span class="n">page</span><span class="p">:</span>
+            <span class="k">async</span> <span class="k">for</span> <span class="n">visit</span> <span class="ow">in</span> <span class="n">walk</span><span class="p">(</span>
+                <span class="n">page</span><span class="p">,</span>
+                <span class="n">target_pages</span><span class="o">=</span><span class="mi">200</span><span class="p">,</span>          <span class="c1"># 上限
+</span>                <span class="n">same_domain</span><span class="o">=</span><span class="bp">True</span><span class="p">,</span>          <span class="c1"># 同一ドメインのみ
+</span>                <span class="n">max_depth</span><span class="o">=</span><span class="mi">3</span><span class="p">,</span>
+            <span class="p">):</span>
+                <span class="k">await</span> <span class="n">visit</span><span class="p">.</span><span class="n">capture</span><span class="p">()</span>       <span class="c1"># ページごとに HTML + 画像を保存
+</span>                <span class="k">print</span><span class="p">(</span><span class="sa">f</span><span class="s">"[</span><span class="si">{</span><span class="n">visit</span><span class="p">.</span><span class="n">index</span><span class="si">}</span><span class="s">/</span><span class="si">{</span><span class="n">visit</span><span class="p">.</span><span class="n">target</span><span class="si">}</span><span class="s">] </span><span class="si">{</span><span class="n">visit</span><span class="p">.</span><span class="n">url</span><span class="si">}</span><span class="s">"</span><span class="p">)</span>
+
+<span class="n">asyncio</span><span class="p">.</span><span class="n">run</span><span class="p">(</span><span class="n">main</span><span class="p">())</span>
+</code></pre></div></div>
+
+<p>得られるもの: 各ページの HTML と画像が、その時のセッションのアセットとして蓄積。途中経過は管理画面の <strong>Live パネル</strong>でリアルタイム確認できます。</p>
+
+<blockquote>
+  <p>主オプション: <code class="language-plaintext highlighter-rouge">target_pages</code> / <code class="language-plaintext highlighter-rouge">same_domain</code> / <code class="language-plaintext highlighter-rouge">allowed_domains</code> / <code class="language-plaintext highlighter-rouge">max_depth</code> / <code class="language-plaintext highlighter-rouge">host_dedup</code>。<a href="/paprika/api.html#walk">API: walk</a> も参照。</p>
+</blockquote>
+
+<h2 id="-ニュースサイトの新着リンクだけ拾う">④ ニュースサイトの新着リンクだけ拾う</h2>
+
+<p>トップページからリンクを列挙して、巡回せず<strong>一覧だけ</strong>取り出します。</p>
+
+<div class="language-python highlighter-rouge"><div class="highlight"><pre class="highlight"><code><span class="kn">import</span> <span class="nn">asyncio</span>
+<span class="kn">from</span> <span class="nn">paprika_client</span> <span class="kn">import</span> <span class="n">paprika</span>
+
+<span class="k">async</span> <span class="k">def</span> <span class="nf">main</span><span class="p">():</span>
+    <span class="k">async</span> <span class="k">with</span> <span class="n">paprika</span><span class="p">()</span> <span class="k">as</span> <span class="n">cli</span><span class="p">:</span>
+        <span class="k">async</span> <span class="k">with</span> <span class="n">cli</span><span class="p">.</span><span class="n">session</span><span class="p">(</span><span class="s">"https://news.example.com"</span><span class="p">)</span> <span class="k">as</span> <span class="n">page</span><span class="p">:</span>
+            <span class="n">links</span> <span class="o">=</span> <span class="k">await</span> <span class="n">page</span><span class="p">.</span><span class="n">links</span><span class="p">(</span><span class="n">same_domain</span><span class="o">=</span><span class="bp">True</span><span class="p">)</span>
+            <span class="k">for</span> <span class="n">l</span> <span class="ow">in</span> <span class="n">links</span><span class="p">[:</span><span class="mi">20</span><span class="p">]:</span>
+                <span class="k">print</span><span class="p">(</span><span class="n">l</span><span class="p">.</span><span class="n">text</span> <span class="ow">or</span> <span class="s">""</span><span class="p">,</span> <span class="s">"→"</span><span class="p">,</span> <span class="n">l</span><span class="p">.</span><span class="n">href</span><span class="p">)</span>
+
+<span class="n">asyncio</span><span class="p">.</span><span class="n">run</span><span class="p">(</span><span class="n">main</span><span class="p">())</span>
+</code></pre></div></div>
+
+<p>得られるもの: そのページから抽出した遷移可能リンク一覧。<strong>何件あるかだけ知りたい</strong>用途や、<strong>外部のクローラに渡す前段</strong>として軽量に使えます。</p>
+
+<h2 id="-ログインが必要なサイトから取得">⑤ ログインが必要なサイトから取得</h2>
+
+<p>ログインしてから商品ページを fetch します。ログイン手順は <strong>AI</strong> に任せます。</p>
+
+<div class="language-python highlighter-rouge"><div class="highlight"><pre class="highlight"><code><span class="kn">import</span> <span class="nn">asyncio</span>
+<span class="kn">from</span> <span class="nn">paprika_client</span> <span class="kn">import</span> <span class="n">paprika</span>
+
+<span class="k">async</span> <span class="k">def</span> <span class="nf">main</span><span class="p">():</span>
+    <span class="k">async</span> <span class="k">with</span> <span class="n">paprika</span><span class="p">()</span> <span class="k">as</span> <span class="n">cli</span><span class="p">:</span>
+        <span class="c1"># 1) AI で 1 回ログイン → Cookie をホストへ保存
+</span>        <span class="k">async</span> <span class="k">with</span> <span class="n">cli</span><span class="p">.</span><span class="n">session</span><span class="p">(</span><span class="s">"https://market.example/login"</span><span class="p">)</span> <span class="k">as</span> <span class="n">page</span><span class="p">:</span>
+            <span class="k">await</span> <span class="n">page</span><span class="p">.</span><span class="n">agent</span><span class="p">(</span>
+                <span class="s">"ID=alice / PW=secret でログインして"</span><span class="p">,</span>
+                <span class="n">max_steps</span><span class="o">=</span><span class="mi">5</span><span class="p">,</span>
+            <span class="p">)</span>
+            <span class="k">await</span> <span class="n">page</span><span class="p">.</span><span class="n">save_cookies</span><span class="p">()</span>   <span class="c1"># /hosts/{host} に保存（次回以降は自動注入）
+</span>
+        <span class="c1"># 2) その Cookie で商品ページを fetch
+</span>        <span class="n">job</span> <span class="o">=</span> <span class="k">await</span> <span class="n">cli</span><span class="p">.</span><span class="n">fetch</span><span class="p">(</span>
+            <span class="s">"https://market.example/item/xxx"</span><span class="p">,</span>
+            <span class="n">capture_assets</span><span class="o">=</span><span class="bp">True</span><span class="p">,</span>
+        <span class="p">)</span>
+        <span class="k">print</span><span class="p">(</span><span class="nb">len</span><span class="p">(</span><span class="n">job</span><span class="p">.</span><span class="n">assets</span><span class="p">),</span> <span class="s">"assets"</span><span class="p">)</span>
+
+<span class="n">asyncio</span><span class="p">.</span><span class="n">run</span><span class="p">(</span><span class="n">main</span><span class="p">())</span>
+</code></pre></div></div>
+
+<p>ポイント:</p>
+
+<ul>
+  <li>一度 <strong><code class="language-plaintext highlighter-rouge">save_cookies()</code></strong> すれば、以後 <strong><code class="language-plaintext highlighter-rouge">cli.fetch(...)</code> でも自動で Cookie が注入</strong>されます。</li>
+  <li>セッション Cookie の期限切れも、<strong>ホストにログインレシピを登録</strong>しておけば自動再ログインで救えます（<a href="faq.html">FAQ: Cookie がすぐ切れる</a>）。</li>
+  <li>Chrome 上のログインを丸ごと持ち込みたい場合は <strong>Paprika Bridge 拡張</strong>または <strong><code class="language-plaintext highlighter-rouge">use_profile</code></strong>（<a href="faq.html">FAQ: ログイン必須サイト</a>）。</li>
+</ul>
+
+<h2 id="-ai-に丸投げcodegen-loop">⑥ AI に丸投げ（codegen-loop）</h2>
+
+<p>未知のサイトで何が必要か分からないとき、URL と <strong>目的（自然言語）</strong> だけ投げると、LLM がスクリプトを生成・実行・失敗時に再生成します。</p>
+
+<div class="language-bash highlighter-rouge"><div class="highlight"><pre class="highlight"><code>curl <span class="nt">-X</span> POST http://localhost:8000/jobs <span class="se">\</span>
+  <span class="nt">-H</span> <span class="s1">'Content-Type: application/json'</span> <span class="se">\</span>
+  <span class="nt">-d</span> <span class="s1">'{
+    "url":"https://example.com",
+    "options":{
+      "mode":"codegen-loop",
+      "goal":"このページの本文 HTML と、本文中に出てくる画像を集める",
+      "max_codegen_attempts": 3
+    }
+  }'</span>
+</code></pre></div></div>
+
+<p>完成したスクリプトは <strong>次回からそのまま <code class="language-plaintext highlighter-rouge">mode: rerun</code></strong> で実行できます（LLM 費用なし、決定的に動作）。</p>
+
+<blockquote>
+  <p>仕組みは <a href="architecture-hub.html#codegen-loop">Hub の仕組み: codegen-loop</a> を参照。</p>
+</blockquote>
+
+<h2 id="-任意の言語から-http-で叩く">⑦ 任意の言語から HTTP で叩く</h2>
+
+<p>Python / PHP の SDK を使わなくても、<strong><code class="language-plaintext highlighter-rouge">curl</code> / JS / Go</strong> で同じことができます。</p>
+
+<div class="language-javascript highlighter-rouge"><div class="highlight"><pre class="highlight"><code><span class="k">async</span> <span class="kd">function</span> <span class="nx">fetchOne</span><span class="p">(</span><span class="nx">url</span><span class="p">)</span> <span class="p">{</span>
+  <span class="kd">const</span> <span class="nx">hub</span> <span class="o">=</span> <span class="nx">process</span><span class="p">.</span><span class="nx">env</span><span class="p">.</span><span class="nx">PAPRIKA_HUB</span><span class="p">;</span>       <span class="c1">// e.g. http://localhost:8000</span>
+  <span class="kd">const</span> <span class="nx">r</span> <span class="o">=</span> <span class="k">await</span> <span class="nx">fetch</span><span class="p">(</span><span class="s2">`</span><span class="p">${</span><span class="nx">hub</span><span class="p">}</span><span class="s2">/jobs`</span><span class="p">,</span> <span class="p">{</span>
+    <span class="na">method</span><span class="p">:</span> <span class="dl">'</span><span class="s1">POST</span><span class="dl">'</span><span class="p">,</span>
+    <span class="na">headers</span><span class="p">:</span> <span class="p">{</span> <span class="dl">'</span><span class="s1">Content-Type</span><span class="dl">'</span><span class="p">:</span> <span class="dl">'</span><span class="s1">application/json</span><span class="dl">'</span> <span class="p">},</span>
+    <span class="na">body</span><span class="p">:</span> <span class="nx">JSON</span><span class="p">.</span><span class="nx">stringify</span><span class="p">({</span> <span class="nx">url</span><span class="p">,</span> <span class="na">options</span><span class="p">:</span> <span class="p">{</span> <span class="na">mode</span><span class="p">:</span> <span class="dl">'</span><span class="s1">fetch</span><span class="dl">'</span><span class="p">,</span> <span class="na">capture_assets</span><span class="p">:</span> <span class="kc">true</span> <span class="p">}</span> <span class="p">}),</span>
+  <span class="p">});</span>
+  <span class="k">if</span> <span class="p">(</span><span class="nx">r</span><span class="p">.</span><span class="nx">status</span> <span class="o">===</span> <span class="mi">503</span><span class="p">)</span> <span class="k">throw</span> <span class="k">new</span> <span class="nb">Error</span><span class="p">(</span><span class="dl">'</span><span class="s1">fleet busy — retry with backoff</span><span class="dl">'</span><span class="p">);</span>
+  <span class="kd">const</span> <span class="p">{</span> <span class="nx">job_id</span> <span class="p">}</span> <span class="o">=</span> <span class="k">await</span> <span class="nx">r</span><span class="p">.</span><span class="nx">json</span><span class="p">();</span>
+  <span class="c1">// ポーリングして完了を待つ → /jobs/{id}/assets.json</span>
+  <span class="c1">// ...</span>
+<span class="p">}</span>
+</code></pre></div></div>
+
+<p>詳細は <a href="http-api.html">HTTP API</a> を参照。<code class="language-plaintext highlighter-rouge">503</code> の指数バックオフ再試行を忘れずに（<a href="faq.html#retry-503">FAQ</a>）。</p>
+
+<hr />
+
+<h2 id="どれを使うかの早見表">どれを使うかの早見表</h2>
+
+<table>
+  <thead>
+    <tr>
+      <th>やりたいこと</th>
+      <th>推奨</th>
+    </tr>
+  </thead>
+  <tbody>
+    <tr>
+      <td>既知の 1 URL の画像を取る</td>
+      <td><strong><code class="language-plaintext highlighter-rouge">cli.fetch(url, scroll=True)</code></strong></td>
+    </tr>
+    <tr>
+      <td>動画ページから動画</td>
+      <td><strong><code class="language-plaintext highlighter-rouge">session</code> + <code class="language-plaintext highlighter-rouge">page.agent("再生して")</code> + <code class="language-plaintext highlighter-rouge">page.download_video()</code></strong></td>
+    </tr>
+    <tr>
+      <td>サイト全体を保存</td>
+      <td><strong><code class="language-plaintext highlighter-rouge">session</code> + <code class="language-plaintext highlighter-rouge">walk()</code></strong></td>
+    </tr>
+    <tr>
+      <td>リンク一覧だけ</td>
+      <td><strong><code class="language-plaintext highlighter-rouge">session</code> + <code class="language-plaintext highlighter-rouge">page.links()</code></strong></td>
+    </tr>
+    <tr>
+      <td>ログイン後の取得</td>
+      <td><strong><code class="language-plaintext highlighter-rouge">session</code> で <code class="language-plaintext highlighter-rouge">agent</code> ログイン → <code class="language-plaintext highlighter-rouge">save_cookies()</code> → <code class="language-plaintext highlighter-rouge">cli.fetch</code></strong></td>
+    </tr>
+    <tr>
+      <td>未知サイトに丸投げ</td>
+      <td><strong><code class="language-plaintext highlighter-rouge">mode: codegen-loop</code></strong></td>
+    </tr>
+    <tr>
+      <td>任意の言語から</td>
+      <td><strong>HTTP（<code class="language-plaintext highlighter-rouge">POST /jobs</code>）</strong></td>
+    </tr>
+  </tbody>
+</table>
+
+<h2 id="次のステップ">次のステップ</h2>
+
+<ul>
+  <li><a href="/paprika/guides.html">ガイド</a> — 各手順の細目</li>
+  <li><a href="/paprika/examples.html">サンプル</a> — API スニペット集</li>
+  <li><a href="/paprika/api.html">API リファレンス</a> — Python / PHP SDK の全引数</li>
+  <li><a href="http-api.html">HTTP API</a> — SDK 不要で叩く</li>
+</ul>
+
+  </main>
+</div>
+<script>
+// Build the "このページ" sidebar from the rendered <h2> headings (each gets an
+// id from kramdown auto_ids). No headings -> drop the sidebar column so the
+// content fills the full width instead of sitting in the narrow sidebar slot.
+(function () {
+  var toc = document.getElementById('doc-toc');
+  var heads = document.querySelectorAll('.content h2[id]');
+  if (!toc) return;
+  if (!heads.length) {
+    var aside = document.querySelector('.sidebar');
+    var layout = document.querySelector('.layout');
+    if (aside) aside.style.display = 'none';
+    if (layout) layout.style.gridTemplateColumns = '1fr';
+    return;
+  }
+  heads.forEach(function (h) {
+    var li = document.createElement('li');
+    var a = document.createElement('a');
+    a.href = '#' + h.id;
+    a.textContent = h.textContent;
+    li.appendChild(a);
+    toc.appendChild(li);
+  });
+})();
+</script>
+</body>
+</html>

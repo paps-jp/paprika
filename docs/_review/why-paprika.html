@@ -1,0 +1,301 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+<meta charset="utf-8">
+<title>なぜ Paprika? — Playwright / Selenium との違い — Paprika</title>
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<link rel="stylesheet" href="/paprika/style.css">
+<script src="https://code.iconify.design/iconify-icon/2.1.0/iconify-icon.min.js"></script>
+<meta name="description" content="Playwright スタイルの API で書きやすく、分散ワーカー上の Chrome を AI とともに動かして画像・動画・リンクを集める。Paprika と Playwright・Selenium の違いを、シナリオ別に比較。">
+<link rel="canonical" href="https://paps-jp.github.io/paprika/why-paprika.html">
+<meta property="og:type" content="article">
+<meta property="og:site_name" content="Paprika">
+<meta property="og:title" content="なぜ Paprika? — Playwright / Selenium との違い — Paprika">
+<meta property="og:description" content="Playwright スタイルの API で書きやすく、分散ワーカー上の Chrome を AI とともに動かして画像・動画・リンクを集める。Paprika と Playwright・Selenium の違いを、シナリオ別に比較。">
+<meta property="og:url" content="https://paps-jp.github.io/paprika/why-paprika.html">
+<meta property="og:locale" content="ja_JP">
+</head>
+<body>
+
+<nav class="topnav">
+  <a class="brand" href="index.html"><span class="logo"><img src="icon.svg" alt=""></span> Paprika</a>
+  <span class="links">
+    <span class="dropdown">
+      <a class="dropdown-toggle active" href="why-paprika.html">はじめに ▾</a>
+      <span class="dropdown-menu">
+        <a href="why-paprika.html" class="active">なぜ Paprika?</a>
+        <a href="intro.html">Client インストール</a>
+        <a href="quickstart.html">Server インストール</a>
+      </span>
+    </span>
+    <span class="dropdown">
+      <a class="dropdown-toggle" href="guides.html">学ぶ ▾</a>
+      <span class="dropdown-menu">
+        <a href="guides.html">ガイド</a>
+        <a href="examples.html">サンプル</a>
+        <a href="usecases.html">ユースケース</a>
+        <a href="video.html">動画</a>
+        <a href="faq.html">FAQ</a>
+      </span>
+    </span>
+    <span class="dropdown">
+      <a class="dropdown-toggle" href="api.html">リファレンス ▾</a>
+      <span class="dropdown-menu">
+        <a href="api.html">API</a>
+        <a href="http-api.html">HTTP API</a>
+        <a href="cli.html">CLI</a>
+        <a href="job-options.html">JobOptions</a>
+        <a href="walk.html">walk（巡回）</a>
+        <a href="locator.html">Locator（要素指定）</a>
+        <a href="ws-events.html">WebSocket（ライブログ）</a>
+        <a href="errors.html">エラー一覧</a>
+        <a href="bridge-extension.html">Bridge 拡張</a>
+        <a href="profile.html">use_profile</a>
+        <a href="host-recipe.html">Host レシピ</a>
+        <a href="admin.html">管理画面</a>
+      </span>
+    </span>
+    <a href="operations.html">運用</a>
+    <a href="architecture.html">設計</a>
+  </span>
+  <a class="gh" href="search.html" title="サイト内検索" aria-label="サイト内検索" style="padding:5px 10px; margin-right:6px;"><iconify-icon icon="lucide:search" style="font-size:1.05rem; vertical-align:-3px;"></iconify-icon></a>
+  <a class="gh" href="https://github.com/paps-jp/paprika">GitHub ↗</a>
+</nav>
+
+<div class="layout">
+  <aside class="sidebar">
+    <h4>このページ</h4>
+    <ul id="doc-toc"></ul>
+  </aside>
+  <main class="content">
+    <h1>なぜ Paprika? — Playwright / Selenium との違い</h1>
+    <p class="lead">Playwright スタイルの API で書きやすく、分散ワーカー上の Chrome を AI とともに動かして画像・動画・リンクを集める。Paprika と Playwright・Selenium の違いを、シナリオ別に比較。</p>
+    <p><strong>Playwright と書き味は同じまま、フリート（複数ホストの Chrome）と AI で動かす</strong>。Paprika は「ブラウザ自動化のフレームワーク」ではなく、<strong>収集ワークロードを丸ごと面倒見るプラットフォーム</strong>です。</p>
+
+<video class="shot" autoplay="" loop="" muted="" playsinline="" preload="metadata" aria-label="Paprika 管理画面で複数の Chrome Lane が同時にページを取得している様子">
+  <source src="img/admin-live.webm" type="video/webm" />
+  <source src="img/admin-live.mp4" type="video/mp4" />
+  <img src="img/admin-live.gif" alt="Paprika 管理画面で複数の Chrome Lane が同時にページを取得している様子" />
+</video>
+<p class="shot-cap">分散ワーカー上の Chrome が並列でページを取得している様子（管理画面 Live プレビュー）。</p>
+
+<blockquote>
+  <p>採用判断のためのページです。導入は <a href="quickstart.html">Server インストール</a>、SDK の使い方は <a href="/paprika/intro.html">Client インストール</a>、内部構造は <a href="architecture.html">アーキテクチャ概要</a> を参照。</p>
+</blockquote>
+
+<h2 id="何が違うのか要点">何が違うのか（要点）</h2>
+
+<ul>
+  <li><strong>Playwright 風 API</strong>（<code class="language-plaintext highlighter-rouge">locator</code> / <code class="language-plaintext highlighter-rouge">get_by_*</code> / <code class="language-plaintext highlighter-rouge">fill</code> / <code class="language-plaintext highlighter-rouge">press</code> / <code class="language-plaintext highlighter-rouge">wait_for</code> …）。書き味は Playwright とほぼ同じ。</li>
+  <li><strong>分散フリート</strong>: 複数ホストの Chrome（<strong>Lane</strong>）を Hub が束ね、ジョブを <strong>WebSocket でディスパッチ</strong>。1 台でも、100 台でも同じ API。</li>
+  <li><strong>AI コード生成</strong>（<code class="language-plaintext highlighter-rouge">codegen-loop</code>）: URL と自然言語の <strong><code class="language-plaintext highlighter-rouge">goal</code> だけ</strong>渡せば、LLM がスクリプトを生成・実行・失敗時に再生成。成功したスクリプトは <strong>そのまま <code class="language-plaintext highlighter-rouge">mode: rerun</code> で再利用</strong>できる（次回からは LLM 不要・決定的）。</li>
+  <li><strong>収集に最適化</strong>: スクロール・ネットワークトレース・<strong><code class="language-plaintext highlighter-rouge">yt-dlp</code> 連携</strong>で動画も画像と同じ感覚で取得（<a href="video.html">動画の仕組み</a>）。</li>
+  <li><strong>二度取りしない</strong>: <strong>ブラウザが実際に読み込んだレスポンス</strong>をそのまま回収（CDP <code class="language-plaintext highlighter-rouge">Network.responseReceived</code> を passive にサブスクライブ）。<code class="language-plaintext highlighter-rouge">&lt;img src=&gt;</code> を見て <strong>URL から再取得しない</strong>ので、(a) 帯域・サーバ負荷が半分、(b) <strong>Cookie / Referer / 認証ヘッダーが必要な画像</strong>もそのまま取れる、(c) <strong>JS で動的に差し込まれた画像・lazy-load・CSS <code class="language-plaintext highlighter-rouge">background-image</code>・iframe 内</strong>もまとめて拾えます。</li>
+  <li><strong>Chrome 拡張で JS 注入</strong>: 同梱の <code class="language-plaintext highlighter-rouge">paprika-agent</code> 拡張（<code class="language-plaintext highlighter-rouge">userScripts</code> 権限）で <strong>任意の JS を全ページに常駐注入</strong>。CDP 単独では届かない領域（リクエストヘッダ書き換え・Content Settings・Proxy・downloads）まで操作できます。</li>
+  <li><strong>普段使いの Chrome 拡張をそのまま持ち込み</strong>: <code class="language-plaintext highlighter-rouge">--load-extension</code> で <strong>既存の拡張（uBlock Origin / Bitwarden / MetaMask 等）が動く</strong>。広告抜きで収集、Bitwarden で自動ログイン、Web3 サインなど、<strong>手作業の Chrome と同じ環境</strong>でジョブが動かせます。</li>
+  <li><strong>既存の Chrome プロファイル流用</strong>: 普段使いの Chrome の <strong>User Data フォルダをそのままアップロード</strong>（<a href="profile.html"><code class="language-plaintext highlighter-rouge">use_profile</code></a>）。Cookie / 保存パスワード / autofill / 拡張機能まで一式持ち込めるので、<strong>ログイン済みの状態でいきなり収集を始められます</strong>。</li>
+  <li><strong>ライブ可観測性</strong>: 各 Chrome に <strong>noVNC ライブ画面</strong>が紐づき、管理画面で何が起きているか目で確認できる。</li>
+  <li><strong>検出されにくい起動</strong>: <code class="language-plaintext highlighter-rouge">nodriver</code> を採用し、<code class="language-plaintext highlighter-rouge">navigator.webdriver</code> などの典型的なシグナルを出さない。</li>
+</ul>
+
+<h2 id="playwright--selenium-との比較">Playwright / Selenium との比較</h2>
+
+<table>
+  <thead>
+    <tr>
+      <th>観点</th>
+      <th>Paprika</th>
+      <th>Playwright</th>
+      <th>Selenium</th>
+    </tr>
+  </thead>
+  <tbody>
+    <tr>
+      <td><strong>対象</strong></td>
+      <td><strong>収集ワークロードのプラットフォーム</strong></td>
+      <td>ブラウザ自動化のライブラリ</td>
+      <td>ブラウザ自動化のライブラリ</td>
+    </tr>
+    <tr>
+      <td><strong>API スタイル</strong></td>
+      <td>Playwright 風（同じ書き味）</td>
+      <td>Playwright</td>
+      <td>WebDriver</td>
+    </tr>
+    <tr>
+      <td><strong>分散実行</strong></td>
+      <td><strong>標準で分散</strong>（Hub + N ワーカー × M レーン）</td>
+      <td>自前で Grid/k8s を組む</td>
+      <td>Selenium Grid</td>
+    </tr>
+    <tr>
+      <td><strong>ジョブモデル</strong></td>
+      <td><strong>REST/SDK で投入 → 完了待ち → アセット回収</strong></td>
+      <td>自分でプロセス管理</td>
+      <td>自分でプロセス管理</td>
+    </tr>
+    <tr>
+      <td><strong>AI 駆動</strong></td>
+      <td><strong><code class="language-plaintext highlighter-rouge">codegen-loop</code>（生成→実行→再生成）</strong></td>
+      <td>なし</td>
+      <td>なし</td>
+    </tr>
+    <tr>
+      <td><strong>動画取得</strong></td>
+      <td><strong><code class="language-plaintext highlighter-rouge">yt-dlp</code> + 通信トレース統合</strong></td>
+      <td>手作業で連携</td>
+      <td>手作業で連携</td>
+    </tr>
+    <tr>
+      <td><strong>画像/アセット収集</strong></td>
+      <td><strong>既定機能</strong>（min size / scroll / lazy 対応）</td>
+      <td>自分で書く</td>
+      <td>自分で書く</td>
+    </tr>
+    <tr>
+      <td><strong>取得方式</strong></td>
+      <td><strong>ブラウザが読み込んだものを passive 回収</strong>（再 GET なし）</td>
+      <td>URL を取り出して再 GET</td>
+      <td>URL を取り出して再 GET</td>
+    </tr>
+    <tr>
+      <td><strong>ライブ可観測性</strong></td>
+      <td><strong>noVNC + 管理画面</strong></td>
+      <td>デバッガ / 録画</td>
+      <td>スクリーンショット</td>
+    </tr>
+    <tr>
+      <td><strong>ログイン継続</strong></td>
+      <td><strong>Bridge 拡張 / <code class="language-plaintext highlighter-rouge">use_profile</code> / Host レシピ</strong></td>
+      <td>自前で Cookie / storage 注入</td>
+      <td>同左</td>
+    </tr>
+    <tr>
+      <td><strong>既存 Chrome 拡張</strong>（uBlock / Bitwarden / MetaMask 等）</td>
+      <td><strong>そのまま動く</strong>（<code class="language-plaintext highlighter-rouge">--load-extension</code>）</td>
+      <td>自前でビルドして読込</td>
+      <td>自前でビルドして読込</td>
+    </tr>
+    <tr>
+      <td><strong>Chrome プロファイル流用</strong>（Cookie / autofill / 拡張ごと）</td>
+      <td><strong>アップロードして直に使う</strong></td>
+      <td>別途エクスポート＆注入</td>
+      <td>別途エクスポート＆注入</td>
+    </tr>
+    <tr>
+      <td><strong>JS 注入の範囲</strong></td>
+      <td><strong>拡張権限まで使える</strong>（userScripts / declarativeNetRequest）</td>
+      <td><code class="language-plaintext highlighter-rouge">addInitScript</code>(=ページコンテキスト) のみ</td>
+      <td><code class="language-plaintext highlighter-rouge">execute_script</code> のみ</td>
+    </tr>
+    <tr>
+      <td><strong>検出回避</strong></td>
+      <td><strong><code class="language-plaintext highlighter-rouge">nodriver</code></strong>（webdriver シグナルを抑える）</td>
+      <td>パッチが必要</td>
+      <td>パッチが必要</td>
+    </tr>
+    <tr>
+      <td><strong>管理画面</strong></td>
+      <td><strong>既定で付属</strong></td>
+      <td>自前</td>
+      <td>自前</td>
+    </tr>
+  </tbody>
+</table>
+
+<blockquote>
+  <p>Playwright や Selenium が悪い、という話ではありません。<strong>「複数台で長く回す収集ワークロード」</strong>が用途のとき、その上に組むべき配管が<strong>標準で揃っている</strong>のが Paprika の立ち位置です。</p>
+</blockquote>
+
+<h2 id="こんなときに-paprika">こんなときに Paprika</h2>
+
+<ul>
+  <li><strong>複数サイト × 複数ホスト</strong>で <strong>数千〜数百万ページ</strong>を収集したい</li>
+  <li><strong>画像 / 動画 / リンク</strong>をまとめて回収したい（HLS/DASH 含む）</li>
+  <li><strong>未知サイト</strong>にとりあえず投げて、AI に拾ってもらいたい</li>
+  <li>ログイン継続・年代/確認画面・ポップアップなどの <strong>「ブラウザならではの障壁」</strong> を乗り越えたい</li>
+  <li>何が起きているか <strong>目で見える</strong>運用にしたい</li>
+</ul>
+
+<h2 id="こんなときは-playwright--selenium-が素直">こんなときは Playwright / Selenium が素直</h2>
+
+<ul>
+  <li><strong>アプリの E2E テスト</strong>（CI で 1 台 / 短時間 / 結果は pass/fail）</li>
+  <li>1 つのスクリプトを <strong>自前のジョブキュー</strong> で十分に回せる</li>
+  <li>ブラウザ自動化を <strong>既存システムに組み込む</strong>ライブラリとして使いたい</li>
+</ul>
+
+<h2 id="移行の見当playwright-を書いている人向け">移行の見当（Playwright を書いている人向け）</h2>
+
+<p>ほぼそのまま:</p>
+
+<div class="language-python highlighter-rouge"><div class="highlight"><pre class="highlight"><code><span class="c1"># Playwright
+</span><span class="n">page</span><span class="p">.</span><span class="n">locator</span><span class="p">(</span><span class="s">"button.primary"</span><span class="p">).</span><span class="n">click</span><span class="p">()</span>
+<span class="n">page</span><span class="p">.</span><span class="n">get_by_role</span><span class="p">(</span><span class="s">"button"</span><span class="p">,</span> <span class="n">name</span><span class="o">=</span><span class="s">"送信"</span><span class="p">).</span><span class="n">click</span><span class="p">()</span>
+<span class="n">page</span><span class="p">.</span><span class="n">fill</span><span class="p">(</span><span class="s">"#email"</span><span class="p">,</span> <span class="s">"alice@example.com"</span><span class="p">)</span>
+</code></pre></div></div>
+
+<p>Paprika:</p>
+
+<div class="language-python highlighter-rouge"><div class="highlight"><pre class="highlight"><code><span class="k">async</span> <span class="k">with</span> <span class="n">cli</span><span class="p">.</span><span class="n">session</span><span class="p">(</span><span class="s">"https://..."</span><span class="p">)</span> <span class="k">as</span> <span class="n">page</span><span class="p">:</span>
+    <span class="k">await</span> <span class="n">page</span><span class="p">.</span><span class="n">locator</span><span class="p">(</span><span class="s">"button.primary"</span><span class="p">).</span><span class="n">click</span><span class="p">()</span>
+    <span class="k">await</span> <span class="n">page</span><span class="p">.</span><span class="n">get_by_role</span><span class="p">(</span><span class="s">"button"</span><span class="p">,</span> <span class="n">name</span><span class="o">=</span><span class="s">"送信"</span><span class="p">).</span><span class="n">click</span><span class="p">()</span>
+    <span class="k">await</span> <span class="n">page</span><span class="p">.</span><span class="n">fill</span><span class="p">(</span><span class="s">"#email"</span><span class="p">,</span> <span class="s">"alice@example.com"</span><span class="p">)</span>
+</code></pre></div></div>
+
+<p>違うのは「<strong>Hub に接続している</strong>」点と、<strong>ジョブ単位</strong>で結果が積み上がる点です。詳しくは <a href="locator.html">Locator リファレンス</a> と <a href="/paprika/api.html">API リファレンス</a>。</p>
+
+<h2 id="いま無いもの正直に">いま無いもの（正直に）</h2>
+
+<ul>
+  <li><strong>DRM 動画は取得不可・かつ取得を試みてはいけません</strong>（Widevine / FairPlay / PlayReady。Netflix・Amazon Prime Video・Disney+ などの有料配信が該当）。Paprika は <strong>DRM の回避・解除は一切行いません</strong>。これは技術的な仕様であると同時に、<strong>法的・倫理的に許されないため</strong>です。
+    <ul>
+      <li><strong>著作権法 第30条第1項第2号</strong> — 技術的保護手段（DRM）を回避して行う複製は、私的使用目的であっても<strong>違法</strong>です。</li>
+      <li><strong>著作権法 第120条の2</strong> — DRM 解除を目的とするツールの提供・公衆送信は<strong>刑事罰</strong>の対象です。</li>
+      <li><strong>不正アクセス禁止法</strong> — 配信プラットフォームのアクセス制御を破る形で行う場合、<strong>不正アクセス行為</strong>に該当する可能性があります。</li>
+      <li>米国 DMCA 1201 条、EU 著作権指令 6 条など、<strong>国際的にも DRM 回避は禁止</strong>されています。</li>
+      <li><strong>DRM を回避する目的での Paprika 利用は固く禁止</strong>します。発覚した場合、サポートの対象外となるだけでなく、利用者本人の法的責任となります。</li>
+    </ul>
+  </li>
+  <li>既定で <strong>認証なし</strong>（private LAN 想定）。外部公開する場合はリバプロ + 認証を手前に置いてください。</li>
+  <li><strong>Windows ワーカー</strong>は Linux フリートと別経路（noVNC ではなく CDP screencast）。</li>
+</ul>
+
+<h2 id="次のステップ">次のステップ</h2>
+
+<ul>
+  <li><a href="quickstart.html">Server インストール</a> — まず動かしてみる（5 分）</li>
+  <li><a href="/paprika/intro.html">Client インストール</a> — SDK で接続する</li>
+  <li><a href="usecases.html">ユースケース集</a> — 目的別の通し</li>
+  <li><a href="architecture.html">アーキテクチャ概要</a> — 内部構造の地図</li>
+</ul>
+
+  </main>
+</div>
+<script>
+// Build the "このページ" sidebar from the rendered <h2> headings (each gets an
+// id from kramdown auto_ids). No headings -> drop the sidebar column so the
+// content fills the full width instead of sitting in the narrow sidebar slot.
+(function () {
+  var toc = document.getElementById('doc-toc');
+  var heads = document.querySelectorAll('.content h2[id]');
+  if (!toc) return;
+  if (!heads.length) {
+    var aside = document.querySelector('.sidebar');
+    var layout = document.querySelector('.layout');
+    if (aside) aside.style.display = 'none';
+    if (layout) layout.style.gridTemplateColumns = '1fr';
+    return;
+  }
+  heads.forEach(function (h) {
+    var li = document.createElement('li');
+    var a = document.createElement('a');
+    a.href = '#' + h.id;
+    a.textContent = h.textContent;
+    li.appendChild(a);
+    toc.appendChild(li);
+  });
+})();
+</script>
+</body>
+</html>

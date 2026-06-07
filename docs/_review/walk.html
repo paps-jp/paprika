@@ -1,0 +1,375 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+<meta charset="utf-8">
+<title>walk — サイト巡回(BFS / DFS) — Paprika</title>
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<link rel="stylesheet" href="/paprika/style.css">
+<script src="https://code.iconify.design/iconify-icon/2.1.0/iconify-icon.min.js"></script>
+<meta name="description" content="Paprika の walk() / Walker でサイトを BFS/DFS で巡回する完全リファレンス — start_url / target_pages / same_domain / allowed_domains / allow_paths / deny_paths / order / max_depth / per_page_timeout_s / persist_state / host_dedup / recrawl_patterns、Visit のフィールド、ベストプラクティス。">
+<link rel="canonical" href="https://paps-jp.github.io/paprika/walk.html">
+<meta property="og:type" content="article">
+<meta property="og:site_name" content="Paprika">
+<meta property="og:title" content="walk — サイト巡回(BFS / DFS) — Paprika">
+<meta property="og:description" content="Paprika の walk() / Walker でサイトを BFS/DFS で巡回する完全リファレンス — start_url / target_pages / same_domain / allowed_domains / allow_paths / deny_paths / order / max_depth / per_page_timeout_s / persist_state / host_dedup / recrawl_patterns、Visit のフィールド、ベストプラクティス。">
+<meta property="og:url" content="https://paps-jp.github.io/paprika/walk.html">
+<meta property="og:locale" content="ja_JP">
+</head>
+<body>
+
+<nav class="topnav">
+  <a class="brand" href="index.html"><span class="logo"><img src="icon.svg" alt=""></span> Paprika</a>
+  <span class="links">
+    <span class="dropdown">
+      <a class="dropdown-toggle" href="why-paprika.html">はじめに ▾</a>
+      <span class="dropdown-menu">
+        <a href="why-paprika.html">なぜ Paprika?</a>
+        <a href="intro.html">Client インストール</a>
+        <a href="quickstart.html">Server インストール</a>
+      </span>
+    </span>
+    <span class="dropdown">
+      <a class="dropdown-toggle" href="guides.html">学ぶ ▾</a>
+      <span class="dropdown-menu">
+        <a href="guides.html">ガイド</a>
+        <a href="examples.html">サンプル</a>
+        <a href="usecases.html">ユースケース</a>
+        <a href="video.html">動画</a>
+        <a href="faq.html">FAQ</a>
+      </span>
+    </span>
+    <span class="dropdown">
+      <a class="dropdown-toggle active" href="api.html">リファレンス ▾</a>
+      <span class="dropdown-menu">
+        <a href="api.html">API</a>
+        <a href="http-api.html">HTTP API</a>
+        <a href="cli.html">CLI</a>
+        <a href="job-options.html">JobOptions</a>
+        <a href="walk.html" class="active">walk（巡回）</a>
+        <a href="locator.html">Locator（要素指定）</a>
+        <a href="ws-events.html">WebSocket（ライブログ）</a>
+        <a href="errors.html">エラー一覧</a>
+        <a href="bridge-extension.html">Bridge 拡張</a>
+        <a href="profile.html">use_profile</a>
+        <a href="host-recipe.html">Host レシピ</a>
+        <a href="admin.html">管理画面</a>
+      </span>
+    </span>
+    <a href="operations.html">運用</a>
+    <a href="architecture.html">設計</a>
+  </span>
+  <a class="gh" href="search.html" title="サイト内検索" aria-label="サイト内検索" style="padding:5px 10px; margin-right:6px;"><iconify-icon icon="lucide:search" style="font-size:1.05rem; vertical-align:-3px;"></iconify-icon></a>
+  <a class="gh" href="https://github.com/paps-jp/paprika">GitHub ↗</a>
+</nav>
+
+<div class="layout">
+  <aside class="sidebar">
+    <h4>このページ</h4>
+    <ul id="doc-toc"></ul>
+  </aside>
+  <main class="content">
+    <h1>walk — サイト巡回(BFS / DFS)</h1>
+    <p class="lead">Paprika の walk() / Walker でサイトを BFS/DFS で巡回する完全リファレンス — start_url / target_pages / same_domain / allowed_domains / allow_paths / deny_paths / order / max_depth / per_page_timeout_s / persist_state / host_dedup / recrawl_patterns、Visit のフィールド、ベストプラクティス。</p>
+    <p><code class="language-plaintext highlighter-rouge">walk()</code> はサイトを <strong>BFS / DFS</strong> で巡回しながら 1 ページずつ <code class="language-plaintext highlighter-rouge">Visit</code> を yield する<strong>非同期イテレータ</strong>です。キュー・重複除去・ドメインとパスのフィルタ・オフスコープ redirect 対応まで内部で処理するので、自前の BFS ループより堅牢です。</p>
+
+<blockquote>
+  <p>全体像は <a href="/paprika/intro.html">Client インストール</a> / <a href="/paprika/guides.html#walk">ガイド</a> / 目的別の例は <a href="usecases.html">ユースケース</a>。</p>
+</blockquote>
+
+<h2 id="最小例">最小例</h2>
+
+<div class="language-python highlighter-rouge"><div class="highlight"><pre class="highlight"><code><span class="kn">import</span> <span class="nn">asyncio</span>
+<span class="kn">from</span> <span class="nn">paprika_client</span> <span class="kn">import</span> <span class="n">paprika</span><span class="p">,</span> <span class="n">walk</span>
+
+<span class="k">async</span> <span class="k">def</span> <span class="nf">main</span><span class="p">():</span>
+    <span class="k">async</span> <span class="k">with</span> <span class="n">paprika</span><span class="p">()</span> <span class="k">as</span> <span class="n">cli</span><span class="p">:</span>
+        <span class="k">async</span> <span class="k">with</span> <span class="n">cli</span><span class="p">.</span><span class="n">session</span><span class="p">(</span><span class="s">"https://example.com"</span><span class="p">,</span> <span class="n">parent_job_id</span><span class="o">=</span><span class="s">"crawl"</span><span class="p">)</span> <span class="k">as</span> <span class="n">page</span><span class="p">:</span>
+            <span class="k">async</span> <span class="k">for</span> <span class="n">visit</span> <span class="ow">in</span> <span class="n">walk</span><span class="p">(</span><span class="n">page</span><span class="p">,</span> <span class="n">target_pages</span><span class="o">=</span><span class="mi">50</span><span class="p">,</span> <span class="n">same_domain</span><span class="o">=</span><span class="bp">True</span><span class="p">):</span>
+                <span class="k">print</span><span class="p">(</span><span class="sa">f</span><span class="s">"[</span><span class="si">{</span><span class="n">visit</span><span class="p">.</span><span class="n">n</span><span class="si">}</span><span class="s">/</span><span class="si">{</span><span class="n">visit</span><span class="p">.</span><span class="n">target</span><span class="si">}</span><span class="s">] depth=</span><span class="si">{</span><span class="n">visit</span><span class="p">.</span><span class="n">depth</span><span class="si">}</span><span class="s"> </span><span class="si">{</span><span class="n">visit</span><span class="p">.</span><span class="n">url</span><span class="si">}</span><span class="s">"</span><span class="p">)</span>
+                <span class="k">await</span> <span class="n">page</span><span class="p">.</span><span class="n">save_assets</span><span class="p">(</span><span class="s">"out/images"</span><span class="p">)</span>
+
+<span class="n">asyncio</span><span class="p">.</span><span class="n">run</span><span class="p">(</span><span class="n">main</span><span class="p">())</span>
+</code></pre></div></div>
+
+<ul>
+  <li><code class="language-plaintext highlighter-rouge">walk(page, **opts)</code> は <code class="language-plaintext highlighter-rouge">Visit</code> を yield する <strong>AsyncIterator</strong>。クラス版は <code class="language-plaintext highlighter-rouge">Walker</code>（ステートを覗きたいとき）。</li>
+  <li>ループ中で <code class="language-plaintext highlighter-rouge">await page.save_assets(...)</code> などを呼べば、そのページのアセットを保存できます。</li>
+</ul>
+
+<blockquote>
+  <p><strong><code class="language-plaintext highlighter-rouge">walk</code> は async のみ</strong>。<code class="language-plaintext highlighter-rouge">sync_paprika</code> から直接は使えません（<code class="language-plaintext highlighter-rouge">asyncio.run()</code> でラップしてください）。</p>
+</blockquote>
+
+<h2 id="オプション一覧完全版">オプション一覧（完全版）</h2>
+
+<table>
+  <thead>
+    <tr>
+      <th>引数</th>
+      <th>型</th>
+      <th>既定</th>
+      <th>意味</th>
+    </tr>
+  </thead>
+  <tbody>
+    <tr>
+      <td><code class="language-plaintext highlighter-rouge">start_url</code></td>
+      <td><code class="language-plaintext highlighter-rouge">str</code></td>
+      <td>現在 URL</td>
+      <td>巡回の起点。<strong>絶対 URL</strong> が必須（省略時は <code class="language-plaintext highlighter-rouge">page.url</code> から取る）</td>
+    </tr>
+    <tr>
+      <td><code class="language-plaintext highlighter-rouge">target_pages</code></td>
+      <td><code class="language-plaintext highlighter-rouge">int</code></td>
+      <td><code class="language-plaintext highlighter-rouge">100</code></td>
+      <td>訪問ページ数の上限（達したら停止）</td>
+    </tr>
+    <tr>
+      <td><code class="language-plaintext highlighter-rouge">same_domain</code></td>
+      <td><code class="language-plaintext highlighter-rouge">bool</code></td>
+      <td><code class="language-plaintext highlighter-rouge">True</code></td>
+      <td>開始 URL と<strong>同じドメイン</strong>だけを巡回</td>
+    </tr>
+    <tr>
+      <td><code class="language-plaintext highlighter-rouge">allowed_domains</code></td>
+      <td><code class="language-plaintext highlighter-rouge">Iterable[str] \| None</code></td>
+      <td><code class="language-plaintext highlighter-rouge">None</code></td>
+      <td>明示的に許可するドメインのリスト（指定すると <code class="language-plaintext highlighter-rouge">same_domain</code> より優先）</td>
+    </tr>
+    <tr>
+      <td><code class="language-plaintext highlighter-rouge">allow_paths</code></td>
+      <td><code class="language-plaintext highlighter-rouge">Iterable[str] \| None</code></td>
+      <td><code class="language-plaintext highlighter-rouge">None</code></td>
+      <td>パスの<strong>正規表現</strong>許可リスト</td>
+    </tr>
+    <tr>
+      <td><code class="language-plaintext highlighter-rouge">deny_paths</code></td>
+      <td><code class="language-plaintext highlighter-rouge">Iterable[str] \| None</code></td>
+      <td><code class="language-plaintext highlighter-rouge">None</code></td>
+      <td>パスの<strong>正規表現</strong>除外リスト</td>
+    </tr>
+    <tr>
+      <td><code class="language-plaintext highlighter-rouge">deny_defaults</code></td>
+      <td><code class="language-plaintext highlighter-rouge">bool</code></td>
+      <td><code class="language-plaintext highlighter-rouge">True</code></td>
+      <td>既定の除外パターンを使う（管理画面・ログイン・カートなどを除外）</td>
+    </tr>
+    <tr>
+      <td><code class="language-plaintext highlighter-rouge">order</code></td>
+      <td><code class="language-plaintext highlighter-rouge">"bfs" \| "dfs" \| "random"</code></td>
+      <td><code class="language-plaintext highlighter-rouge">"bfs"</code></td>
+      <td>探索順</td>
+    </tr>
+    <tr>
+      <td><code class="language-plaintext highlighter-rouge">max_depth</code></td>
+      <td><code class="language-plaintext highlighter-rouge">int \| None</code></td>
+      <td><code class="language-plaintext highlighter-rouge">None</code></td>
+      <td>開始 URL からのリンク階層の上限（None = 無制限）</td>
+    </tr>
+    <tr>
+      <td><code class="language-plaintext highlighter-rouge">per_page_timeout_s</code></td>
+      <td><code class="language-plaintext highlighter-rouge">float</code></td>
+      <td><code class="language-plaintext highlighter-rouge">30.0</code></td>
+      <td>1 ページあたりの上限（秒）</td>
+    </tr>
+    <tr>
+      <td><code class="language-plaintext highlighter-rouge">handle_modal_each_page</code></td>
+      <td><code class="language-plaintext highlighter-rouge">str \| None</code></td>
+      <td><code class="language-plaintext highlighter-rouge">None</code></td>
+      <td>各ページで割り込み画面に対処する agent ゴール</td>
+    </tr>
+    <tr>
+      <td><code class="language-plaintext highlighter-rouge">persist_state</code></td>
+      <td><code class="language-plaintext highlighter-rouge">bool \| str</code></td>
+      <td><code class="language-plaintext highlighter-rouge">True</code></td>
+      <td>進捗を parent job に永続化（<strong>attempt 跨ぎで再開可能</strong>）。<code class="language-plaintext highlighter-rouge">str</code> を渡すと保存キー名になる</td>
+    </tr>
+    <tr>
+      <td><code class="language-plaintext highlighter-rouge">host_dedup</code></td>
+      <td><code class="language-plaintext highlighter-rouge">bool</code></td>
+      <td><code class="language-plaintext highlighter-rouge">False</code></td>
+      <td><strong>ホストを跨いだ既訪 URL の重複除去</strong>（同じ URL を別ホストで再訪しない）</td>
+    </tr>
+    <tr>
+      <td><code class="language-plaintext highlighter-rouge">recrawl_patterns</code></td>
+      <td><code class="language-plaintext highlighter-rouge">Iterable[str] \| None</code></td>
+      <td><code class="language-plaintext highlighter-rouge">None</code></td>
+      <td>host_dedup 有効時に<strong>再訪を許可</strong>する URL glob パターン（カテゴリ一覧などに使う）</td>
+    </tr>
+  </tbody>
+</table>
+
+<h2 id="visit-のフィールド">Visit のフィールド</h2>
+
+<p><code class="language-plaintext highlighter-rouge">walk()</code> が yield するのは <strong><code class="language-plaintext highlighter-rouge">Visit</code></strong> インスタンス。<strong>ページの読み込みに成功</strong>したときだけ yield されます（失敗・オフドメイン・フィルタ除外は無音でスキップ）。</p>
+
+<table>
+  <thead>
+    <tr>
+      <th>フィールド</th>
+      <th>型</th>
+      <th>説明</th>
+    </tr>
+  </thead>
+  <tbody>
+    <tr>
+      <td><code class="language-plaintext highlighter-rouge">visit.n</code></td>
+      <td><code class="language-plaintext highlighter-rouge">int</code></td>
+      <td>1 始まりの<strong>成功</strong>訪問番号</td>
+    </tr>
+    <tr>
+      <td><code class="language-plaintext highlighter-rouge">visit.target</code></td>
+      <td><code class="language-plaintext highlighter-rouge">int</code></td>
+      <td>walker に渡した <code class="language-plaintext highlighter-rouge">target_pages</code>（進捗表示用）</td>
+    </tr>
+    <tr>
+      <td><code class="language-plaintext highlighter-rouge">visit.url</code></td>
+      <td><code class="language-plaintext highlighter-rouge">str</code></td>
+      <td><strong>実際</strong>今いる URL（リダイレクト後）</td>
+    </tr>
+    <tr>
+      <td><code class="language-plaintext highlighter-rouge">visit.requested_url</code></td>
+      <td><code class="language-plaintext highlighter-rouge">str</code></td>
+      <td>walker が <code class="language-plaintext highlighter-rouge">page.goto()</code> に渡した URL</td>
+    </tr>
+    <tr>
+      <td><code class="language-plaintext highlighter-rouge">visit.depth</code></td>
+      <td><code class="language-plaintext highlighter-rouge">int</code></td>
+      <td>開始 URL からのリンク階層（start_url は 0）</td>
+    </tr>
+    <tr>
+      <td><code class="language-plaintext highlighter-rouge">visit.outline</code></td>
+      <td><code class="language-plaintext highlighter-rouge">str</code></td>
+      <td>ページのアウトライン（walker が事前取得済み・再フェッチ不要）</td>
+    </tr>
+    <tr>
+      <td><code class="language-plaintext highlighter-rouge">visit.page</code></td>
+      <td><code class="language-plaintext highlighter-rouge">Page</code></td>
+      <td>そのページに居る <code class="language-plaintext highlighter-rouge">Page</code> ハンドル（ループ外から閉包しなくて良い）</td>
+    </tr>
+  </tbody>
+</table>
+
+<p>進捗を表示する典型:</p>
+
+<div class="language-python highlighter-rouge"><div class="highlight"><pre class="highlight"><code><span class="k">async</span> <span class="k">for</span> <span class="n">visit</span> <span class="ow">in</span> <span class="n">walk</span><span class="p">(</span><span class="n">page</span><span class="p">,</span> <span class="n">target_pages</span><span class="o">=</span><span class="mi">200</span><span class="p">):</span>
+    <span class="k">print</span><span class="p">(</span><span class="sa">f</span><span class="s">"[</span><span class="si">{</span><span class="n">visit</span><span class="p">.</span><span class="n">n</span><span class="si">}</span><span class="s">/</span><span class="si">{</span><span class="n">visit</span><span class="p">.</span><span class="n">target</span><span class="si">}</span><span class="s">] depth=</span><span class="si">{</span><span class="n">visit</span><span class="p">.</span><span class="n">depth</span><span class="si">}</span><span class="s"> </span><span class="si">{</span><span class="n">visit</span><span class="p">.</span><span class="n">url</span><span class="si">}</span><span class="s">"</span><span class="p">)</span>
+</code></pre></div></div>
+
+<h2 id="巡回範囲の絞り込み">巡回範囲の絞り込み</h2>
+
+<h3 id="同じドメインだけ">同じドメインだけ</h3>
+
+<div class="language-python highlighter-rouge"><div class="highlight"><pre class="highlight"><code><span class="n">walk</span><span class="p">(</span><span class="n">page</span><span class="p">,</span> <span class="n">target_pages</span><span class="o">=</span><span class="mi">200</span><span class="p">,</span> <span class="n">same_domain</span><span class="o">=</span><span class="bp">True</span><span class="p">)</span>
+</code></pre></div></div>
+
+<h3 id="複数ドメインを許可">複数ドメインを許可</h3>
+
+<div class="language-python highlighter-rouge"><div class="highlight"><pre class="highlight"><code><span class="n">walk</span><span class="p">(</span>
+    <span class="n">page</span><span class="p">,</span>
+    <span class="n">target_pages</span><span class="o">=</span><span class="mi">500</span><span class="p">,</span>
+    <span class="n">allowed_domains</span><span class="o">=</span><span class="p">[</span><span class="s">"example.com"</span><span class="p">,</span> <span class="s">"cdn.example.com"</span><span class="p">],</span>
+<span class="p">)</span>
+</code></pre></div></div>
+
+<h3 id="パスを許可除外正規表現">パスを許可・除外（正規表現）</h3>
+
+<div class="language-python highlighter-rouge"><div class="highlight"><pre class="highlight"><code><span class="n">walk</span><span class="p">(</span>
+    <span class="n">page</span><span class="p">,</span>
+    <span class="n">target_pages</span><span class="o">=</span><span class="mi">300</span><span class="p">,</span>
+    <span class="n">allow_paths</span><span class="o">=</span><span class="p">[</span><span class="sa">r</span><span class="s">"^/articles/"</span><span class="p">],</span>
+    <span class="n">deny_paths</span><span class="o">=</span><span class="p">[</span><span class="sa">r</span><span class="s">"^/admin/"</span><span class="p">,</span> <span class="sa">r</span><span class="s">"\.pdf$"</span><span class="p">],</span>
+<span class="p">)</span>
+</code></pre></div></div>
+
+<blockquote>
+  <p><code class="language-plaintext highlighter-rouge">deny_defaults=True</code>（既定）のときは、管理画面・ログイン・カート・印刷ビューなどの<strong>経験則的な除外</strong>もあわせて適用されます。</p>
+</blockquote>
+
+<h3 id="階層順序">階層・順序</h3>
+
+<div class="language-python highlighter-rouge"><div class="highlight"><pre class="highlight"><code><span class="n">walk</span><span class="p">(</span><span class="n">page</span><span class="p">,</span> <span class="n">target_pages</span><span class="o">=</span><span class="mi">300</span><span class="p">,</span> <span class="n">max_depth</span><span class="o">=</span><span class="mi">2</span><span class="p">,</span> <span class="n">order</span><span class="o">=</span><span class="s">"dfs"</span><span class="p">)</span>
+</code></pre></div></div>
+
+<h2 id="失敗の扱い">失敗の扱い</h2>
+
+<p><code class="language-plaintext highlighter-rouge">walk()</code> は<strong>成功した訪問だけ yield</strong> します。失敗ページ・オフドメイン redirect・フィルタ除外は walker が無音でスキップするので、<strong>ループ内で握りつぶす必要はありません</strong>。</p>
+
+<p>各ページ内の処理が落ちた場合だけ try で囲ってください:</p>
+
+<div class="language-python highlighter-rouge"><div class="highlight"><pre class="highlight"><code><span class="k">async</span> <span class="k">for</span> <span class="n">visit</span> <span class="ow">in</span> <span class="n">walk</span><span class="p">(</span><span class="n">page</span><span class="p">,</span> <span class="n">target_pages</span><span class="o">=</span><span class="mi">300</span><span class="p">):</span>
+    <span class="k">try</span><span class="p">:</span>
+        <span class="k">await</span> <span class="n">page</span><span class="p">.</span><span class="n">save_assets</span><span class="p">(</span><span class="s">"out/images"</span><span class="p">)</span>
+    <span class="k">except</span> <span class="nb">Exception</span> <span class="k">as</span> <span class="n">e</span><span class="p">:</span>
+        <span class="k">print</span><span class="p">(</span><span class="sa">f</span><span class="s">"  skip </span><span class="si">{</span><span class="n">visit</span><span class="p">.</span><span class="n">url</span><span class="si">}</span><span class="s">: </span><span class="si">{</span><span class="n">e</span><span class="si">}</span><span class="s">"</span><span class="p">)</span>
+</code></pre></div></div>
+
+<h2 id="attempt-跨ぎで再開">attempt 跨ぎで再開</h2>
+
+<p><code class="language-plaintext highlighter-rouge">persist_state=True</code>（既定）のとき、walker の進捗（<code class="language-plaintext highlighter-rouge">crawled</code> / <code class="language-plaintext highlighter-rouge">queue</code>）は parent job のディスクに保存されます。途中で止まっても、<strong>同じ <code class="language-plaintext highlighter-rouge">parent_job_id</code> で再開すれば続きから</strong>走ります。</p>
+
+<div class="language-python highlighter-rouge"><div class="highlight"><pre class="highlight"><code><span class="k">async</span> <span class="k">with</span> <span class="n">cli</span><span class="p">.</span><span class="n">session</span><span class="p">(</span><span class="s">"https://example.com"</span><span class="p">,</span> <span class="n">parent_job_id</span><span class="o">=</span><span class="s">"crawl-001"</span><span class="p">)</span> <span class="k">as</span> <span class="n">page</span><span class="p">:</span>
+    <span class="k">async</span> <span class="k">for</span> <span class="n">visit</span> <span class="ow">in</span> <span class="n">walk</span><span class="p">(</span><span class="n">page</span><span class="p">,</span> <span class="n">target_pages</span><span class="o">=</span><span class="mi">10000</span><span class="p">,</span> <span class="n">persist_state</span><span class="o">=</span><span class="bp">True</span><span class="p">):</span>
+        <span class="p">...</span>
+</code></pre></div></div>
+
+<h2 id="クラス版-walker">クラス版 <code class="language-plaintext highlighter-rouge">Walker</code></h2>
+
+<p><code class="language-plaintext highlighter-rouge">walk()</code> は内部で <code class="language-plaintext highlighter-rouge">Walker</code> を作っています。ステートを覗きたい / 別の場所で組み立てたい場合に使います。</p>
+
+<div class="language-python highlighter-rouge"><div class="highlight"><pre class="highlight"><code><span class="kn">from</span> <span class="nn">paprika_client</span> <span class="kn">import</span> <span class="n">Walker</span>
+
+<span class="n">walker</span> <span class="o">=</span> <span class="n">Walker</span><span class="p">(</span><span class="n">page</span><span class="p">,</span> <span class="n">target_pages</span><span class="o">=</span><span class="mi">200</span><span class="p">,</span> <span class="n">same_domain</span><span class="o">=</span><span class="bp">True</span><span class="p">)</span>
+<span class="k">async</span> <span class="k">for</span> <span class="n">visit</span> <span class="ow">in</span> <span class="n">walker</span><span class="p">:</span>
+    <span class="p">...</span>
+<span class="k">print</span><span class="p">(</span><span class="nb">len</span><span class="p">(</span><span class="n">walker</span><span class="p">.</span><span class="n">crawled</span><span class="p">),</span> <span class="s">"pages crawled"</span><span class="p">)</span>
+<span class="k">print</span><span class="p">(</span><span class="nb">len</span><span class="p">(</span><span class="n">walker</span><span class="p">.</span><span class="n">queue</span><span class="p">),</span> <span class="s">"still in queue"</span><span class="p">)</span>
+</code></pre></div></div>
+
+<h2 id="ベストプラクティス">ベストプラクティス</h2>
+
+<ul>
+  <li><strong><code class="language-plaintext highlighter-rouge">target_pages</code> を明示する</strong> — 無限に走らせないための基本。</li>
+  <li><strong><code class="language-plaintext highlighter-rouge">max_depth</code> で浅く保つ</strong> — フッタの外部リンクから無関係なドメインに迷い込まないように。</li>
+  <li><strong>ループ内のサンプル数は <code class="language-plaintext highlighter-rouge">visit.n</code> を使う</strong> — 自分で <code class="language-plaintext highlighter-rouge">i++</code> カウントしない（dedup でスキップされるとずれる）。</li>
+  <li><strong><code class="language-plaintext highlighter-rouge">requested_url</code> と <code class="language-plaintext highlighter-rouge">url</code> の食い違い</strong>に注意 — 強制リダイレクトされたページを記録するなら <code class="language-plaintext highlighter-rouge">visit.url</code> を、リンク元 URL を残したいなら <code class="language-plaintext highlighter-rouge">visit.requested_url</code> を。</li>
+  <li><strong>長時間クロールは <code class="language-plaintext highlighter-rouge">persist_state=True</code></strong> — 失敗時に最初からやり直さずに済みます。</li>
+</ul>
+
+<h2 id="関連">関連</h2>
+
+<ul>
+  <li><a href="/paprika/api.html#walk">API リファレンス: walk</a></li>
+  <li><a href="/paprika/guides.html">ガイド: サイトを巡回（walk）</a></li>
+  <li><a href="usecases.html">ユースケース: サイト全体をアーカイブ</a></li>
+</ul>
+
+  </main>
+</div>
+<script>
+// Build the "このページ" sidebar from the rendered <h2> headings (each gets an
+// id from kramdown auto_ids). No headings -> drop the sidebar column so the
+// content fills the full width instead of sitting in the narrow sidebar slot.
+(function () {
+  var toc = document.getElementById('doc-toc');
+  var heads = document.querySelectorAll('.content h2[id]');
+  if (!toc) return;
+  if (!heads.length) {
+    var aside = document.querySelector('.sidebar');
+    var layout = document.querySelector('.layout');
+    if (aside) aside.style.display = 'none';
+    if (layout) layout.style.gridTemplateColumns = '1fr';
+    return;
+  }
+  heads.forEach(function (h) {
+    var li = document.createElement('li');
+    var a = document.createElement('a');
+    a.href = '#' + h.id;
+    a.textContent = h.textContent;
+    li.appendChild(a);
+    toc.appendChild(li);
+  });
+})();
+</script>
+</body>
+</html>

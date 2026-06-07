@@ -97,6 +97,78 @@ from .video import _make_video_downloader, _parse_dl_progress, detect_yt_dlp
 from .workerid import WORKER_ID_FILE, _WorkerIdReassigned, hub_http_base
 
 
+# Module-level CPU sample state. The first heartbeat returns 0.0% because
+# we have no prior baseline; from then on each call computes the delta
+# (busy / total cpu jiffies) against the previous sample. Module-level is
+# safe: one WorkerAgent per process.
+_cpu_last_sample: tuple[int, int] | None = None
+
+
+def _sample_resources() -> tuple[float, float, float, float, float]:
+    """Return (cpu_pct, mem_pct, disk_pct, disk_free_gb, load1) for this CT.
+
+    Best-effort. A missing or unparseable /proc entry returns 0.0 for that
+    field instead of raising, so the heartbeat loop stays tight and a
+    funky kernel doesn't take the worker down. Designed to be called from
+    the heartbeat thread (~10s cadence) so the CPU% delta window matches.
+
+    cpu_pct + load1 are LXC-host (Proxmox node) signals because the CT
+    shares /proc/stat + getloadavg with its host. mem_pct + disk_* are
+    CT-local (cgroup memory + overlayfs root). The split matches what an
+    operator needs to triage "this CT is full" vs "this whole node is
+    overloaded across all CTs sharing it".
+    """
+    global _cpu_last_sample
+    cpu_pct = 0.0
+    try:
+        with open("/proc/stat") as f:
+            fields = f.readline().split()
+        # cpu user nice system idle iowait irq softirq steal guest guest_nice
+        idle = int(fields[4]) + int(fields[5])
+        total = sum(int(x) for x in fields[1:8])
+        if _cpu_last_sample is not None:
+            d_idle = idle - _cpu_last_sample[0]
+            d_total = total - _cpu_last_sample[1]
+            if d_total > 0:
+                cpu_pct = max(0.0, min(100.0, 100.0 * (1.0 - d_idle / d_total)))
+        _cpu_last_sample = (idle, total)
+    except (OSError, ValueError, IndexError):
+        pass
+
+    mem_pct = 0.0
+    try:
+        info: dict[str, int] = {}
+        with open("/proc/meminfo") as f:
+            for line in f:
+                key, _, rest = line.partition(":")
+                info[key.strip()] = int(rest.strip().split()[0])
+        total_kb = info.get("MemTotal", 0) or 1
+        # MemAvailable is the right field on kernels >=3.14 (accounts for
+        # reclaimable cache); fall back to MemFree on ancient kernels.
+        avail_kb = info.get("MemAvailable", info.get("MemFree", 0))
+        mem_pct = max(0.0, min(100.0, 100.0 * (1.0 - avail_kb / total_kb)))
+    except (OSError, ValueError, KeyError, IndexError):
+        pass
+
+    disk_pct = 0.0
+    disk_free_gb = 0.0
+    try:
+        du = shutil.disk_usage("/")
+        if du.total > 0:
+            disk_pct = max(0.0, min(100.0, 100.0 * du.used / du.total))
+        disk_free_gb = du.free / (1024.0 ** 3)
+    except OSError:
+        pass
+
+    load1 = 0.0
+    try:
+        load1 = os.getloadavg()[0]
+    except (OSError, AttributeError):
+        pass
+
+    return cpu_pct, mem_pct, disk_pct, disk_free_gb, load1
+
+
 class _RunMixin:
     async def run(self) -> None:
         """Reconnect loop. Reconnects with backoff on disconnect."""
@@ -475,11 +547,27 @@ class _RunMixin:
                     eff_in_flight = (
                         self.max_concurrent if self._draining else self._in_flight
                     )
+                    # Snapshot CT/host resources for the admin Workers list
+                    # + the hub-side disk-pressure dispatch gate (pick_worker
+                    # skips workers with disk_pct > 90). Stamp onto the
+                    # WorkerAgent so _mix_jobexec can read the same sample
+                    # in its preflight without re-walking /proc.
+                    cpu_pct, mem_pct, disk_pct, disk_free_gb, load1 = (
+                        _sample_resources()
+                    )
+                    self._last_resources = (
+                        cpu_pct, mem_pct, disk_pct, disk_free_gb, load1,
+                    )
                     await self._send(
                         WorkerHeartbeat(
                             in_flight=eff_in_flight,
                             capacity=self.max_concurrent,
                             profiles_cached=cached,
+                            cpu_pct=cpu_pct,
+                            mem_pct=mem_pct,
+                            disk_pct=disk_pct,
+                            disk_free_gb=disk_free_gb,
+                            load1=load1,
                         )
                     )
                     # A successful heartbeat == the hub link is alive.

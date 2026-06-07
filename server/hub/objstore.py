@@ -206,6 +206,7 @@ async def mirror_dir(local_dir: Path | str) -> int:
         if client is None:
             return 0
         n = 0
+        bucket = _bucket()
         try:
             for p in root.rglob("*"):
                 try:
@@ -214,7 +215,20 @@ async def mirror_dir(local_dir: Path | str) -> int:
                     key = _key_for(p)
                     if key is None:
                         continue
-                    client.upload_file(str(p), _bucket(), key)
+                    # INCREMENTAL: skip files already in the bucket at the same
+                    # size (the per-file mirror already sent most assets). This
+                    # keeps mirror_dir cheap when called repeatedly -- e.g. the
+                    # cache-evict loop, which would otherwise RE-upload every
+                    # multi-GB video on each pass and never keep up. Only genuinely
+                    # missing files (typically the .meta sidecars) are uploaded.
+                    try:
+                        sz = p.stat().st_size
+                        h = client.head_object(Bucket=bucket, Key=key)
+                        if int(h.get("ContentLength", -1)) == sz:
+                            continue
+                    except Exception:
+                        pass  # not present / head failed -> upload below
+                    client.upload_file(str(p), bucket, key)
                     n += 1
                 except Exception:
                     continue

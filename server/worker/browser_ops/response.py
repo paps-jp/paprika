@@ -17,7 +17,7 @@ from nodriver import cdp
 from ._base import *  # noqa: F401,F403
 from ._base import LogFn
 from .input import click, fill, press_key, scroll, type_text
-from .nav import back, forward, history_first, navigate
+from .nav import back, forward, history_first, navigate, wait_for_load
 
 _VAR_PLACEHOLDER_RE = re.compile(r"\$\{([A-Za-z_][A-Za-z0-9_]*)\}")
 
@@ -318,17 +318,26 @@ async def execute_nav_with_response(
     vars_map = action.get("variables") or None
     if kind == "navigate":
         url = _apply_variables(action.get("url") or "", vars_map)
-        return await _capture_nav_response(
+        result = await _capture_nav_response(
             tab, navigate(tab, url, log), expected_url=url,
         )
-    if kind == "back":
-        return await _capture_nav_response(tab, back(tab, log))
-    if kind == "forward":
-        return await _capture_nav_response(tab, forward(tab, log))
-    if kind == "history_first":
-        return await _capture_nav_response(tab, history_first(tab, log))
-    # Non-nav: delegate to the existing dispatcher; no response info.
-    return await execute(tab, action, log), None
+    elif kind == "back":
+        result = await _capture_nav_response(tab, back(tab, log))
+    elif kind == "forward":
+        result = await _capture_nav_response(tab, forward(tab, log))
+    elif kind == "history_first":
+        result = await _capture_nav_response(tab, history_first(tab, log))
+    else:
+        # Non-nav: delegate to the existing dispatcher; no response info,
+        # no navigation to wait on.
+        return await execute(tab, action, log), None
+    # Wait for the navigated document to reach DOM-ready BEFORE returning, so
+    # the SDK's next page.click()/fill()/etc. runs against a parsed page
+    # rather than a still-loading one (the response capture above only waits
+    # for the document's HTTP headers, not the DOM). The HTTP response was
+    # already captured with listeners armed; this is a pure readyState poll.
+    await wait_for_load(tab, log)
+    return result
 
 
 async def execute(tab, action: dict, log: LogFn) -> str:

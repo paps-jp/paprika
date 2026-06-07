@@ -1,0 +1,488 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+<meta charset="utf-8">
+<title>Locator — 要素の指定 — Paprika</title>
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<link rel="stylesheet" href="/paprika/style.css">
+<script src="https://code.iconify.design/iconify-icon/2.1.0/iconify-icon.min.js"></script>
+<meta name="description" content="Paprika の Locator(Playwright スタイル)で DOM 要素を指定する完全リファレンス — CSS/role/text/testid/placeholder/title/alt の取得、操作・入力デバイス・取得・状態判定・チェーン・wait_for の全メソッド。">
+<link rel="canonical" href="https://paps-jp.github.io/paprika/locator.html">
+<meta property="og:type" content="article">
+<meta property="og:site_name" content="Paprika">
+<meta property="og:title" content="Locator — 要素の指定 — Paprika">
+<meta property="og:description" content="Paprika の Locator(Playwright スタイル)で DOM 要素を指定する完全リファレンス — CSS/role/text/testid/placeholder/title/alt の取得、操作・入力デバイス・取得・状態判定・チェーン・wait_for の全メソッド。">
+<meta property="og:url" content="https://paps-jp.github.io/paprika/locator.html">
+<meta property="og:locale" content="ja_JP">
+</head>
+<body>
+
+<nav class="topnav">
+  <a class="brand" href="index.html"><span class="logo"><img src="icon.svg" alt=""></span> Paprika</a>
+  <span class="links">
+    <span class="dropdown">
+      <a class="dropdown-toggle" href="why-paprika.html">はじめに ▾</a>
+      <span class="dropdown-menu">
+        <a href="why-paprika.html">なぜ Paprika?</a>
+        <a href="intro.html">Client インストール</a>
+        <a href="quickstart.html">Server インストール</a>
+      </span>
+    </span>
+    <span class="dropdown">
+      <a class="dropdown-toggle" href="guides.html">学ぶ ▾</a>
+      <span class="dropdown-menu">
+        <a href="guides.html">ガイド</a>
+        <a href="examples.html">サンプル</a>
+        <a href="usecases.html">ユースケース</a>
+        <a href="video.html">動画</a>
+        <a href="faq.html">FAQ</a>
+      </span>
+    </span>
+    <span class="dropdown">
+      <a class="dropdown-toggle active" href="api.html">リファレンス ▾</a>
+      <span class="dropdown-menu">
+        <a href="api.html">API</a>
+        <a href="http-api.html">HTTP API</a>
+        <a href="cli.html">CLI</a>
+        <a href="job-options.html">JobOptions</a>
+        <a href="walk.html">walk（巡回）</a>
+        <a href="locator.html" class="active">Locator（要素指定）</a>
+        <a href="ws-events.html">WebSocket（ライブログ）</a>
+        <a href="errors.html">エラー一覧</a>
+        <a href="bridge-extension.html">Bridge 拡張</a>
+        <a href="profile.html">use_profile</a>
+        <a href="host-recipe.html">Host レシピ</a>
+        <a href="admin.html">管理画面</a>
+      </span>
+    </span>
+    <a href="operations.html">運用</a>
+    <a href="architecture.html">設計</a>
+  </span>
+  <a class="gh" href="search.html" title="サイト内検索" aria-label="サイト内検索" style="padding:5px 10px; margin-right:6px;"><iconify-icon icon="lucide:search" style="font-size:1.05rem; vertical-align:-3px;"></iconify-icon></a>
+  <a class="gh" href="https://github.com/paps-jp/paprika">GitHub ↗</a>
+</nav>
+
+<div class="layout">
+  <aside class="sidebar">
+    <h4>このページ</h4>
+    <ul id="doc-toc"></ul>
+  </aside>
+  <main class="content">
+    <h1>Locator — 要素の指定</h1>
+    <p class="lead">Paprika の Locator(Playwright スタイル)で DOM 要素を指定する完全リファレンス — CSS/role/text/testid/placeholder/title/alt の取得、操作・入力デバイス・取得・状態判定・チェーン・wait_for の全メソッド。</p>
+    <p><code class="language-plaintext highlighter-rouge">Locator</code> は <strong>要素の指し方</strong>だけを保持して、<code class="language-plaintext highlighter-rouge">click()</code> や <code class="language-plaintext highlighter-rouge">wait_for()</code> のタイミングで初めて DOM を探しに行く<strong>遅延評価</strong>の参照です。Playwright と同じ感覚で書けます。</p>
+
+<blockquote>
+  <p>全体 API は <a href="/paprika/api.html">API リファレンス</a>。基本ガイドは <a href="/paprika/guides.html">ガイド: DOM 操作</a>。</p>
+</blockquote>
+
+<h2 id="作り方">作り方</h2>
+
+<p><code class="language-plaintext highlighter-rouge">Page</code> の以下のメソッドが <code class="language-plaintext highlighter-rouge">Locator</code> を返します。</p>
+
+<table>
+  <thead>
+    <tr>
+      <th>メソッド</th>
+      <th>例</th>
+      <th>マッチするもの</th>
+    </tr>
+  </thead>
+  <tbody>
+    <tr>
+      <td><code class="language-plaintext highlighter-rouge">page.locator(css)</code></td>
+      <td><code class="language-plaintext highlighter-rouge">page.locator("button.primary")</code></td>
+      <td>任意の <strong>CSS セレクタ</strong></td>
+    </tr>
+    <tr>
+      <td><code class="language-plaintext highlighter-rouge">page.get_by_role(role, *, name=None)</code></td>
+      <td><code class="language-plaintext highlighter-rouge">page.get_by_role("button", name="購入")</code></td>
+      <td><code class="language-plaintext highlighter-rouge">role=</code> 属性で書かれた要素</td>
+    </tr>
+    <tr>
+      <td><code class="language-plaintext highlighter-rouge">page.get_by_text(text)</code></td>
+      <td><code class="language-plaintext highlighter-rouge">page.get_by_text("ログイン")</code></td>
+      <td><strong>テキスト一致</strong>（可視テキスト）</td>
+    </tr>
+    <tr>
+      <td><code class="language-plaintext highlighter-rouge">page.get_by_test_id(id)</code></td>
+      <td><code class="language-plaintext highlighter-rouge">page.get_by_test_id("submit-btn")</code></td>
+      <td><code class="language-plaintext highlighter-rouge">data-testid="..."</code> 属性</td>
+    </tr>
+    <tr>
+      <td><code class="language-plaintext highlighter-rouge">page.get_by_placeholder(text)</code></td>
+      <td><code class="language-plaintext highlighter-rouge">page.get_by_placeholder("メール")</code></td>
+      <td><code class="language-plaintext highlighter-rouge">placeholder="..."</code></td>
+    </tr>
+    <tr>
+      <td><code class="language-plaintext highlighter-rouge">page.get_by_title(text)</code></td>
+      <td><code class="language-plaintext highlighter-rouge">page.get_by_title("ヘルプ")</code></td>
+      <td><code class="language-plaintext highlighter-rouge">title="..."</code></td>
+    </tr>
+    <tr>
+      <td><code class="language-plaintext highlighter-rouge">page.get_by_alt_text(text)</code></td>
+      <td><code class="language-plaintext highlighter-rouge">page.get_by_alt_text("ロゴ")</code></td>
+      <td><code class="language-plaintext highlighter-rouge">&lt;img alt="..."&gt;</code></td>
+    </tr>
+  </tbody>
+</table>
+
+<blockquote>
+  <p><strong>解決はアクション時</strong>です。<code class="language-plaintext highlighter-rouge">Locator</code> を作っても DOM 検索はまだ走りません。<code class="language-plaintext highlighter-rouge">click()</code> / <code class="language-plaintext highlighter-rouge">wait_for()</code> などを呼んだときに初めて探します。</p>
+</blockquote>
+
+<h2 id="メソッド一覧完全版">メソッド一覧（完全版）</h2>
+
+<h3 id="操作クリック入力">操作（クリック・入力）</h3>
+
+<table>
+  <thead>
+    <tr>
+      <th>メソッド</th>
+      <th>戻り値</th>
+      <th>説明</th>
+    </tr>
+  </thead>
+  <tbody>
+    <tr>
+      <td><code class="language-plaintext highlighter-rouge">await loc.click()</code></td>
+      <td><code class="language-plaintext highlighter-rouge">dict</code></td>
+      <td>クリック</td>
+    </tr>
+    <tr>
+      <td><code class="language-plaintext highlighter-rouge">await loc.dblclick()</code></td>
+      <td><code class="language-plaintext highlighter-rouge">bool</code></td>
+      <td>ダブルクリック</td>
+    </tr>
+    <tr>
+      <td><code class="language-plaintext highlighter-rouge">await loc.hover()</code></td>
+      <td><code class="language-plaintext highlighter-rouge">bool</code></td>
+      <td>ホバー</td>
+    </tr>
+    <tr>
+      <td><code class="language-plaintext highlighter-rouge">await loc.focus()</code></td>
+      <td><code class="language-plaintext highlighter-rouge">bool</code></td>
+      <td>フォーカス</td>
+    </tr>
+    <tr>
+      <td><code class="language-plaintext highlighter-rouge">await loc.fill(value)</code></td>
+      <td><code class="language-plaintext highlighter-rouge">dict</code></td>
+      <td>入力欄に値を <strong>置換</strong></td>
+    </tr>
+    <tr>
+      <td><code class="language-plaintext highlighter-rouge">await loc.type(text)</code></td>
+      <td><code class="language-plaintext highlighter-rouge">dict</code></td>
+      <td>キー入力をエミュレート</td>
+    </tr>
+    <tr>
+      <td><code class="language-plaintext highlighter-rouge">await loc.press(key, *, modifiers=None)</code></td>
+      <td><code class="language-plaintext highlighter-rouge">dict</code></td>
+      <td>単一キー押下（<code class="language-plaintext highlighter-rouge">"Enter"</code> / <code class="language-plaintext highlighter-rouge">"ArrowDown"</code> 等）</td>
+    </tr>
+    <tr>
+      <td><code class="language-plaintext highlighter-rouge">await loc.check()</code></td>
+      <td><code class="language-plaintext highlighter-rouge">bool</code></td>
+      <td>チェックボックス ON</td>
+    </tr>
+    <tr>
+      <td><code class="language-plaintext highlighter-rouge">await loc.uncheck()</code></td>
+      <td><code class="language-plaintext highlighter-rouge">bool</code></td>
+      <td>チェックボックス OFF</td>
+    </tr>
+    <tr>
+      <td><code class="language-plaintext highlighter-rouge">await loc.select_option(value)</code></td>
+      <td><code class="language-plaintext highlighter-rouge">bool</code></td>
+      <td><code class="language-plaintext highlighter-rouge">&lt;select&gt;</code> の値選択</td>
+    </tr>
+    <tr>
+      <td><code class="language-plaintext highlighter-rouge">await loc.set_input_files(files)</code></td>
+      <td><code class="language-plaintext highlighter-rouge">dict</code></td>
+      <td><code class="language-plaintext highlighter-rouge">&lt;input type=file&gt;</code> にファイル添付</td>
+    </tr>
+    <tr>
+      <td><code class="language-plaintext highlighter-rouge">await loc.scroll_into_view_if_needed()</code></td>
+      <td><code class="language-plaintext highlighter-rouge">bool</code></td>
+      <td>表示位置までスクロール</td>
+    </tr>
+  </tbody>
+</table>
+
+<h3 id="取得テキスト--属性">取得（テキスト / 属性）</h3>
+
+<table>
+  <thead>
+    <tr>
+      <th>メソッド</th>
+      <th>戻り値</th>
+      <th>説明</th>
+    </tr>
+  </thead>
+  <tbody>
+    <tr>
+      <td><code class="language-plaintext highlighter-rouge">await loc.text_content()</code></td>
+      <td><code class="language-plaintext highlighter-rouge">str \| None</code></td>
+      <td>テキスト内容（<code class="language-plaintext highlighter-rouge">textContent</code>）</td>
+    </tr>
+    <tr>
+      <td><code class="language-plaintext highlighter-rouge">await loc.inner_text()</code></td>
+      <td><code class="language-plaintext highlighter-rouge">str \| None</code></td>
+      <td>可視テキスト（<code class="language-plaintext highlighter-rouge">innerText</code>）</td>
+    </tr>
+    <tr>
+      <td><code class="language-plaintext highlighter-rouge">await loc.inner_html()</code></td>
+      <td><code class="language-plaintext highlighter-rouge">str \| None</code></td>
+      <td>HTML 内容（<code class="language-plaintext highlighter-rouge">innerHTML</code>）</td>
+    </tr>
+    <tr>
+      <td><code class="language-plaintext highlighter-rouge">await loc.input_value()</code></td>
+      <td><code class="language-plaintext highlighter-rouge">str \| None</code></td>
+      <td>フォーム入力の値</td>
+    </tr>
+    <tr>
+      <td><code class="language-plaintext highlighter-rouge">await loc.get_attribute(name)</code></td>
+      <td><code class="language-plaintext highlighter-rouge">str \| None</code></td>
+      <td>属性の値</td>
+    </tr>
+  </tbody>
+</table>
+
+<h3 id="状態判定">状態判定</h3>
+
+<table>
+  <thead>
+    <tr>
+      <th>メソッド</th>
+      <th>戻り値</th>
+      <th>説明</th>
+    </tr>
+  </thead>
+  <tbody>
+    <tr>
+      <td><code class="language-plaintext highlighter-rouge">await loc.is_visible()</code></td>
+      <td><code class="language-plaintext highlighter-rouge">bool</code></td>
+      <td>表示中か</td>
+    </tr>
+    <tr>
+      <td><code class="language-plaintext highlighter-rouge">await loc.is_checked()</code></td>
+      <td><code class="language-plaintext highlighter-rouge">bool</code></td>
+      <td>チェック済みか</td>
+    </tr>
+    <tr>
+      <td><code class="language-plaintext highlighter-rouge">await loc.is_enabled()</code></td>
+      <td><code class="language-plaintext highlighter-rouge">bool</code></td>
+      <td>操作可能か</td>
+    </tr>
+    <tr>
+      <td><code class="language-plaintext highlighter-rouge">await loc.is_disabled()</code></td>
+      <td><code class="language-plaintext highlighter-rouge">bool</code></td>
+      <td>無効化されているか</td>
+    </tr>
+    <tr>
+      <td><code class="language-plaintext highlighter-rouge">await loc.is_editable()</code></td>
+      <td><code class="language-plaintext highlighter-rouge">bool</code></td>
+      <td>編集可能か</td>
+    </tr>
+  </tbody>
+</table>
+
+<h3 id="チェーン複数要素の絞り込み">チェーン（複数要素の絞り込み）</h3>
+
+<table>
+  <thead>
+    <tr>
+      <th>メソッド</th>
+      <th>戻り値</th>
+      <th>説明</th>
+    </tr>
+  </thead>
+  <tbody>
+    <tr>
+      <td><code class="language-plaintext highlighter-rouge">loc.nth(i)</code></td>
+      <td><code class="language-plaintext highlighter-rouge">Locator</code></td>
+      <td>i 番目（0 始まり、負も可）</td>
+    </tr>
+    <tr>
+      <td><code class="language-plaintext highlighter-rouge">loc.first</code></td>
+      <td><code class="language-plaintext highlighter-rouge">Locator</code></td>
+      <td>先頭</td>
+    </tr>
+    <tr>
+      <td><code class="language-plaintext highlighter-rouge">loc.last</code></td>
+      <td><code class="language-plaintext highlighter-rouge">Locator</code></td>
+      <td>末尾</td>
+    </tr>
+    <tr>
+      <td><code class="language-plaintext highlighter-rouge">await loc.count()</code></td>
+      <td><code class="language-plaintext highlighter-rouge">int</code></td>
+      <td>マッチ数</td>
+    </tr>
+    <tr>
+      <td><code class="language-plaintext highlighter-rouge">await loc.all()</code></td>
+      <td><code class="language-plaintext highlighter-rouge">list[Locator]</code></td>
+      <td>全要素を <code class="language-plaintext highlighter-rouge">Locator</code> のリストで取り出し</td>
+    </tr>
+  </tbody>
+</table>
+
+<h3 id="待機">待機</h3>
+
+<table>
+  <thead>
+    <tr>
+      <th>メソッド</th>
+      <th>戻り値</th>
+      <th>説明</th>
+    </tr>
+  </thead>
+  <tbody>
+    <tr>
+      <td><code class="language-plaintext highlighter-rouge">await loc.wait_for(*, state="visible", timeout=30.0)</code></td>
+      <td><code class="language-plaintext highlighter-rouge">bool</code></td>
+      <td>要素が <code class="language-plaintext highlighter-rouge">state</code> になるまで待つ。<code class="language-plaintext highlighter-rouge">state</code> は <code class="language-plaintext highlighter-rouge">visible</code> / <code class="language-plaintext highlighter-rouge">hidden</code> / <code class="language-plaintext highlighter-rouge">attached</code> / <code class="language-plaintext highlighter-rouge">detached</code>。<code class="language-plaintext highlighter-rouge">timeout</code> は秒（<strong>既定 30 秒</strong>）</td>
+    </tr>
+  </tbody>
+</table>
+
+<h2 id="実例">実例</h2>
+
+<h3 id="基本">基本</h3>
+
+<div class="language-python highlighter-rouge"><div class="highlight"><pre class="highlight"><code><span class="n">btn</span> <span class="o">=</span> <span class="n">page</span><span class="p">.</span><span class="n">locator</span><span class="p">(</span><span class="s">"button.primary"</span><span class="p">)</span>
+<span class="k">await</span> <span class="n">btn</span><span class="p">.</span><span class="n">click</span><span class="p">()</span>
+<span class="k">await</span> <span class="n">btn</span><span class="p">.</span><span class="n">wait_for</span><span class="p">(</span><span class="n">state</span><span class="o">=</span><span class="s">"visible"</span><span class="p">,</span> <span class="n">timeout</span><span class="o">=</span><span class="mi">10</span><span class="p">)</span>
+</code></pre></div></div>
+
+<h3 id="テキストロール属性で指す">テキスト・ロール・属性で指す</h3>
+
+<div class="language-python highlighter-rouge"><div class="highlight"><pre class="highlight"><code><span class="k">await</span> <span class="n">page</span><span class="p">.</span><span class="n">get_by_text</span><span class="p">(</span><span class="s">"カートに入れる"</span><span class="p">).</span><span class="n">click</span><span class="p">()</span>
+<span class="k">await</span> <span class="n">page</span><span class="p">.</span><span class="n">get_by_role</span><span class="p">(</span><span class="s">"button"</span><span class="p">,</span> <span class="n">name</span><span class="o">=</span><span class="s">"送信"</span><span class="p">).</span><span class="n">click</span><span class="p">()</span>
+<span class="k">await</span> <span class="n">page</span><span class="p">.</span><span class="n">get_by_test_id</span><span class="p">(</span><span class="s">"login-form"</span><span class="p">).</span><span class="n">wait_for</span><span class="p">()</span>
+<span class="k">await</span> <span class="n">page</span><span class="p">.</span><span class="n">get_by_placeholder</span><span class="p">(</span><span class="s">"メールアドレス"</span><span class="p">).</span><span class="n">fill</span><span class="p">(</span><span class="s">"alice@example.com"</span><span class="p">)</span>
+<span class="k">await</span> <span class="n">page</span><span class="p">.</span><span class="n">get_by_alt_text</span><span class="p">(</span><span class="s">"メイン画像"</span><span class="p">).</span><span class="n">wait_for</span><span class="p">()</span>
+</code></pre></div></div>
+
+<h3 id="複数ヒット">複数ヒット</h3>
+
+<div class="language-python highlighter-rouge"><div class="highlight"><pre class="highlight"><code><span class="n">items</span> <span class="o">=</span> <span class="n">page</span><span class="p">.</span><span class="n">locator</span><span class="p">(</span><span class="s">"ul.products &gt; li"</span><span class="p">)</span>
+<span class="n">n</span> <span class="o">=</span> <span class="k">await</span> <span class="n">items</span><span class="p">.</span><span class="n">count</span><span class="p">()</span>
+<span class="k">print</span><span class="p">(</span><span class="n">n</span><span class="p">,</span> <span class="s">"items"</span><span class="p">)</span>
+
+<span class="c1"># 先頭・末尾・i 番目
+</span><span class="n">first</span>  <span class="o">=</span> <span class="n">items</span><span class="p">.</span><span class="n">first</span>
+<span class="n">last</span>   <span class="o">=</span> <span class="n">items</span><span class="p">.</span><span class="n">last</span>
+<span class="n">third</span>  <span class="o">=</span> <span class="n">items</span><span class="p">.</span><span class="n">nth</span><span class="p">(</span><span class="mi">2</span><span class="p">)</span>
+
+<span class="c1"># 全部取り出して処理
+</span><span class="k">for</span> <span class="n">it</span> <span class="ow">in</span> <span class="k">await</span> <span class="n">items</span><span class="p">.</span><span class="nb">all</span><span class="p">():</span>
+    <span class="n">title</span> <span class="o">=</span> <span class="k">await</span> <span class="n">it</span><span class="p">.</span><span class="n">locator</span><span class="p">(</span><span class="s">".title"</span><span class="p">).</span><span class="n">inner_text</span><span class="p">()</span>
+    <span class="k">print</span><span class="p">(</span><span class="n">title</span><span class="p">)</span>
+</code></pre></div></div>
+
+<h3 id="入力--送信">入力 → 送信</h3>
+
+<div class="language-python highlighter-rouge"><div class="highlight"><pre class="highlight"><code><span class="n">inp</span> <span class="o">=</span> <span class="n">page</span><span class="p">.</span><span class="n">locator</span><span class="p">(</span><span class="s">"input[name='q']"</span><span class="p">)</span>
+<span class="k">await</span> <span class="n">inp</span><span class="p">.</span><span class="n">fill</span><span class="p">(</span><span class="s">"paprika"</span><span class="p">)</span>
+<span class="k">await</span> <span class="n">inp</span><span class="p">.</span><span class="n">press</span><span class="p">(</span><span class="s">"Enter"</span><span class="p">)</span>
+</code></pre></div></div>
+
+<h3 id="属性値の取得">属性・値の取得</h3>
+
+<div class="language-python highlighter-rouge"><div class="highlight"><pre class="highlight"><code><span class="n">el</span> <span class="o">=</span> <span class="n">page</span><span class="p">.</span><span class="n">locator</span><span class="p">(</span><span class="s">".item-name"</span><span class="p">).</span><span class="n">first</span>
+<span class="k">print</span><span class="p">(</span><span class="k">await</span> <span class="n">el</span><span class="p">.</span><span class="n">inner_text</span><span class="p">())</span>
+<span class="k">print</span><span class="p">(</span><span class="k">await</span> <span class="n">el</span><span class="p">.</span><span class="n">get_attribute</span><span class="p">(</span><span class="s">"data-id"</span><span class="p">))</span>
+
+<span class="n">inp</span> <span class="o">=</span> <span class="n">page</span><span class="p">.</span><span class="n">locator</span><span class="p">(</span><span class="s">"input[name='email']"</span><span class="p">)</span>
+<span class="k">print</span><span class="p">(</span><span class="k">await</span> <span class="n">inp</span><span class="p">.</span><span class="n">input_value</span><span class="p">())</span>
+</code></pre></div></div>
+
+<h3 id="連鎖子要素を絞り込む">連鎖（子要素を絞り込む）</h3>
+
+<div class="language-python highlighter-rouge"><div class="highlight"><pre class="highlight"><code><span class="n">card</span> <span class="o">=</span> <span class="n">page</span><span class="p">.</span><span class="n">locator</span><span class="p">(</span><span class="s">".card"</span><span class="p">).</span><span class="n">first</span>
+<span class="n">title</span> <span class="o">=</span> <span class="n">card</span><span class="p">.</span><span class="n">locator</span><span class="p">(</span><span class="s">"h2.title"</span><span class="p">)</span>
+<span class="k">await</span> <span class="n">title</span><span class="p">.</span><span class="n">click</span><span class="p">()</span>
+</code></pre></div></div>
+
+<h3 id="状態判定-1">状態判定</h3>
+
+<div class="language-python highlighter-rouge"><div class="highlight"><pre class="highlight"><code><span class="k">if</span> <span class="k">await</span> <span class="n">page</span><span class="p">.</span><span class="n">locator</span><span class="p">(</span><span class="s">".loading"</span><span class="p">).</span><span class="n">is_visible</span><span class="p">():</span>
+    <span class="k">await</span> <span class="n">page</span><span class="p">.</span><span class="n">locator</span><span class="p">(</span><span class="s">".loading"</span><span class="p">).</span><span class="n">wait_for</span><span class="p">(</span><span class="n">state</span><span class="o">=</span><span class="s">"hidden"</span><span class="p">,</span> <span class="n">timeout</span><span class="o">=</span><span class="mi">10</span><span class="p">)</span>
+
+<span class="k">if</span> <span class="k">await</span> <span class="n">page</span><span class="p">.</span><span class="n">locator</span><span class="p">(</span><span class="s">"input[type=checkbox]"</span><span class="p">).</span><span class="n">is_checked</span><span class="p">():</span>
+    <span class="k">print</span><span class="p">(</span><span class="s">"already checked"</span><span class="p">)</span>
+</code></pre></div></div>
+
+<h3 id="ファイル添付">ファイル添付</h3>
+
+<div class="language-python highlighter-rouge"><div class="highlight"><pre class="highlight"><code><span class="k">await</span> <span class="n">page</span><span class="p">.</span><span class="n">locator</span><span class="p">(</span><span class="s">"input[type=file]"</span><span class="p">).</span><span class="n">set_input_files</span><span class="p">(</span><span class="s">"/path/to/photo.jpg"</span><span class="p">)</span>
+</code></pre></div></div>
+
+<h3 id="select-の選択"><code class="language-plaintext highlighter-rouge">&lt;select&gt;</code> の選択</h3>
+
+<div class="language-python highlighter-rouge"><div class="highlight"><pre class="highlight"><code><span class="k">await</span> <span class="n">page</span><span class="p">.</span><span class="n">locator</span><span class="p">(</span><span class="s">"select[name='country']"</span><span class="p">).</span><span class="n">select_option</span><span class="p">(</span><span class="s">"JP"</span><span class="p">)</span>
+</code></pre></div></div>
+
+<h2 id="同期版sync_paprika">同期版（<code class="language-plaintext highlighter-rouge">sync_paprika</code>）</h2>
+
+<p><code class="language-plaintext highlighter-rouge">await</code> を外すだけで同じ API が使えます。</p>
+
+<div class="language-python highlighter-rouge"><div class="highlight"><pre class="highlight"><code><span class="kn">from</span> <span class="nn">paprika_client</span> <span class="kn">import</span> <span class="n">sync_paprika</span>
+
+<span class="k">with</span> <span class="n">sync_paprika</span><span class="p">()</span> <span class="k">as</span> <span class="n">cli</span><span class="p">:</span>
+    <span class="k">with</span> <span class="n">cli</span><span class="p">.</span><span class="n">session</span><span class="p">(</span><span class="s">"https://example.com"</span><span class="p">)</span> <span class="k">as</span> <span class="n">page</span><span class="p">:</span>
+        <span class="n">page</span><span class="p">.</span><span class="n">locator</span><span class="p">(</span><span class="s">".item"</span><span class="p">).</span><span class="n">first</span><span class="p">.</span><span class="n">click</span><span class="p">()</span>
+        <span class="k">for</span> <span class="n">r</span> <span class="ow">in</span> <span class="n">page</span><span class="p">.</span><span class="n">locator</span><span class="p">(</span><span class="s">".item"</span><span class="p">).</span><span class="nb">all</span><span class="p">():</span>
+            <span class="k">print</span><span class="p">(</span><span class="n">r</span><span class="p">.</span><span class="n">get_attribute</span><span class="p">(</span><span class="s">"data-id"</span><span class="p">))</span>
+</code></pre></div></div>
+
+<h2 id="php-sdk">PHP SDK</h2>
+
+<blockquote>
+  <p><strong>Locator は Phase 2 で対応予定</strong>です（チェーン API <code class="language-plaintext highlighter-rouge">$page-&gt;locator(...)-&gt;first()-&gt;click()</code> を実装予定）。現在の Phase 1 では <code class="language-plaintext highlighter-rouge">Job</code> / <code class="language-plaintext highlighter-rouge">Session</code> の基本操作までが対象です。</p>
+</blockquote>
+
+<h2 id="よくあるハマりどころ">よくあるハマりどころ</h2>
+
+<ul>
+  <li><strong>複数ヒットでは <code class="language-plaintext highlighter-rouge">nth()</code> か <code class="language-plaintext highlighter-rouge">first</code> を使う</strong> — マッチ数が 2 以上ある状態で <code class="language-plaintext highlighter-rouge">click()</code> を呼ぶと、SDK は最初の要素に対して操作します（明示的に絞り込むのが安全）。</li>
+  <li><strong><code class="language-plaintext highlighter-rouge">get_by_text</code> は部分一致</strong>。完全一致したいときは CSS や属性で指す。</li>
+  <li><strong>動的に出る要素</strong>は <code class="language-plaintext highlighter-rouge">wait_for(state="visible")</code> で待ってから操作する。<code class="language-plaintext highlighter-rouge">timeout</code> の既定は 30 秒。</li>
+  <li><strong>CSS が効かない画面</strong>（Canvas、Shadow DOM の深い所など）は <a href="/paprika/vision-mouse.html">Vision AI（<code class="language-plaintext highlighter-rouge">page.agent</code>）</a> に逃がす。</li>
+</ul>
+
+<h2 id="関連">関連</h2>
+
+<ul>
+  <li><a href="/paprika/api.html">API リファレンス</a> — 全 API</li>
+  <li><a href="/paprika/guides.html">ガイド: DOM 操作</a></li>
+  <li><a href="/paprika/examples.html">サンプル: クリック・入力・キー操作</a></li>
+</ul>
+
+  </main>
+</div>
+<script>
+// Build the "このページ" sidebar from the rendered <h2> headings (each gets an
+// id from kramdown auto_ids). No headings -> drop the sidebar column so the
+// content fills the full width instead of sitting in the narrow sidebar slot.
+(function () {
+  var toc = document.getElementById('doc-toc');
+  var heads = document.querySelectorAll('.content h2[id]');
+  if (!toc) return;
+  if (!heads.length) {
+    var aside = document.querySelector('.sidebar');
+    var layout = document.querySelector('.layout');
+    if (aside) aside.style.display = 'none';
+    if (layout) layout.style.gridTemplateColumns = '1fr';
+    return;
+  }
+  heads.forEach(function (h) {
+    var li = document.createElement('li');
+    var a = document.createElement('a');
+    a.href = '#' + h.id;
+    a.textContent = h.textContent;
+    li.appendChild(a);
+    toc.appendChild(li);
+  });
+})();
+</script>
+</body>
+</html>

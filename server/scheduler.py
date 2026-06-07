@@ -38,6 +38,13 @@ from server.protocol import (
 
 # Heartbeat-related constants (seconds)
 WORKER_TTL = 120  # if no heartbeat for this long, worker is considered dead
+# How long stats_async() may reuse the last GOOD cross-hub (redis) worker
+# aggregation when a fresh fetch times out, instead of collapsing the list to
+# this hub's local connections only. Bridges transient redis stalls so the
+# Workers tab row count doesn't flap (37 -> 30/7/0) as nginx round-robins the
+# poll across hubs with different local fleets. Kept <= WORKER_TTL so a genuinely
+# dead worker can't linger in the list longer than its heartbeat window.
+_KNOWN_WORKERS_CACHE_TTL_S = 60.0
 HEARTBEAT_INTERVAL = 10  # worker sends this often
 # 120s TTL = 12 heartbeats of slack. Higher value than the old 30s so a
 # brief event-loop stall (yt-dlp subprocess block, gc pause, big
@@ -191,6 +198,17 @@ class ConnectedWorker:
     # (or this worker hasn't sent a heartbeat yet -- prefetch may
     # be in flight). Each entry: {name, etag, size_bytes}.
     profiles_cached: list[dict] = field(default_factory=list)
+    # CT / LXC-host resource snapshot from the most recent heartbeat.
+    # All zero until the first heartbeat lands, or if the worker is on
+    # a pre-2026-06-06 build that doesn't send them. cpu_pct + load1
+    # reflect the Proxmox node; mem_pct + disk_* reflect the CT itself.
+    # Used for: (a) the admin Workers list CPU/Mem/Disk columns, (b) the
+    # pick_worker() disk-pressure skip (disk_pct > 90 -> no new jobs).
+    cpu_pct: float = 0.0
+    mem_pct: float = 0.0
+    disk_pct: float = 0.0
+    disk_free_gb: float = 0.0
+    load1: float = 0.0
     send_lock: asyncio.Lock = field(default_factory=asyncio.Lock)
     # Operator-controlled status set from the admin UI:
     #   active   = normal -- receives new jobs (default)
@@ -473,6 +491,12 @@ class WorkerRegistry:
         # logs are the in-process companion to that).
         self._worker_logs: dict[str, deque] = {}
         self._worker_log_cap = 400
+        # Last GOOD cross-hub aggregation from _fetch_known_workers (redis),
+        # reused by stats_async() as a fallback when a fresh fetch times out so
+        # the Workers tab doesn't flap to local-hub-only. See
+        # _KNOWN_WORKERS_CACHE_TTL_S.
+        self._last_known_extra: list[dict] | None = None
+        self._last_known_extra_at: float = 0.0
 
     # ----- registration ----------------------------------------------------
 
@@ -614,7 +638,7 @@ class WorkerRegistry:
         except Exception:
             return False
 
-    async def preview_subscribe_loop(self, interval_s: float = 8.0) -> None:
+    async def preview_subscribe_loop(self, interval_s: float = 3.0) -> None:
         """Background loop: while an admin is watching one of THIS hub's
         connected workers, tell that worker to self-capture + push its lanes
         (HubPreviewSubscribe). Only workers advertising supports_preview_push
@@ -631,9 +655,17 @@ class WorkerRegistry:
                     try:
                         if not await self.preview_is_watched(worker_id):
                             continue
+                        # Cadence tuning (2026-06-06, #screens "もっさり" fix):
+                        # this loop now ticks every 3s (was 8s) so a freshly
+                        # watched worker starts capturing within ~3s instead of
+                        # ~9s (warm-up), and the worker self-captures every 5s
+                        # (was 10s) so the grid refreshes twice as smoothly. Cost
+                        # is bounded: only WATCHED + push-capable workers (≤ the
+                        # 20-tile page) capture, at 320px/low-q -- far below the
+                        # old per-poll live-capture storm this push model replaced.
                         await worker.send(
                             HubPreviewSubscribe(
-                                lanes=None, interval_s=10.0, ttl_s=30.0,
+                                lanes=None, interval_s=5.0, ttl_s=30.0,
                                 max_width=320, quality=5,
                             )
                         )
@@ -661,12 +693,26 @@ class WorkerRegistry:
             except Exception:
                 pass
 
-    async def heartbeat(self, worker_id: str, in_flight: int) -> None:
+    async def heartbeat(
+        self,
+        worker_id: str,
+        in_flight: int,
+        cpu_pct: float = 0.0,
+        mem_pct: float = 0.0,
+        disk_pct: float = 0.0,
+        disk_free_gb: float = 0.0,
+        load1: float = 0.0,
+    ) -> None:
         worker = self.connections.get(worker_id)
         if worker is None:
             return
         worker.in_flight = in_flight
         worker.last_heartbeat = time.time()
+        worker.cpu_pct = cpu_pct
+        worker.mem_pct = mem_pct
+        worker.disk_pct = disk_pct
+        worker.disk_free_gb = disk_free_gb
+        worker.load1 = load1
         if self._r is not None:
             try:
                 await self._r.zadd(_k_index(), {worker_id: time.time()})
@@ -734,6 +780,29 @@ class WorkerRegistry:
                             changed = True
                         if d.get("pending_update_to") != worker.pending_update_to:
                             d["pending_update_to"] = worker.pending_update_to
+                            changed = True
+                        # Mirror the resource snapshot into the row so a
+                        # NON-OWNER hub serving /workers can render the
+                        # CPU/Mem/Disk columns instead of "—". These move
+                        # every heartbeat (true rates / disk-on-write), so we
+                        # accept the write cost for every refresh -- without
+                        # it the columns flicker depending on which hub the
+                        # nginx round-robin lands on. Skip-write threshold
+                        # not worth the complexity at heartbeat cadence.
+                        if d.get("cpu_pct") != worker.cpu_pct:
+                            d["cpu_pct"] = worker.cpu_pct
+                            changed = True
+                        if d.get("mem_pct") != worker.mem_pct:
+                            d["mem_pct"] = worker.mem_pct
+                            changed = True
+                        if d.get("disk_pct") != worker.disk_pct:
+                            d["disk_pct"] = worker.disk_pct
+                            changed = True
+                        if d.get("disk_free_gb") != worker.disk_free_gb:
+                            d["disk_free_gb"] = worker.disk_free_gb
+                            changed = True
+                        if d.get("load1") != worker.load1:
+                            d["load1"] = worker.load1
                             changed = True
                         if changed:
                             await self._r.set(
@@ -807,6 +876,13 @@ class WorkerRegistry:
                 len(w.capabilities.lane_novnc_urls or []) > 0
                 or bool(w.capabilities.novnc_url)
             )
+            # Disk-pressure dispatch gate: skip workers whose CT root is
+            # >90% full. A heartbeat lag means the worker-side preflight in
+            # _mix_jobexec is the final defence, but doing it here too saves
+            # the dispatch round-trip + the WorkerJobFailed handshake when
+            # the operator can see it's full. disk_pct==0.0 == pre-2026-06-06
+            # build (didn't report) -- treat as healthy to stay compatible.
+            and w.disk_pct < 90.0
         ]
         if not candidates:
             return None
@@ -855,6 +931,15 @@ class WorkerRegistry:
                     "version": w.capabilities.version or "",
                     "status": w.status,
                     "address": w.client_address or "",
+                    # CT/host resource snapshot from the last heartbeat.
+                    # All zero for pre-2026-06-06 workers; admin UI renders
+                    # those as "—" so the operator can tell unreported from
+                    # genuinely-idle.
+                    "cpu_pct": w.cpu_pct,
+                    "mem_pct": w.mem_pct,
+                    "disk_pct": w.disk_pct,
+                    "disk_free_gb": w.disk_free_gb,
+                    "load1": w.load1,
                     # Which hub owns this worker's control WS. A live
                     # connection in THIS process is owned by THIS hub, so the
                     # admin can show which hub each worker is connected to.
@@ -1012,6 +1097,15 @@ class WorkerRegistry:
                 # Rolling-update target (heartbeat-stamped) so the
                 # "draining→vX" badge survives a non-owner-hub /workers poll.
                 "pending_update_to": data.get("pending_update_to"),
+                # CT/host resource snapshot (heartbeat-stamped). Each is
+                # ``float(... or 0)`` so a legacy row without these keys
+                # renders as 0.0 (= "—" in the admin UI), matching what
+                # stats() returns for a worker that hasn't heartbeated yet.
+                "cpu_pct": float(data.get("cpu_pct") or 0.0),
+                "mem_pct": float(data.get("mem_pct") or 0.0),
+                "disk_pct": float(data.get("disk_pct") or 0.0),
+                "disk_free_gb": float(data.get("disk_free_gb") or 0.0),
+                "load1": float(data.get("load1") or 0.0),
             })
         return out
 
@@ -1026,14 +1120,31 @@ class WorkerRegistry:
         seen = {w["worker_id"] for w in snap["workers"]}
         # Defensive ceiling: _fetch_known_workers is now pipelined (~1 RTT),
         # but if redis itself stalls we must NOT hang the /overview admin poll
-        # (called every ~2s). Degrade to the local-hub snapshot instead of
-        # blocking the UI for seconds.
+        # (called every ~2s). Cap the wait at 1.5s.
         try:
             extra = await asyncio.wait_for(
                 self._fetch_known_workers(seen), timeout=1.5
             )
+            # Fresh aggregation succeeded -> remember it as the fallback.
+            self._last_known_extra = extra
+            self._last_known_extra_at = time.time()
         except Exception:
+            # Redis stalled / timed out. Do NOT collapse to local-hub-only --
+            # that's what made the Workers tab row count flap (37 -> 30/7/0)
+            # as nginx round-robined the poll across hubs. Reuse the most recent
+            # GOOD aggregation if it's still fresh; only then fall back to empty.
             extra = []
+            if (
+                self._last_known_extra is not None
+                and (time.time() - self._last_known_extra_at)
+                <= _KNOWN_WORKERS_CACHE_TTL_S
+            ):
+                # Drop any cached id that is now a live local connection (it's
+                # already in ``snap`` with fresher data) to avoid duplicate rows.
+                extra = [
+                    w for w in self._last_known_extra
+                    if w.get("worker_id") not in seen
+                ]
         snap["workers"].extend(extra)
         snap["count"] = len(snap["workers"])
         return snap

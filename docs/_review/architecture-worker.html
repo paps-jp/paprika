@@ -1,0 +1,218 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+<meta charset="utf-8">
+<title>Worker・Lane・Chrome の仕組み — Paprika</title>
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<link rel="stylesheet" href="/paprika/style.css">
+<script src="https://code.iconify.design/iconify-icon/2.1.0/iconify-icon.min.js"></script>
+<meta name="description" content="Paprika の Worker の内部 — 起動時に立ち上がる Lane プール、1 本の Lane の中身(Xvfb + Chrome + x11vnc + noVNC とポート割当)、CDP での操作と noVNC でのライブ閲覧、ジョブとセッション、自己更新/自己回復を解説。">
+<link rel="canonical" href="https://paps-jp.github.io/paprika/architecture-worker.html">
+<meta property="og:type" content="article">
+<meta property="og:site_name" content="Paprika">
+<meta property="og:title" content="Worker・Lane・Chrome の仕組み — Paprika">
+<meta property="og:description" content="Paprika の Worker の内部 — 起動時に立ち上がる Lane プール、1 本の Lane の中身(Xvfb + Chrome + x11vnc + noVNC とポート割当)、CDP での操作と noVNC でのライブ閲覧、ジョブとセッション、自己更新/自己回復を解説。">
+<meta property="og:url" content="https://paps-jp.github.io/paprika/architecture-worker.html">
+<meta property="og:locale" content="ja_JP">
+</head>
+<body>
+
+<nav class="topnav">
+  <a class="brand" href="index.html"><span class="logo"><img src="icon.svg" alt=""></span> Paprika</a>
+  <span class="links">
+    <span class="dropdown">
+      <a class="dropdown-toggle" href="why-paprika.html">はじめに ▾</a>
+      <span class="dropdown-menu">
+        <a href="why-paprika.html">なぜ Paprika?</a>
+        <a href="intro.html">Client インストール</a>
+        <a href="quickstart.html">Server インストール</a>
+      </span>
+    </span>
+    <span class="dropdown">
+      <a class="dropdown-toggle" href="guides.html">学ぶ ▾</a>
+      <span class="dropdown-menu">
+        <a href="guides.html">ガイド</a>
+        <a href="examples.html">サンプル</a>
+        <a href="usecases.html">ユースケース</a>
+        <a href="video.html">動画</a>
+        <a href="faq.html">FAQ</a>
+      </span>
+    </span>
+    <span class="dropdown">
+      <a class="dropdown-toggle" href="api.html">リファレンス ▾</a>
+      <span class="dropdown-menu">
+        <a href="api.html">API</a>
+        <a href="http-api.html">HTTP API</a>
+        <a href="cli.html">CLI</a>
+        <a href="job-options.html">JobOptions</a>
+        <a href="walk.html">walk（巡回）</a>
+        <a href="locator.html">Locator（要素指定）</a>
+        <a href="ws-events.html">WebSocket（ライブログ）</a>
+        <a href="errors.html">エラー一覧</a>
+        <a href="bridge-extension.html">Bridge 拡張</a>
+        <a href="profile.html">use_profile</a>
+        <a href="host-recipe.html">Host レシピ</a>
+        <a href="admin.html">管理画面</a>
+      </span>
+    </span>
+    <a href="operations.html">運用</a>
+    <a href="architecture.html" class="active">設計</a>
+  </span>
+  <a class="gh" href="search.html" title="サイト内検索" aria-label="サイト内検索" style="padding:5px 10px; margin-right:6px;"><iconify-icon icon="lucide:search" style="font-size:1.05rem; vertical-align:-3px;"></iconify-icon></a>
+  <a class="gh" href="https://github.com/paps-jp/paprika">GitHub ↗</a>
+</nav>
+
+<div class="layout">
+  <aside class="sidebar">
+    <h4>このページ</h4>
+    <ul id="doc-toc"></ul>
+  </aside>
+  <main class="content">
+    <h1>Worker・Lane・Chrome の仕組み</h1>
+    <p class="lead">Paprika の Worker の内部 — 起動時に立ち上がる Lane プール、1 本の Lane の中身(Xvfb + Chrome + x11vnc + noVNC とポート割当)、CDP での操作と noVNC でのライブ閲覧、ジョブとセッション、自己更新/自己回復を解説。</p>
+    <p>Worker は実際にブラウザを動かすホストです。自律的に動き、<code class="language-plaintext highlighter-rouge">--hub-url</code> を渡すだけで <strong>自分を登録 → 心拍 → 割り当てジョブを実行 → 完了報告</strong>まで行います。全体像は <a href="architecture.html">アーキテクチャ概要</a>。</p>
+
+<p><img class="shot" src="img/cap-workers.png" alt="管理画面のワーカー一覧 — 接続中のワーカーと各 Lane の状態が一覧表示" /></p>
+<p class="shot-cap">管理画面の <strong>ワーカー</strong> タブ。各ワーカーの Lane 数・状態・バージョン・所属 Hub が一目で分かります。</p>
+
+<h2 id="lane-プール">Lane プール</h2>
+
+<p>Worker は起動時に <strong>N 本の「Lane」を先に立ち上げて常駐</strong>させます（プール）。Lane は空のスロットではなく、<strong>長命でステートを持つブラウザ</strong>です。</p>
+
+<div class="language-text highlighter-rouge"><div class="highlight"><pre class="highlight"><code> Worker ホスト
+ ├─ agent プロセス ──── WebSocket ───▶ Hub
+ └─ Lane プール（起動時から常駐）
+     ├─ Lane 0
+     ├─ Lane 1
+     └─ … （= 並列実行できるジョブ数）
+</code></pre></div></div>
+
+<ul>
+  <li>Lane の本数 = その Worker が<strong>同時に処理できるジョブ数</strong>（capacity）。</li>
+  <li>ジョブが来ると Worker は <strong>空き Lane を 1 本確保（acquire）</strong> し、その Chrome で実行、終わったら<strong>解放（release）</strong>します。1 Lane = 同時に 1 ジョブ。</li>
+  <li>Lane は使い回されるので、<strong>クッキー / ログイン状態 / プロファイルがジョブをまたいで残ります</strong>（<code class="language-plaintext highlighter-rouge">use_profile</code> を指定するとその Lane に操作者のプロファイルを差し込みます）。</li>
+</ul>
+
+<h2 id="1-本の-lane-の中身">1 本の Lane の中身</h2>
+
+<p>各 Lane は独立した X 画面と、それを覗くための VNC 一式を持ちます。</p>
+
+<div class="language-text highlighter-rouge"><div class="highlight"><pre class="highlight"><code> Lane i
+  ├─ Xvfb              :100+i   仮想ディスプレイ（画面はあるが物理モニタは無い）
+  ├─ fluxbox                    軽量ウィンドウマネージャ
+  ├─ Chrome            :9223+i  remote-debugging(CDP) ポート ← ここを操作する
+  ├─ x11vnc            :5901+i  Xvfb の画面を VNC で配信
+  └─ noVNC(websockify) :6080+i  ブラウザから見られる形に橋渡し
+</code></pre></div></div>
+
+<p>つまり「<strong>画面を持つ本物の Chrome</strong>」を、モニタの無いサーバ上で動かしているだけです。だから JavaScript・動画再生・各種ダイアログなど、実ブラウザと同じ挙動になります。</p>
+
+<h2 id="操作と閲覧は別経路">「操作」と「閲覧」は別経路</h2>
+
+<p>Lane の Chrome に対して、<strong>操作（自動化）</strong> と <strong>ライブ閲覧</strong> は別の経路で行われます。</p>
+
+<div class="language-text highlighter-rouge"><div class="highlight"><pre class="highlight"><code> Hub / スクリプト ──── CDP ───────────────────────▶ Chrome を操作（クリック/取得/JS）
+ 操作者のブラウザ ─ noVNC(websockify) ─▶ x11vnc ─▶ Xvfb 画面 ⟵ Chrome が描画
+</code></pre></div></div>
+
+<ul>
+  <li><strong>操作</strong> は CDP（Chrome DevTools Protocol、nodriver 経由）。ナビゲーション・クリック・スクロール・DOM 取得・通信トレースなど。</li>
+  <li><strong>閲覧</strong> は noVNC。管理画面の Live パネルや <code class="language-plaintext highlighter-rouge">#screens</code> で、いま Chrome に映っているものをそのまま見られます（<a href="/paprika/vnc-embed.html">VNC 埋め込み</a>）。Hub は worker の LAN IP を隠すため、noVNC をハブ経由のプロキシ URL に書き換えて配信します。</li>
+</ul>
+
+<h2 id="アセットの取り方passive-network-capture">アセットの取り方（passive network capture）</h2>
+
+<p>Paprika は HTML をパースして <code class="language-plaintext highlighter-rouge">&lt;img src=&gt;</code> を読み、その URL に<strong>再リクエスト</strong>する方式ではありません。CDP の <code class="language-plaintext highlighter-rouge">Network.responseReceived</code> イベントを <strong>passive にサブスクライブ</strong>して、<strong>ブラウザが実際にダウンロードしたレスポンス本体</strong>をそのまま回収します。</p>
+
+<div class="language-text highlighter-rouge"><div class="highlight"><pre class="highlight"><code>通常のスクレイパ:  ページ取得 → HTML パース → &lt;img src&gt; から URL 取り出し → 改めてその URL に GET
+Paprika:           ページ取得 → Chrome が画像をロード → CDP イベントで Paprika がレスポンスを横取り
+</code></pre></div></div>
+
+<p>この方式の利点:</p>
+
+<ul>
+  <li><strong>帯域・サーバ負荷が半分</strong> — 同じバイトを 2 回ダウンロードしない。</li>
+  <li><strong>認証・Referer 必須の画像も取れる</strong> — ブラウザがすでに正しい Cookie / Referer / セッションヘッダー付きで取得済みなので、別途リクエストして 403 / 401 になる事故が無い。</li>
+  <li><strong>JS で動的に差し込まれた画像・lazy-load・CSS の <code class="language-plaintext highlighter-rouge">background-image</code>・<code class="language-plaintext highlighter-rouge">&lt;iframe&gt;</code>/ネスト iframe の内部通信</strong>もすべて拾えます（HTML パースでは見つからない領域）。</li>
+  <li><strong>動画ストリーム</strong>（HLS の <code class="language-plaintext highlighter-rouge">.m3u8</code> セグメント、DASH の <code class="language-plaintext highlighter-rouge">.m4s</code>）も同じ仕組みで検出 → <code class="language-plaintext highlighter-rouge">yt-dlp</code> で連結（<a href="video.html">動画の仕組み</a>）。</li>
+</ul>
+
+<p>しきい値（<code class="language-plaintext highlighter-rouge">min_asset_size_bytes</code>）はこの passive リスナー段で適用されるので、アイコンやスペーサーの 100 byte 画像は最初から記録に上がりません（<a href="job-options.html">JobOptions</a>）。</p>
+
+<h2 id="ジョブとセッション">ジョブとセッション</h2>
+
+<table>
+  <thead>
+    <tr>
+      <th> </th>
+      <th>Lane の使い方</th>
+    </tr>
+  </thead>
+  <tbody>
+    <tr>
+      <td><strong>ジョブ（fetch）</strong></td>
+      <td>1 本の Lane を確保 → 取得 → 解放。短時間で完結。</td>
+    </tr>
+    <tr>
+      <td><strong>セッション</strong></td>
+      <td>Lane を<strong>予約</strong>し続け、Hub 経由の <code class="language-plaintext highlighter-rouge">/sessions/{sid}/*</code> で対話的・スクリプト的に操作。codegen-loop / SDK の <code class="language-plaintext highlighter-rouge">Page</code> / keep_session な fetch が使う。アイドル TTL・絶対 TTL で自動解放。</td>
+    </tr>
+  </tbody>
+</table>
+
+<p>Hub から見たセッションの管理は <a href="architecture-hub.html">Hub の仕組み</a>。</p>
+
+<h2 id="自己回復self-healing">自己回復（self-healing）</h2>
+
+<p>Worker は「壊れたら自分で気づいて作り直す」設計です（詳細は <a href="/paprika/worker-resilience.html">Worker 自己回復</a>）。</p>
+
+<ul>
+  <li><strong>Chrome の番犬</strong> — Lane の Chrome が死んでも watchdog が<strong>その Lane だけ</strong>を再起動。Lane や他のプロセスは生きたまま。</li>
+  <li><strong>接続断は再接続</strong> — Hub との WebSocket が切れても、その場で<strong>無期限に再接続</strong>（自滅しない）。</li>
+  <li><strong>定期リサイクル</strong> — 一定ジョブ数ごとに drain → 終了 → docker が作り直し、状態をクリーンに保つ。</li>
+</ul>
+
+<h2 id="自己更新self-updateself-update">自己更新（self-update）{#self-update}</h2>
+
+<p>Hub はワーカー用のソースを配布し、<strong>バージョンハッシュ</strong>を WebSocket ハンドシェイクで突き合わせます。</p>
+
+<div class="language-text highlighter-rouge"><div class="highlight"><pre class="highlight"><code> 接続 → Hub のバージョンと比較
+   ├─ 一致   → そのまま稼働
+   └─ 不一致 → Hub からソースを取得 → sys.exit(42) → スーパーバイザが再起動
+</code></pre></div></div>
+
+<p><code class="language-plaintext highlighter-rouge">server/*.py</code> を直すだけで <strong>手動 rsync 不要</strong>でフリート全体が追従します（コード変更時の運用は <a href="/paprika/worker-autodeploy.html">ワーカー自動デプロイ</a>）。</p>
+
+<hr />
+
+<p>戻る: <a href="architecture.html">アーキテクチャ概要</a> / <a href="architecture-hub.html">Hub の仕組み</a></p>
+
+  </main>
+</div>
+<script>
+// Build the "このページ" sidebar from the rendered <h2> headings (each gets an
+// id from kramdown auto_ids). No headings -> drop the sidebar column so the
+// content fills the full width instead of sitting in the narrow sidebar slot.
+(function () {
+  var toc = document.getElementById('doc-toc');
+  var heads = document.querySelectorAll('.content h2[id]');
+  if (!toc) return;
+  if (!heads.length) {
+    var aside = document.querySelector('.sidebar');
+    var layout = document.querySelector('.layout');
+    if (aside) aside.style.display = 'none';
+    if (layout) layout.style.gridTemplateColumns = '1fr';
+    return;
+  }
+  heads.forEach(function (h) {
+    var li = document.createElement('li');
+    var a = document.createElement('a');
+    a.href = '#' + h.id;
+    a.textContent = h.textContent;
+    li.appendChild(a);
+    toc.appendChild(li);
+  });
+})();
+</script>
+</body>
+</html>

@@ -1,0 +1,173 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+<meta charset="utf-8">
+<title>動画の取得と配信のしくみ — Paprika</title>
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<link rel="stylesheet" href="/paprika/style.css">
+<script src="https://code.iconify.design/iconify-icon/2.1.0/iconify-icon.min.js"></script>
+<meta name="description" content="Paprika は画像と同じように動画も取得できます。プログレッシブ(直 mp4)と HLS/DASH ストリーミングの違い、なぜ再生が必要になるのか、Paprika がどう取得するか(通信トレース + yt-dlp)を解説します。">
+<link rel="canonical" href="https://paps-jp.github.io/paprika/video.html">
+<meta property="og:type" content="article">
+<meta property="og:site_name" content="Paprika">
+<meta property="og:title" content="動画の取得と配信のしくみ — Paprika">
+<meta property="og:description" content="Paprika は画像と同じように動画も取得できます。プログレッシブ(直 mp4)と HLS/DASH ストリーミングの違い、なぜ再生が必要になるのか、Paprika がどう取得するか(通信トレース + yt-dlp)を解説します。">
+<meta property="og:url" content="https://paps-jp.github.io/paprika/video.html">
+<meta property="og:locale" content="ja_JP">
+</head>
+<body>
+
+<nav class="topnav">
+  <a class="brand" href="index.html"><span class="logo"><img src="icon.svg" alt=""></span> Paprika</a>
+  <span class="links">
+    <span class="dropdown">
+      <a class="dropdown-toggle" href="why-paprika.html">はじめに ▾</a>
+      <span class="dropdown-menu">
+        <a href="why-paprika.html">なぜ Paprika?</a>
+        <a href="intro.html">Client インストール</a>
+        <a href="quickstart.html">Server インストール</a>
+      </span>
+    </span>
+    <span class="dropdown">
+      <a class="dropdown-toggle active" href="guides.html">学ぶ ▾</a>
+      <span class="dropdown-menu">
+        <a href="guides.html">ガイド</a>
+        <a href="examples.html">サンプル</a>
+        <a href="usecases.html">ユースケース</a>
+        <a href="video.html" class="active">動画</a>
+        <a href="faq.html">FAQ</a>
+      </span>
+    </span>
+    <span class="dropdown">
+      <a class="dropdown-toggle" href="api.html">リファレンス ▾</a>
+      <span class="dropdown-menu">
+        <a href="api.html">API</a>
+        <a href="http-api.html">HTTP API</a>
+        <a href="cli.html">CLI</a>
+        <a href="job-options.html">JobOptions</a>
+        <a href="walk.html">walk（巡回）</a>
+        <a href="locator.html">Locator（要素指定）</a>
+        <a href="ws-events.html">WebSocket（ライブログ）</a>
+        <a href="errors.html">エラー一覧</a>
+        <a href="bridge-extension.html">Bridge 拡張</a>
+        <a href="profile.html">use_profile</a>
+        <a href="host-recipe.html">Host レシピ</a>
+        <a href="admin.html">管理画面</a>
+      </span>
+    </span>
+    <a href="operations.html">運用</a>
+    <a href="architecture.html">設計</a>
+  </span>
+  <a class="gh" href="search.html" title="サイト内検索" aria-label="サイト内検索" style="padding:5px 10px; margin-right:6px;"><iconify-icon icon="lucide:search" style="font-size:1.05rem; vertical-align:-3px;"></iconify-icon></a>
+  <a class="gh" href="https://github.com/paps-jp/paprika">GitHub ↗</a>
+</nav>
+
+<div class="layout">
+  <aside class="sidebar">
+    <h4>このページ</h4>
+    <ul id="doc-toc"></ul>
+  </aside>
+  <main class="content">
+    <h1>動画の取得と配信のしくみ</h1>
+    <p class="lead">Paprika は画像と同じように動画も取得できます。プログレッシブ(直 mp4)と HLS/DASH ストリーミングの違い、なぜ再生が必要になるのか、Paprika がどう取得するか(通信トレース + yt-dlp)を解説します。</p>
+    <p>Paprika は <strong>画像と同じ感覚で、動画も取得できます</strong>。違いは「動画は既定でオフ」という一点だけ — <code class="language-plaintext highlighter-rouge">options.download_video: true</code>（SDK なら <code class="language-plaintext highlighter-rouge">page.download_video()</code>）を有効にすると、画像の収集に加えて動画も拾えるようになります。</p>
+
+<blockquote>
+  <p>取得の <strong>手順</strong> そのものは <a href="/paprika/guides.html">ガイド: 動画を取得</a> / <a href="/paprika/examples.html">サンプル: 動画をダウンロード</a> を参照してください。このページでは「<strong>なぜその手順になるのか = 動画配信のしくみ</strong>」を説明します。</p>
+</blockquote>
+
+<h2 id="画像と動画はどう違う">画像と動画はどう違う?</h2>
+
+<p>画像は 1 枚 = 1 ファイル（<code class="language-plaintext highlighter-rouge">&lt;img src&gt;</code>）なので、ページを開けば URL が出そろい、そのまま取得できます。
+動画は <strong>配信方式によって取得の難しさが変わります</strong>。大きく 2 種類です。</p>
+
+<h2 id="1-プログレッシブ配信直リンクの-mp4">1. プログレッシブ配信（直リンクの mp4）</h2>
+
+<p><code class="language-plaintext highlighter-rouge">&lt;video src="movie.mp4"&gt;</code> のように <strong>1 本のファイル</strong> をそのまま配信する方式。画像と同じで、URL さえ分かればそのままダウンロードできます。いちばん簡単なケースです。</p>
+
+<h2 id="2-ストリーミング配信hls--dash">2. ストリーミング配信（HLS / DASH）</h2>
+
+<p>多くの動画サイトはこちらです。動画を <strong>数秒ごとの小さなセグメント</strong>（<code class="language-plaintext highlighter-rouge">.ts</code> / <code class="language-plaintext highlighter-rouge">.m4s</code>）に分割し、その並び順を書いた <strong>マニフェスト</strong>（HLS は <code class="language-plaintext highlighter-rouge">.m3u8</code>、DASH は <code class="language-plaintext highlighter-rouge">.mpd</code>）で配信します。</p>
+
+<ul>
+  <li>ブラウザはマニフェストを読み、セグメントを順に取得して繋ぎながら再生します（回線に応じて画質を切り替える＝ABR）。</li>
+  <li>つまり「動画ファイルへの直リンク」は存在せず、<strong>再生して初めてマニフェストとセグメントの URL が通信に現れます</strong>。</li>
+  <li>だから「ページを開いただけ」では URL が取れないことがあり、<strong>再生を発火させる</strong>必要があります。</li>
+</ul>
+
+<div class="language-text highlighter-rouge"><div class="highlight"><pre class="highlight"><code>マニフェスト (.m3u8 / .mpd)
+ ├─ segment0.ts
+ ├─ segment1.ts   ← これらを順に取得して連結 = 1 本の動画
+ └─ ...
+</code></pre></div></div>
+
+<h2 id="paprika-はどう取得するか">Paprika はどう取得するか</h2>
+
+<ol>
+  <li><strong>通信トレース</strong> — <code class="language-plaintext highlighter-rouge">download_video: true</code> のとき、ページ（および埋め込み <code class="language-plaintext highlighter-rouge">iframe</code> / ネスト <code class="language-plaintext highlighter-rouge">iframe</code>）の通信を監視し、<code class="language-plaintext highlighter-rouge">.m3u8</code> / <code class="language-plaintext highlighter-rouge">.mpd</code> / <code class="language-plaintext highlighter-rouge">.mp4</code> を検出します。</li>
+  <li><strong>必要なら再生を発火</strong> — ストリーミングはマニフェストが出ないことがあるので、AI モード（<code class="language-plaintext highlighter-rouge">mode: codegen-loop</code>）に「動画を再生してから取得して」と指示すると、<code class="language-plaintext highlighter-rouge">page.agent()</code> がプレイヤーを操作して再生し、URL を出させます。</li>
+  <li><strong>yt-dlp で取得 + 連結</strong> — 見つかったマニフェストを <code class="language-plaintext highlighter-rouge">yt-dlp</code> に渡し、セグメントをまとめて 1 本の動画ファイルにして保存します。保存後は <strong>画像と同じ「アセット」</strong> として gallery や <code class="language-plaintext highlighter-rouge">assets.json</code> に並びます。</li>
+</ol>
+
+<p>最頻のレシピはこれだけです:</p>
+
+<div class="language-python highlighter-rouge"><div class="highlight"><pre class="highlight"><code><span class="k">await</span> <span class="n">page</span><span class="p">.</span><span class="n">agent</span><span class="p">(</span><span class="s">"メイン動画を再生して"</span><span class="p">)</span>   <span class="c1"># 必要なら再生を発火
+</span><span class="k">await</span> <span class="n">page</span><span class="p">.</span><span class="n">download_video</span><span class="p">()</span>               <span class="c1"># 検出した m3u8 / mp4 を取得・連結して保存
+</span></code></pre></div></div>
+
+<h2 id="取れないケースdrm-かつ取得を試みてはいけません">取れないケース（DRM）— かつ取得を試みてはいけません</h2>
+
+<p><strong>DRM（Widevine / FairPlay / PlayReady など）で暗号化された配信</strong>は、復号鍵がブラウザの保護領域（CDM）にあるため、Paprika では取得できません。Netflix・Amazon Prime Video・Disney+・U-NEXT・ABEMA プレミアム等の<strong>多くの有料配信サービス</strong>が該当します。</p>
+
+<p><strong>Paprika は DRM の回避・解除を一切行いません。</strong> これは単なる技術的制約ではなく、<strong>法的・倫理的に許されない行為</strong>だからです。</p>
+
+<ul>
+  <li><strong>著作権法 第30条第1項第2号</strong> — 技術的保護手段（DRM）を<strong>回避して行う複製</strong>は、私的使用目的であっても<strong>違法</strong>です。</li>
+  <li><strong>著作権法 第120条の2</strong> — DRM 解除を目的とするツールの<strong>提供・公衆送信は刑事罰</strong>の対象（懲役 / 罰金）。</li>
+  <li><strong>不正アクセス禁止法</strong> — 配信プラットフォームのアクセス制御を破る形で行うと<strong>不正アクセス行為</strong>に該当する可能性があります。</li>
+  <li>米国 <strong>DMCA 1201 条</strong>、EU <strong>著作権指令 第 6 条</strong>など、<strong>国際的にも DRM 回避は禁止</strong>されています。</li>
+</ul>
+
+<div class="callout warn">
+  <p><strong>⚠️ 厳禁</strong> — DRM を回避する目的で Paprika を使うこと、回避を試みるスクリプトを生成・実行することは<strong>固く禁止</strong>します。違反は利用者本人の法的責任となり、サポート対象外です。</p>
+</div>
+
+<p>DRM で守られたコンテンツが必要な場合は、<strong>配信元サービスが公式に提供する手段</strong>（公式アプリのダウンロード機能、API、再販ライセンスなど）を利用してください。</p>
+
+<h2 id="補足">補足</h2>
+
+<ul>
+  <li>取得した動画は画像と同じく <code class="language-plaintext highlighter-rouge">GET /jobs/{id}/assets.json</code> の <code class="language-plaintext highlighter-rouge">kind: "video"</code> として並びます（<a href="http-api.html">HTTP API</a>）。</li>
+  <li>大きな動画は取得・連結に時間がかかるため、ジョブが完了した後も「downloading」フェーズでバックグラウンド転送が続くことがあります。</li>
+  <li>うまく検出できないときは <a href="faq.html">FAQ: 動画が取れない</a> も参照してください。</li>
+</ul>
+
+  </main>
+</div>
+<script>
+// Build the "このページ" sidebar from the rendered <h2> headings (each gets an
+// id from kramdown auto_ids). No headings -> drop the sidebar column so the
+// content fills the full width instead of sitting in the narrow sidebar slot.
+(function () {
+  var toc = document.getElementById('doc-toc');
+  var heads = document.querySelectorAll('.content h2[id]');
+  if (!toc) return;
+  if (!heads.length) {
+    var aside = document.querySelector('.sidebar');
+    var layout = document.querySelector('.layout');
+    if (aside) aside.style.display = 'none';
+    if (layout) layout.style.gridTemplateColumns = '1fr';
+    return;
+  }
+  heads.forEach(function (h) {
+    var li = document.createElement('li');
+    var a = document.createElement('a');
+    a.href = '#' + h.id;
+    a.textContent = h.textContent;
+    li.appendChild(a);
+    toc.appendChild(li);
+  });
+})();
+</script>
+</body>
+</html>

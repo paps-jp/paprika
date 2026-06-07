@@ -1,0 +1,567 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+<meta charset="utf-8">
+<title>VNC 埋め込み API — Paprika</title>
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="description" content="Paprika の hub-proxy noVNC を外部 Web ページに iframe 埋め込みする実装ガイド">
+<link rel="stylesheet" href="style.css">
+<script src="https://code.iconify.design/iconify-icon/2.1.0/iconify-icon.min.js"></script>
+<style>
+  :root {
+    --paprika-yellow: #f5b800;
+    --paprika-stem: #5c9138;
+    --fg: #24292f;
+    --fg-muted: #57606a;
+    --bg: #ffffff;
+    --bg-soft: #f6f8fa;
+    --bg-code: #f6f8fa;
+    --border: #d0d7de;
+    --border-soft: #e6e8eb;
+    --link: #0969da;
+    --warn: #9a6700;
+    --warn-bg: #fff8c5;
+    --danger: #cf222e;
+    --danger-bg: #ffebe9;
+    --ok: #1a7f37;
+    --ok-bg: #dafbe1;
+    --sidebar-w: 240px;
+  }
+  * { box-sizing: border-box; }
+  html, body { margin: 0; padding: 0; background: var(--bg); color: var(--fg);
+    font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", "Helvetica Neue",
+                 "Hiragino Kaku Gothic ProN", "Meiryo", sans-serif;
+    font-size: 15px; line-height: 1.65; }
+  a { color: var(--link); text-decoration: none; }
+  a:hover { text-decoration: underline; }
+  code, pre { font-family: ui-monospace, "SF Mono", Consolas, "Liberation Mono", monospace;
+              font-size: 13px; }
+  code { background: var(--bg-code); padding: 1px 5px; border-radius: 4px; font-size: 0.9em; }
+  pre { background: var(--bg-code); padding: 12px 14px; border-radius: 6px;
+        overflow-x: auto; line-height: 1.5; border: 1px solid var(--border-soft); }
+  pre code { background: transparent; padding: 0; font-size: inherit; }
+  table { border-collapse: collapse; width: 100%; margin: 12px 0; font-size: 0.93em; }
+  th, td { border: 1px solid var(--border); padding: 6px 10px; vertical-align: top;
+           text-align: left; }
+  th { background: var(--bg-soft); font-weight: 600; }
+  tr:nth-child(even) td { background: #fbfbfd; }
+  h1, h2, h3, h4 { font-weight: 600; line-height: 1.3; margin-top: 1.6em; }
+  h1 { font-size: 2em; border-bottom: 2px solid var(--paprika-yellow); padding-bottom: 8px;
+       margin-top: 0; }
+  h2 { font-size: 1.5em; border-bottom: 1px solid var(--border); padding-bottom: 5px; }
+  h3 { font-size: 1.18em; }
+  blockquote { margin: 12px 0; padding: 8px 14px; border-left: 4px solid var(--border);
+               color: var(--fg-muted); background: var(--bg-soft); border-radius: 0 4px 4px 0; }
+  .topbanner { background: #c0392b; color: #fff; padding: 14px 28px;
+               box-shadow: 0 1px 4px rgba(0,0,0,.15); position: sticky; top: 0;
+               z-index: 30; display: flex; align-items: center; gap: 14px; }
+  .topbanner h1 { margin: 0; font-size: 1.4rem; font-weight: 600;
+                  display: inline-flex; align-items: center; gap: 12px;
+                  border: none; padding: 0; }
+  .topbanner h1 .logo { width: 32px; height: 32px; flex-shrink: 0; }
+  .topbanner .sub { margin-left: auto; font-size: 0.88rem; opacity: 0.9;
+                    display: flex; align-items: center; gap: 12px; }
+  .topbanner .sub a { color: #fff; text-decoration: none; padding: 2px 8px;
+                      border: 1px solid rgba(255,255,255,0.4); border-radius: 4px; }
+  .topbanner .sub a:hover { background: rgba(255,255,255,0.12); }
+  @media (max-width: 700px) {
+    .topbanner { padding: 10px 16px; flex-wrap: wrap; }
+    .topbanner .sub { width: 100%; margin-left: 0; margin-top: 6px;
+                      justify-content: flex-start; font-size: 0.8rem; }
+  }
+  .layout { display: grid; grid-template-columns: var(--sidebar-w) 1fr;
+            max-width: 1180px; margin: 0 auto; gap: 32px; padding: 24px; }
+  aside { position: sticky; top: 24px; align-self: start;
+          max-height: calc(100vh - 48px); overflow-y: auto;
+          padding-right: 8px; font-size: 13px; }
+  aside .brand { display: flex; align-items: center; gap: 8px; font-weight: 600;
+                 font-size: 16px; margin-bottom: 12px; padding-bottom: 8px;
+                 border-bottom: 1px solid var(--border-soft); }
+  aside ol { list-style: none; padding-left: 0; margin: 0; }
+  aside li { margin: 4px 0; }
+  aside a { color: var(--fg); display: block; padding: 2px 6px; border-radius: 3px; }
+  aside a:hover { background: var(--bg-soft); text-decoration: none; }
+  main { min-width: 0; }
+  .header { margin-bottom: 24px; }
+  .header .tagline { color: var(--fg-muted); font-size: 1.1em; margin-top: 4px; }
+  .meta { color: var(--fg-muted); font-size: 0.9em; margin-bottom: 24px; }
+  .callout { padding: 10px 14px; border-radius: 6px; margin: 14px 0;
+             border-left: 4px solid; }
+  .callout.warn { background: var(--warn-bg); border-color: var(--warn); }
+  .callout.danger { background: var(--danger-bg); border-color: var(--danger); }
+  .callout.ok { background: var(--ok-bg); border-color: var(--ok); }
+  .callout.info { background: #ddf4ff; border-color: var(--link); }
+  .callout strong { display: block; margin-bottom: 4px; }
+  .endpoint { font-family: ui-monospace, monospace; font-size: 0.9em;
+              background: var(--bg-soft); padding: 4px 8px; border-radius: 4px;
+              display: inline-block; border: 1px solid var(--border-soft); }
+  .endpoint .method { display: inline-block; font-weight: 700; padding: 0 6px;
+                      border-radius: 3px; margin-right: 4px; color: #fff; font-size: 0.85em; }
+  .method.get { background: #0969da; }
+  .method.ws  { background: #8250df; }
+
+  /* Demo iframe sample (visual aid only — no live load) */
+  .demo-frame {
+    border: 2px dashed #c0392b; border-radius: 6px;
+    background:
+      linear-gradient(135deg, #2c3e50 25%, transparent 25%, transparent 75%, #2c3e50 75%) 0 0/24px 24px,
+      linear-gradient(135deg, #2c3e50 25%, #34495e 25%, #34495e 75%, #2c3e50 75%) 12px 12px/24px 24px;
+    height: 320px; position: relative; color: #fff;
+    display: flex; align-items: center; justify-content: center;
+    font-family: ui-monospace, monospace; font-size: 13px; text-align: center;
+  }
+  .demo-frame::after {
+    content: "iframe placeholder (live noVNC at runtime)";
+    background: rgba(0,0,0,.45); padding: 6px 12px; border-radius: 4px;
+  }
+  hr { border: 0; border-top: 1px solid var(--border-soft); margin: 32px 0; }
+  .anchor-link { color: var(--fg-muted); margin-left: 6px; opacity: 0;
+                 text-decoration: none; font-weight: normal; }
+  h2:hover .anchor-link, h3:hover .anchor-link { opacity: 1; }
+  .footer { color: var(--fg-muted); font-size: 0.88em; text-align: center;
+            padding: 32px 0 16px; border-top: 1px solid var(--border-soft); margin-top: 48px; }
+  .badge { display: inline-block; padding: 1px 8px; font-size: 0.78em; border-radius: 10px;
+           background: var(--bg-soft); border: 1px solid var(--border-soft);
+           color: var(--fg-muted); }
+  @media (max-width: 900px) {
+    .layout { grid-template-columns: 1fr; padding: 16px; gap: 16px; }
+    aside { position: static; max-height: none;
+            border-bottom: 1px solid var(--border-soft); padding-bottom: 16px; }
+  }
+</style>
+</head>
+<body>
+
+<nav class="topnav">
+  <a class="brand" href="index.html"><span class="logo"><img src="icon.svg" alt=""></span> Paprika</a>
+  <span class="links">
+    <span class="dropdown">
+      <a class="dropdown-toggle" href="why-paprika.html">はじめに ▾</a>
+      <span class="dropdown-menu">
+        <a href="why-paprika.html">なぜ Paprika?</a>
+        <a href="intro.html">Client インストール</a>
+        <a href="quickstart.html">Server インストール</a>
+      </span>
+    </span>
+    <span class="dropdown">
+      <a class="dropdown-toggle" href="guides.html">学ぶ ▾</a>
+      <span class="dropdown-menu">
+        <a href="guides.html">ガイド</a>
+        <a href="examples.html">サンプル</a>
+        <a href="usecases.html">ユースケース</a>
+        <a href="video.html">動画</a>
+        <a href="faq.html">FAQ</a>
+      </span>
+    </span>
+    <span class="dropdown">
+      <a class="dropdown-toggle" href="api.html">リファレンス ▾</a>
+      <span class="dropdown-menu">
+        <a href="api.html">API</a>
+        <a href="http-api.html">HTTP API</a>
+        <a href="cli.html">CLI</a>
+        <a href="job-options.html">JobOptions</a>
+        <a href="walk.html">walk（巡回）</a>
+        <a href="locator.html">Locator（要素指定）</a>
+        <a href="ws-events.html">WebSocket（ライブログ）</a>
+        <a href="errors.html">エラー一覧</a>
+        <a href="bridge-extension.html">Bridge 拡張</a>
+        <a href="profile.html">use_profile</a>
+        <a href="host-recipe.html">Host レシピ</a>
+        <a href="admin.html">管理画面</a>
+      </span>
+    </span>
+    <a href="operations.html">運用</a>
+    <a href="architecture.html" class="active">設計</a>
+  </span>
+  <a class="gh" href="search.html" title="サイト内検索" aria-label="サイト内検索" style="padding:5px 10px; margin-right:6px;"><iconify-icon icon="lucide:search" style="font-size:1.05rem; vertical-align:-3px;"></iconify-icon></a>
+  <a class="gh" href="https://github.com/paps-jp/paprika">GitHub ↗</a>
+</nav>
+
+
+<div class="layout">
+
+<aside>
+  <div class="brand">🖥️ VNC Embed</div>
+  <ol>
+    <li><a href="#tldr">TL;DR</a></li>
+    <li><a href="#url">1. URL の組み立て</a></li>
+    <li><a href="#minimal">2. 最小 iframe 例</a></li>
+    <li><a href="#params">3. クエリパラメータ</a></li>
+    <li><a href="#lifecycle">4. ライフサイクル</a></li>
+    <li><a href="#js">5. JavaScript 制御</a></li>
+    <li><a href="#react">6. React コンポーネント例</a></li>
+    <li><a href="#multiembed">7. 複数同時埋め込み</a></li>
+    <li><a href="#sizing">8. サイズ / アスペクト比</a></li>
+    <li><a href="#csp">9. CSP / X-Frame-Options</a></li>
+    <li><a href="#cors">10. クロスオリジン</a></li>
+    <li><a href="#auth">11. 認証 / トークン</a></li>
+    <li><a href="#errors">12. エラーハンドリング</a></li>
+    <li><a href="#perf">13. パフォーマンス Tips</a></li>
+    <li><a href="#faq">14. FAQ</a></li>
+  </ol>
+</aside>
+
+<main>
+
+<div class="header">
+  <h1>VNC 埋め込み API</h1>
+  <p class="tagline">Paprika worker のライブ画面を外部 Web ページに <code>iframe</code> で埋め込む実装ガイド</p>
+</div>
+
+<div class="meta">
+  関連: <a href="architecture.html">アーキテクチャ概要</a> · <a href="worker-autodeploy.html">Worker 自動配信</a> · 関連 commit <code>584fcb7</code> (hub-side noVNC proxy)
+</div>
+
+<h2 id="tldr">TL;DR <a class="anchor-link" href="#tldr">#</a></h2>
+
+<div class="callout info">
+<strong>3 行で:</strong>
+1) <code>POST /jobs</code> で帰ってくる <code>novnc_url</code> をそのまま iframe の <code>src</code> に放り込む。<br>
+2) URL は <code>https://&lt;hub&gt;/sessions/&lt;session_id&gt;/novnc/?...</code> ── hub 経由なので worker LAN IP は隠れる。<br>
+3) ジョブ終了で iframe が黒くなる前に <code>postMessage</code> 等で自前で外す。
+</div>
+
+<h2 id="url">1. URL の組み立て <a class="anchor-link" href="#url">#</a></h2>
+
+<p>ジョブ作成のレスポンスから <code>novnc_url</code> を取得する:</p>
+
+<pre><code>$ curl -s -X POST https://paprika.example.com/jobs \
+       -H 'Content-Type: application/json' \
+       -d '{"url": "https://example.com",
+            "options": {"mode": "fetch", "wait_seconds": 30}}'
+
+{
+  "job_id": "a3b4c5d6e7f8",
+  "status": "queued",
+  "url": "https://example.com",
+  "novnc_url": null,                        <-- まだ lane に bind 前
+  "worker_id": null,
+  "lane_idx": null,
+  ...
+}</code></pre>
+
+<p>数秒後 <code>GET /jobs/{id}</code> でポーリングすると lane が割り当てられ、hub-proxy URL が返ってくる:</p>
+
+<pre><code>$ curl -s https://paprika.example.com/jobs/a3b4c5d6e7f8 | jq .novnc_url
+
+"/sessions/ses_abc123def456/novnc/?path=sessions/ses_abc123def456/novnc/websockify&autoconnect=1&resize=scale&reconnect=1"</code></pre>
+
+<p>これは <strong>hub からの相対パス</strong>。同一オリジンで埋めるならそのまま使える。別オリジンに埋めるなら hub の絶対 URL を前置:</p>
+
+<pre><code>const HUB = 'https://paprika.example.com';
+const fullUrl = HUB + novnc_url;
+// -> https://paprika.example.com/sessions/ses_abc123def456/novnc/?path=jobs/...&autoconnect=1...</code></pre>
+
+<div class="callout warn">
+<strong>注意:</strong> hub が HTTPS 配下にあるとき、viewer は自動で <code>wss://</code> を使う (vnc_lite.html の <code>window.location.protocol</code> 判定)。HTTP / HTTPS 混在ブラウザ警告を避けたい場合は埋め込み元ページと hub の TLS を揃える。
+</div>
+
+<h2 id="minimal">2. 最小 iframe 例 <a class="anchor-link" href="#minimal">#</a></h2>
+
+<pre><code>&lt;iframe
+  src="https://paprika.example.com/sessions/ses_abc123def456/novnc/?path=sessions/ses_abc123def456/novnc/websockify&amp;autoconnect=1&amp;resize=scale&amp;reconnect=1"
+  width="1024" height="640"
+  style="border: 1px solid #444; background: #000;"
+  allow="clipboard-read; clipboard-write"
+  title="paprika worker live view"&gt;
+&lt;/iframe&gt;</code></pre>
+
+<p>これだけでブラウザに worker の Chrome が出る。マウス / キーボードも届く (operator が触れる)。読み取り専用にしたければ <code>?view_only=true</code> を追加。</p>
+
+<div class="demo-frame"></div>
+
+<h2 id="params">3. クエリパラメータ <a class="anchor-link" href="#params">#</a></h2>
+
+<p>vnc_lite.html が解釈する query (noVNC 上流仕様 + path のみ paprika 拡張):</p>
+
+<table>
+  <thead><tr><th>キー</th><th>値</th><th>説明</th></tr></thead>
+  <tbody>
+    <tr><td><code>path</code></td><td><code>sessions/&lt;sid&gt;/novnc/websockify</code></td><td><strong>★必須★</strong> WS の forward 先パス。<code>POST /jobs</code> の応答に既に embed されている</td></tr>
+    <tr><td><code>autoconnect</code></td><td><code>1</code></td><td>ページロード即接続。embed 用途では常に <code>1</code></td></tr>
+    <tr><td><code>resize</code></td><td><code>scale</code> / <code>remote</code> / <code>off</code></td><td>iframe サイズに対する画面の追従。<code>scale</code> は等比縮小、<code>remote</code> は worker 側 viewport を変更</td></tr>
+    <tr><td><code>reconnect</code></td><td><code>1</code></td><td>WS 切断時の自動再接続</td></tr>
+    <tr><td><code>view_only</code></td><td><code>true</code></td><td>キーボード / マウス入力を無効化 (= 監視専用)</td></tr>
+    <tr><td><code>password</code></td><td>(string)</td><td>RFB password。worker 側で設定していなければ無視</td></tr>
+    <tr><td><code>host</code> / <code>port</code></td><td>(string / int)</td><td>WS 接続先のホスト / ポート上書き。**通常は touch しない** (window.location から自動)</td></tr>
+  </tbody>
+</table>
+
+<h3>監視専用 (view_only) 例</h3>
+
+<pre><code>&lt;iframe
+  src="https://paprika.example.com/sessions/&lt;sid&gt;/novnc/?path=sessions/&lt;sid&gt;/novnc/websockify&amp;autoconnect=1&amp;resize=scale&amp;reconnect=1&amp;view_only=true"
+  width="800" height="500" style="border:none;"&gt;
+&lt;/iframe&gt;</code></pre>
+
+<p>operator がうっかり画面を触ってもクリック / 入力が伝わらない。BI ダッシュボード組み込みに最適。</p>
+
+<h2 id="lifecycle">4. ライフサイクル <a class="anchor-link" href="#lifecycle">#</a></h2>
+
+<p><strong>session_id は <code>secrets.token_urlsafe(16)</code> = 128 bit ランダムなので global かつ恒久的に一意</strong>。一度発行された ID は再発行されない。session が reap された後その ID で叩くと永遠に 404 が返る (= URL が "切れた" ことを冪等に検知できる)。</p>
+
+<p>ジョブには 4 つの状態がある。embed 側でハンドルすべき遷移:</p>
+
+<table>
+<thead><tr><th>ジョブ状態</th><th>novnc_url</th><th>iframe 動作</th><th>推奨対処</th></tr></thead>
+<tbody>
+<tr><td><code>queued</code></td><td><code>null</code></td><td>埋められない</td><td>「割り当て中…」プレースホルダ表示</td></tr>
+<tr><td><code>running</code> (lane 未 bind)</td><td><code>null</code></td><td>埋められない</td><td>同上、~5 秒間隔でポーリング</td></tr>
+<tr><td><code>running</code> (lane bind 済)</td><td>有 (/sessions/{sid}/novnc/?...)</td><td>live 表示 ✓</td><td>そのまま埋め込み</td></tr>
+<tr><td><code>completed</code> / <code>failed</code> / <code>cancelled</code></td><td>有 (URL 上の session は reaped 済み)</td><td>iframe 内に <code>HTTP 404</code> が返る</td><td>iframe を DOM から外す or プレースホルダに差し替え</td></tr>
+</tbody>
+</table>
+
+<div class="callout warn">
+<strong>404 を踏むと:</strong> iframe 内に hub の素朴な JSON エラー画面が出る。見栄えが悪いので、親側で <code>GET /jobs/{id}</code> を 2-5 秒間隔でポーリングし、terminal 状態を見つけたら iframe を unmount するのが standard pattern (<a href="#js">§5</a>)。session-rooted は「session が有る = URL が live」「session が無い = 404」のシンプル 2 値で扱える。
+</div>
+
+<h2 id="js">5. JavaScript 制御 <a class="anchor-link" href="#js">#</a></h2>
+
+<p>素の JS で job 開始 → ライフサイクル監視 → iframe 出し入れする最小例:</p>
+
+<pre><code>const HUB = 'https://paprika.example.com';
+
+async function embedPaprikaJob(targetUrl, mountEl) {
+  // 1) ジョブ投入
+  const submit = await fetch(`${HUB}/jobs`, {
+    method: 'POST',
+    headers: {'Content-Type': 'application/json'},
+    body: JSON.stringify({
+      url: targetUrl,
+      options: { mode: 'fetch', wait_seconds: 30 },
+    }),
+  });
+  const job = await submit.json();
+  const jobId = job.job_id;
+
+  // 2) Loading プレースホルダ
+  mountEl.innerHTML =
+    `&lt;div style="padding:20px;color:#888;"&gt;割り当て中... (${jobId})&lt;/div&gt;`;
+
+  // 3) novnc_url が立ち上がるまでポーリング (5s 間隔)
+  let info = job;
+  while (!info.novnc_url) {
+    await new Promise(r =&gt; setTimeout(r, 5000));
+    info = await (await fetch(`${HUB}/jobs/${jobId}`)).json();
+    if (['completed','failed','cancelled'].includes(info.status)) {
+      mountEl.innerHTML = `&lt;div style="color:#c00;"&gt;早期終了: ${info.status}&lt;/div&gt;`;
+      return;
+    }
+  }
+
+  // 4) iframe を作って差し込む
+  const iframe = document.createElement('iframe');
+  iframe.src = HUB + info.novnc_url;
+  iframe.style.cssText = 'width:100%; height:100%; border:none; background:#000;';
+  iframe.title = `paprika ${jobId}`;
+  mountEl.replaceChildren(iframe);
+
+  // 5) 終了監視 — terminal になったら iframe を外す
+  const watcher = setInterval(async () =&gt; {
+    const r = await fetch(`${HUB}/jobs/${jobId}`);
+    if (!r.ok) return;
+    const cur = await r.json();
+    if (['completed','failed','cancelled'].includes(cur.status)) {
+      clearInterval(watcher);
+      iframe.remove();
+      mountEl.innerHTML =
+        `&lt;div style="color:#888;"&gt;ジョブ終了 (${cur.status})&lt;/div&gt;`;
+    }
+  }, 5000);
+}
+
+// 使い方
+embedPaprikaJob('https://example.com',
+                document.getElementById('vnc-host'));</code></pre>
+
+<h2 id="react">6. React コンポーネント例 <a class="anchor-link" href="#react">#</a></h2>
+
+<pre><code>import { useEffect, useState } from 'react';
+
+const HUB = process.env.NEXT_PUBLIC_PAPRIKA_HUB || 'https://paprika.example.com';
+
+export function PaprikaVNC({ jobId, viewOnly = false }) {
+  const [info, setInfo] = useState(null);
+  const [error, setError] = useState(null);
+
+  useEffect(() =&gt; {
+    let alive = true;
+    const tick = async () =&gt; {
+      try {
+        const r = await fetch(`${HUB}/jobs/${jobId}`);
+        if (!r.ok) throw new Error(`HTTP ${r.status}`);
+        const j = await r.json();
+        if (!alive) return;
+        setInfo(j);
+        if (['completed','failed','cancelled'].includes(j.status)) {
+          return; // stop polling
+        }
+        setTimeout(tick, 3000);
+      } catch (e) {
+        if (alive) setError(e.message);
+      }
+    };
+    tick();
+    return () =&gt; { alive = false; };
+  }, [jobId]);
+
+  if (error)               return &lt;div className="vnc-err"&gt;⚠ {error}&lt;/div&gt;;
+  if (!info)               return &lt;div className="vnc-loading"&gt;…&lt;/div&gt;;
+  if (!info.novnc_url)     return &lt;div className="vnc-pending"&gt;割り当て中…&lt;/div&gt;;
+  if (['completed','failed','cancelled'].includes(info.status)) {
+    return &lt;div className="vnc-done"&gt;ジョブ終了 ({info.status})&lt;/div&gt;;
+  }
+
+  let src = HUB + info.novnc_url;
+  if (viewOnly) src += '&amp;view_only=true';
+
+  return (
+    &lt;iframe
+      src={src}
+      title={`paprika ${jobId}`}
+      style={{ width: '100%', height: '100%', border: 'none', background: '#000' }}
+      allow="clipboard-read; clipboard-write"
+    /&gt;
+  );
+}</code></pre>
+
+<h2 id="multiembed">7. 複数同時埋め込み <a class="anchor-link" href="#multiembed">#</a></h2>
+
+<p>1 ページに 4 つの worker 画面を並べるダッシュボード例:</p>
+
+<pre><code>&lt;div style="display: grid; grid-template-columns: repeat(2, 1fr); gap: 8px; height: 600px;"&gt;
+  &lt;iframe src="https://paprika.example.com/sessions/ses_aaaa/novnc/?path=sessions/ses_aaaa/novnc/websockify&amp;autoconnect=1&amp;resize=scale&amp;reconnect=1&amp;view_only=true"&gt;&lt;/iframe&gt;
+  &lt;iframe src="https://paprika.example.com/sessions/ses_aaab/novnc/?path=sessions/ses_aaab/novnc/websockify&amp;autoconnect=1&amp;resize=scale&amp;reconnect=1&amp;view_only=true"&gt;&lt;/iframe&gt;
+  &lt;iframe src="https://paprika.example.com/sessions/ses_aaac/novnc/?path=sessions/ses_aaac/novnc/websockify&amp;autoconnect=1&amp;resize=scale&amp;reconnect=1&amp;view_only=true"&gt;&lt;/iframe&gt;
+  &lt;iframe src="https://paprika.example.com/sessions/ses_aaad/novnc/?path=sessions/ses_aaad/novnc/websockify&amp;autoconnect=1&amp;resize=scale&amp;reconnect=1&amp;view_only=true"&gt;&lt;/iframe&gt;
+&lt;/div&gt;</code></pre>
+
+<p>同時 10 viewer 接続は smoke test 済。同時 100+ は hub のメモリ / CPU に応じて要評価。各 iframe = 1 WebSocket + 1 HTTP keepalive、いずれも hub にプール。</p>
+
+<h2 id="sizing">8. サイズ / アスペクト比 <a class="anchor-link" href="#sizing">#</a></h2>
+
+<p>worker の Chrome 解像度は <code>1920×1080</code> がデフォルト。<code>resize=scale</code> 指定時 iframe のサイズに <strong>等比縮小</strong>で fit する (余白は背景色で埋まる)。</p>
+
+<p>iframe を 16:9 で固定したい場合:</p>
+
+<pre><code>&lt;div style="position: relative; padding-top: 56.25%;"&gt;
+  &lt;iframe src="..."
+          style="position:absolute; top:0; left:0; width:100%; height:100%; border:none; background:#000;"&gt;
+  &lt;/iframe&gt;
+&lt;/div&gt;</code></pre>
+
+<p>worker 側の解像度を変えたい場合は <code>resize=remote</code> を指定。iframe サイズが server-side viewport にそのまま反映される (Chrome の表示領域が変わる)。<strong>fetch ジョブの再現性に影響する</strong>ので、scraping 用途では推奨しない。</p>
+
+<h2 id="csp">9. CSP / X-Frame-Options <a class="anchor-link" href="#csp">#</a></h2>
+
+<p>現状 hub / worker のいずれも <code>X-Frame-Options</code> も <code>Content-Security-Policy: frame-ancestors</code> も設定していないので、<strong>任意のオリジンから iframe で埋め込める</strong>。</p>
+
+<div class="callout warn">
+<strong>本番運用 (公開 SaaS 等) では:</strong> 信頼する埋め込み元ドメインに絞る <code>frame-ancestors</code> を hub の reverse proxy で付与することを推奨。
+<pre style="margin-top:6px;"><code>add_header Content-Security-Policy "frame-ancestors 'self' https://customer.example.com;";</code></pre>
+</div>
+
+<h3>埋め込み元 CSP との衝突</h3>
+
+<p>埋め込み元ページ自身が <code>Content-Security-Policy: frame-src</code> を厳格化していると iframe ロードがブロックされる。hub オリジンを許可する:</p>
+
+<pre><code>Content-Security-Policy: frame-src https://paprika.example.com;
+                         connect-src https://paprika.example.com wss://paprika.example.com;</code></pre>
+
+<p><code>connect-src</code> も忘れずに ── iframe 内の noVNC viewer が WebSocket を hub に張る。これが CSP で禁止されると iframe は無音で死ぬ。</p>
+
+<h2 id="cors">10. クロスオリジン <a class="anchor-link" href="#cors">#</a></h2>
+
+<p>iframe 自体は same-origin policy の対象外 (リソースとして読み込む)。ただし <strong>JS API で <code>POST /jobs</code> を叩く部分</strong>は CORS 制約を受ける。hub 側で <code>CORSMiddleware</code> を有効化する:</p>
+
+<pre><code># server/hub/app.py
+from fastapi.middleware.cors import CORSMiddleware
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["https://customer.example.com"],
+    allow_methods=["GET", "POST"],
+    allow_headers=["*"],
+)</code></pre>
+
+<p>あるいは埋め込み元と hub の間に reverse proxy を入れて同一オリジンに見せる方が安全。</p>
+
+<h2 id="auth">11. 認証 / トークン <a class="anchor-link" href="#auth">#</a></h2>
+
+<p>現行 hub は <strong>LAN 信頼前提</strong>で、<code>/sessions/&lt;sid&gt;/novnc/*</code> エンドポイントには認証なし。<code>session_id</code> を知っている = 該当セッションを見れる (session_id は 128bit ランダムなので URL の知識自体がトークン相当)、というアクセスモデル。</p>
+
+<p>公開公開で配信する場合の選択肢:</p>
+
+<ol>
+  <li><strong>Reverse proxy で Basic 認証</strong> ── 一番楽。nginx で <code>auth_basic</code> を hub 全体にかける</li>
+  <li><strong>セッショントークンをパスに挟む</strong> ── <code>/sessions/&lt;sid&gt;/novnc/&lt;token&gt;/</code> 形式に拡張、hub 側で issue + validate</li>
+  <li><strong>署名つき URL (HMAC)</strong> ── <code>?sig=&lt;hmac&gt;&amp;exp=&lt;ts&gt;</code> をクエリに付与、hub middleware で検証 (RFB の動作には影響しないので推奨)</li>
+</ol>
+
+<p>v1 の範囲外。実装するなら別 endpoint hook で middleware として挿入。</p>
+
+<h2 id="errors">12. エラーハンドリング <a class="anchor-link" href="#errors">#</a></h2>
+
+<p>iframe 内で起きる代表的なエラー:</p>
+
+<table>
+<thead><tr><th>表示</th><th>原因</th><th>対処</th></tr></thead>
+<tbody>
+<tr><td>HTTP 404 (session not found)</td><td>session_id が存在しない / 既に reap 済み (ジョブが terminal 状態 / idle TTL 5分超過 / hub 再起動)</td><td>親側で <code>GET /jobs/&lt;id&gt;</code> で current session_id を再取得、または iframe を unmount</td></tr>
+<tr><td>HTTP 502 Bad Gateway</td><td>worker host 到達不可 (worker crash / network 断)</td><td>worker host の死活確認 → 自動 reschedule 待ち</td></tr>
+<tr><td>真っ黒画面 + status: "Disconnected"</td><td>WS が確立できていない (CSP / proxy / 認証問題)</td><td>DevTools の Network タブで wss:// upgrade の失敗理由を見る</td></tr>
+<tr><td>"Failed to connect to server" loop</td><td>worker 側 websockify が応答していない</td><td>worker の <code>docker logs paprika-worker-1</code> でエラー確認</td></tr>
+</tbody>
+</table>
+
+<h2 id="perf">13. パフォーマンス Tips <a class="anchor-link" href="#perf">#</a></h2>
+
+<ul>
+  <li><strong>非アクティブな iframe は <code>display: none</code> しない</strong>: vnc_lite.html は visibility 監視で接続を切ったりはしないが、レンダリング負荷は走り続ける。タブ切替のときは iframe.remove() で完全に外す方が GPU / CPU に優しい</li>
+  <li><strong>更新頻度は worker 側で決まる</strong>: hub はバイト透過しているだけで rate-limit していない。worker の x11vnc が変化検知ベースで送るので、静止画なら帯域はほぼゼロ</li>
+  <li><strong>圧縮プロファイル</strong>: 帯域が厳しい環境では noVNC の <code>quality</code> / <code>compression</code> 設定を URL に追加。例: <code>&amp;quality=4&amp;compression=6</code></li>
+  <li><strong>Hub からのレイテンシ</strong>: 同 LAN で ~10 ms、別 datacenter 経由 + WAN だと 50-100 ms。Web ベースの操作なので 200 ms までは違和感少ない</li>
+</ul>
+
+<h2 id="faq">14. FAQ <a class="anchor-link" href="#faq">#</a></h2>
+
+<h3>Q. iframe 内のページを右クリック保存できる?</h3>
+
+<p>noVNC は VNC RFB プロトコルの中継。iframe 内に映っているのは「画像」(VNC framebuffer) であって DOM ではない。ブラウザのコンテキストメニューは無効。スクリーンショット保存は親ページから <code>POST /jobs/{id}/screenshot/capture</code> を叩くのが正攻法。</p>
+
+<h3>Q. iframe を表示したまま親ページからクリックを送れる?</h3>
+
+<p>同一オリジンなら iframe 内の noVNC API (<code>rfb.sendKey()</code>, <code>rfb.sendCtrlAltDel()</code> 等) に直アクセス可能。クロスオリジンなら <code>postMessage</code> で iframe 内に届けるためのブリッジを <code>vnc_lite.html</code> 改造で追加する必要がある (要 hub ビルド)。<strong>v1 ではサポート外</strong>。</p>
+
+<h3>Q. iPad / モバイルでも動く?</h3>
+
+<p>動く。noVNC は touch event を VNC pointer event に翻訳する。が、worker の Chrome は desktop 表示なのでタップ範囲がきつい。<code>resize=scale</code> 必須。</p>
+
+<h3>Q. 同時にどれくらい繋げる?</h3>
+
+<p>1 worker lane あたり同時 viewer 数の上限なし (websockify 仕様)。だが <strong>1 lane に複数 viewer は同じ画面を見るだけ</strong> (RFB は単一 framebuffer の共有閲覧)。Worker は最大 25 台 × 2 lane = 50 lane なので、ユニークな画面の上限は 50。Hub 側のスループット上限は別途要評価 (~100 同時 viewer まで実績あり)。</p>
+
+<h3>Q. ジョブ終了後にちらっと表示が残るのを綺麗に消したい</h3>
+
+<p>iframe を `display:none` ではなく `iframe.remove()` で確実に DOM から外す。worker 側 lane は次の job が来たら別画面で上書きされるので、消さないと「前のジョブの最後の状態」がうっすら残る。</p>
+
+<h3>Q. デバッグで生 noVNC URL を見たい</h3>
+
+<p>API は hub-proxy URL に書き換えて返すが、内部の worker-direct URL は<code>/workers</code> から取れる:</p>
+
+<pre><code>curl -s https://paprika.example.com/workers | jq '.workers[] | {worker_id, address, lane_novnc_urls}'</code></pre>
+
+<p>運用時はこれを社外に出さない (= 元々隠したかった LAN IP)。トラブルシュート用。</p>
+
+<hr/>
+
+<div class="footer">
+  <p>このページは <code>docs/vnc-embed.html</code> として paprika repo に含まれている。<br/>
+     誤りや改善案は <a href="https://github.com/paps-jp/paprika/issues">issue</a> へ。</p>
+</div>
+
+</main>
+</div>
+
+</body>
+</html>

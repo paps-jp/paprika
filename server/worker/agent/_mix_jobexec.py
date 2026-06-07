@@ -97,9 +97,119 @@ from .video import _make_video_downloader, _parse_dl_progress, detect_yt_dlp
 from .workerid import WORKER_ID_FILE, _WorkerIdReassigned, hub_http_base
 
 
+# Worker-internal disk pressure threshold. Above this %, _run_assigned_job
+# fails the assignment fast (before acquiring a lane) and runs the
+# emergency cleanup so the next dispatch has a fighting chance. Hub side
+# also filters at this threshold in pick_worker, so dispatches only slip
+# through during the heartbeat lag window (≤10s).
+_DISK_PRESSURE_FAIL_PCT = 90.0
+
+
+def _emergency_disk_cleanup() -> None:
+    """Prune worker-internal transient state to recover disk when a CT hits
+    >90% full. Called from the per-job preflight after the job is failed.
+
+    Targets are ordered cheapest-to-rebuild first so a single pass usually
+    frees enough without taking down anything the operator cares about
+    (login state in Chrome profile cookies/Preferences is NOT touched).
+
+    Out of scope: the CT-level containerd bloat (30G snapshots seen on
+    w11/w18 / 2026-06-06). That lives outside the docker container's
+    mount namespace; the per-CT paprika-worker-housekeep systemd timer
+    (scripts/install-worker-housekeep.sh) handles it.
+    """
+    import glob as _glob
+
+    cleaned = 0
+    # (pattern, kind) — kind is "dir" or "file".
+    targets: list[tuple[str, str]] = [
+        # yt-dlp HLS fragment scratch — single biggest hog during video DLs.
+        ("/root/.cache/yt-dlp", "dir"),
+        # Chrome on-disk caches: GPU + shader + Code Cache + HTTP cache.
+        # Safe to nuke (Chrome rebuilds on next launch; worst-case is a
+        # warm-up pause on the first hit). Cookies / Preferences untouched.
+        ("/tmp/chrome-lane-*/Default/Cache", "dir"),
+        ("/tmp/chrome-lane-*/Default/Code Cache", "dir"),
+        ("/tmp/chrome-lane-*/Default/GPUCache", "dir"),
+        ("/tmp/chrome-lane-*/Default/Service Worker/CacheStorage", "dir"),
+        ("/tmp/chrome-lane-*/ShaderCache", "dir"),
+        ("/tmp/chrome-lane-*/GraphiteDawnCache", "dir"),
+        # Chrome's own /tmp leak — single biggest hog seen in the wild
+        # (2026-06-06: 24k stale files / ~9G per CT across the fleet after
+        # 5 days of jobs). Chrome spills two patterns into the system /tmp
+        # whenever a renderer is SIGKILLed before its cleanup runs (which
+        # happens on every lane swap, every Xvfb restart, every container
+        # SIGTERM): ".com.google.Chrome.*" (~9.7M each) and "scoped_dir*"
+        # (~52M each). They build up indefinitely because no one owns
+        # cleanup. Glob match here; the live Chrome process holds an open
+        # fd on its CURRENT entry so rmtree-ignore-errors skips it.
+        ("/tmp/.com.google.Chrome.*", "file"),
+        ("/tmp/scoped_dir*", "dir"),
+        # Per-job scratch from completed jobs. Live jobs hold an open fd on
+        # their workdir, so rmtree-ignore-errors skips active content; the
+        # job's own finally cleans up after itself anyway.
+        ("/tmp/paprika-*", "dir"),
+        # Chrome renderer scratch dirs left behind by killed renderers.
+        ("/tmp/.org.chromium.*", "dir"),
+        # Stale /tmp video downloads from prior jobs that didn't clean up.
+        ("/tmp/*.mp4", "file"),
+        ("/tmp/*.ts", "file"),
+        ("/tmp/*.m4s", "file"),
+        ("/tmp/*.webm", "file"),
+    ]
+    for pattern, kind in targets:
+        for path in _glob.glob(pattern):
+            try:
+                if kind == "dir":
+                    shutil.rmtree(path, ignore_errors=True)
+                else:
+                    os.unlink(path)
+                cleaned += 1
+            except OSError:
+                pass
+    _logger.info(
+        f"emergency disk cleanup: removed {cleaned} transient target(s)",
+    )
+
+
 class _JobExecMixin:
     async def _run_assigned_job(self, assign: HubAssignJob) -> None:
         job_id = assign.job_id
+        # Disk-pressure preflight: fail-fast before claiming a lane or
+        # bumping in_flight. The hub's pick_worker skips disk-pressured
+        # workers, but a heartbeat lag (≤10s) can let one through; this
+        # is the final defence. Reads the snapshot the heartbeat loop
+        # already captured -- no extra /proc walk. Pre-2026-06-06 builds
+        # leave _last_resources at all-zeros, so this is a no-op until a
+        # real heartbeat populates it.
+        _, _, _disk_pct, _disk_free_gb, _ = getattr(
+            self, "_last_resources", (0.0, 0.0, 0.0, 0.0, 0.0),
+        )
+        if _disk_pct > _DISK_PRESSURE_FAIL_PCT:
+            _logger.warning(
+                f"[{job_id}] worker disk pressure {_disk_pct:.0f}% "
+                f"({_disk_free_gb:.1f}GB free) > {_DISK_PRESSURE_FAIL_PCT:.0f}%"
+                f" -- failing job + running emergency cleanup",
+            )
+            try:
+                _emergency_disk_cleanup()
+            except Exception as e:
+                _logger.info(
+                    f"emergency cleanup raised (continuing): "
+                    f"{type(e).__name__}: {e}",
+                )
+            await self._send(
+                WorkerJobFailed(
+                    job_id=job_id,
+                    error=(
+                        f"worker disk pressure "
+                        f"({_disk_pct:.0f}% used, "
+                        f"{_disk_free_gb:.1f}GB free); "
+                        f"cleanup triggered, retry shortly"
+                    ),
+                )
+            )
+            return
         async with self._sem:
             self._in_flight += 1
             lane = None
@@ -129,6 +239,16 @@ class _JobExecMixin:
             # otherwise hit UnboundLocalError and mask the real error.
             keep_session = False
             inspect_sid = assign.session_id
+            # Per-job log file handle, opened further down once the
+            # workdir exists. Pre-bound so the finally can close it on
+            # EVERY exit path. The success and fetch-crash paths close it
+            # explicitly, but any OTHER exception (e.g. page.html write
+            # failing on a full disk, or a callback/option build raising
+            # before the inner fetch try) escapes to the outer except
+            # below and used to skip both closes -- leaking one fd per
+            # failed job until the worker hit RLIMIT_NOFILE and crashed
+            # with "Too many open files: '/tmp/paprika-<jobid>-...'".
+            log_fp = None
             try:
                 await self._send(
                     WorkerJobAccepted(
@@ -558,6 +678,20 @@ class _JobExecMixin:
                 except Exception:
                     pass
             finally:
+                # Always close the per-job log file. The success and
+                # fetch-crash paths close it explicitly (so _upload_log /
+                # _upload_files read a flushed file), but any other
+                # exception lands in the outer except above and would
+                # otherwise leak this fd -- the root cause of the slow
+                # "[Errno 24] Too many open files: '/tmp/paprika-...'"
+                # worker crash. close() is idempotent, so this is a
+                # no-op on the paths that already closed it.
+                if log_fp is not None:
+                    try:
+                        if not log_fp.closed:
+                            log_fp.close()
+                    except Exception:
+                        pass
                 # Restore the lane's default profile when we swapped
                 # one in. Skipped for keep_session+use_profile because
                 # the session is still using the operator profile via

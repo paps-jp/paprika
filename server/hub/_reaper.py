@@ -293,6 +293,225 @@ async def _dead_worker_reaper_loop():
 
 
 # ----------------------------------------------------------------------------
+# Stale-job reconciler (durable backstop for orphaned running + stuck queued)
+# ----------------------------------------------------------------------------
+# WHY THIS EXISTS (incident 2026-06-06: 35 orphan-running + 113 stuck-queued
+# jobs piled up; admin "実行中" badge read 204).
+#
+# Every other recovery net is tied to a single hub PROCESS or a single
+# OBSERVED event, and all three were defeated by the multi-hub topology +
+# the heavy redeploy/worker-id-migration churn of 2026-06-05/06:
+#
+#   * _recover_orphan_running_jobs (startup one-shot) -> returns early when
+#     ANY peer hub is alive, so in a 3-hub prod cluster it never fires.
+#   * _queued_timeout_guard (in-process asyncio task) -> dies with the hub on
+#     every rolling restart and is never re-armed for jobs already in the
+#     store, so a job queued <180s before a restart is stranded forever.
+#   * the worker-disconnect settle in routes/workers.py -> only fires while
+#     the OWNING hub observes the WS drop AND the job still has a registered
+#     session; a worker that changed id (d41662a57eef-* -> w50*) during the
+#     stable-worker-id migration disconnected once, unobserved, and its old
+#     id never reconnects, so that path can never fire for it again.
+#
+# This loop is the missing piece: a periodic, idempotent, cluster-wide
+# reconciler that diffs the job store against the *fleet-wide* live worker
+# set (stats_async, NOT just this hub's local connections) and settles what
+# the per-process nets missed. Runs on every hub; terminal writes are
+# content-identical so concurrent passes converge (no lease/claim needed —
+# unlike the lease reaper, which re-DISPATCHES and therefore must single-win).
+_STALE_RECONCILE_INTERVAL_S = float(
+    os.environ.get("PAPRIKA_STALE_RECONCILE_INTERVAL_S", "90")
+)
+# A running job younger than this is spared even when its worker_id is absent
+# from the alive set. Covers the worker self-update / WS-reconnect / re-announce
+# window (P2 session survival: a worker can briefly drop and come back with the
+# SAME id, re-adopting its jobs). Must comfortably exceed a worker's rolling
+# self-update gap so we never fail a job whose worker is mid-update.
+_STALE_RUNNING_GRACE_S = float(
+    os.environ.get("PAPRIKA_STALE_RUNNING_GRACE_S", "300")
+)
+# Durable twin of routes/jobs/_base.py::_QUEUE_TIMEOUT_S. Same env var so the
+# in-process guard and this backstop agree on the budget; whichever fires first
+# wins (idempotent). A job still `queued` past this had no worker/lane pick it
+# up and no re-dispatch loop exists, so fail it as timed_out.
+_STALE_QUEUED_TIMEOUT_S = float(os.environ.get("PAPRIKA_QUEUE_TIMEOUT_S", "180"))
+
+
+async def _stale_job_reconciler_loop():
+    """Periodically settle jobs the per-process recovery nets missed:
+    running jobs whose worker is gone fleet-wide, and queued jobs that
+    timed out without assignment. Idempotent; safe to run on every hub."""
+    first = True
+    while True:
+        try:
+            await asyncio.sleep(45 if first else _STALE_RECONCILE_INTERVAL_S)
+        except asyncio.CancelledError:
+            return
+        first = False
+        try:
+            await _reconcile_stale_jobs()
+        except Exception:
+            log.debug("stale-job reconciler pass failed", exc_info=True)
+
+
+async def _reconcile_stale_jobs() -> tuple[int, int]:
+    """One reconciliation pass. Returns (running_settled, queued_failed).
+
+    Pulled out of the loop so it can be unit-/dry-run-tested directly.
+    """
+    store = state.store
+    if store is None or not hasattr(store, "list_job_infos"):
+        return (0, 0)
+
+    now = datetime.utcnow()
+
+    # ---- fleet-wide alive worker set (cross-hub, via Redis) ----
+    # CRITICAL: this hub's state.registry.connections only holds ~1/3 of the
+    # fleet (the workers whose control WS lands here). A running job's worker
+    # may be alive on a PEER hub. stats_async() merges local connections +
+    # the Redis-known peers (alive = fresh heartbeat AND owner present), which
+    # is exactly the set GET /workers shows. Judging liveness off local
+    # connections would mass-fail healthy peer-owned jobs.
+    alive_ids: set[str] = set()
+    have_fleet_view = False
+    if state.registry is not None:
+        try:
+            snap = await state.registry.stats_async()
+            alive_ids = {
+                w.get("worker_id")
+                for w in snap.get("workers", [])
+                if w.get("alive") and w.get("worker_id")
+            }
+            have_fleet_view = True
+        except Exception:
+            log.debug("reconciler: stats_async failed; skipping running pass", exc_info=True)
+            have_fleet_view = False
+
+    running_settled = 0
+    queued_failed = 0
+
+    # ---- pass 1: orphaned running jobs ----
+    # Only when we actually have a fleet view -- an empty alive set from a
+    # Redis blip must NEVER be read as "every worker is dead".
+    if have_fleet_view and alive_ids:
+        try:
+            infos, _ = await store.list_job_infos(status=["running"], limit=0)
+        except Exception:
+            infos = []
+        for info in infos:
+            jid = info.job_id
+            # codegen-loop / rerun run in-process on the owning hub; a live
+            # local task means it's alive here. (We can't see a peer hub's
+            # local_tasks, but those are covered by the lease reaper; this
+            # pass targets worker-orchestrated fetch jobs.)
+            if jid in state.local_tasks:
+                continue
+            if info.status != JobStatus.running:
+                continue
+            wid = info.worker_id
+            if wid and wid in alive_ids:
+                continue  # worker is alive somewhere in the fleet -> leave it
+            try:
+                started = info.started_at or info.created_at
+                age = (now - started).total_seconds()
+            except Exception:
+                age = _STALE_RUNNING_GRACE_S + 1
+            if age < _STALE_RUNNING_GRACE_S:
+                continue  # grace: worker may be mid-update / re-announcing
+            phase = getattr(info.progress, "phase", "") if info.progress else ""
+            if phase == "keepalive":
+                # Crawl already finished + assets saved; only the interactive
+                # keepalive session died with the worker. Mirror the
+                # disconnect-settle: complete cleanly, not a failure.
+                info.status = JobStatus.completed
+                if info.progress is not None:
+                    info.progress.phase = "completed"
+                    info.progress.last_log = (
+                        "[reconciler] keepalive worker gone; capture already saved"
+                    )
+                settle_reason = "completed (keepalive worker gone)"
+            else:
+                info.status = JobStatus.failed
+                info.error = (
+                    f"worker {wid or '(unassigned)'} no longer in the live fleet "
+                    f"(orphaned by a hub/worker restart or self-update; ran for "
+                    f"{age/3600:.1f}h); previous attempts preserved under "
+                    f"/jobs/{{id}}/attempts. Re-submit to retry."
+                )
+                if info.progress is not None:
+                    info.progress.phase = "failed"
+                    info.progress.last_log = "[reconciler] orphaned running job settled"
+                settle_reason = "failed (orphaned)"
+            info.completed_at = info.completed_at or now
+            try:
+                await store.save_job_info(info)
+                await store.publish_log(jid, "  !! [reconciler] " + (info.error or settle_reason))
+                await store.publish_log(jid, DONE_SENTINEL)
+            except Exception:
+                continue
+            running_settled += 1
+            log.info(
+                "reconciler: settled orphaned running job %s -> %s "
+                "(worker=%s age=%.1fh)",
+                jid, settle_reason, wid, age / 3600,
+            )
+    elif have_fleet_view and not alive_ids:
+        log.info(
+            "reconciler: fleet alive set is empty (no live workers or Redis "
+            "blip) -> skipping running-orphan pass this tick (safety)"
+        )
+
+    # ---- pass 2: stuck queued jobs (durable queued-timeout) ----
+    # Independent of the fleet view: a queued job has no worker yet. If it's
+    # still queued past the timeout, no synchronous dispatch and no in-process
+    # guard ever resolved it -> fail it out. New queued jobs (< timeout) are
+    # left for the normal POST-time dispatch / in-process guard.
+    try:
+        qinfos, _ = await store.list_job_infos(status=["queued"], limit=0)
+    except Exception:
+        qinfos = []
+    for info in qinfos:
+        jid = info.job_id
+        if jid in state.local_tasks:
+            continue  # codegen/rerun pre-dispatch; its own task will resolve it
+        if info.status != JobStatus.queued:
+            continue
+        try:
+            age = (now - info.created_at).total_seconds()
+        except Exception:
+            age = _STALE_QUEUED_TIMEOUT_S + 1
+        if age < _STALE_QUEUED_TIMEOUT_S:
+            continue
+        info.status = JobStatus.failed
+        info.completed_at = now
+        if info.progress is not None:
+            info.progress.phase = "timed_out"
+            info.progress.last_log = "[reconciler] queued without assignment past timeout"
+        info.error = (
+            f"queued for {age/60:.0f} min without assignment (no worker/lane "
+            f"picked it up; durable reconciler). Re-submit to retry."
+        )
+        try:
+            await store.save_job_info(info)
+            await store.publish_log(jid, "  !! [reconciler] " + info.error)
+            await store.publish_log(jid, DONE_SENTINEL)
+        except Exception:
+            continue
+        queued_failed += 1
+        log.info(
+            "reconciler: failed stuck queued job %s (queued %.0f min)",
+            jid, age / 60,
+        )
+
+    if running_settled or queued_failed:
+        log.info(
+            "reconciler: pass settled %d orphaned-running + %d stuck-queued job(s)",
+            running_settled, queued_failed,
+        )
+    return (running_settled, queued_failed)
+
+
+# ----------------------------------------------------------------------------
 # Skill / convention retire reaper (selection loop, retire phase)
 # ----------------------------------------------------------------------------
 # How often to scan the registries. Slow -- fitness only shifts over many

@@ -1,0 +1,371 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+<meta charset="utf-8">
+<title>ガイド — Paprika で画像・動画取得・ログイン・ブラウザ操作・サイト巡回</title>
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<link rel="stylesheet" href="style.css">
+<meta name="description" content="Paprika 実践ガイド。1 URL の画像一括取得・動画ダウンロード（yt-dlp 連携）・ログイン必須サイトの自動再ログイン・DOM 操作・サイト巡回 (walk)・LLM (codegen-loop / page.agent) の使い分けまでレシピで解説。">
+<link rel="canonical" href="https://paps-jp.github.io/paprika/guides.html">
+<meta property="og:type" content="website">
+<meta property="og:site_name" content="Paprika">
+<meta property="og:title" content="ガイド — Paprika で画像・動画取得・ログイン・ブラウザ操作・サイト巡回">
+<meta property="og:description" content="Paprika 実践ガイド。1 URL の画像一括取得・動画ダウンロード（yt-dlp 連携）・ログイン必須サイトの自動再ログイン・DOM 操作・サイト巡回 (walk)・LLM (codegen-loop / page.agent) の使い分けまでレシピで解説。">
+<meta property="og:url" content="https://paps-jp.github.io/paprika/guides.html">
+<meta property="og:image" content="https://paps-jp.github.io/paprika/img/admin-submit.png">
+<meta property="og:locale" content="ja_JP">
+<meta name="twitter:card" content="summary_large_image">
+<meta name="twitter:title" content="ガイド — Paprika で画像・動画取得・ログイン・ブラウザ操作・サイト巡回">
+<meta name="twitter:description" content="Paprika 実践ガイド。1 URL の画像一括取得・動画ダウンロード（yt-dlp 連携）・ログイン必須サイトの自動再ログイン・DOM 操作・サイト巡回 (walk)・LLM (codegen-loop / page.agent) の使い分けまでレシピで解説。">
+<meta name="twitter:image" content="https://paps-jp.github.io/paprika/img/admin-submit.png">
+<script type="application/ld+json">{
+  "@context": "https://schema.org",
+  "@type": "Organization",
+  "name": "特定非営利活動法人ぱっぷす",
+  "alternateName": ["paps", "PAPS", "ぱっぷす"],
+  "url": "https://www.paps.jp",
+  "logo": "https://paps-jp.github.io/paprika/icon.svg",
+  "sameAs": [
+    "https://github.com/paps-jp",
+    "https://paps-jp.github.io/paprika/"
+  ]
+}</script>
+</head>
+<body>
+
+<nav class="topnav">
+  <a class="brand" href="index.html"><span class="logo"><img src="icon.svg" alt=""></span> Paprika</a>
+  <span class="links">
+    <span class="dropdown">
+      <a class="dropdown-toggle" href="why-paprika.html">はじめに ▾</a>
+      <span class="dropdown-menu">
+        <a href="why-paprika.html">なぜ Paprika?</a>
+        <a href="intro.html">Client インストール</a>
+        <a href="quickstart.html">Server インストール</a>
+      </span>
+    </span>
+    <span class="dropdown">
+      <a class="dropdown-toggle active" href="guides.html">学ぶ ▾</a>
+      <span class="dropdown-menu">
+        <a href="guides.html" class="active">ガイド</a>
+        <a href="examples.html">サンプル</a>
+        <a href="usecases.html">ユースケース</a>
+        <a href="video.html">動画</a>
+        <a href="faq.html">FAQ</a>
+      </span>
+    </span>
+    <span class="dropdown">
+      <a class="dropdown-toggle" href="api.html">リファレンス ▾</a>
+      <span class="dropdown-menu">
+        <a href="api.html">API</a>
+        <a href="http-api.html">HTTP API</a>
+        <a href="cli.html">CLI</a>
+        <a href="job-options.html">JobOptions</a>
+        <a href="walk.html">walk（巡回）</a>
+        <a href="locator.html">Locator（要素指定）</a>
+        <a href="ws-events.html">WebSocket（ライブログ）</a>
+        <a href="errors.html">エラー一覧</a>
+        <a href="bridge-extension.html">Bridge 拡張</a>
+        <a href="profile.html">use_profile</a>
+        <a href="host-recipe.html">Host レシピ</a>
+        <a href="admin.html">管理画面</a>
+      </span>
+    </span>
+    <a href="operations.html">運用</a>
+    <a href="architecture.html">設計</a>
+  </span>
+  <a class="gh" href="search.html" title="サイト内検索" aria-label="サイト内検索" style="padding:5px 10px; margin-right:6px;"><iconify-icon icon="lucide:search" style="font-size:1.05rem; vertical-align:-3px;"></iconify-icon></a>
+  <a class="gh" href="https://github.com/paps-jp/paprika">GitHub ↗</a>
+</nav>
+
+
+<div class="layout">
+  <aside class="sidebar">
+    <h4>ガイド</h4>
+    <ul>
+      <li><a href="#images">画像を一括で取得</a></li>
+      <li><a href="#from-jobs">既存ジョブから取得</a></li>
+      <li><a href="#list-assets">画像一覧を for で出力</a></li>
+      <li><a href="#videos">動画を取得</a></li>
+      <li><a href="#login">ログイン必須サイト</a></li>
+      <li><a href="#session">セッションで操作</a></li>
+      <li><a href="#dom">DOM 取得・待機・入力</a></li>
+      <li><a href="#crawl">サイトを巡回（walk）</a></li>
+      <li><a href="#llm">LLM の使い分け</a></li>
+      <li><a href="#macro">Simple Macro</a></li>
+      <li><a href="#sync">同期版で書く</a></li>
+    </ul>
+  </aside>
+
+  <main class="content">
+    <h1>ガイド</h1>
+    <p class="lead">よくあるタスクを動くコードで紹介します。全関数の仕様は <a href="api.html">API リファレンス</a>、用途別の動くスニペット集は <a href="examples.html">サンプルコード集</a> をご覧ください。</p>
+
+    <h2 id="images">画像を一括で取得</h2>
+    <p>URL を 1 つ渡すだけです。<code>cli.fetch()</code> が実行から完了まで行います。</p>
+    <pre><code>import asyncio
+from paprika_client import async_paprika
+
+async def main():
+    async with async_paprika.connect() as cli:
+        job = await cli.fetch("https://example.com/article", scroll=True)
+        images = await cli.job_images(job.job_id)        # 画像URL一覧
+        print(len(images), "枚")
+        await cli.download_job_assets(job.job_id, "out/images")  # 保存
+
+asyncio.run(main())</code></pre>
+    <div class="callout tip"><strong>遅延ロード対策</strong>
+    多くのサイトは画面に入った画像だけ読み込みます。<code>scroll=True</code>（既定）でスクロールさせ、長いページは <code>scroll_max=12000</code> など大きめに設定してください。</div>
+    <p class="see-also">→ <a href="examples.html#assets">詳細はこちら（サンプル集: アセット取得）</a></p>
+
+    <h2 id="from-jobs">既存ジョブから取得</h2>
+    <p>管理 UI や別スクリプトで実行済みのジョブから、あとで回収します:</p>
+    <pre><code>jobs   = await cli.list_jobs()                 # 一覧（新しい順）
+job_id = jobs[0].job_id
+images = await cli.job_images(job_id)          # 画像URL一覧
+rows   = await cli.job_assets(job_id, details=True)  # メタ付き(size/source_url/mime)
+await cli.download_job_assets(job_id, f"out/{job_id}")</code></pre>
+    <p class="see-also">→ <a href="examples.html#assets">詳細はこちら（サンプル集: アセット取得）</a></p>
+
+    <h2 id="list-assets">画像一覧を 1 件ずつ表示（for で出力）</h2>
+    <p>収集した画像をまとめて確認したいときの基本パターンです。<code>cli.job_assets(..., details=True)</code> で
+    メタ情報込みの dict のリストを取得し、<code>for</code> で 1 件ずつ出力します。各エントリは
+    <code>name</code> / <code>url</code> / <code>size</code> / <code>size_h</code> / <code>mime</code> /
+    <code>source_url</code>（元のページ上の画像 URL）/ <code>page_url</code> / <code>kind</code> を持ちます。</p>
+    <pre><code>import asyncio
+from paprika_client import async_paprika
+
+async def main():
+    async with async_paprika.connect() as cli:
+        # 1) ページを取得して画像を集める
+        job = await cli.fetch("https://en.wikipedia.org/wiki/Cat", scroll=True)
+
+        # 2) 画像一覧（メタ付き dict のリスト）を取得
+        rows = await cli.job_assets(job.job_id, kind="image", details=True)
+
+        # 3) for で 1 件ずつ詳細を出力
+        print(f"{len(rows)} 枚の画像:")
+        for i, a in enumerate(rows, 1):
+            print(f"[{i:3}] {a.size_h:>10}  {a.mime or '-':&lt;12}  {a.name}")
+            print(f"      URL:  {a.url}")
+            if a.get("source_url"):
+                print(f"      元:   {a.source_url}")
+
+asyncio.run(main())</code></pre>
+    <p><strong>実行結果（例 — 最初の 4 件 / 全 49 件）:</strong></p>
+    <pre><code>49 枚の画像:
+[  1]     3.0 KB  image/jpeg    120px-Felis_chaus_-_1700-…jpg
+      URL:  http://paprika.lan:8000/jobs/356ad248c57c/assets/120px-Felis_chaus_-_1700-…jpg
+      元:   https://upload.wikimedia.org/.../120px-Felis_chaus_-_1700-…jpg
+[  2]     6.5 KB  image/jpeg    120px-Gustav_chocolate.jpg
+      URL:  http://paprika.lan:8000/jobs/356ad248c57c/assets/120px-Gustav_chocolate.jpg
+      元:   https://upload.wikimedia.org/.../120px-Gustav_chocolate.jpg
+[  3]     8.9 KB  image/jpeg    120px-Orange_tabby_cat_…jpg
+      URL:  http://paprika.lan:8000/jobs/356ad248c57c/assets/120px-Orange_tabby_cat_…jpg
+      元:   https://upload.wikimedia.org/.../120px-Orange_tabby_cat_…jpg
+[  4]     5.9 KB  image/jpeg    120px-Sheba1.JPG
+      URL:  http://paprika.lan:8000/jobs/356ad248c57c/assets/120px-Sheba1.JPG
+      元:   https://upload.wikimedia.org/.../120px-Sheba1.JPG
+…
+(残り 45 枚)</code></pre>
+    <div class="callout tip"><strong>応用</strong>
+    <ul>
+      <li><code>details=False</code>（既定）なら URL 文字列のリスト → さらに簡単な <code>for u in urls: print(u)</code></li>
+      <li><code>kind=None</code> で画像以外も含める（動画は <code>kind="video"</code>、音声は <code>"audio"</code>）</li>
+      <li>条件でフィルタしてダウンロード: <code>if a.size &gt; 100_000: ...</code></li>
+      <li>同期版なら <code>from paprika_client import sync_paprika</code> で <code>await</code> を外すだけ（<a href="api.html#sync">API → 同期版</a>）</li>
+    </ul>
+    </div>
+    <p class="see-also">→ <a href="examples.html#assets">詳細はこちら（サンプル集: アセット取得）</a></p>
+
+    <h2 id="videos">動画を取得</h2>
+    <p>ページ上の動画をまとめて取得するなら fetch + <code>download_video=True</code> を使います。worker が iframe / ネスト iframe の通信を観測し、HLS/DASH の配信動画を yt-dlp で 1 本の mp4 にまとめます:</p>
+    <pre><code>job = await cli.fetch("https://example.com/clips", download_video=True)
+videos = await cli.job_assets(job.job_id, kind="video")
+await cli.download_job_assets(job.job_id, "out/videos", kind="video")</code></pre>
+    <p>HLS/DASH の配信動画を 1 本の mp4 として取得したいときは、セッションで <code>download_video()</code>（yt-dlp）を使います:</p>
+    <pre><code>async with cli.session("https://video.example/watch/123",
+                       parent_job_id="video-grab") as page:
+    await page.download_video()                # 現ページを yt-dlp
+    await page.save_assets("out/videos", kind="video")</code></pre>
+    <p class="see-also">→ <a href="examples.html#video">詳細はこちら（サンプル集: 動画をダウンロード）</a></p>
+
+    <h2 id="login">ログイン必須サイト</h2>
+    <p>一度ログインして Cookie を Host レジストリに保存すれば、以後は自動で再利用されます。
+    継続運用の選択肢は <a href="bridge-extension.html">Bridge 拡張</a>（手動 push）／<a href="profile.html"><code>use_profile</code></a>（フルプロファイル）／<a href="host-recipe.html">Host レシピ</a>（自動再ログイン）の 3 通りです。</p>
+    <pre><code># 1) セッションでログイン（手動 noVNC でも page 操作でも）
+async with cli.session("https://market.example.com/login",
+                       parent_job_id="login") as page:
+    await page.fill("input[name=email]", "user@example.com")
+    await page.fill("input[name=password]", "******")
+    await page.click("button[type=submit]")
+    await page.save_cookies_to_host(all_cookies=True)   # Cookie を保存
+
+# 2) 以後は cookies_from で会員ページを収集
+job = await cli.fetch("https://market.example.com/item/xxx",
+                      cookies_from="market.example.com")
+await cli.download_job_assets(job.job_id, "out/item")</code></pre>
+    <p class="see-also">→ <a href="examples.html#login">詳細はこちら（サンプル集: ログイン必須サイト）</a></p>
+
+    <h2 id="session">セッションで操作</h2>
+    <p>クリックや入力を挟んでから取得したいとき。Playwright と同じ書き方です。</p>
+    <pre><code>async with cli.session("https://news.ycombinator.com") as page:
+    await page.locator(".athing .titleline > a").click()
+    await page.scroll()                       # 遅延ロードを発火
+    srcs = await page.assets()                # このページの画像URL
+    await page.save_assets("out/images")</code></pre>
+    <div class="callout warn"><strong>parent_job_id が必須</strong>
+    <code>page.assets()</code> / <code>save_assets()</code> は画像の保存先となる親ジョブが要ります。
+    手元実行なら <code>cli.session(url, parent_job_id="任意のID")</code> を渡してください
+    （runner 上では <code>PAPRIKA_JOB_ID</code> で自動）。</div>
+    <p class="see-also">→ <a href="examples.html#session-basics">詳細はこちら（サンプル集: セッションを開く / 閉じる）</a></p>
+
+    <h2 id="dom">DOM 取得・待機・入力</h2>
+    <p><code>page.evaluate()</code> を土台に、Playwright スタイルの取得・待機・入力デバイスが使えます。
+    <code>Locator</code>（<code>page.locator(...)</code> / <code>get_by_*</code>）の完全な API は <a href="locator.html">Locator リファレンス</a> を参照。</p>
+    <pre><code># JS 実行
+title = await page.evaluate("document.title")
+
+# 取得
+txt  = await page.text_content("h1")
+href = await page.get_attribute("a", "href")
+n    = await page.count(".item")
+
+# 待機
+await page.wait_for_selector("#result")                 # 出現を待つ
+await page.wait_for_selector(".spinner", state="detached")
+
+# 入力デバイス
+await page.hover(".menu")
+await page.select_option("select#country", "JP")
+await page.check("#agree")
+await page.set_input_files("input[type=file]", "photo.jpg")
+
+# Locator（遅延解決・チェーン）
+rows = page.locator(".item")
+for r in await rows.all():
+    print(await r.get_attribute("data-id"))
+await page.get_by_text("ログイン").click()</code></pre>
+    <div class="callout info"><strong>「実マウス」ではない点に注意</strong>
+    <code>hover</code> / <code>select_option</code> / <code>check</code> などの入力系は、
+    <strong>実際にマウスを動かしているのではなく、JavaScript からその要素にイベントを発火させる方式</strong>で動きます。
+    ほとんどのサイトはこれで反応しますが、まれに「<em>人間が本当にクリックしたか</em>」を厳しくチェックする画面（広告ゲート・一部の動画再生ボタン等）には効きません。
+    そのときは <code>page.agent()</code>（LLM が画面を見て操作）か、noVNC で人手操作してください。
+    <code>set_input_files</code>（ファイルアップロード）だけは別ルート（CDP）で実際にファイルを渡すので確実です。</div>
+    <p class="see-also">→ <a href="examples.html#interact">詳細はこちら（サンプル集: クリック・入力・キー操作 / スクロール・待機 / DOM を見る）</a></p>
+
+    <h2 id="crawl">サイトを巡回（walk）</h2>
+    <p>「このサイトを N 件たどって各ページの画像を保存」のようなクロールは、<code>walk()</code> に任せると
+    キュー・重複除去・ドメイン/パス制限・オフスコープ redirect 対応まで対応しています。
+    全オプション（15 項目）と <code>Visit</code> フィールドの完全リファレンスは <a href="walk.html">walk リファレンス</a> を参照。</p>
+    <pre><code>from paprika_client import async_paprika, walk
+
+async def main():
+    async with async_paprika.connect() as cli:
+        async with cli.session("https://example.com",
+                               parent_job_id="crawl") as page:
+            async for visit in walk(page, target_pages=50, same_domain=True,
+                                    deny_paths=["/login", "/cart"]):
+                print(visit.n, visit.depth, visit.url)
+                await page.save_assets(f"out/{visit.n:04d}")   # 各ページで保存
+
+asyncio.run(main())</code></pre>
+
+    <h3>例: walk + <code>page.extract()</code> で構造化データを集める</h3>
+    <p>各ページを巡回しつつ、その場で Pydantic スキーマに沿って LLM に抽出させる組み合わせ。
+    画像だけでなく「タイトル・著者・公開日・タグ」のような構造化情報をクロール中に集約できます。
+    取得不能なページは skip して続行。</p>
+    <pre><code>import asyncio
+import json
+from pydantic import BaseModel
+from paprika_client import async_paprika, walk
+
+class Article(BaseModel):
+    title: str
+    author: str | None = None
+    published_at: str | None = None
+    tags: list[str] = []
+
+async def main():
+    async with async_paprika.connect() as cli:
+        async with cli.session("https://news.example.com",
+                               parent_job_id="news-crawl") as page:
+            collected: list[dict] = []
+            async for visit in walk(
+                page,
+                target_pages=30,
+                same_domain=True,
+                allow_paths=["/articles/"],
+                deny_paths=["/login", "/tag/"],
+            ):
+                try:
+                    # extract() は outline をコンテキストに LLM へ投げ、
+                    # JSON を返し → Pydantic で検証してから型付きで戻る
+                    art = await page.extract(
+                        "記事のタイトル・著者・公開日・タグを抽出。"
+                        "見つからない項目は null。",
+                        Article,
+                    )
+                    collected.append({"url": visit.url, **art.model_dump()})
+                    print(f"[{visit.n:3}] {art.title}")
+                except Exception as e:
+                    # スキーマ違反 / LLM 不達は 1 件単位で skip。
+                    print(f"[{visit.n:3}] skipped: {e}")
+
+            with open("articles.json", "w", encoding="utf-8") as f:
+                json.dump(collected, f, ensure_ascii=False, indent=2)
+            print(f"total: {len(collected)} articles")
+
+asyncio.run(main())</code></pre>
+    <div class="callout tip"><strong>extract と walk の相性</strong>
+    <ul>
+      <li><code>list[Article]</code> を渡せばリスト形式のページ（記事一覧）も一括取得できます: <code>arts = await page.extract("記事一覧を取得", list[Article])</code></li>
+      <li>失敗ページを止めずに続行したい場合は <code>try/except</code> で <code>PaprikaActionError</code> を捕捉（スキーマ違反 / JSON パース不能はこれ）。</li>
+      <li>収集中に画像も併せて保存するなら <code>await page.save_assets(f"out/{visit.n:04d}")</code> を同じループに追加。</li>
+    </ul></div>
+
+    <p>主なオプション: <code>target_pages</code>（上限）/ <code>same_domain</code>・<code>allowed_domains</code>（範囲）/
+    <code>allow_paths</code>・<code>deny_paths</code>（フィルタ）/ <code>order</code>（bfs・dfs）/ <code>max_depth</code> /
+    <code>persist_state</code>（attempt 跨ぎ再開）。全項目は <a href="api.html#walk">API → サイト巡回</a> をご覧ください。</p>
+    <div class="callout tip"><strong>手書きループより walk</strong>
+    「リンクを集めて for で回す」を自前で書くと、重複・無限ループ・別ドメイン流出でハマりがちです。<code>walk()</code> はそれらを内蔵しています。</div>
+
+    <h2 id="llm">LLM の使い分け</h2>
+    <table>
+      <thead><tr><th>使い方</th><th>向いてるタスク</th></tr></thead>
+      <tbody>
+        <tr><td><code>page.agent(goal)</code></td><td>スクリプト内の局所的な不確実部分（年齢ゲート突破、再生ボタン探し、ログイン）。CSS が効かない画面も Qwen-VL が「見て」操作</td></tr>
+        <tr><td><code>mode="codegen-loop"</code></td><td>「このサイトを巡回」のような大きめタスクを抽象的な言葉で操作</td></tr>
+      </tbody>
+    </table>
+    <pre><code># スクリプト内で 1 ステップだけ LLM に任せる
+async with cli.session("https://example.com") as page:
+    if await page.ask("認証ダイアログが出ている?"):
+        await page.agent("確認画面の「はい」を押す", max_steps=3)
+    await page.capture("after-gate")</code></pre>
+    <p class="see-also">→ <a href="examples.html#llm">詳細はこちら（サンプル集: LLM (ask / observe / agent)）</a></p>
+
+    <h2 id="macro">Simple Macro</h2>
+    <p>コードを書かずに、管理 UI 上で「開く → クリック → 入力 → 保存」を行のように積んで実行できます
+    （内部では paprika-client の Python に compile されて <code>rerun</code> モードで走ります）。
+    詳しくは管理 UI の Macro タブを参照してください。</p>
+
+    <h2 id="sync">同期版で書く</h2>
+    <p>async/await を使わずに書きたい場合（ノートブック、簡単なスクリプト、既存の同期コード）は、
+    <code>sync_paprika</code> を使うと <code>await</code> を全部外した同じコードで記述できます。</p>
+    <pre><code>from paprika_client import sync_paprika
+
+with sync_paprika.connect() as cli:
+    job = cli.fetch("https://example.com/article")
+    for url in cli.job_images(job.job_id):
+        print(url)
+
+    with cli.session("https://example.com") as page:
+        page.click("text=ログイン")
+        print(page.title())</code></pre>
+    <p>メソッドは async 版と同一です。詳細は <a href="api.html#sync">API → 同期版</a> をご覧ください。</p>
+    <p class="see-also">→ <a href="examples.html#sync">詳細はこちら（サンプル集: 同期版で書く）</a></p>
+  </main>
+</div>
+</body>
+</html>

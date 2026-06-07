@@ -1,0 +1,550 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+<meta charset="utf-8">
+<title>JobOptions — ジョブの全オプション — Paprika</title>
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<link rel="stylesheet" href="/paprika/style.css">
+<script src="https://code.iconify.design/iconify-icon/2.1.0/iconify-icon.min.js"></script>
+<meta name="description" content="POST /jobs と SDK の options に渡せる全フィールドの完全リファレンス — モード(fetch / codegen-loop / rerun)、Fetch 系(待機・スクロール・動画・Cookie)、プロファイル、AI、rerun ソース、min_asset_size_bytes、fetch_strategy、keep_session、ハブ注入フィールドまで。">
+<link rel="canonical" href="https://paps-jp.github.io/paprika/job-options.html">
+<meta property="og:type" content="article">
+<meta property="og:site_name" content="Paprika">
+<meta property="og:title" content="JobOptions — ジョブの全オプション — Paprika">
+<meta property="og:description" content="POST /jobs と SDK の options に渡せる全フィールドの完全リファレンス — モード(fetch / codegen-loop / rerun)、Fetch 系(待機・スクロール・動画・Cookie)、プロファイル、AI、rerun ソース、min_asset_size_bytes、fetch_strategy、keep_session、ハブ注入フィールドまで。">
+<meta property="og:url" content="https://paps-jp.github.io/paprika/job-options.html">
+<meta property="og:locale" content="ja_JP">
+</head>
+<body>
+
+<nav class="topnav">
+  <a class="brand" href="index.html"><span class="logo"><img src="icon.svg" alt=""></span> Paprika</a>
+  <span class="links">
+    <span class="dropdown">
+      <a class="dropdown-toggle" href="why-paprika.html">はじめに ▾</a>
+      <span class="dropdown-menu">
+        <a href="why-paprika.html">なぜ Paprika?</a>
+        <a href="intro.html">Client インストール</a>
+        <a href="quickstart.html">Server インストール</a>
+      </span>
+    </span>
+    <span class="dropdown">
+      <a class="dropdown-toggle" href="guides.html">学ぶ ▾</a>
+      <span class="dropdown-menu">
+        <a href="guides.html">ガイド</a>
+        <a href="examples.html">サンプル</a>
+        <a href="usecases.html">ユースケース</a>
+        <a href="video.html">動画</a>
+        <a href="faq.html">FAQ</a>
+      </span>
+    </span>
+    <span class="dropdown">
+      <a class="dropdown-toggle active" href="api.html">リファレンス ▾</a>
+      <span class="dropdown-menu">
+        <a href="api.html">API</a>
+        <a href="http-api.html">HTTP API</a>
+        <a href="cli.html">CLI</a>
+        <a href="job-options.html" class="active">JobOptions</a>
+        <a href="walk.html">walk（巡回）</a>
+        <a href="locator.html">Locator（要素指定）</a>
+        <a href="ws-events.html">WebSocket（ライブログ）</a>
+        <a href="errors.html">エラー一覧</a>
+        <a href="bridge-extension.html">Bridge 拡張</a>
+        <a href="profile.html">use_profile</a>
+        <a href="host-recipe.html">Host レシピ</a>
+        <a href="admin.html">管理画面</a>
+      </span>
+    </span>
+    <a href="operations.html">運用</a>
+    <a href="architecture.html">設計</a>
+  </span>
+  <a class="gh" href="search.html" title="サイト内検索" aria-label="サイト内検索" style="padding:5px 10px; margin-right:6px;"><iconify-icon icon="lucide:search" style="font-size:1.05rem; vertical-align:-3px;"></iconify-icon></a>
+  <a class="gh" href="https://github.com/paps-jp/paprika">GitHub ↗</a>
+</nav>
+
+<div class="layout">
+  <aside class="sidebar">
+    <h4>このページ</h4>
+    <ul id="doc-toc"></ul>
+  </aside>
+  <main class="content">
+    <h1>JobOptions — ジョブの全オプション</h1>
+    <p class="lead">POST /jobs と SDK の options に渡せる全フィールドの完全リファレンス — モード(fetch / codegen-loop / rerun)、Fetch 系(待機・スクロール・動画・Cookie)、プロファイル、AI、rerun ソース、min_asset_size_bytes、fetch_strategy、keep_session、ハブ注入フィールドまで。</p>
+    <p><code class="language-plaintext highlighter-rouge">POST /jobs</code> のリクエスト body <code class="language-plaintext highlighter-rouge">options</code>（SDK では <code class="language-plaintext highlighter-rouge">cli.fetch(url, **kwargs)</code> の追加引数 / <code class="language-plaintext highlighter-rouge">cli.session(url, options=...)</code> の dict）に渡せる全フィールドの<strong>完全リファレンス</strong>です。SDK の型定義（<code class="language-plaintext highlighter-rouge">server/protocol.py:JobOptions</code>）と 1 対 1 です。</p>
+
+<blockquote>
+  <p>投入経路の概要は <a href="http-api.html">HTTP API</a>、SDK の使い方は <a href="/paprika/api.html">API リファレンス</a> を参照。</p>
+</blockquote>
+
+<h2 id="早見表">早見表</h2>
+
+<table>
+  <thead>
+    <tr>
+      <th>カテゴリ</th>
+      <th>フィールド</th>
+    </tr>
+  </thead>
+  <tbody>
+    <tr>
+      <td><strong>モード</strong></td>
+      <td><code class="language-plaintext highlighter-rouge">mode</code>, <code class="language-plaintext highlighter-rouge">goal</code>, <code class="language-plaintext highlighter-rouge">max_codegen_attempts</code>, <code class="language-plaintext highlighter-rouge">attempt_timeout_s</code>, <code class="language-plaintext highlighter-rouge">rerun_from</code>, <code class="language-plaintext highlighter-rouge">code</code></td>
+    </tr>
+    <tr>
+      <td><strong>Fetch 系（待機）</strong></td>
+      <td><code class="language-plaintext highlighter-rouge">wait_seconds</code>, <code class="language-plaintext highlighter-rouge">settle_seconds</code>, <code class="language-plaintext highlighter-rouge">idle_seconds</code>, <code class="language-plaintext highlighter-rouge">max_wait_seconds</code>, <code class="language-plaintext highlighter-rouge">post_click_seconds</code></td>
+    </tr>
+    <tr>
+      <td><strong>Fetch 系（スクロール）</strong></td>
+      <td><code class="language-plaintext highlighter-rouge">scroll</code>, <code class="language-plaintext highlighter-rouge">scroll_step</code>, <code class="language-plaintext highlighter-rouge">scroll_max</code>, <code class="language-plaintext highlighter-rouge">scroll_early_after</code></td>
+    </tr>
+    <tr>
+      <td><strong>動画 / アセット</strong></td>
+      <td><code class="language-plaintext highlighter-rouge">download_video</code>, <code class="language-plaintext highlighter-rouge">capture_assets</code>, <code class="language-plaintext highlighter-rouge">min_asset_size_bytes</code></td>
+    </tr>
+    <tr>
+      <td><strong>ブラウザ</strong></td>
+      <td><code class="language-plaintext highlighter-rouge">headless</code>, <code class="language-plaintext highlighter-rouge">referer</code>, <code class="language-plaintext highlighter-rouge">cookies_from</code></td>
+    </tr>
+    <tr>
+      <td><strong>プロファイル / アタッチ</strong></td>
+      <td><code class="language-plaintext highlighter-rouge">use_profile</code>, <code class="language-plaintext highlighter-rouge">attach</code>, <code class="language-plaintext highlighter-rouge">clone_chrome_profile</code>, <code class="language-plaintext highlighter-rouge">attach_to_job</code></td>
+    </tr>
+    <tr>
+      <td><strong>AI</strong></td>
+      <td><code class="language-plaintext highlighter-rouge">codegen_engine</code></td>
+    </tr>
+    <tr>
+      <td><strong>Fetch サブモード</strong></td>
+      <td><code class="language-plaintext highlighter-rouge">fetch_strategy</code>, <code class="language-plaintext highlighter-rouge">fetch_recipe</code>（Hub 注入）</td>
+    </tr>
+    <tr>
+      <td><strong>セッション</strong></td>
+      <td><code class="language-plaintext highlighter-rouge">keep_session</code></td>
+    </tr>
+  </tbody>
+</table>
+
+<h2 id="モード">モード</h2>
+
+<table>
+  <thead>
+    <tr>
+      <th>フィールド</th>
+      <th>型</th>
+      <th>既定</th>
+      <th>説明</th>
+    </tr>
+  </thead>
+  <tbody>
+    <tr>
+      <td><code class="language-plaintext highlighter-rouge">mode</code></td>
+      <td><code class="language-plaintext highlighter-rouge">"fetch" \| "codegen-loop" \| "rerun"</code></td>
+      <td><code class="language-plaintext highlighter-rouge">"fetch"</code></td>
+      <td>実行モード（<a href="architecture-hub.html#codegen-loop">Hub の仕組み</a>）</td>
+    </tr>
+    <tr>
+      <td><code class="language-plaintext highlighter-rouge">goal</code></td>
+      <td><code class="language-plaintext highlighter-rouge">str \| None</code></td>
+      <td><code class="language-plaintext highlighter-rouge">null</code></td>
+      <td><code class="language-plaintext highlighter-rouge">codegen-loop</code> の目標（自然言語）。<strong><code class="language-plaintext highlighter-rouge">codegen-loop</code> では必須</strong></td>
+    </tr>
+    <tr>
+      <td><code class="language-plaintext highlighter-rouge">max_codegen_attempts</code></td>
+      <td><code class="language-plaintext highlighter-rouge">int</code> (1–10)</td>
+      <td><code class="language-plaintext highlighter-rouge">3</code></td>
+      <td><code class="language-plaintext highlighter-rouge">codegen-loop</code> の生成→実行→再生成の試行回数</td>
+    </tr>
+    <tr>
+      <td><code class="language-plaintext highlighter-rouge">attempt_timeout_s</code></td>
+      <td><code class="language-plaintext highlighter-rouge">int</code> (30–864000)</td>
+      <td><code class="language-plaintext highlighter-rouge">180</code></td>
+      <td>1 試行のサンドボックス実行タイムアウト（秒）。最大 <strong>10 日</strong></td>
+    </tr>
+    <tr>
+      <td><code class="language-plaintext highlighter-rouge">rerun_from</code></td>
+      <td><code class="language-plaintext highlighter-rouge">str \| None</code></td>
+      <td><code class="language-plaintext highlighter-rouge">null</code></td>
+      <td><code class="language-plaintext highlighter-rouge">rerun</code>: 既存ジョブ/アテンプトの script を再実行。形式: <code class="language-plaintext highlighter-rouge">"{job_id}"</code> / <code class="language-plaintext highlighter-rouge">"{job_id}/attempts/N"</code></td>
+    </tr>
+    <tr>
+      <td><code class="language-plaintext highlighter-rouge">code</code></td>
+      <td><code class="language-plaintext highlighter-rouge">str \| None</code></td>
+      <td><code class="language-plaintext highlighter-rouge">null</code></td>
+      <td><code class="language-plaintext highlighter-rouge">rerun</code>: インライン Python スクリプト（最大 <strong>200 KB</strong>）</td>
+    </tr>
+  </tbody>
+</table>
+
+<blockquote>
+  <p><strong><code class="language-plaintext highlighter-rouge">rerun_from</code> と <code class="language-plaintext highlighter-rouge">code</code> は同時指定不可</strong>。両方ある場合は <code class="language-plaintext highlighter-rouge">rerun_from</code> が勝ちます。</p>
+</blockquote>
+
+<h2 id="fetch-系待機スクロール">Fetch 系（待機・スクロール）</h2>
+
+<p><code class="language-plaintext highlighter-rouge">mode: "fetch"</code> のときに効きます。</p>
+
+<table>
+  <thead>
+    <tr>
+      <th>フィールド</th>
+      <th>型</th>
+      <th>既定</th>
+      <th>説明</th>
+    </tr>
+  </thead>
+  <tbody>
+    <tr>
+      <td><code class="language-plaintext highlighter-rouge">wait_seconds</code></td>
+      <td><code class="language-plaintext highlighter-rouge">int</code></td>
+      <td><code class="language-plaintext highlighter-rouge">20</code></td>
+      <td>ページ読み込み待ち（秒）</td>
+    </tr>
+    <tr>
+      <td><code class="language-plaintext highlighter-rouge">settle_seconds</code></td>
+      <td><code class="language-plaintext highlighter-rouge">float</code></td>
+      <td><code class="language-plaintext highlighter-rouge">0.0</code></td>
+      <td>ナビ後の落ち着き待ち（秒）</td>
+    </tr>
+    <tr>
+      <td><code class="language-plaintext highlighter-rouge">idle_seconds</code></td>
+      <td><code class="language-plaintext highlighter-rouge">float</code></td>
+      <td><code class="language-plaintext highlighter-rouge">3.0</code></td>
+      <td>ネットワーク無通信の判定（秒）</td>
+    </tr>
+    <tr>
+      <td><code class="language-plaintext highlighter-rouge">max_wait_seconds</code></td>
+      <td><code class="language-plaintext highlighter-rouge">float</code></td>
+      <td><code class="language-plaintext highlighter-rouge">60.0</code></td>
+      <td>全体上限（秒）</td>
+    </tr>
+    <tr>
+      <td><code class="language-plaintext highlighter-rouge">post_click_seconds</code></td>
+      <td><code class="language-plaintext highlighter-rouge">float</code></td>
+      <td><code class="language-plaintext highlighter-rouge">5.0</code></td>
+      <td>クリック後の追加待ち（秒）</td>
+    </tr>
+    <tr>
+      <td><code class="language-plaintext highlighter-rouge">scroll</code></td>
+      <td><code class="language-plaintext highlighter-rouge">bool</code></td>
+      <td><code class="language-plaintext highlighter-rouge">false</code></td>
+      <td>最後までスクロールして lazy-load も拾う</td>
+    </tr>
+    <tr>
+      <td><code class="language-plaintext highlighter-rouge">scroll_step</code></td>
+      <td><code class="language-plaintext highlighter-rouge">int</code></td>
+      <td><code class="language-plaintext highlighter-rouge">50</code></td>
+      <td>1 回のスクロール量（px）</td>
+    </tr>
+    <tr>
+      <td><code class="language-plaintext highlighter-rouge">scroll_max</code></td>
+      <td><code class="language-plaintext highlighter-rouge">int</code></td>
+      <td><code class="language-plaintext highlighter-rouge">3000</code></td>
+      <td>スクロール上限（px）</td>
+    </tr>
+    <tr>
+      <td><code class="language-plaintext highlighter-rouge">scroll_early_after</code></td>
+      <td><code class="language-plaintext highlighter-rouge">float</code></td>
+      <td><code class="language-plaintext highlighter-rouge">5.0</code></td>
+      <td>スクロール早期終了の閾値（秒）</td>
+    </tr>
+  </tbody>
+</table>
+
+<h2 id="動画--アセット">動画 / アセット</h2>
+
+<table>
+  <thead>
+    <tr>
+      <th>フィールド</th>
+      <th>型</th>
+      <th>既定</th>
+      <th>説明</th>
+    </tr>
+  </thead>
+  <tbody>
+    <tr>
+      <td><code class="language-plaintext highlighter-rouge">download_video</code></td>
+      <td><code class="language-plaintext highlighter-rouge">bool</code></td>
+      <td><code class="language-plaintext highlighter-rouge">false</code></td>
+      <td>iframe+ネスト iframe の通信トレースを ON + <code class="language-plaintext highlighter-rouge">yt-dlp</code> で動画取得。<strong><code class="language-plaintext highlighter-rouge">true</code> だと <code class="language-plaintext highlighter-rouge">capture_assets</code> も強制 <code class="language-plaintext highlighter-rouge">true</code></strong>（<a href="video.html">動画の仕組み</a>）</td>
+    </tr>
+    <tr>
+      <td><code class="language-plaintext highlighter-rouge">capture_assets</code></td>
+      <td><code class="language-plaintext highlighter-rouge">bool</code></td>
+      <td><code class="language-plaintext highlighter-rouge">true</code></td>
+      <td>取得したアセットをサーバ側に保存する</td>
+    </tr>
+    <tr>
+      <td><code class="language-plaintext highlighter-rouge">min_asset_size_bytes</code></td>
+      <td><code class="language-plaintext highlighter-rouge">int</code> (≥0)</td>
+      <td><code class="language-plaintext highlighter-rouge">0</code></td>
+      <td>このサイズ未満のアセットを除外（<code class="language-plaintext highlighter-rouge">0</code> = 制限なし）。クライアントが <code class="language-plaintext highlighter-rouge">0</code> のままなら Hub の Settings 値で上書き</td>
+    </tr>
+  </tbody>
+</table>
+
+<h2 id="ブラウザ">ブラウザ</h2>
+
+<table>
+  <thead>
+    <tr>
+      <th>フィールド</th>
+      <th>型</th>
+      <th>既定</th>
+      <th>説明</th>
+    </tr>
+  </thead>
+  <tbody>
+    <tr>
+      <td><code class="language-plaintext highlighter-rouge">headless</code></td>
+      <td><code class="language-plaintext highlighter-rouge">bool</code></td>
+      <td><code class="language-plaintext highlighter-rouge">false</code></td>
+      <td>画面を出さずに実行（Chrome <code class="language-plaintext highlighter-rouge">--headless</code>）</td>
+    </tr>
+    <tr>
+      <td><code class="language-plaintext highlighter-rouge">referer</code></td>
+      <td><code class="language-plaintext highlighter-rouge">str \| None</code></td>
+      <td><code class="language-plaintext highlighter-rouge">null</code></td>
+      <td>リクエストの Referer</td>
+    </tr>
+    <tr>
+      <td><code class="language-plaintext highlighter-rouge">cookies_from</code></td>
+      <td><code class="language-plaintext highlighter-rouge">str \| None</code></td>
+      <td><code class="language-plaintext highlighter-rouge">null</code></td>
+      <td>指定ホストの Cookie を <a href="host-recipe.html">Host レジストリ</a> から注入</td>
+    </tr>
+  </tbody>
+</table>
+
+<h2 id="プロファイル--アタッチ">プロファイル / アタッチ</h2>
+
+<p>ログイン状態の持ち込み・既存ブラウザの再利用系。<strong>4 つは同時指定不可</strong>（最大 1 つ）。</p>
+
+<table>
+  <thead>
+    <tr>
+      <th>フィールド</th>
+      <th>型</th>
+      <th>既定</th>
+      <th>説明</th>
+    </tr>
+  </thead>
+  <tbody>
+    <tr>
+      <td><code class="language-plaintext highlighter-rouge">use_profile</code></td>
+      <td><code class="language-plaintext highlighter-rouge">str \| None</code></td>
+      <td><code class="language-plaintext highlighter-rouge">null</code></td>
+      <td>Hub に <a href="profile.html">アップロード済み</a>のプロファイル名。省略時は既定プロファイルがあれば適用</td>
+    </tr>
+    <tr>
+      <td><code class="language-plaintext highlighter-rouge">attach</code></td>
+      <td><code class="language-plaintext highlighter-rouge">str \| None</code></td>
+      <td><code class="language-plaintext highlighter-rouge">null</code></td>
+      <td>既に走っている Chrome に接続。形式: <code class="language-plaintext highlighter-rouge">[HOST:]PORT</code></td>
+    </tr>
+    <tr>
+      <td><code class="language-plaintext highlighter-rouge">clone_chrome_profile</code></td>
+      <td><code class="language-plaintext highlighter-rouge">str \| None</code></td>
+      <td><code class="language-plaintext highlighter-rouge">null</code></td>
+      <td><strong>ローカル限定</strong>: 操作者の Chrome プロファイル名を tempdir にクローン（Hub と Chrome が同一ホストのときのみ）</td>
+    </tr>
+    <tr>
+      <td><code class="language-plaintext highlighter-rouge">attach_to_job</code></td>
+      <td><code class="language-plaintext highlighter-rouge">str \| None</code></td>
+      <td><code class="language-plaintext highlighter-rouge">null</code></td>
+      <td>前ジョブのブラウザ Lane を再利用（同じ Chrome / user-data-dir → Cookie / ログインを維持）</td>
+    </tr>
+  </tbody>
+</table>
+
+<h2 id="aicodegen-loop">AI（<code class="language-plaintext highlighter-rouge">codegen-loop</code>）</h2>
+
+<table>
+  <thead>
+    <tr>
+      <th>フィールド</th>
+      <th>型</th>
+      <th>既定</th>
+      <th>説明</th>
+    </tr>
+  </thead>
+  <tbody>
+    <tr>
+      <td><code class="language-plaintext highlighter-rouge">codegen_engine</code></td>
+      <td><code class="language-plaintext highlighter-rouge">str \| None</code></td>
+      <td><code class="language-plaintext highlighter-rouge">null</code></td>
+      <td><code class="language-plaintext highlighter-rouge">/engines</code> の slug。<code class="language-plaintext highlighter-rouge">kind=chat</code> または <code class="language-plaintext highlighter-rouge">vision-chat</code> + <code class="language-plaintext highlighter-rouge">protocol=openai</code> のもの。省略時は env 既定（<code class="language-plaintext highlighter-rouge">CODEGEN_LLM_URL</code> + <code class="language-plaintext highlighter-rouge">CODEGEN_MODEL_NAME</code>）</td>
+    </tr>
+  </tbody>
+</table>
+
+<h2 id="fetch-サブモード">Fetch サブモード</h2>
+
+<table>
+  <thead>
+    <tr>
+      <th>フィールド</th>
+      <th>型</th>
+      <th>既定</th>
+      <th>説明</th>
+    </tr>
+  </thead>
+  <tbody>
+    <tr>
+      <td><code class="language-plaintext highlighter-rouge">fetch_strategy</code></td>
+      <td><code class="language-plaintext highlighter-rouge">"recipe" \| "normal"</code></td>
+      <td><code class="language-plaintext highlighter-rouge">"recipe"</code></td>
+      <td><code class="language-plaintext highlighter-rouge">recipe</code>: ホストにマッチするレシピを自動適用 / <code class="language-plaintext highlighter-rouge">normal</code>: スキップ（<a href="host-recipe.html">Host レシピ</a>）</td>
+    </tr>
+    <tr>
+      <td><code class="language-plaintext highlighter-rouge">fetch_recipe</code></td>
+      <td><code class="language-plaintext highlighter-rouge">dict \| None</code></td>
+      <td><code class="language-plaintext highlighter-rouge">null</code></td>
+      <td><strong>Hub 注入</strong>。<code class="language-plaintext highlighter-rouge">HostRegistry.pick_recipe</code> で見つかったレシピを Hub が差し込む。<strong>API 側で直接セットしない</strong></td>
+    </tr>
+  </tbody>
+</table>
+
+<blockquote>
+  <p>AI 調査（管理画面の「AI で解析する」）は <code class="language-plaintext highlighter-rouge">fetch_strategy</code> の値ではなく、<strong><code class="language-plaintext highlighter-rouge">mode: "codegen-loop"</code></strong> で投入される別経路です。</p>
+</blockquote>
+
+<h2 id="セッション">セッション</h2>
+
+<table>
+  <thead>
+    <tr>
+      <th>フィールド</th>
+      <th>型</th>
+      <th>既定</th>
+      <th>説明</th>
+    </tr>
+  </thead>
+  <tbody>
+    <tr>
+      <td><code class="language-plaintext highlighter-rouge">keep_session</code></td>
+      <td><code class="language-plaintext highlighter-rouge">bool</code></td>
+      <td><code class="language-plaintext highlighter-rouge">false</code></td>
+      <td><strong><code class="language-plaintext highlighter-rouge">fetch</code> のみ</strong>。クロール終了後もブラウザ / セッションを残し、<code class="language-plaintext highlighter-rouge">JobInfo.session_id</code> の解決を続ける。noVNC で人手操作が可能。終了は <code class="language-plaintext highlighter-rouge">DELETE /sessions/{sid}</code></td>
+    </tr>
+  </tbody>
+</table>
+
+<h2 id="使用例">使用例</h2>
+
+<h3 id="fetchスクロール--動画">Fetch（スクロール + 動画）</h3>
+
+<div class="language-bash highlighter-rouge"><div class="highlight"><pre class="highlight"><code>curl <span class="nt">-X</span> POST <span class="s2">"</span><span class="nv">$PAPRIKA_HUB</span><span class="s2">/jobs"</span> <span class="nt">-H</span> <span class="s1">'Content-Type: application/json'</span> <span class="nt">-d</span> <span class="s1">'{
+  "url": "https://example.com",
+  "options": {
+    "mode": "fetch",
+    "scroll": true,
+    "scroll_max": 5000,
+    "download_video": true,
+    "min_asset_size_bytes": 2048
+  }
+}'</span>
+</code></pre></div></div>
+
+<h3 id="codegen-loopai-駆動">codegen-loop（AI 駆動）</h3>
+
+<div class="language-bash highlighter-rouge"><div class="highlight"><pre class="highlight"><code>curl <span class="nt">-X</span> POST <span class="s2">"</span><span class="nv">$PAPRIKA_HUB</span><span class="s2">/jobs"</span> <span class="nt">-H</span> <span class="s1">'Content-Type: application/json'</span> <span class="nt">-d</span> <span class="s1">'{
+  "url": "https://example.com",
+  "options": {
+    "mode": "codegen-loop",
+    "goal": "メイン動画を再生してダウンロードして保存して",
+    "max_codegen_attempts": 3,
+    "attempt_timeout_s": 600
+  }
+}'</span>
+</code></pre></div></div>
+
+<h3 id="rerun保存済みスクリプトを再実行">rerun（保存済みスクリプトを再実行）</h3>
+
+<div class="language-bash highlighter-rouge"><div class="highlight"><pre class="highlight"><code>curl <span class="nt">-X</span> POST <span class="s2">"</span><span class="nv">$PAPRIKA_HUB</span><span class="s2">/jobs"</span> <span class="nt">-H</span> <span class="s1">'Content-Type: application/json'</span> <span class="nt">-d</span> <span class="s1">'{
+  "url": "https://example.com",
+  "options": {
+    "mode": "rerun",
+    "rerun_from": "abc123/attempts/2",
+    "attempt_timeout_s": 600
+  }
+}'</span>
+</code></pre></div></div>
+
+<h3 id="keep_session人手で続きを触る">keep_session（人手で続きを触る）</h3>
+
+<div class="language-bash highlighter-rouge"><div class="highlight"><pre class="highlight"><code>curl <span class="nt">-X</span> POST <span class="s2">"</span><span class="nv">$PAPRIKA_HUB</span><span class="s2">/jobs"</span> <span class="nt">-H</span> <span class="s1">'Content-Type: application/json'</span> <span class="nt">-d</span> <span class="s1">'{
+  "url": "https://example.com",
+  "options": {"mode": "fetch", "keep_session": true}
+}'</span>
+<span class="c"># -&gt; 終わったら session_id が JobInfo に残るので noVNC で開ける</span>
+<span class="c"># 終わったら明示的に閉じる:</span>
+curl <span class="nt">-X</span> DELETE <span class="s2">"</span><span class="nv">$PAPRIKA_HUB</span><span class="s2">/sessions/&lt;session_id&gt;"</span>
+</code></pre></div></div>
+
+<h2 id="sdk-からの渡し方">SDK からの渡し方</h2>
+
+<div class="language-python highlighter-rouge"><div class="highlight"><pre class="highlight"><code><span class="k">async</span> <span class="k">with</span> <span class="n">paprika</span><span class="p">()</span> <span class="k">as</span> <span class="n">cli</span><span class="p">:</span>
+    <span class="c1"># cli.fetch はキーワード引数として options を受け取る
+</span>    <span class="n">job</span> <span class="o">=</span> <span class="k">await</span> <span class="n">cli</span><span class="p">.</span><span class="n">fetch</span><span class="p">(</span>
+        <span class="s">"https://example.com"</span><span class="p">,</span>
+        <span class="n">scroll</span><span class="o">=</span><span class="bp">True</span><span class="p">,</span>
+        <span class="n">download_video</span><span class="o">=</span><span class="bp">True</span><span class="p">,</span>
+        <span class="n">min_asset_size_bytes</span><span class="o">=</span><span class="mi">2048</span><span class="p">,</span>
+    <span class="p">)</span>
+</code></pre></div></div>
+
+<h2 id="バリデーション">バリデーション</h2>
+
+<p>サーバ側で以下を強制します（違反は <strong>422</strong>）。</p>
+
+<ul>
+  <li><code class="language-plaintext highlighter-rouge">mode == "codegen-loop"</code> → <code class="language-plaintext highlighter-rouge">goal</code> 必須</li>
+  <li><code class="language-plaintext highlighter-rouge">mode == "rerun"</code> → <code class="language-plaintext highlighter-rouge">rerun_from</code> か <code class="language-plaintext highlighter-rouge">code</code> のいずれか必須</li>
+  <li><code class="language-plaintext highlighter-rouge">code</code> ≤ <strong>200 KB</strong></li>
+  <li><code class="language-plaintext highlighter-rouge">max_codegen_attempts</code>: <strong>1–10</strong></li>
+  <li><code class="language-plaintext highlighter-rouge">attempt_timeout_s</code>: <strong>30 – 864000</strong>（10 日）</li>
+  <li><code class="language-plaintext highlighter-rouge">min_asset_size_bytes</code>: <strong>≥ 0</strong></li>
+  <li><code class="language-plaintext highlighter-rouge">download_video=true</code> のとき <strong><code class="language-plaintext highlighter-rouge">capture_assets</code> は自動で <code class="language-plaintext highlighter-rouge">true</code></strong> に強制</li>
+</ul>
+
+<h2 id="関連">関連</h2>
+
+<ul>
+  <li><a href="http-api.html">HTTP API</a></li>
+  <li><a href="/paprika/api.html">API リファレンス</a></li>
+  <li><a href="architecture-hub.html">Hub の仕組み: 3 つのジョブモード</a></li>
+  <li><a href="video.html">動画の仕組み</a></li>
+  <li><a href="host-recipe.html">Host レシピ</a> / <a href="profile.html"><code class="language-plaintext highlighter-rouge">use_profile</code></a></li>
+</ul>
+
+  </main>
+</div>
+<script>
+// Build the "このページ" sidebar from the rendered <h2> headings (each gets an
+// id from kramdown auto_ids). No headings -> drop the sidebar column so the
+// content fills the full width instead of sitting in the narrow sidebar slot.
+(function () {
+  var toc = document.getElementById('doc-toc');
+  var heads = document.querySelectorAll('.content h2[id]');
+  if (!toc) return;
+  if (!heads.length) {
+    var aside = document.querySelector('.sidebar');
+    var layout = document.querySelector('.layout');
+    if (aside) aside.style.display = 'none';
+    if (layout) layout.style.gridTemplateColumns = '1fr';
+    return;
+  }
+  heads.forEach(function (h) {
+    var li = document.createElement('li');
+    var a = document.createElement('a');
+    a.href = '#' + h.id;
+    a.textContent = h.textContent;
+    li.appendChild(a);
+    toc.appendChild(li);
+  });
+})();
+</script>
+</body>
+</html>

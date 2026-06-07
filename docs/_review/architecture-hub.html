@@ -1,0 +1,199 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+<meta charset="utf-8">
+<title>Hub の仕組み — Paprika</title>
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<link rel="stylesheet" href="/paprika/style.css">
+<script src="https://code.iconify.design/iconify-icon/2.1.0/iconify-icon.min.js"></script>
+<meta name="description" content="Paprika の Hub の内部 — ジョブのディスパッチ(空き Worker への割り当て)、3 つのジョブモード(fetch / codegen-loop / rerun)、セッションレジストリ、Worker の登録と心拍、ストアとの関係を解説。">
+<link rel="canonical" href="https://paps-jp.github.io/paprika/architecture-hub.html">
+<meta property="og:type" content="article">
+<meta property="og:site_name" content="Paprika">
+<meta property="og:title" content="Hub の仕組み — Paprika">
+<meta property="og:description" content="Paprika の Hub の内部 — ジョブのディスパッチ(空き Worker への割り当て)、3 つのジョブモード(fetch / codegen-loop / rerun)、セッションレジストリ、Worker の登録と心拍、ストアとの関係を解説。">
+<meta property="og:url" content="https://paps-jp.github.io/paprika/architecture-hub.html">
+<meta property="og:locale" content="ja_JP">
+</head>
+<body>
+
+<nav class="topnav">
+  <a class="brand" href="index.html"><span class="logo"><img src="icon.svg" alt=""></span> Paprika</a>
+  <span class="links">
+    <span class="dropdown">
+      <a class="dropdown-toggle" href="why-paprika.html">はじめに ▾</a>
+      <span class="dropdown-menu">
+        <a href="why-paprika.html">なぜ Paprika?</a>
+        <a href="intro.html">Client インストール</a>
+        <a href="quickstart.html">Server インストール</a>
+      </span>
+    </span>
+    <span class="dropdown">
+      <a class="dropdown-toggle" href="guides.html">学ぶ ▾</a>
+      <span class="dropdown-menu">
+        <a href="guides.html">ガイド</a>
+        <a href="examples.html">サンプル</a>
+        <a href="usecases.html">ユースケース</a>
+        <a href="video.html">動画</a>
+        <a href="faq.html">FAQ</a>
+      </span>
+    </span>
+    <span class="dropdown">
+      <a class="dropdown-toggle" href="api.html">リファレンス ▾</a>
+      <span class="dropdown-menu">
+        <a href="api.html">API</a>
+        <a href="http-api.html">HTTP API</a>
+        <a href="cli.html">CLI</a>
+        <a href="job-options.html">JobOptions</a>
+        <a href="walk.html">walk（巡回）</a>
+        <a href="locator.html">Locator（要素指定）</a>
+        <a href="ws-events.html">WebSocket（ライブログ）</a>
+        <a href="errors.html">エラー一覧</a>
+        <a href="bridge-extension.html">Bridge 拡張</a>
+        <a href="profile.html">use_profile</a>
+        <a href="host-recipe.html">Host レシピ</a>
+        <a href="admin.html">管理画面</a>
+      </span>
+    </span>
+    <a href="operations.html">運用</a>
+    <a href="architecture.html" class="active">設計</a>
+  </span>
+  <a class="gh" href="search.html" title="サイト内検索" aria-label="サイト内検索" style="padding:5px 10px; margin-right:6px;"><iconify-icon icon="lucide:search" style="font-size:1.05rem; vertical-align:-3px;"></iconify-icon></a>
+  <a class="gh" href="https://github.com/paps-jp/paprika">GitHub ↗</a>
+</nav>
+
+<div class="layout">
+  <aside class="sidebar">
+    <h4>このページ</h4>
+    <ul id="doc-toc"></ul>
+  </aside>
+  <main class="content">
+    <h1>Hub の仕組み</h1>
+    <p class="lead">Paprika の Hub の内部 — ジョブのディスパッチ(空き Worker への割り当て)、3 つのジョブモード(fetch / codegen-loop / rerun)、セッションレジストリ、Worker の登録と心拍、ストアとの関係を解説。</p>
+    <p>Hub は司令塔です。<strong>Chrome は持ちません</strong> — クライアント API・Worker の WebSocket・管理画面を束ね、ジョブを Worker に割り当て、結果をストアに保存します。全体像は <a href="architecture.html">アーキテクチャ概要</a> を参照。</p>
+
+<p><img class="shot" src="img/cap-jobs.png" alt="管理画面のジョブ一覧 — Hub が受け付けたジョブの状態が一覧表示" /></p>
+<p class="shot-cap">Hub が受け付けたジョブは <strong>最近のジョブ</strong> タブで一覧できます。状態・ワーカー・所要時間・取得物数を一目で確認。</p>
+
+<h2 id="ジョブのディスパッチ">ジョブのディスパッチ</h2>
+
+<div class="language-text highlighter-rouge"><div class="highlight"><pre class="highlight"><code> POST /jobs
+   │  ① URL 検査・JobInfo を queued で保存
+   ▼
+ 空き Worker を選ぶ (pick_worker)
+   │  満杯なら数秒待つ → それでも無ければ 503
+   ▼
+ WebSocket で HubAssignJob を送信 ──▶ Worker が Lane を確保して実行
+   │
+   ▼  worker_id・noVNC URL を JobInfo に記録 → 返却
+</code></pre></div></div>
+
+<ul>
+  <li>Hub は <strong>Chrome を持たない</strong>ので、空き Worker が無ければ在庫待ちせず <strong><code class="language-plaintext highlighter-rouge">503</code>（fleet at capacity）</strong> を返します。クライアントはバックオフ再試行を（<a href="faq.html">FAQ</a>）。</li>
+  <li><code class="language-plaintext highlighter-rouge">pick_worker</code> は WebSocket 接続中で空き容量のある Worker を選びます。<code class="language-plaintext highlighter-rouge">docker compose restart hub</code> 直後など一瞬 Worker が居ない時間帯のために、数秒の <strong>猶予ウィンドウ</strong>を設けて待ってから 503 にします。</li>
+</ul>
+
+<h2 id="3-つのジョブモード">3 つのジョブモード</h2>
+
+<table>
+  <thead>
+    <tr>
+      <th>モード</th>
+      <th>Hub が何をするか</th>
+    </tr>
+  </thead>
+  <tbody>
+    <tr>
+      <td><strong>fetch</strong></td>
+      <td>その場で Worker にディスパッチ。Worker の取得エンジン（nodriver）がページを開いて画像/動画/リンクを収集。レシピがあれば適用。</td>
+    </tr>
+    <tr>
+      <td><strong>codegen-loop</strong>（AI）</td>
+      <td><strong>Hub 自身がループを回す</strong> — LLM がスクリプトを生成 → サンドボックスで実行 → 失敗なら再生成。生成スクリプトは Hub の <code class="language-plaintext highlighter-rouge">/sessions/*</code> に接続して Worker の Lane を駆動。→ 下記</td>
+    </tr>
+    <tr>
+      <td><strong>rerun</strong>（Code）</td>
+      <td>保存済み / インラインのスクリプトを LLM 抜きで実行（codegen-loop と同じ実行経路）。</td>
+    </tr>
+  </tbody>
+</table>
+
+<p>fetch は同期的にディスパッチして即返し、codegen-loop / rerun は Hub 内の非同期タスクとして起動して即 <code class="language-plaintext highlighter-rouge">job_id</code> を返します（だから投入は速い）。</p>
+
+<h2 id="codegen-loopai-モードcodegen-loop">codegen-loop（AI モード）{#codegen-loop}</h2>
+
+<div class="language-text highlighter-rouge"><div class="highlight"><pre class="highlight"><code> goal（自然言語）
+   │
+   ▼
+ ┌─ planner(LLM) → スクリプト生成
+ │      ▼
+ │  サンドボックスで実行 ──▶ /sessions/* ──▶ Worker の Lane(Chrome)
+ │      ▼
+ └─ 失敗なら judge(LLM) で原因分析 → 再生成（max_codegen_attempts まで）
+</code></pre></div></div>
+
+<p>Hub がブラウザを直接触るのではなく、<strong>生成されたスクリプトが SDK と同じ経路（<code class="language-plaintext highlighter-rouge">/sessions/*</code>）で Worker の Lane を操作</strong>します。これにより AI モードも手書きスクリプトも同じ実行基盤に乗ります。</p>
+
+<h2 id="セッションレジストリ">セッションレジストリ</h2>
+
+<p>「セッション」は <strong>Lane の予約</strong>です。<code class="language-plaintext highlighter-rouge">session_id → (worker, lane)</code> を Hub が管理し、<code class="language-plaintext highlighter-rouge">/sessions/{sid}/click</code> などの操作を<strong>所有 Worker の Lane へ WebSocket で転送</strong>します。</p>
+
+<ul>
+  <li>セッションは、keep_session な fetch・codegen-loop・SDK の <code class="language-plaintext highlighter-rouge">Page</code> / <code class="language-plaintext highlighter-rouge">Session</code> などが開きます。</li>
+  <li><strong>複数 Hub</strong>ではセッションのライブ状態は所有 Hub にしか無いので、別 Hub に届いたリクエストは Redis の <strong>セッションマップ（sid → 所有 Hub）</strong> を引いて所有 Hub へ転送します。</li>
+</ul>
+
+<h2 id="worker-の登録と心拍">Worker の登録と心拍</h2>
+
+<p>Worker は Hub の <code class="language-plaintext highlighter-rouge">/workers/{id}/link</code> に WebSocket でつなぎ、<strong>capabilities</strong>（Lane 数・各 Lane の noVNC URL・バージョンハッシュなど）を送って登録します。以後 <strong>約 15 秒ごとに心拍</strong>を送り、<code class="language-plaintext highlighter-rouge">in_flight</code>（実行中ジョブ数）を更新します。</p>
+
+<ul>
+  <li>バージョンハッシュが Hub の配布版と食い違うと、Worker は <strong>ソースを取得して自己更新</strong>します（<a href="architecture-worker.html#self-update">Worker の仕組み</a>）。</li>
+  <li>心拍が途絶えた Worker は Hub が一覧から自動で掃除（reap）します。</li>
+</ul>
+
+<h2 id="ストアとの関係">ストアとの関係</h2>
+
+<ul>
+  <li><strong>JobInfo</strong> は DB に保存（複数 Hub で共有）。<code class="language-plaintext highlighter-rouge">GET /jobs/{id}</code> はどの Hub からでも一貫して見えます。</li>
+  <li><strong>アセット</strong>は Worker から Hub にアップロードされ、オブジェクトストレージ（MinIO/S3）に保存。</li>
+  <li><strong>Redis</strong> はワーカー登録・セッションマップ・リース・ライブプレビューのフレームなどの揮発状態を共有。</li>
+</ul>
+
+<blockquote>
+  <p>スケール時の挙動は <a href="/paprika/scaling.html">Hub スケーリング</a>、構築は <a href="/paprika/operations.html">サーバー構成</a>。</p>
+</blockquote>
+
+<hr />
+
+<p>次へ: <a href="architecture-worker.html">Worker・Lane・Chrome の仕組み</a> / 戻る: <a href="architecture.html">アーキテクチャ概要</a></p>
+
+  </main>
+</div>
+<script>
+// Build the "このページ" sidebar from the rendered <h2> headings (each gets an
+// id from kramdown auto_ids). No headings -> drop the sidebar column so the
+// content fills the full width instead of sitting in the narrow sidebar slot.
+(function () {
+  var toc = document.getElementById('doc-toc');
+  var heads = document.querySelectorAll('.content h2[id]');
+  if (!toc) return;
+  if (!heads.length) {
+    var aside = document.querySelector('.sidebar');
+    var layout = document.querySelector('.layout');
+    if (aside) aside.style.display = 'none';
+    if (layout) layout.style.gridTemplateColumns = '1fr';
+    return;
+  }
+  heads.forEach(function (h) {
+    var li = document.createElement('li');
+    var a = document.createElement('a');
+    a.href = '#' + h.id;
+    a.textContent = h.textContent;
+    li.appendChild(a);
+    toc.appendChild(li);
+  });
+})();
+</script>
+</body>
+</html>

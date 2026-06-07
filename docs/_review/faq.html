@@ -1,0 +1,203 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+<meta charset="utf-8">
+<title>FAQ / トラブルシューティング — Paprika</title>
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<link rel="stylesheet" href="/paprika/style.css">
+<script src="https://code.iconify.design/iconify-icon/2.1.0/iconify-icon.min.js"></script>
+<meta name="description" content="Paprika でよくある質問とハマりどころ — 503 リトライ、タイムアウト、画像が0件、ログイン必須サイト、認証・確認画面、動画取得、モード選択、セルフホストなど。">
+<link rel="canonical" href="https://paps-jp.github.io/paprika/faq.html">
+<meta property="og:type" content="article">
+<meta property="og:site_name" content="Paprika">
+<meta property="og:title" content="FAQ / トラブルシューティング — Paprika">
+<meta property="og:description" content="Paprika でよくある質問とハマりどころ — 503 リトライ、タイムアウト、画像が0件、ログイン必須サイト、認証・確認画面、動画取得、モード選択、セルフホストなど。">
+<meta property="og:url" content="https://paps-jp.github.io/paprika/faq.html">
+<meta property="og:locale" content="ja_JP">
+</head>
+<body>
+
+<nav class="topnav">
+  <a class="brand" href="index.html"><span class="logo"><img src="icon.svg" alt=""></span> Paprika</a>
+  <span class="links">
+    <span class="dropdown">
+      <a class="dropdown-toggle" href="why-paprika.html">はじめに ▾</a>
+      <span class="dropdown-menu">
+        <a href="why-paprika.html">なぜ Paprika?</a>
+        <a href="intro.html">Client インストール</a>
+        <a href="quickstart.html">Server インストール</a>
+      </span>
+    </span>
+    <span class="dropdown">
+      <a class="dropdown-toggle active" href="guides.html">学ぶ ▾</a>
+      <span class="dropdown-menu">
+        <a href="guides.html">ガイド</a>
+        <a href="examples.html">サンプル</a>
+        <a href="usecases.html">ユースケース</a>
+        <a href="video.html">動画</a>
+        <a href="faq.html" class="active">FAQ</a>
+      </span>
+    </span>
+    <span class="dropdown">
+      <a class="dropdown-toggle" href="api.html">リファレンス ▾</a>
+      <span class="dropdown-menu">
+        <a href="api.html">API</a>
+        <a href="http-api.html">HTTP API</a>
+        <a href="cli.html">CLI</a>
+        <a href="job-options.html">JobOptions</a>
+        <a href="walk.html">walk（巡回）</a>
+        <a href="locator.html">Locator（要素指定）</a>
+        <a href="ws-events.html">WebSocket（ライブログ）</a>
+        <a href="errors.html">エラー一覧</a>
+        <a href="bridge-extension.html">Bridge 拡張</a>
+        <a href="profile.html">use_profile</a>
+        <a href="host-recipe.html">Host レシピ</a>
+        <a href="admin.html">管理画面</a>
+      </span>
+    </span>
+    <a href="operations.html">運用</a>
+    <a href="architecture.html">設計</a>
+  </span>
+  <a class="gh" href="search.html" title="サイト内検索" aria-label="サイト内検索" style="padding:5px 10px; margin-right:6px;"><iconify-icon icon="lucide:search" style="font-size:1.05rem; vertical-align:-3px;"></iconify-icon></a>
+  <a class="gh" href="https://github.com/paps-jp/paprika">GitHub ↗</a>
+</nav>
+
+<div class="layout">
+  <aside class="sidebar">
+    <h4>このページ</h4>
+    <ul id="doc-toc"></ul>
+  </aside>
+  <main class="content">
+    <h1>FAQ / トラブルシューティング</h1>
+    <p class="lead">Paprika でよくある質問とハマりどころ — 503 リトライ、タイムアウト、画像が0件、ログイン必須サイト、認証・確認画面、動画取得、モード選択、セルフホストなど。</p>
+    <p>使う側でよく出る質問とハマりどころをまとめました。基本の使い方は <a href="/paprika/intro.html">Client インストール</a> / <a href="/paprika/guides.html">ガイド</a>、API は <a href="http-api.html">HTTP API</a> / <a href="/paprika/api.html">API リファレンス</a> を参照してください。</p>
+
+<video class="shot" autoplay="" loop="" muted="" playsinline="" preload="metadata" aria-label="管理画面の Live パネル — ジョブの実行ログとブラウザ画面がリアルタイムに表示される">
+  <source src="img/admin-live.webm" type="video/webm" />
+  <source src="img/admin-live.mp4" type="video/mp4" />
+  <img src="img/admin-live.gif" alt="管理画面の Live パネル — ジョブの実行ログとブラウザ画面がリアルタイムに表示される" />
+</video>
+<p class="shot-cap">うまく動かないときの一次情報は管理画面の <strong>Live パネル</strong>（実行ログ＋ noVNC ライブ画面）です。</p>
+
+<h2 id="503-fleet-at-capacity-が返る"><code class="language-plaintext highlighter-rouge">503 fleet at capacity</code> が返る</h2>
+
+<p>フリート（ワーカー）が全レーン埋まっているときの <strong>正常な背圧</strong> です。Hub は満杯時に在庫待ちせず即 <code class="language-plaintext highlighter-rouge">503</code> を返すので、<strong>クライアント側で指数バックオフ再試行</strong>してください（1, 2, 4, 8 秒…）。SDK は自動でリトライします。素の HTTP で叩く場合の実装例は <a href="http-api.html#retry-503">HTTP API の 503 リトライ</a> を参照。</p>
+
+<h2 id="ジョブが終わらない--タイムアウトする">ジョブが終わらない / タイムアウトする</h2>
+
+<ul>
+  <li><code class="language-plaintext highlighter-rouge">options.attempt_timeout_s</code> で 1 試行の上限を調整。</li>
+  <li><code class="language-plaintext highlighter-rouge">options.wait_seconds</code> / <code class="language-plaintext highlighter-rouge">idle_seconds</code> でページ読み込み・ネットワーク無通信の判定を調整。</li>
+  <li>まず<strong>ログを見る</strong>のが近道: <code class="language-plaintext highlighter-rouge">GET /jobs/{id}/log.txt</code>、またはライブで <code class="language-plaintext highlighter-rouge">WS /jobs/{id}/events</code>、管理画面の <strong>Live パネル</strong>。</li>
+</ul>
+
+<h2 id="画像が-0-件--少ない">画像が 0 件 / 少ない</h2>
+
+<ul>
+  <li><code class="language-plaintext highlighter-rouge">options.min_asset_size_bytes</code> のしきい値で小さい画像が除外されています → <strong><code class="language-plaintext highlighter-rouge">0</code></strong> にすると全部拾います。</li>
+  <li>遅延ロード（lazy）の画像は <code class="language-plaintext highlighter-rouge">options.scroll: true</code> で最後までスクロールすると拾えます。</li>
+  <li><code class="language-plaintext highlighter-rouge">options.capture_assets</code>（既定 <code class="language-plaintext highlighter-rouge">true</code>）が <code class="language-plaintext highlighter-rouge">false</code> になっていないか確認。</li>
+</ul>
+
+<h2 id="ログインが必要なサイト">ログインが必要なサイト</h2>
+
+<p>3 通りあります:</p>
+
+<ol>
+  <li><strong>Paprika Bridge 拡張</strong>（推奨）— ブラウザの <code class="language-plaintext highlighter-rouge">chrome.cookies</code> を Hub に push します。最新 Chrome の App-Bound 暗号化 Cookie も扱えます。</li>
+  <li><strong><code class="language-plaintext highlighter-rouge">use_profile</code></strong> — ログイン済みの Chrome プロファイルをアップロードして指定。</li>
+  <li><strong>AI モード</strong>（<code class="language-plaintext highlighter-rouge">mode: codegen-loop</code>）— <code class="language-plaintext highlighter-rouge">goal</code> に「ログインして〜」と書けば LLM がフォーム入力します。</li>
+</ol>
+
+<p>詳しくは <a href="/paprika/guides.html">ガイド: ログイン必須サイト</a> を参照。</p>
+
+<h2 id="認証画面確認ダイアログが抜けない">認証画面・確認ダイアログが抜けない</h2>
+
+<ul>
+  <li><code class="language-plaintext highlighter-rouge">fetch</code> モードは、そのサイト用のレシピがあれば自動で処理します。</li>
+  <li>無い場合は <strong>AI モード</strong>（<code class="language-plaintext highlighter-rouge">codegen-loop</code>）が <code class="language-plaintext highlighter-rouge">page.agent()</code> で画面を見て突破します。<code class="language-plaintext highlighter-rouge">goal</code> に「確認画面が出たら進めて」のように明示すると確実です。</li>
+</ul>
+
+<h2 id="動画が取れない">動画が取れない</h2>
+
+<ul>
+  <li><code class="language-plaintext highlighter-rouge">options.download_video: true</code> を指定してください（既定 <code class="language-plaintext highlighter-rouge">false</code>。指定すると通信トレース + yt-dlp が有効になります）。</li>
+  <li>HLS / DASH（<code class="language-plaintext highlighter-rouge">.m3u8</code> / <code class="language-plaintext highlighter-rouge">.mpd</code>）は <strong>再生を発火しないと URL が出ない</strong>ことがあります → AI モードで「動画を再生してからダウンロード」と指示するのが確実です。</li>
+</ul>
+
+<h2 id="cookie-がすぐ切れる">Cookie がすぐ切れる</h2>
+
+<p>セッション Cookie の期限切れです。Bridge 拡張で再 push するか、そのホストに<strong>ログインレシピ</strong>を設定しておくと、期限切れ時に自動再ログインされます。</p>
+
+<h2 id="どのモードを使えばいい">どのモードを使えばいい?</h2>
+
+<table>
+  <thead>
+    <tr>
+      <th>モード</th>
+      <th>向いている場面</th>
+      <th>速度 / コスト</th>
+    </tr>
+  </thead>
+  <tbody>
+    <tr>
+      <td><code class="language-plaintext highlighter-rouge">fetch</code></td>
+      <td>既知サイト / 画像をざっと収集</td>
+      <td><strong>速い</strong>・LLM 不使用</td>
+    </tr>
+    <tr>
+      <td><code class="language-plaintext highlighter-rouge">codegen-loop</code>（AI）</td>
+      <td>未知サイト / 複雑な操作 / 動画</td>
+      <td>LLM が走る（<strong>課金</strong>）・賢い</td>
+    </tr>
+    <tr>
+      <td><code class="language-plaintext highlighter-rouge">rerun</code>（Code）</td>
+      <td>自分で書いたスクリプトを実行</td>
+      <td>確定的・LLM 不使用</td>
+    </tr>
+  </tbody>
+</table>
+
+<p>迷ったら <code class="language-plaintext highlighter-rouge">fetch</code> で試し、うまく拾えなければ AI モードに上げる、が定石です。</p>
+
+<h2 id="同期--非同期はどっち">同期 / 非同期はどっち?</h2>
+
+<p><code class="language-plaintext highlighter-rouge">async</code> が基本です。スクリプトを手早く書きたいときは同期版（<code class="language-plaintext highlighter-rouge">sync_paprika</code>）も使えます。詳細は <a href="/paprika/api.html">API リファレンス</a>。</p>
+
+<h2 id="自分の環境で動かしたいセルフホスト">自分の環境で動かしたい（セルフホスト）</h2>
+
+<p><code class="language-plaintext highlighter-rouge">docker compose up</code> で Hub + worker + redis 一式が立ち上がります。構成と運用は <a href="/paprika/operations.html">サーバー構成</a> を参照してください。</p>
+
+<h2 id="まだ解決しない">まだ解決しない</h2>
+
+<p>実行ログ（<code class="language-plaintext highlighter-rouge">GET /jobs/{id}/log.txt</code>）と管理画面の <strong>Live パネル</strong>が一次情報です。再現するバグは <a href="https://github.com/paps-jp/paprika/issues">GitHub Issues</a> へどうぞ。</p>
+
+  </main>
+</div>
+<script>
+// Build the "このページ" sidebar from the rendered <h2> headings (each gets an
+// id from kramdown auto_ids). No headings -> drop the sidebar column so the
+// content fills the full width instead of sitting in the narrow sidebar slot.
+(function () {
+  var toc = document.getElementById('doc-toc');
+  var heads = document.querySelectorAll('.content h2[id]');
+  if (!toc) return;
+  if (!heads.length) {
+    var aside = document.querySelector('.sidebar');
+    var layout = document.querySelector('.layout');
+    if (aside) aside.style.display = 'none';
+    if (layout) layout.style.gridTemplateColumns = '1fr';
+    return;
+  }
+  heads.forEach(function (h) {
+    var li = document.createElement('li');
+    var a = document.createElement('a');
+    a.href = '#' + h.id;
+    a.textContent = h.textContent;
+    li.appendChild(a);
+    toc.appendChild(li);
+  });
+})();
+</script>
+</body>
+</html>

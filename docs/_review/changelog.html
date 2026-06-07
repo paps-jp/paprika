@@ -1,0 +1,180 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+<meta charset="utf-8">
+<title>CHANGELOG / リリースノート — Paprika</title>
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<link rel="stylesheet" href="/paprika/style.css">
+<script src="https://code.iconify.design/iconify-icon/2.1.0/iconify-icon.min.js"></script>
+<meta name="description" content="Paprika の主な変更履歴。マルチハブ・セッション存続・ゼロダウンタイム更新・管理画面のクロスハブ集約など、利用者に影響する変更を時期別にまとめました。">
+<link rel="canonical" href="https://paps-jp.github.io/paprika/changelog.html">
+<meta property="og:type" content="article">
+<meta property="og:site_name" content="Paprika">
+<meta property="og:title" content="CHANGELOG / リリースノート — Paprika">
+<meta property="og:description" content="Paprika の主な変更履歴。マルチハブ・セッション存続・ゼロダウンタイム更新・管理画面のクロスハブ集約など、利用者に影響する変更を時期別にまとめました。">
+<meta property="og:url" content="https://paps-jp.github.io/paprika/changelog.html">
+<meta property="og:locale" content="ja_JP">
+</head>
+<body>
+
+<nav class="topnav">
+  <a class="brand" href="index.html"><span class="logo"><img src="icon.svg" alt=""></span> Paprika</a>
+  <span class="links">
+    <span class="dropdown">
+      <a class="dropdown-toggle" href="why-paprika.html">はじめに ▾</a>
+      <span class="dropdown-menu">
+        <a href="why-paprika.html">なぜ Paprika?</a>
+        <a href="intro.html">Client インストール</a>
+        <a href="quickstart.html">Server インストール</a>
+      </span>
+    </span>
+    <span class="dropdown">
+      <a class="dropdown-toggle" href="guides.html">学ぶ ▾</a>
+      <span class="dropdown-menu">
+        <a href="guides.html">ガイド</a>
+        <a href="examples.html">サンプル</a>
+        <a href="usecases.html">ユースケース</a>
+        <a href="video.html">動画</a>
+        <a href="faq.html">FAQ</a>
+      </span>
+    </span>
+    <span class="dropdown">
+      <a class="dropdown-toggle" href="api.html">リファレンス ▾</a>
+      <span class="dropdown-menu">
+        <a href="api.html">API</a>
+        <a href="http-api.html">HTTP API</a>
+        <a href="cli.html">CLI</a>
+        <a href="job-options.html">JobOptions</a>
+        <a href="walk.html">walk（巡回）</a>
+        <a href="locator.html">Locator（要素指定）</a>
+        <a href="ws-events.html">WebSocket（ライブログ）</a>
+        <a href="errors.html">エラー一覧</a>
+        <a href="bridge-extension.html">Bridge 拡張</a>
+        <a href="profile.html">use_profile</a>
+        <a href="host-recipe.html">Host レシピ</a>
+        <a href="admin.html">管理画面</a>
+      </span>
+    </span>
+    <a href="operations.html">運用</a>
+    <a href="architecture.html">設計</a>
+  </span>
+  <a class="gh" href="search.html" title="サイト内検索" aria-label="サイト内検索" style="padding:5px 10px; margin-right:6px;"><iconify-icon icon="lucide:search" style="font-size:1.05rem; vertical-align:-3px;"></iconify-icon></a>
+  <a class="gh" href="https://github.com/paps-jp/paprika">GitHub ↗</a>
+</nav>
+
+<div class="layout">
+  <aside class="sidebar">
+    <h4>このページ</h4>
+    <ul id="doc-toc"></ul>
+  </aside>
+  <main class="content">
+    <h1>CHANGELOG / リリースノート</h1>
+    <p class="lead">Paprika の主な変更履歴。マルチハブ・セッション存続・ゼロダウンタイム更新・管理画面のクロスハブ集約など、利用者に影響する変更を時期別にまとめました。</p>
+    <p>主な変更だけ抜粋して時期別にまとめます。すべての変更は <a href="https://github.com/paps-jp/paprika/commits/main">GitHub のコミット履歴</a> を参照してください。</p>
+
+<p><img class="shot" src="img/cap-modes.png" alt="管理画面の実行モード — Fetch / AI / Script / Macro の選択 UI" /></p>
+<p class="shot-cap">実行モードの UI（<strong>Fetch / AI / Script / Macro</strong>）— Paprika のジョブモデルそのものを反映した管理画面の入口。</p>
+
+<hr />
+
+<h2 id="2026-06">2026-06</h2>
+
+<h3 id="マルチハブ運用が標準化">マルチハブ運用が標準化</h3>
+
+<ul>
+  <li><strong>クロスハブ転送</strong>: セッション・noVNC・ジョブ取得・スクリーンショットなどを所有 Hub へ自動転送。どの Hub に当たっても同じ挙動になり、管理画面の点滅も解消。</li>
+  <li><strong>クローン安全な Hub ID</strong>: ホスト IP から自動導出（<code class="language-plaintext highlighter-rouge">hub-35</code> 等）。VM クローンしてもオーファン誤判定しない。</li>
+  <li><strong>nginx 自動再構成</strong>: 新しい Hub が起動すると LB に自動登録（reconciler、<code class="language-plaintext highlighter-rouge">docker-compose.reconciler.yml</code>）。</li>
+  <li><strong>共有レジストリ</strong>: 設定・ホスト情報・スキル/会話規約/プリセット・拡張機能・Chrome プロファイルを MariaDB + MinIO で共有。どの Hub からも同じものが見える。</li>
+  <li><strong>クロスハブ・ディスパッチ</strong>: 自 Hub が満杯でも、空き容量のあるピア Hub に<strong>ジョブを転送</strong>して 503 を減らす。</li>
+  <li>詳細は <a href="architecture-hub.html">Hub の仕組み</a> / <a href="/paprika/scaling.html">Hub スケーリング</a>。</li>
+</ul>
+
+<h3 id="セッションが-hub-再起動を生き残るようにp1p2">セッションが Hub 再起動を生き残るように（P1/P2）</h3>
+
+<ul>
+  <li><strong>完全な SessionInfo を Redis に永続化</strong> → 再起動した Hub やピア Hub が同じセッションを再構成可能。</li>
+  <li><strong><code class="language-plaintext highlighter-rouge">/sessions/*</code> のクロスハブ集約</strong>で、ライブプレビューのフラップ（RUNNING ↔ keepalive の点滅）が解消。</li>
+  <li><strong>ワーカー WS 切断時もセッション維持</strong>: 一時的な切断で Worker 側がセッションを強制終了しないように修正。</li>
+</ul>
+
+<h3 id="ゼロダウンタイム更新">ゼロダウンタイム更新</h3>
+
+<ul>
+  <li><strong><code class="language-plaintext highlighter-rouge">worker+hub: zero-downtime rolling update</code></strong> — Hub 側が「期待バージョン」を心拍で広告し、Worker が新バージョンへ段階的に切り替え。再起動中もジョブが落ちない。</li>
+  <li>既存の <strong>自己更新（exit 42）</strong> と組み合わせ、<code class="language-plaintext highlighter-rouge">hub</code> の再起動だけでフリート全体が静かに新版へ移行。</li>
+  <li>詳細は <a href="architecture-worker.html#self-update">Worker の仕組み</a> / <a href="/paprika/worker-resilience.html">Worker 自己回復</a> / <a href="/paprika/worker-autodeploy.html">ワーカー自動デプロイ</a>。</li>
+</ul>
+
+<h3 id="worker-信頼性">Worker 信頼性</h3>
+
+<ul>
+  <li><strong>ハング検知 watchdog v2</strong> — 詰まったハブリンクを別ループから監視し、確実に救済。</li>
+  <li><strong>Chrome の UA を <code class="language-plaintext highlighter-rouge">get_version</code> タプルから読む</strong> — 一部サイトでのフラグメント 403 を修正。</li>
+</ul>
+
+<h3 id="管理画面">管理画面</h3>
+
+<ul>
+  <li><strong>Workers タブをサブタブ化</strong>（一覧 / ハブ / 機能）。ハブ ID / バージョンを色分けし、更新中も badge が安定。</li>
+  <li><strong><code class="language-plaintext highlighter-rouge">#screens</code> ライブプレビュー</strong> — プッシュ型フレームに変更（取得レートとポーリングレートを分離）、20 タイル/ページのページネーション、<code class="language-plaintext highlighter-rouge">#screens</code> から <code class="language-plaintext highlighter-rouge">#live</code> への深リンク。</li>
+  <li><strong>取得方法ラジオ</strong>の change 配線を遅延参照に修正（<code class="language-plaintext highlighter-rouge">syncFetchSubMode</code> の ReferenceError が他機能を巻き込んで停止していた）。</li>
+  <li><strong>ヘッダのバナー数値</strong>を「共有 <code class="language-plaintext highlighter-rouge">/workers</code> 件数」に変更（自ハブのローカル件数で点滅していた）。</li>
+  <li><strong><code class="language-plaintext highlighter-rouge">admin.js</code> を 10 ファイルに分割</strong>（13k 行 → 機能別）。</li>
+</ul>
+
+<h3 id="ドキュメント">ドキュメント</h3>
+
+<ul>
+  <li><strong>Jekyll 化</strong> — <code class="language-plaintext highlighter-rouge">_includes/header.html</code> でナビを共有、新ドキュメントは Markdown で書ける。</li>
+  <li>新ページ: <strong>HTTP API</strong>（任意の言語から）、<strong>FAQ</strong>、<strong>動画の取得と配信のしくみ</strong>、<strong>アーキテクチャ概要 / Hub の仕組み / Worker の仕組み</strong>、<strong>Server インストール</strong>、<strong>CHANGELOG</strong>（本ページ）。</li>
+  <li>ナビ整理（Home → ロゴ、運用 / 設計 を直リンク化、学ぶ ▾ に統合）。</li>
+</ul>
+
+<hr />
+
+<h2 id="既知の挙動">既知の挙動</h2>
+
+<ul>
+  <li><strong><code class="language-plaintext highlighter-rouge">503 fleet at capacity</code></strong> はワーカー満杯時の正常な背圧です。指数バックオフ再試行を（<a href="faq.html#retry-503">FAQ</a>）。SDK は自動でリトライします。</li>
+  <li><strong>DRM 動画</strong>（Widevine / FairPlay / PlayReady）は取得できません（仕様、<a href="video.html">動画の仕組み</a>）。</li>
+  <li><strong>Windows ワーカー</strong>（portable build）は Linux フリートと別経路で動作（noVNC ではなく CDP screencast）。</li>
+</ul>
+
+<hr />
+
+<h2 id="バージョニング方針">バージョニング方針</h2>
+
+<p>Paprika はまだ <strong><code class="language-plaintext highlighter-rouge">dev</code></strong> タグで運用しており、SemVer タグは未付与です。事実上のリリース単位は「<strong>Hub をローリング再起動した時点</strong>」で、Worker は自己更新で追従します。</p>
+
+<p>正式な SemVer 採用と GitHub Release の発行は今後の予定です。それまでは本ページとコミット履歴を参照してください。</p>
+
+  </main>
+</div>
+<script>
+// Build the "このページ" sidebar from the rendered <h2> headings (each gets an
+// id from kramdown auto_ids). No headings -> drop the sidebar column so the
+// content fills the full width instead of sitting in the narrow sidebar slot.
+(function () {
+  var toc = document.getElementById('doc-toc');
+  var heads = document.querySelectorAll('.content h2[id]');
+  if (!toc) return;
+  if (!heads.length) {
+    var aside = document.querySelector('.sidebar');
+    var layout = document.querySelector('.layout');
+    if (aside) aside.style.display = 'none';
+    if (layout) layout.style.gridTemplateColumns = '1fr';
+    return;
+  }
+  heads.forEach(function (h) {
+    var li = document.createElement('li');
+    var a = document.createElement('a');
+    a.href = '#' + h.id;
+    a.textContent = h.textContent;
+    li.appendChild(a);
+    toc.appendChild(li);
+  });
+})();
+</script>
+</body>
+</html>

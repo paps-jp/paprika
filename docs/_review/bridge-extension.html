@@ -1,0 +1,242 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+<meta charset="utf-8">
+<title>Paprika Bridge（Chrome 拡張） — Paprika</title>
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<link rel="stylesheet" href="/paprika/style.css">
+<script src="https://code.iconify.design/iconify-icon/2.1.0/iconify-icon.min.js"></script>
+<meta name="description" content="普段使いの Chrome で取ったログインの Cookie を、ワンクリックで Paprika Hub に push する Chrome 拡張機能の使い方と仕組み。">
+<link rel="canonical" href="https://paps-jp.github.io/paprika/bridge-extension.html">
+<meta property="og:type" content="article">
+<meta property="og:site_name" content="Paprika">
+<meta property="og:title" content="Paprika Bridge（Chrome 拡張） — Paprika">
+<meta property="og:description" content="普段使いの Chrome で取ったログインの Cookie を、ワンクリックで Paprika Hub に push する Chrome 拡張機能の使い方と仕組み。">
+<meta property="og:url" content="https://paps-jp.github.io/paprika/bridge-extension.html">
+<meta property="og:locale" content="ja_JP">
+</head>
+<body>
+
+<nav class="topnav">
+  <a class="brand" href="index.html"><span class="logo"><img src="icon.svg" alt=""></span> Paprika</a>
+  <span class="links">
+    <span class="dropdown">
+      <a class="dropdown-toggle" href="why-paprika.html">はじめに ▾</a>
+      <span class="dropdown-menu">
+        <a href="why-paprika.html">なぜ Paprika?</a>
+        <a href="intro.html">Client インストール</a>
+        <a href="quickstart.html">Server インストール</a>
+      </span>
+    </span>
+    <span class="dropdown">
+      <a class="dropdown-toggle" href="guides.html">学ぶ ▾</a>
+      <span class="dropdown-menu">
+        <a href="guides.html">ガイド</a>
+        <a href="examples.html">サンプル</a>
+        <a href="usecases.html">ユースケース</a>
+        <a href="video.html">動画</a>
+        <a href="faq.html">FAQ</a>
+      </span>
+    </span>
+    <span class="dropdown">
+      <a class="dropdown-toggle active" href="api.html">リファレンス ▾</a>
+      <span class="dropdown-menu">
+        <a href="api.html">API</a>
+        <a href="http-api.html">HTTP API</a>
+        <a href="cli.html">CLI</a>
+        <a href="job-options.html">JobOptions</a>
+        <a href="walk.html">walk（巡回）</a>
+        <a href="locator.html">Locator（要素指定）</a>
+        <a href="ws-events.html">WebSocket（ライブログ）</a>
+        <a href="errors.html">エラー一覧</a>
+        <a href="bridge-extension.html" class="active">Bridge 拡張</a>
+        <a href="profile.html">use_profile</a>
+        <a href="host-recipe.html">Host レシピ</a>
+        <a href="admin.html">管理画面</a>
+      </span>
+    </span>
+    <a href="operations.html">運用</a>
+    <a href="architecture.html">設計</a>
+  </span>
+  <a class="gh" href="search.html" title="サイト内検索" aria-label="サイト内検索" style="padding:5px 10px; margin-right:6px;"><iconify-icon icon="lucide:search" style="font-size:1.05rem; vertical-align:-3px;"></iconify-icon></a>
+  <a class="gh" href="https://github.com/paps-jp/paprika">GitHub ↗</a>
+</nav>
+
+<div class="layout">
+  <aside class="sidebar">
+    <h4>このページ</h4>
+    <ul id="doc-toc"></ul>
+  </aside>
+  <main class="content">
+    <h1>Paprika Bridge（Chrome 拡張）</h1>
+    <p class="lead">普段使いの Chrome で取ったログインの Cookie を、ワンクリックで Paprika Hub に push する Chrome 拡張機能の使い方と仕組み。</p>
+    <p><strong>Paprika Bridge</strong> は、普段使いの Chrome で取ったログインの <strong>Cookie をワンクリックで Hub に保存</strong>するための Chrome 拡張です。これにより、Paprika のジョブが<strong>そのログイン済み状態</strong>でサイトにアクセスできるようになります。</p>
+
+<blockquote>
+  <p>ログイン継続の選択肢には他に <strong><code class="language-plaintext highlighter-rouge">use_profile</code></strong>（<a href="profile.html">プロファイル</a>）と <strong>Host レシピの自動再ログイン</strong>（<a href="host-recipe.html">Host レシピ</a>）があります。要件に応じて選びましょう。</p>
+</blockquote>
+
+<h2 id="できることv02">できること（v0.2）</h2>
+
+<ul>
+  <li>ブラウザの <strong>Cookie 全体</strong> を読んで、<strong>ホスト別</strong>にまとめて Hub の <code class="language-plaintext highlighter-rouge">/hosts/{host}</code> レジストリに PUT します。</li>
+  <li>ジョブは <code class="language-plaintext highlighter-rouge">options.cookies_from="&lt;host&gt;"</code>、もしくは保存済みであれば<strong>自動で</strong>そのホストの Cookie を持っていきます。</li>
+  <li>最新 Chrome の <strong>App-Bound 暗号化 Cookie</strong>（v20）にも対応（拡張 API 経由で取得するため、復号鍵に依存しません）。</li>
+</ul>
+
+<blockquote>
+  <p>Chrome 内の <strong>保存パスワード / Local Storage / IndexedDB</strong> は API 制約で対象外です。フルプロファイルが必要なら <a href="profile.html"><code class="language-plaintext highlighter-rouge">use_profile</code></a> を使ってください。</p>
+</blockquote>
+
+<h2 id="インストール">インストール</h2>
+
+<p>二通りあります。</p>
+
+<h3 id="a-hub-から配布されたものを使う">A. Hub から配布されたものを使う</h3>
+
+<div class="language-text highlighter-rouge"><div class="highlight"><pre class="highlight"><code>http://&lt;your-hub&gt;/profiles/extension/install
+</code></pre></div></div>
+
+<p>を Chrome で開き、案内に従って zip をダウンロード → 展開 → <code class="language-plaintext highlighter-rouge">chrome://extensions</code> で「<strong>デベロッパーモード</strong>」をオンにして「<strong>パッケージ化されていない拡張機能を読み込む</strong>」で展開したフォルダを選びます。</p>
+
+<h3 id="b-git-ソースから直接">B. Git ソースから直接</h3>
+
+<div class="language-bash highlighter-rouge"><div class="highlight"><pre class="highlight"><code>git clone https://github.com/paps-jp/paprika.git
+</code></pre></div></div>
+
+<p><code class="language-plaintext highlighter-rouge">chrome://extensions</code> → 「パッケージ化されていない拡張機能を読み込む」→ <code class="language-plaintext highlighter-rouge">server/web/extensions/paprika-bridge/</code> を選択。</p>
+
+<h2 id="使い方3-ステップ">使い方（3 ステップ）</h2>
+
+<ol>
+  <li>ツールバーのアイコンをクリック（最初はパズルピースから固定しておくと楽）</li>
+  <li><strong>初回のみ</strong> Hub の URL を入力（例: <code class="language-plaintext highlighter-rouge">http://paprika.lan:8000</code> / <code class="language-plaintext highlighter-rouge">http://localhost:8000</code>）。保存されます。</li>
+  <li>スコープを選んで <strong>「Push cookies to hub」</strong> をクリック
+    <ul>
+      <li><strong>active-host</strong>（既定）: 今アクティブなタブのホストだけ送る</li>
+      <li><strong>all</strong>: ブラウザに Cookie がある全ホストを送る</li>
+    </ul>
+  </li>
+</ol>
+
+<p>成功すると ✓ が出ます。<strong>いつでも再 push 可能</strong>（最後の書き込みが勝ち、同じ操作を何度繰り返しても安全）。</p>
+
+<h2 id="ジョブから使う">ジョブから使う</h2>
+
+<p>push 後は、そのホスト宛のジョブに <strong>自動で Cookie が注入</strong>されます。明示したいときは <code class="language-plaintext highlighter-rouge">cookies_from</code> を指定します:</p>
+
+<div class="language-python highlighter-rouge"><div class="highlight"><pre class="highlight"><code><span class="n">job</span> <span class="o">=</span> <span class="k">await</span> <span class="n">cli</span><span class="p">.</span><span class="n">fetch</span><span class="p">(</span>
+    <span class="s">"https://market.example.com/item/xxx"</span><span class="p">,</span>
+    <span class="n">cookies_from</span><span class="o">=</span><span class="s">"market.example.com"</span><span class="p">,</span>
+    <span class="n">capture_assets</span><span class="o">=</span><span class="bp">True</span><span class="p">,</span>
+<span class="p">)</span>
+</code></pre></div></div>
+
+<p>HTTP から:</p>
+
+<div class="language-bash highlighter-rouge"><div class="highlight"><pre class="highlight"><code>curl <span class="nt">-X</span> POST <span class="s2">"</span><span class="nv">$PAPRIKA_HUB</span><span class="s2">/jobs"</span> <span class="nt">-H</span> <span class="s1">'Content-Type: application/json'</span> <span class="nt">-d</span> <span class="s1">'{
+  "url":"https://market.example.com/item/xxx",
+  "options":{"mode":"fetch","cookies_from":"market.example.com","capture_assets":true}
+}'</span>
+</code></pre></div></div>
+
+<h2 id="仕組み参考">仕組み（参考）</h2>
+
+<ul>
+  <li><code class="language-plaintext highlighter-rouge">chrome.cookies.getAll({})</code> で <strong>全 Cookie ストア</strong>（既定 + Incognito + プロファイル別）を読む</li>
+  <li>ホスト別にグループ化（<code class="language-plaintext highlighter-rouge">www.</code> を外して小文字化 = Hub の <code class="language-plaintext highlighter-rouge">HostRegistry</code> の正規形に合わせる）</li>
+  <li>ホストごとに <strong>PUT <code class="language-plaintext highlighter-rouge">/hosts/{host}</code></strong>（既存の <code class="language-plaintext highlighter-rouge">notes</code> / <code class="language-plaintext highlighter-rouge">popup_policy</code> / <code class="language-plaintext highlighter-rouge">recrawl_patterns</code> などは保持、<strong>Cookie 部分だけを置き換え</strong>）</li>
+</ul>
+
+<h2 id="権限の説明">権限の説明</h2>
+
+<table>
+  <thead>
+    <tr>
+      <th>権限</th>
+      <th>用途</th>
+    </tr>
+  </thead>
+  <tbody>
+    <tr>
+      <td><code class="language-plaintext highlighter-rouge">cookies</code></td>
+      <td><code class="language-plaintext highlighter-rouge">chrome.cookies.getAll()</code> で Cookie を読む</td>
+    </tr>
+    <tr>
+      <td><code class="language-plaintext highlighter-rouge">storage</code></td>
+      <td>Hub の URL を保存（次回からの入力を省略）</td>
+    </tr>
+    <tr>
+      <td><code class="language-plaintext highlighter-rouge">activeTab</code> / <code class="language-plaintext highlighter-rouge">tabs</code></td>
+      <td>active-host スコープで今のタブのホストを判定</td>
+    </tr>
+    <tr>
+      <td><code class="language-plaintext highlighter-rouge">clipboardWrite</code></td>
+      <td>クリップボードへの状態テキスト書き込み（補助用）</td>
+    </tr>
+  </tbody>
+</table>
+
+<h2 id="いつ使うか">いつ使うか</h2>
+
+<table>
+  <thead>
+    <tr>
+      <th>シナリオ</th>
+      <th>推奨</th>
+    </tr>
+  </thead>
+  <tbody>
+    <tr>
+      <td>1 つのサイトに<strong>手動でログインして取る</strong></td>
+      <td><strong>Bridge 拡張</strong>（このページ）</td>
+    </tr>
+    <tr>
+      <td><strong>完全な Chrome プロファイル</strong>を持ち込みたい（autofill 等）</td>
+      <td><a href="profile.html"><code class="language-plaintext highlighter-rouge">use_profile</code></a></td>
+    </tr>
+    <tr>
+      <td>期限切れになる Cookie を<strong>自動で再取得</strong>したい</td>
+      <td><a href="host-recipe.html">Host レシピ（ログインレシピ）</a></td>
+    </tr>
+  </tbody>
+</table>
+
+<h2 id="関連">関連</h2>
+
+<ul>
+  <li><a href="profile.html">プロファイル <code class="language-plaintext highlighter-rouge">use_profile</code></a></li>
+  <li><a href="host-recipe.html">Host レシピ</a></li>
+  <li><a href="faq.html">FAQ: ログイン必須サイト</a></li>
+  <li><a href="/paprika/examples.html">サンプル: ログイン → 操作 → 動画</a></li>
+</ul>
+
+  </main>
+</div>
+<script>
+// Build the "このページ" sidebar from the rendered <h2> headings (each gets an
+// id from kramdown auto_ids). No headings -> drop the sidebar column so the
+// content fills the full width instead of sitting in the narrow sidebar slot.
+(function () {
+  var toc = document.getElementById('doc-toc');
+  var heads = document.querySelectorAll('.content h2[id]');
+  if (!toc) return;
+  if (!heads.length) {
+    var aside = document.querySelector('.sidebar');
+    var layout = document.querySelector('.layout');
+    if (aside) aside.style.display = 'none';
+    if (layout) layout.style.gridTemplateColumns = '1fr';
+    return;
+  }
+  heads.forEach(function (h) {
+    var li = document.createElement('li');
+    var a = document.createElement('a');
+    a.href = '#' + h.id;
+    a.textContent = h.textContent;
+    li.appendChild(a);
+    toc.appendChild(li);
+  });
+})();
+</script>
+</body>
+</html>

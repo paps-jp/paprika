@@ -1188,7 +1188,7 @@ asyncio.run(main())"
     </div>
     <table id="jobsTable"><thead>
       <tr><th data-col="id" data-i18n="jobs.th.id">id</th><th data-col="mode" data-i18n="jobs.th.mode">mode</th><th data-col="status" data-i18n="jobs.th.status">status</th><th data-col="url">URL</th><th data-col="worker" data-i18n="jobs.th.worker">worker/lane</th><th data-col="started" data-i18n="jobs.th.started">started</th><th data-col="ended" data-i18n="jobs.th.ended">ended</th><th data-col="duration" data-i18n="jobs.th.duration">duration</th><th data-col="actions" data-i18n="jobs.th.actions">actions</th></tr>
-    </thead><tbody><tr><td colspan=9 class="empty" data-i18n="jobs.empty">no jobs yet</td></tr></tbody></table>
+    </thead><tbody><tr><td colspan=9 class="empty loading-row" data-i18n="jobs.loading">Loading…</td></tr></tbody></table>
     <!-- Recent-jobs client-side pager. Rebuilt by admin.js after each
          refresh() tick so total / range / button-enabled state track
          the live data. Page size is operator-set via the select on

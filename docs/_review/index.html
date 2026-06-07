@@ -1,0 +1,306 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+<meta charset="utf-8">
+<title>Paprika — Playwright スタイル Python・PHP SDK と AI で動かす分散ブラウザ自動化 / 画像・動画収集 OSS</title>
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<link rel="stylesheet" href="style.css">
+<script src="https://code.iconify.design/iconify-icon/2.1.0/iconify-icon.min.js"></script>
+<meta name="description" content="Paprika は Playwright スタイルの Python・PHP SDK と AI、管理画面を備えた、分散ワーカー上の Chrome を動かしてページの画像・動画・リンクをまとめて収集するオープンソースのブラウザ自動化プラットフォーム。特定非営利活動法人ぱっぷす (paps.jp) の ProtectionAI 基盤として開発。">
+<link rel="canonical" href="https://paps-jp.github.io/paprika/">
+<meta property="og:type" content="website">
+<meta property="og:site_name" content="Paprika">
+<meta property="og:title" content="Paprika — Playwright スタイル Python・PHP SDK と AI で動かす分散ブラウザ自動化 / 画像・動画収集 OSS">
+<meta property="og:description" content="Paprika は Playwright スタイルの Python・PHP SDK と AI、管理画面を備えた、分散ワーカー上の Chrome を動かしてページの画像・動画・リンクをまとめて収集するオープンソースのブラウザ自動化プラットフォーム。特定非営利活動法人ぱっぷす (paps.jp) の ProtectionAI 基盤として開発。">
+<meta property="og:url" content="https://paps-jp.github.io/paprika/">
+<meta property="og:image" content="https://paps-jp.github.io/paprika/img/admin-submit.png">
+<meta property="og:locale" content="ja_JP">
+<meta name="twitter:card" content="summary_large_image">
+<meta name="twitter:title" content="Paprika — Playwright スタイル Python・PHP SDK と AI で動かす分散ブラウザ自動化 / 画像・動画収集 OSS">
+<meta name="twitter:description" content="Paprika は Playwright スタイルの Python・PHP SDK と AI、管理画面を備えた、分散ワーカー上の Chrome を動かしてページの画像・動画・リンクをまとめて収集するオープンソースのブラウザ自動化プラットフォーム。特定非営利活動法人ぱっぷす (paps.jp) の ProtectionAI 基盤として開発。">
+<meta name="twitter:image" content="https://paps-jp.github.io/paprika/img/admin-submit.png">
+<script type="application/ld+json">{
+  "@context": "https://schema.org",
+  "@type": "Organization",
+  "name": "特定非営利活動法人ぱっぷす",
+  "alternateName": ["paps", "PAPS", "ぱっぷす"],
+  "url": "https://www.paps.jp",
+  "logo": "https://paps-jp.github.io/paprika/icon.svg",
+  "sameAs": [
+    "https://github.com/paps-jp",
+    "https://paps-jp.github.io/paprika/"
+  ]
+}</script>
+<script type="application/ld+json">{
+  "@context": "https://schema.org",
+  "@type": "WebSite",
+  "name": "Paprika",
+  "alternateName": "paprika browser automation",
+  "url": "https://paps-jp.github.io/paprika/",
+  "description": "Paprika — Playwright スタイルの Python・PHP SDK と AI で分散ワーカー上の Chrome を操り、画像・動画を一括収集する OSS ブラウザ自動化プラットフォーム。",
+  "publisher": {
+    "@type": "Organization",
+    "name": "特定非営利活動法人ぱっぷす",
+    "url": "https://www.paps.jp"
+  },
+  "inLanguage": "ja"
+}</script>
+</head>
+<body>
+
+<nav class="topnav">
+  <a class="brand" href="index.html"><span class="logo"><img src="icon.svg" alt=""></span> Paprika</a>
+  <span class="links">
+    <span class="dropdown">
+      <a class="dropdown-toggle" href="why-paprika.html">はじめに ▾</a>
+      <span class="dropdown-menu">
+        <a href="why-paprika.html">なぜ Paprika?</a>
+        <a href="intro.html">Client インストール</a>
+        <a href="quickstart.html">Server インストール</a>
+      </span>
+    </span>
+    <span class="dropdown">
+      <a class="dropdown-toggle" href="guides.html">学ぶ ▾</a>
+      <span class="dropdown-menu">
+        <a href="guides.html">ガイド</a>
+        <a href="examples.html">サンプル</a>
+        <a href="usecases.html">ユースケース</a>
+        <a href="video.html">動画</a>
+        <a href="faq.html">FAQ</a>
+      </span>
+    </span>
+    <span class="dropdown">
+      <a class="dropdown-toggle" href="api.html">リファレンス ▾</a>
+      <span class="dropdown-menu">
+        <a href="api.html">API</a>
+        <a href="http-api.html">HTTP API</a>
+        <a href="cli.html">CLI</a>
+        <a href="job-options.html">JobOptions</a>
+        <a href="walk.html">walk（巡回）</a>
+        <a href="locator.html">Locator（要素指定）</a>
+        <a href="ws-events.html">WebSocket（ライブログ）</a>
+        <a href="errors.html">エラー一覧</a>
+        <a href="bridge-extension.html">Bridge 拡張</a>
+        <a href="profile.html">use_profile</a>
+        <a href="host-recipe.html">Host レシピ</a>
+        <a href="admin.html">管理画面</a>
+      </span>
+    </span>
+    <a href="operations.html">運用</a>
+    <a href="architecture.html">設計</a>
+  </span>
+  <a class="gh" href="search.html" title="サイト内検索" aria-label="サイト内検索" style="padding:5px 10px; margin-right:6px;"><iconify-icon icon="lucide:search" style="font-size:1.05rem; vertical-align:-3px;"></iconify-icon></a>
+  <a class="gh" href="https://github.com/paps-jp/paprika">GitHub ↗</a>
+</nav>
+
+
+<div class="layout">
+  <aside class="sidebar">
+    <h4>このページ</h4>
+    <ul>
+      <li><a href="#what">Paprika とは</a></li>
+      <li><a href="#why">できること</a></li>
+      <li><a href="#example">最短の例</a></li>
+      <li><a href="#next">次のステップ</a></li>
+      <li><a href="#background">背景 — paps / ProtectionAI</a></li>
+      <li><a href="#why-evidence">なぜ証拠保全が必要か</a></li>
+      <li><a href="#usage">利用について</a></li>
+    </ul>
+    <h4 style="margin-top:18px;">クイックリンク</h4>
+    <ul>
+      <li><a href="quickstart.html">Server インストール</a></li>
+      <li><a href="intro.html">Client インストール</a></li>
+      <li><a href="api.html">API リファレンス</a></li>
+      <li><a href="faq.html">FAQ</a></li>
+    </ul>
+  </aside>
+
+  <main class="content">
+    <div class="hero">
+      <div class="logo-lg"><img src="icon.svg" alt="Paprika"></div>
+      <h1>Paprika</h1>
+      <p class="lead">分散ワーカー上の Chrome を <strong>Playwright スタイルの Python・PHP</strong> で操作、
+      <strong>AI</strong> を使って、ページの<strong>画像・動画・リンク</strong>をまとめて収集するブラウザ自動化プラットフォーム。</p>
+      <a class="btn" href="quickstart.html">5 分で動かす →</a>
+      <a class="btn ghost" href="why-paprika.html">なぜ Paprika?</a>
+      <a class="btn ghost" href="intro.html">Client インストール</a>
+    </div>
+
+    <figure style="margin: 22px 0 36px;">
+      <video class="shot" autoplay loop muted playsinline preload="metadata" aria-label="Paprika が Wikipedia の記事から画像を収集する様子 — 管理画面のライブパネル「ギャラリー」タブに収集した画像のサムネイルが次々と並んでいく">
+        <source src="img/admin-live.webm" type="video/webm">
+        <source src="img/admin-live.mp4" type="video/mp4">
+        <img src="img/admin-live.gif" alt="Paprika が Wikipedia の記事から画像を収集する様子 — 管理画面のライブパネル「ギャラリー」タブに収集した画像のサムネイルが次々と並んでいく">
+      </video>
+      <p class="shot-cap">Wikipedia の記事を投入 → 管理画面のライブパネル「ギャラリー」に画像が次々と並んでいく実際の動作（ハブ・ワーカー上で稼働中）。</p>
+    </figure>
+
+    <h2 id="what">Paprika とは</h2>
+    <p>URL を渡すと、フリート上の実ブラウザがページを開き、画像・動画・HTML を収集して返します。
+    ログインが必要・JavaScript で描画される、といった「機械的な巡回が難しいサイト」でも安定して動くことを目指した基盤です。</p>
+    <p>主な用途は <strong>サイトアーカイブ</strong>・<strong>画像／動画の一括収集</strong>・<strong>証拠保全</strong>・<strong>新着監視</strong>など。
+    類似ツール（<a href="https://github.com/browserbase/stagehand" target="_blank" rel="noopener">Stagehand</a>、<a href="https://github.com/browser-use/browser-use" target="_blank" rel="noopener">Browser-Use</a>、<a href="https://www.browserable.ai/" target="_blank" rel="noopener">Browserable</a>）との違いは <a href="why-paprika.html">なぜ Paprika?</a> に整理しています。</p>
+    <p>使い方は <strong>3 通り</strong>。用途に合わせて選べます。</p>
+    <div class="cards">
+      <a class="card" href="admin.html">
+        <iconify-icon class="card-icon" icon="lucide:layout-dashboard"></iconify-icon>
+        <h3>管理画面</h3>
+        <p>ブラウザだけ。URL を貼って実行ボタン。コード不要。</p>
+      </a>
+      <a class="card" href="http-api.html">
+        <iconify-icon class="card-icon" icon="lucide:terminal"></iconify-icon>
+        <h3>HTTP API</h3>
+        <p><code>curl</code> や任意の言語（JS / Go / Ruby …）から REST/JSON で叩く。</p>
+      </a>
+      <a class="card" href="api.html">
+        <iconify-icon class="card-icon" icon="lucide:code-2"></iconify-icon>
+        <h3>SDK（Python / PHP）</h3>
+        <p>Playwright スタイルで本格スクリプト。async / sync 両対応。</p>
+      </a>
+    </div>
+
+    <h2 id="why">できること</h2>
+    <div class="cards">
+      <div class="card">
+        <iconify-icon class="card-icon" icon="lucide:image-down"></iconify-icon>
+        <h3>画像・動画の一括取得</h3>
+        <p><strong>ブラウザが実際に読み込んだもの</strong>をそのまま回収（URL に再リクエストしない）。遅延ロード・動画ストリームも対象。認証済みの画像も取りこぼしません。</p>
+      </div>
+      <div class="card">
+        <iconify-icon class="card-icon" icon="lucide:code-2"></iconify-icon>
+        <h3>Playwright スタイル SDK</h3>
+        <p><code>page.goto()</code> / <code>click()</code> / <code>fill()</code> に加え、<code>evaluate()</code>・待機・Locator まで。</p>
+      </div>
+      <div class="card">
+        <iconify-icon class="card-icon" icon="lucide:cookie"></iconify-icon>
+        <h3>ログイン必須サイト</h3>
+        <p>一度ログインして Cookie を保存すれば、以後の収集で自動的に再利用。<a href="bridge-extension.html">Bridge 拡張</a> / <a href="profile.html">use_profile</a> / <a href="host-recipe.html">Host レシピ</a> から選べます。</p>
+      </div>
+      <div class="card">
+        <iconify-icon class="card-icon" icon="lucide:wand-sparkles"></iconify-icon>
+        <h3>AI コード生成（codegen-loop）</h3>
+        <p>自然言語のゴールを渡すと LLM がスクリプトを生成・実行・失敗時に再生成。成功した script はそのまま <code>rerun</code> で再利用（次回からは LLM 不要・決定的）。</p>
+      </div>
+      <div class="card">
+        <iconify-icon class="card-icon" icon="lucide:monitor"></iconify-icon>
+        <h3>ライブ noVNC</h3>
+        <p>実行中のブラウザをブラウザ上で観察・手動操作できます。人手への引き継ぎや <a href="vnc-embed.html">自前ページへの埋め込み</a> も可能。</p>
+      </div>
+      <div class="card">
+        <iconify-icon class="card-icon" icon="lucide:cpu"></iconify-icon>
+        <h3>分散フリート</h3>
+        <p>多数のワーカーが並列実行。1 台で複数の独立ブラウザ（Lane）を保持。<a href="scaling.html">複数 Hub に水平スケール</a> も可能。</p>
+      </div>
+      <div class="card">
+        <iconify-icon class="card-icon" icon="lucide:syringe"></iconify-icon>
+        <h3>Chrome 拡張で JS 注入</h3>
+        <p>同梱の <code>paprika-agent</code> 拡張（<code>userScripts</code> 権限）で、CDP では届かない領域（リクエストヘッダ書き換え、Content Settings、Proxy、Privacy）まで操作。<strong>任意の JS を全ページに常駐注入</strong>できます。</p>
+      </div>
+      <div class="card">
+        <iconify-icon class="card-icon" icon="lucide:puzzle"></iconify-icon>
+        <h3>既存 Chrome 拡張を利用可能</h3>
+        <p>普段使いの拡張（uBlock Origin / Bitwarden / MetaMask 等）を <strong>そのままワーカーに持ち込める</strong>（<code>--load-extension</code>）。広告抜きで収集、保存パスワードで自動ログイン、Web3 サインなど。</p>
+      </div>
+      <div class="card">
+        <iconify-icon class="card-icon" icon="lucide:user-cog"></iconify-icon>
+        <h3>Chrome プロファイル流用</h3>
+        <p>普段使いの Chrome の <strong>User Data フォルダをアップロード</strong>するだけ。Cookie / 保存パスワード / autofill / 拡張機能まで一式持ち込み、認証必須サイトもそのまま開けます（<a href="profile.html"><code>use_profile</code></a>）。</p>
+      </div>
+    </div>
+
+    <h2 id="example">最短の例</h2>
+    <p>1 つの記事ページの画像を全部ダウンロードする：</p>
+    <pre><code>import asyncio
+from paprika_client import async_paprika
+
+async def main():
+    async with async_paprika.connect() as cli:
+        job = await cli.fetch("https://example.com/article")   # 開いて収集
+        await cli.download_job_assets(job.job_id, "out/")   # 画像を保存
+
+asyncio.run(main())</code></pre>
+    <p>ブラウザを対話的に動かしたいときは <code>cli.session()</code>：</p>
+    <pre><code>async with cli.session("https://example.com") as page:
+    await page.click("text=ログイン")
+    await page.fill("#user", "alice")
+    await page.screenshot(path="shot.png")</code></pre>
+
+    <h2 id="next">次のステップ</h2>
+    <div class="cards">
+      <a class="card" href="why-paprika.html"><h3>なぜ Paprika? →</h3><p>Playwright / Selenium との違い・選び方。評価入口。</p></a>
+      <a class="card" href="quickstart.html"><h3>Server インストール →</h3><p><code>docker compose up</code> で自分の環境に立ち上げる（5 分）。</p></a>
+      <a class="card" href="intro.html"><h3>Client インストール →</h3><p>SDK をインストールしてハブに接続、最初のスクリプト。</p></a>
+      <a class="card" href="usecases.html"><h3>ユースケース →</h3><p>目的別の End-to-End（画像・動画・ログイン・サイトアーカイブ）。</p></a>
+      <a class="card" href="guides.html"><h3>ガイド →</h3><p>画像/動画の取得、ログイン、ブラウザ操作、LLM の使い分け。</p></a>
+      <a class="card" href="api.html"><h3>API リファレンス →</h3><p>SDK の全関数：引数・戻り値・例。</p></a>
+      <a class="card" href="http-api.html"><h3>HTTP API →</h3><p>任意の言語から叩く REST/JSON API。<code>curl</code> / JS / Go の例も。</p></a>
+      <a class="card" href="architecture.html"><h3>アーキテクチャ →</h3><p>Client → Router → Hub → Worker → Lane の全体像と内部構造。</p></a>
+      <a class="card" href="faq.html"><h3>FAQ →</h3><p>503 リトライ、ログイン、動画、ハマりどころ救済。</p></a>
+    </div>
+
+    <h2 id="background">背景 — paps / ProtectionAI</h2>
+    <p><strong>特定非営利活動法人ぱっぷす</strong>（<a href="https://www.paps.jp">paps.jp</a>）は、性的搾取・デジタル性暴力被害の相談窓口です。
+    意に反して拡散された画像・動画の探索と、サイト・プラットフォーム運営者への削除要請までを補助するシステム
+    <strong><a href="https://www.paps.jp">ProtectionAI</a></strong> を開発しています（対面・電話・メール・SNS で被害相談を受付）。</p>
+    <p>その探索基盤として、複雑なサイトでも安定してページを開き画像・動画・リンクを収集できる汎用クローラーが必要になり、Paprika が生まれました。
+    本リポジトリには被害者画像の検出ロジックは含まれず（それは ProtectionAI 側）、ここで公開しているのは汎用的な Web 自動化基盤です。</p>
+
+    <h2 id="why-evidence">なぜ証拠保全が必要か</h2>
+
+    <blockquote class="epigraph" style="border-left:3px solid #888; margin:1.2em 0 1.5em 0.5em; padding:0.6em 1em; font-style:italic; color:#555;">
+      加害者だけが技術を使える社会では、被害者は沈黙させられる。<br>
+      被害者側にも同じ技術を届けること &mdash; それが Paprika の出発点です。
+    </blockquote>
+
+    <div class="callout info">
+    <strong>デジタル性暴力と情報の非対称性</strong>
+    デジタル性暴力では、被害は画像そのものだけでなく、「どこにあるのか分からない」「消したくても対象 URL が分からない」「証拠を残せない」という<strong>情報支配</strong>によっても継続します。被害者側の情報アクセスと証拠保全を保障することは、被害拡大を止めるための支援そのものです。
+    </div>
+
+    <p>被害者や支援者が直面する具体的な課題と、Paprika の機能がそれにどう対応するかを以下に示します。</p>
+
+    <table>
+      <thead><tr><th>被害者・支援者が直面する課題</th><th>Paprika が提供する機能</th></tr></thead>
+      <tbody>
+        <tr>
+          <td><strong>画像がどのサイトにあるか分からない</strong><br>拡散先が無数にあり、手作業では追いきれない</td>
+          <td>分散ワーカーによる大規模並列巡回で、多数のサイトを網羅的に探索</td>
+        </tr>
+        <tr>
+          <td><strong>削除要請に使える証拠を残せない</strong><br>スクリーンショットを撮る前にページが消える・変わる</td>
+          <td>ページの HTML・画像・動画・取得時刻をタイムスタンプ付きで自動保存</td>
+        </tr>
+        <tr>
+          <td><strong>ログインの壁で中に入れない</strong><br>閉鎖的なサイトの証拠取得が困難</td>
+          <td>Cookie 管理・プロフィール機能で、認証が必要なサイトにも対応</td>
+        </tr>
+        <tr>
+          <td><strong>技術的知識がないと対応できない</strong><br>URL の取得やスクリーンショットにも専門知識が必要</td>
+          <td>管理画面から URL を入力するだけで収集が完了。SDK を使えばスクリプトによる自動化も可能</td>
+        </tr>
+      </tbody>
+    </table>
+
+    <p>被害者が「自分の画像がどこにあるか」を知り、証拠を手元に残せる状態を作ること。それが削除要請の第一歩であり、Paprika はそのための技術基盤です。</p>
+
+
+    <h2 id="usage">利用について</h2>
+    <p><strong>想定用途：証拠保全</strong> — 意に反して拡散された画像・動画の <strong>《削除要請に使う記録》</strong>
+    — スクリーンショット・HTML・収集物・取得時刻 — をタイムスタンプ付きで保存する用途を前提に運用されています。
+    想定する利用者は <strong>デジタル性暴力被害支援団体・報道・弁護士</strong> など、
+    被害支援・著作権侵害対応・コンプライアンスなど <strong>正当な目的での利用を前提</strong> としています。</p>
+    <p><strong>禁止する用途</strong> — 取得した画像・動画・テキストには <strong>第三者の著作物</strong> が含まれ得ます。
+    <strong>証拠保全・私的利用・引用の範囲を超えた再配布・公開・商用利用</strong> は著作権侵害となるため <strong>使用してはいけません</strong>。
+    対象サイトの利用規約（ToS）と各国法令（日本では著作権法・不正アクセス禁止法など）の遵守が求められています。
+    判断に迷う場合は実行しないでください。</p>
+    <p><strong>DRM 回避は厳禁</strong> — Paprika は <strong>Widevine / FairPlay / PlayReady などの DRM の解読・回避を一切行いません</strong>。
+    DRM 回避は <strong>著作権法（技術的保護手段の回避禁止：第30条第1項第2号、第120条の2）</strong>に違反し、配信プラットフォームに対する <strong>不正アクセス禁止法</strong>違反となる場合もあります。
+    国内外（米国 DMCA 1201 条、EU 著作権指令 第6条等）で禁止されています。</p>
+
+    <div class="footer">
+      Paprika &copy; 2026 <a href="https://www.paps.jp">paps-jp</a>
+    </div>
+  </main>
+</div>
+</body>
+</html>

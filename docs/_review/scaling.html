@@ -1,0 +1,253 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+<meta charset="utf-8">
+<title>Hub スケーリング — Worker 200 台対応のログバッチ化とマルチプロセス設計</title>
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<link rel="stylesheet" href="style.css">
+<meta name="description" content="Paprika Hub のスケーリング設計。WorkerJobLog バッチ化で Redis ops を 50 分の 1 に削減し、200 Worker を単一プロセスで処理。将来のマルチプロセス拡張パスも解説。">
+<link rel="canonical" href="https://paps-jp.github.io/paprika/scaling.html">
+</head>
+<body>
+
+<nav class="topnav">
+  <a class="brand" href="index.html"><span class="logo"><img src="icon.svg" alt=""></span> Paprika</a>
+  <span class="links">
+    <span class="dropdown">
+      <a class="dropdown-toggle" href="why-paprika.html">はじめに ▾</a>
+      <span class="dropdown-menu">
+        <a href="why-paprika.html">なぜ Paprika?</a>
+        <a href="intro.html">Client インストール</a>
+        <a href="quickstart.html">Server インストール</a>
+      </span>
+    </span>
+    <span class="dropdown">
+      <a class="dropdown-toggle" href="guides.html">学ぶ ▾</a>
+      <span class="dropdown-menu">
+        <a href="guides.html">ガイド</a>
+        <a href="examples.html">サンプル</a>
+        <a href="usecases.html">ユースケース</a>
+        <a href="video.html">動画</a>
+        <a href="faq.html">FAQ</a>
+      </span>
+    </span>
+    <span class="dropdown">
+      <a class="dropdown-toggle" href="api.html">リファレンス ▾</a>
+      <span class="dropdown-menu">
+        <a href="api.html">API</a>
+        <a href="http-api.html">HTTP API</a>
+        <a href="cli.html">CLI</a>
+        <a href="job-options.html">JobOptions</a>
+        <a href="walk.html">walk（巡回）</a>
+        <a href="locator.html">Locator（要素指定）</a>
+        <a href="ws-events.html">WebSocket（ライブログ）</a>
+        <a href="errors.html">エラー一覧</a>
+        <a href="bridge-extension.html">Bridge 拡張</a>
+        <a href="profile.html">use_profile</a>
+        <a href="host-recipe.html">Host レシピ</a>
+        <a href="admin.html">管理画面</a>
+      </span>
+    </span>
+    <a href="operations.html" class="active">運用</a>
+    <a href="architecture.html">設計</a>
+  </span>
+  <a class="gh" href="search.html" title="サイト内検索" aria-label="サイト内検索" style="padding:5px 10px; margin-right:6px;"><iconify-icon icon="lucide:search" style="font-size:1.05rem; vertical-align:-3px;"></iconify-icon></a>
+  <a class="gh" href="https://github.com/paps-jp/paprika">GitHub ↗</a>
+</nav>
+
+
+<div class="layout">
+  <aside class="sidebar">
+    <h4>Hub スケーリング</h4>
+    <ul>
+      <li><a href="#overview">概要</a></li>
+      <li><a href="#bottleneck">ボトルネック分析</a></li>
+      <li><a href="#log-batcher">LogBatcher</a></li>
+      <li><a href="#how-it-works">動作の仕組み</a></li>
+      <li><a href="#numbers">数字で見る効果</a></li>
+      <li><a href="#config">設定</a></li>
+      <li><a href="#selenium-comparison">Selenium Grid との比較</a></li>
+      <li><a href="#future">将来の拡張パス</a></li>
+    </ul>
+  </aside>
+
+  <main class="content">
+    <h1>Hub スケーリング</h1>
+    <p class="lead">Worker 200 台規模に対応するための Hub 側のパフォーマンス設計。
+    LogBatcher による Redis ops 50 分の 1 削減と、将来のマルチプロセス拡張パスを解説します。</p>
+
+    <h2 id="overview">概要</h2>
+    <p>Paprika の Hub は単一の asyncio プロセスです。Worker が WebSocket で接続し、
+    ジョブのログ・ハートビート・セッション RPC を1プロセスで処理します。</p>
+    <p>Worker が 10 台程度の小規模構成では問題になりませんが、
+    <strong>200 台規模</strong>になるとメッセージ量が爆発し、
+    Hub のイベントループが詰まる可能性があります。</p>
+    <p>この問題の正体と、最小限のコード変更で解決する方法を説明します。</p>
+
+    <h2 id="bottleneck">ボトルネック分析</h2>
+
+    <h3>WebSocket 接続数は問題ではない</h3>
+    <p>asyncio は数万の WebSocket 接続を維持できます。200 本は余裕です。</p>
+
+    <h3>メッセージの種類と量</h3>
+    <table>
+      <thead><tr><th>メッセージ種別</th><th>頻度 (Worker 200 台)</th><th>Hub 負荷</th></tr></thead>
+      <tbody>
+        <tr><td>Heartbeat</td><td>200 台 / 10 秒 = <strong>20 msg/sec</strong></td><td>軽い</td></tr>
+        <tr><td>Session RPC (click 等)</td><td>ユーザー操作起点 = <strong>数 msg/sec</strong></td><td>軽い</td></tr>
+        <tr><td>JobComplete / Failed</td><td>ジョブ終了時のみ = <strong>数 msg/sec</strong></td><td>軽い</td></tr>
+        <tr>
+          <td><strong>WorkerJobLog</strong></td>
+          <td><strong>2,000 〜 10,000 msg/sec</strong></td>
+          <td><strong>重い</strong></td>
+        </tr>
+      </tbody>
+    </table>
+
+    <h3>WorkerJobLog が重い理由</h3>
+    <p>各ジョブは実行中にログを出力します（yt-dlp の進捗、agent の操作ログ等）。
+    Worker はログを <strong>1 行 = 1 WebSocket メッセージ</strong> で Hub に送信します。</p>
+    <p>Hub はそれを受信するたびに <strong>2 回の Redis コマンド</strong>を発行します：</p>
+    <pre><code># workers.py — WorkerJobLog 1 行につき:
+await state.store.append_log_line(job_id, line)   # Redis RPUSH
+await state.store.publish_log(job_id, line)        # Redis PUBLISH</code></pre>
+    <p>5,000 行/sec なら <strong>10,000 Redis ops/sec</strong>。
+    各 <code>await</code> がイベントループに制御を返すため、
+    asyncio のスケジューリングコストが積み上がります。</p>
+
+    <div class="callout warn">
+    <strong>ボトルネックは接続数ではなくメッセージ処理量</strong>
+    200 本の WebSocket を維持するコストは無視できます。問題は 1 本 1 本のソケット上を流れる大量のログメッセージが、1 行ごとに Redis 往復を発生させることです。
+    </div>
+
+    <h2 id="log-batcher">LogBatcher</h2>
+    <p><code>LogBatcher</code> は Hub 側でログ行をバッファし、
+    一定量たまるか一定時間経過したら Redis pipeline で一括書き込みするコンポーネントです。</p>
+
+    <h3>トリガー条件（先に到達した方で発火）</h3>
+    <table>
+      <thead><tr><th>条件</th><th>デフォルト値</th><th>意味</th></tr></thead>
+      <tbody>
+        <tr><td><strong>max_lines</strong></td><td>50 行</td><td>1 ジョブにつき 50 行たまったらフラッシュ</td></tr>
+        <tr><td><strong>max_wait_ms</strong></td><td>100 ms</td><td>最初の行から 100 ms 経過したらフラッシュ</td></tr>
+      </tbody>
+    </table>
+
+    <h2 id="how-it-works">動作の仕組み</h2>
+
+    <h3>変更前（1 行 = 2 Redis ops）</h3>
+    <pre><code>Worker → WS msg → Hub: await RPUSH  (1 行)
+                       await PUBLISH (1 行)
+Worker → WS msg → Hub: await RPUSH  (1 行)
+                       await PUBLISH (1 行)
+...
+# 5,000 行/sec = 10,000 Redis 往復/sec</code></pre>
+
+    <h3>変更後（バッチ = 2 Redis ops / 50 行）</h3>
+    <pre><code>Worker → WS msg → Hub: バッファに追加
+Worker → WS msg → Hub: バッファに追加
+Worker → WS msg → Hub: バッファに追加
+... (50 行たまる or 100ms 経過)
+Hub: pipeline {
+       RPUSH 50 行を 1 コマンドで追加
+       PUBLISH 改行結合の 1 メッセージ
+     }
+# 5,000 行/sec = ~100 pipeline/sec = ~200 Redis ops/sec</code></pre>
+
+    <div class="callout tip">
+    <strong>追加レイテンシは最大 100 ms</strong>
+    管理画面のライブログは人間が目で追う用途なので、100 ms の遅延は体感できません。
+    ジョブ完了を示す <code>__JOB_DONE__</code> sentinel は即座にフラッシュされるため、
+    ライブログの終了検知に遅延はありません。
+    </div>
+
+    <h2 id="numbers">数字で見る効果</h2>
+    <table>
+      <thead><tr><th>指標</th><th>変更前</th><th>変更後</th></tr></thead>
+      <tbody>
+        <tr><td>Worker 台数</td><td colspan="2">200</td></tr>
+        <tr><td>同時ジョブ数</td><td colspan="2">~200</td></tr>
+        <tr><td>ログ出力</td><td colspan="2">5,000 行/sec</td></tr>
+        <tr><td>WS メッセージ</td><td colspan="2">5,000 msg/sec（Worker 側は変更なし）</td></tr>
+        <tr><td><strong>Redis ops</strong></td><td><strong>10,000 /sec</strong></td><td><strong>~200 /sec</strong></td></tr>
+        <tr><td><strong>await 回数</strong></td><td><strong>10,000 /sec</strong></td><td><strong>~200 /sec</strong></td></tr>
+        <tr><td>追加レイテンシ</td><td>0 ms</td><td>最大 100 ms</td></tr>
+      </tbody>
+    </table>
+
+    <p><strong>50 倍の削減</strong>により、Hub の asyncio イベントループは
+    主に WS の recv（JSON パース + <code>list.append</code>）を処理するだけになります。
+    これは CPU 的に軽い操作です。</p>
+
+    <h2 id="config">設定</h2>
+    <p>LogBatcher は <strong><code>--redis-url</code> が設定されている場合のみ</strong>有効になります。</p>
+
+    <table>
+      <thead><tr><th>構成</th><th>動作</th></tr></thead>
+      <tbody>
+        <tr><td><code>--redis-url</code> なし</td><td>InMemoryJobStore を使用。LogBatcher は無効（不要）</td></tr>
+        <tr><td><code>--redis-url</code> あり</td><td>RedisJobStore + LogBatcher が自動で有効</td></tr>
+      </tbody>
+    </table>
+    <p>特別な設定は不要です。Redis を使っていれば自動的にバッチ化されます。</p>
+
+    <h2 id="selenium-comparison">Selenium Grid との比較</h2>
+    <p>同じ構造の問題は Selenium Grid Hub (v2/v3) でも発生していました。</p>
+
+    <table>
+      <thead><tr><th>観点</th><th>Selenium Grid Hub</th><th>Paprika Hub</th></tr></thead>
+      <tbody>
+        <tr>
+          <td>ボトルネック</td>
+          <td>全 WebDriver コマンドが Hub をプロキシ経由</td>
+          <td>WorkerJobLog が Hub 経由で Redis へ</td>
+        </tr>
+        <tr>
+          <td>上限</td>
+          <td>~80 ノード</td>
+          <td>LogBatcher なし: ~50 Worker<br>LogBatcher あり: <strong>200+ Worker</strong></td>
+        </tr>
+        <tr>
+          <td>解決策</td>
+          <td>Grid 4 でコンポーネント分離（Router / Distributor / Session Map）</td>
+          <td>バッチ化で解決（コンポーネント分離は不要）</td>
+        </tr>
+        <tr>
+          <td>根本的な違い</td>
+          <td>全コマンドが Hub 経由必須</td>
+          <td>ログだけが重い &rarr; バッチ化でバイパス可能</td>
+        </tr>
+      </tbody>
+    </table>
+
+    <h2 id="future">将来の拡張パス</h2>
+    <p>LogBatcher で 200 台を捌けなくなった場合の次のステップ：</p>
+
+    <h3>Step 1: Worker が直接 Redis に書く</h3>
+    <p>ログの経路を Hub 経由から Worker 直接に変更すると、
+    Hub のイベントループからログ処理が完全に消えます。</p>
+    <pre><code># 現在:   Worker → WS → Hub → Redis
+# Step 1: Worker → Redis (直接)</code></pre>
+    <p>Hub の負荷は Heartbeat 20 msg/sec + Session RPC 数 msg/sec だけ。1,000 台でも余裕です。
+    ただし Worker 側のコード変更が必要です。</p>
+
+    <h3>Step 2: Hub マルチプロセス化</h3>
+    <p>codegen-loop（LLM 呼び出し + Docker 起動）が Hub の CPU を圧迫する場合、
+    Hub を複数プロセスに分散します。</p>
+    <pre><code>Workers → nginx (L7) → Hub #1 (sticky WS)
+                      → Hub #2 (sticky WS)
+                      → Hub #3 (sticky WS)
+Admin UI → nginx → round-robin → any Hub
+                ↕
+              Redis (IPC bus)</code></pre>
+    <p>詳細な設計は
+    <a href="https://github.com/paps-jp/paprika/blob/main/docs/architecture/hub-multiprocess.md">hub-multiprocess.md</a>
+    に記載しています。</p>
+
+    <div class="footer">
+      Paprika &copy; 2026 <a href="https://www.paps.jp">paps-jp</a>
+    </div>
+  </main>
+</div>
+</body>
+</html>

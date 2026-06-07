@@ -1,0 +1,346 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+<meta charset="utf-8">
+<title>HTTP API（任意の言語から） — Paprika</title>
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<link rel="stylesheet" href="/paprika/style.css">
+<script src="https://code.iconify.design/iconify-icon/2.1.0/iconify-icon.min.js"></script>
+<meta name="description" content="Python / PHP SDK を使わずに curl・JavaScript・Go など任意の言語から Paprika を叩く REST/JSON API ガイド。ジョブ投入 → 進捗ポーリング → アセット取得の流れと、503 リトライ・主要オプション。">
+<link rel="canonical" href="https://paps-jp.github.io/paprika/http-api.html">
+<meta property="og:type" content="article">
+<meta property="og:site_name" content="Paprika">
+<meta property="og:title" content="HTTP API（任意の言語から） — Paprika">
+<meta property="og:description" content="Python / PHP SDK を使わずに curl・JavaScript・Go など任意の言語から Paprika を叩く REST/JSON API ガイド。ジョブ投入 → 進捗ポーリング → アセット取得の流れと、503 リトライ・主要オプション。">
+<meta property="og:url" content="https://paps-jp.github.io/paprika/http-api.html">
+<meta property="og:locale" content="ja_JP">
+</head>
+<body>
+
+<nav class="topnav">
+  <a class="brand" href="index.html"><span class="logo"><img src="icon.svg" alt=""></span> Paprika</a>
+  <span class="links">
+    <span class="dropdown">
+      <a class="dropdown-toggle" href="why-paprika.html">はじめに ▾</a>
+      <span class="dropdown-menu">
+        <a href="why-paprika.html">なぜ Paprika?</a>
+        <a href="intro.html">Client インストール</a>
+        <a href="quickstart.html">Server インストール</a>
+      </span>
+    </span>
+    <span class="dropdown">
+      <a class="dropdown-toggle" href="guides.html">学ぶ ▾</a>
+      <span class="dropdown-menu">
+        <a href="guides.html">ガイド</a>
+        <a href="examples.html">サンプル</a>
+        <a href="usecases.html">ユースケース</a>
+        <a href="video.html">動画</a>
+        <a href="faq.html">FAQ</a>
+      </span>
+    </span>
+    <span class="dropdown">
+      <a class="dropdown-toggle active" href="api.html">リファレンス ▾</a>
+      <span class="dropdown-menu">
+        <a href="api.html">API</a>
+        <a href="http-api.html" class="active">HTTP API</a>
+        <a href="cli.html">CLI</a>
+        <a href="job-options.html">JobOptions</a>
+        <a href="walk.html">walk（巡回）</a>
+        <a href="locator.html">Locator（要素指定）</a>
+        <a href="ws-events.html">WebSocket（ライブログ）</a>
+        <a href="errors.html">エラー一覧</a>
+        <a href="bridge-extension.html">Bridge 拡張</a>
+        <a href="profile.html">use_profile</a>
+        <a href="host-recipe.html">Host レシピ</a>
+        <a href="admin.html">管理画面</a>
+      </span>
+    </span>
+    <a href="operations.html">運用</a>
+    <a href="architecture.html">設計</a>
+  </span>
+  <a class="gh" href="search.html" title="サイト内検索" aria-label="サイト内検索" style="padding:5px 10px; margin-right:6px;"><iconify-icon icon="lucide:search" style="font-size:1.05rem; vertical-align:-3px;"></iconify-icon></a>
+  <a class="gh" href="https://github.com/paps-jp/paprika">GitHub ↗</a>
+</nav>
+
+<div class="layout">
+  <aside class="sidebar">
+    <h4>このページ</h4>
+    <ul id="doc-toc"></ul>
+  </aside>
+  <main class="content">
+    <h1>HTTP API（任意の言語から）</h1>
+    <p class="lead">Python / PHP SDK を使わずに curl・JavaScript・Go など任意の言語から Paprika を叩く REST/JSON API ガイド。ジョブ投入 → 進捗ポーリング → アセット取得の流れと、503 リトライ・主要オプション。</p>
+    <p>Paprika SDK（Python / PHP）を使わなくても、Paprika は素の <strong>HTTP / JSON API</strong> で操作できます。<code class="language-plaintext highlighter-rouge">curl</code> でも JavaScript / Go / Ruby / どの言語からでも、やることは「<strong>ジョブを投げて、結果を取る</strong>」だけです。</p>
+
+<blockquote>
+  <p>SDK の使い方は <a href="/paprika/api.html">API リファレンス</a>、概念は <a href="/paprika/intro.html">Client インストール</a> を参照。困ったら <a href="faq.html">FAQ</a> へ。</p>
+</blockquote>
+
+<h2 id="ベース-url-と認証">ベース URL と認証</h2>
+
+<p>すべてのエンドポイントは Hub のベース URL からの相対パスです。本ページの例では <code class="language-plaintext highlighter-rouge">http://localhost:8000</code>（環境変数 <code class="language-plaintext highlighter-rouge">PAPRIKA_HUB</code> を使う想定）。</p>
+
+<div class="language-bash highlighter-rouge"><div class="highlight"><pre class="highlight"><code><span class="nb">export </span><span class="nv">PAPRIKA_HUB</span><span class="o">=</span>http://localhost:8000
+</code></pre></div></div>
+
+<p>既定では <strong>認証なし</strong>（Hub は private LAN 前提）。外部公開する場合は手前にリバースプロキシ + 認証を置いてください。</p>
+
+<h2 id="基本フロー4-ステップ">基本フロー（4 ステップ）</h2>
+
+<ol>
+  <li><code class="language-plaintext highlighter-rouge">POST /jobs</code> でジョブ投入 → <code class="language-plaintext highlighter-rouge">job_id</code> を受け取る</li>
+  <li><code class="language-plaintext highlighter-rouge">GET /jobs/{job_id}</code> を <strong>ポーリング</strong> して <code class="language-plaintext highlighter-rouge">status</code> が終端になるのを待つ</li>
+  <li><code class="language-plaintext highlighter-rouge">GET /jobs/{job_id}/assets.json</code>（または <code class="language-plaintext highlighter-rouge">/result</code>）で取得物の一覧を得る</li>
+  <li>各アセットの <code class="language-plaintext highlighter-rouge">href</code> から <strong>ダウンロード</strong></li>
+</ol>
+
+<h2 id="1-ジョブ投入--post-jobs">1. ジョブ投入 — <code class="language-plaintext highlighter-rouge">POST /jobs</code></h2>
+
+<div class="language-bash highlighter-rouge"><div class="highlight"><pre class="highlight"><code>curl <span class="nt">-X</span> POST <span class="s2">"</span><span class="nv">$PAPRIKA_HUB</span><span class="s2">/jobs"</span> <span class="se">\</span>
+  <span class="nt">-H</span> <span class="s1">'Content-Type: application/json'</span> <span class="se">\</span>
+  <span class="nt">-d</span> <span class="s1">'{"url":"https://example.com","options":{"mode":"fetch","capture_assets":true}}'</span>
+</code></pre></div></div>
+
+<p>レスポンス（<code class="language-plaintext highlighter-rouge">200</code>）:</p>
+
+<div class="language-json highlighter-rouge"><div class="highlight"><pre class="highlight"><code><span class="p">{</span><span class="w"> </span><span class="nl">"job_id"</span><span class="p">:</span><span class="w"> </span><span class="s2">"ccea8ea9dc2a"</span><span class="p">,</span><span class="w"> </span><span class="nl">"status"</span><span class="p">:</span><span class="w"> </span><span class="s2">"queued"</span><span class="p">,</span><span class="w"> </span><span class="nl">"url"</span><span class="p">:</span><span class="w"> </span><span class="s2">"https://example.com"</span><span class="p">,</span><span class="w"> </span><span class="nl">"options"</span><span class="p">:</span><span class="w"> </span><span class="p">{</span><span class="w"> </span><span class="p">}</span><span class="w"> </span><span class="p">}</span><span class="w">
+</span></code></pre></div></div>
+
+<p>フリート（ワーカー）が満杯のときは <strong><code class="language-plaintext highlighter-rouge">503</code></strong> が返ります。Hub は在庫待ちせず即返すので、<strong>クライアント側で指数バックオフ再試行</strong>してください（<a href="#retry-503">下記</a>）。</p>
+
+<blockquote>
+  <p>ショートカット: <code class="language-plaintext highlighter-rouge">GET /&lt;URL&gt;</code> でも投入できます — <code class="language-plaintext highlighter-rouge">curl "$PAPRIKA_HUB/https://example.com"</code></p>
+</blockquote>
+
+<h2 id="2-進捗ポーリング--get-jobsid">2. 進捗ポーリング — <code class="language-plaintext highlighter-rouge">GET /jobs/{id}</code></h2>
+
+<div class="language-bash highlighter-rouge"><div class="highlight"><pre class="highlight"><code>curl <span class="s2">"</span><span class="nv">$PAPRIKA_HUB</span><span class="s2">/jobs/ccea8ea9dc2a"</span>
+</code></pre></div></div>
+
+<p><code class="language-plaintext highlighter-rouge">status</code> は <code class="language-plaintext highlighter-rouge">queued</code> → <code class="language-plaintext highlighter-rouge">running</code> → <strong><code class="language-plaintext highlighter-rouge">completed</code> / <code class="language-plaintext highlighter-rouge">failed</code> / <code class="language-plaintext highlighter-rouge">cancelled</code></strong>（後ろ 3 つが終端）。1〜2 秒間隔のポーリングで十分です。</p>
+
+<h2 id="3-取得物の一覧--get-jobsidassetsjson">3. 取得物の一覧 — <code class="language-plaintext highlighter-rouge">GET /jobs/{id}/assets.json</code></h2>
+
+<div class="language-json highlighter-rouge"><div class="highlight"><pre class="highlight"><code><span class="p">{</span><span class="w">
+  </span><span class="nl">"job_id"</span><span class="p">:</span><span class="w"> </span><span class="s2">"ccea8ea9dc2a"</span><span class="p">,</span><span class="w">
+  </span><span class="nl">"count"</span><span class="p">:</span><span class="w"> </span><span class="mi">24</span><span class="p">,</span><span class="w">
+  </span><span class="nl">"items"</span><span class="p">:</span><span class="w"> </span><span class="p">[</span><span class="w">
+    </span><span class="p">{</span><span class="w">
+      </span><span class="nl">"name"</span><span class="p">:</span><span class="w"> </span><span class="s2">"06.jpg"</span><span class="p">,</span><span class="w">
+      </span><span class="nl">"href"</span><span class="p">:</span><span class="w"> </span><span class="s2">"/jobs/ccea8ea9dc2a/assets/06.jpg"</span><span class="p">,</span><span class="w">
+      </span><span class="nl">"kind"</span><span class="p">:</span><span class="w"> </span><span class="s2">"image"</span><span class="p">,</span><span class="w">
+      </span><span class="nl">"mime"</span><span class="p">:</span><span class="w"> </span><span class="s2">"image/jpeg"</span><span class="p">,</span><span class="w">
+      </span><span class="nl">"size"</span><span class="p">:</span><span class="w"> </span><span class="mi">7160</span><span class="p">,</span><span class="w">
+      </span><span class="nl">"size_h"</span><span class="p">:</span><span class="w"> </span><span class="s2">"7.0 KB"</span><span class="p">,</span><span class="w">
+      </span><span class="nl">"ext"</span><span class="p">:</span><span class="w"> </span><span class="s2">"jpg"</span><span class="p">,</span><span class="w">
+      </span><span class="nl">"source_url"</span><span class="p">:</span><span class="w"> </span><span class="s2">"https://.../06.jpg"</span><span class="p">,</span><span class="w">
+      </span><span class="nl">"page_url"</span><span class="p">:</span><span class="w"> </span><span class="s2">"https://..."</span><span class="w">
+    </span><span class="p">}</span><span class="w">
+  </span><span class="p">]</span><span class="w">
+</span><span class="p">}</span><span class="w">
+</span></code></pre></div></div>
+
+<p><code class="language-plaintext highlighter-rouge">kind</code> は <code class="language-plaintext highlighter-rouge">image</code> / <code class="language-plaintext highlighter-rouge">video</code> / <code class="language-plaintext highlighter-rouge">audio</code> / <code class="language-plaintext highlighter-rouge">other</code>。
+<code class="language-plaintext highlighter-rouge">GET /jobs/{id}/result</code> でも <code class="language-plaintext highlighter-rouge">html_href</code>・<code class="language-plaintext highlighter-rouge">log_href</code> + アセット一覧（やや簡易版）が得られます。</p>
+
+<h2 id="4-ダウンロード">4. ダウンロード</h2>
+
+<p><code class="language-plaintext highlighter-rouge">href</code> は Hub 相対パスなので、ベース URL を前置して取得します:</p>
+
+<div class="language-bash highlighter-rouge"><div class="highlight"><pre class="highlight"><code>curl <span class="nt">-O</span> <span class="s2">"</span><span class="nv">$PAPRIKA_HUB</span><span class="s2">/jobs/ccea8ea9dc2a/assets/06.jpg"</span>
+</code></pre></div></div>
+
+<h2 id="まとめてエンドツーエンドの例bash">まとめて：エンドツーエンドの例（bash）</h2>
+
+<div class="language-bash highlighter-rouge"><div class="highlight"><pre class="highlight"><code><span class="c">#!/usr/bin/env bash</span>
+<span class="nb">set</span> <span class="nt">-euo</span> pipefail
+<span class="nv">HUB</span><span class="o">=</span><span class="k">${</span><span class="nv">PAPRIKA_HUB</span><span class="k">:-</span><span class="nv">http</span>://localhost:8000<span class="k">}</span>
+
+<span class="c"># 1) 投入（503 は数回リトライ）</span>
+<span class="k">for </span>i <span class="k">in </span>1 2 3 4 5<span class="p">;</span> <span class="k">do
+  </span><span class="nv">resp</span><span class="o">=</span><span class="si">$(</span>curl <span class="nt">-s</span> <span class="nt">-o</span> /tmp/j.json <span class="nt">-w</span> <span class="s1">'%{http_code}'</span> <span class="nt">-X</span> POST <span class="s2">"</span><span class="nv">$HUB</span><span class="s2">/jobs"</span> <span class="se">\</span>
+    <span class="nt">-H</span> <span class="s1">'Content-Type: application/json'</span> <span class="se">\</span>
+    <span class="nt">-d</span> <span class="s1">'{"url":"https://example.com","options":{"mode":"fetch","capture_assets":true}}'</span><span class="si">)</span>
+  <span class="o">[</span> <span class="s2">"</span><span class="nv">$resp</span><span class="s2">"</span> <span class="o">=</span> <span class="s2">"503"</span> <span class="o">]</span> <span class="o">||</span> <span class="nb">break
+  sleep</span> <span class="k">$((</span>i<span class="o">*</span><span class="m">2</span><span class="k">))</span>
+<span class="k">done
+</span><span class="nv">jid</span><span class="o">=</span><span class="si">$(</span>python <span class="nt">-c</span> <span class="s1">'import json;print(json.load(open("/tmp/j.json"))["job_id"])'</span><span class="si">)</span>
+<span class="nb">echo</span> <span class="s2">"job=</span><span class="nv">$jid</span><span class="s2">"</span>
+
+<span class="c"># 2) 完了までポーリング</span>
+<span class="k">while</span> :<span class="p">;</span> <span class="k">do
+  </span><span class="nv">st</span><span class="o">=</span><span class="si">$(</span>curl <span class="nt">-s</span> <span class="s2">"</span><span class="nv">$HUB</span><span class="s2">/jobs/</span><span class="nv">$jid</span><span class="s2">"</span> | python <span class="nt">-c</span> <span class="s1">'import sys,json;print(json.load(sys.stdin)["status"])'</span><span class="si">)</span>
+  <span class="nb">echo</span> <span class="s2">"status=</span><span class="nv">$st</span><span class="s2">"</span><span class="p">;</span> <span class="k">case</span> <span class="s2">"</span><span class="nv">$st</span><span class="s2">"</span> <span class="k">in </span>completed|failed|cancelled<span class="p">)</span> <span class="nb">break</span><span class="p">;;</span> <span class="k">esac</span><span class="p">;</span> <span class="nb">sleep </span>2
+<span class="k">done</span>
+
+<span class="c"># 3) アセットを全部ダウンロード</span>
+curl <span class="nt">-s</span> <span class="s2">"</span><span class="nv">$HUB</span><span class="s2">/jobs/</span><span class="nv">$jid</span><span class="s2">/assets.json"</span> <span class="se">\</span>
+  | python <span class="nt">-c</span> <span class="s1">'import sys,json;[print(i["href"]) for i in json.load(sys.stdin)["items"]]'</span> <span class="se">\</span>
+  | <span class="k">while </span><span class="nb">read</span> <span class="nt">-r</span> href<span class="p">;</span> <span class="k">do </span>curl <span class="nt">-sO</span> <span class="s2">"</span><span class="nv">$HUB$href</span><span class="s2">"</span><span class="p">;</span> <span class="k">done</span>
+</code></pre></div></div>
+
+<h2 id="ai-に任せるmode-codegen-loop">AI に任せる（<code class="language-plaintext highlighter-rouge">mode: codegen-loop</code>）</h2>
+
+<p>URL と「やりたいこと（<code class="language-plaintext highlighter-rouge">goal</code>）」を渡すと、LLM がスクリプトを生成して実行します（未知サイト・複雑な操作・動画向け。LLM が走るので課金あり）:</p>
+
+<div class="language-bash highlighter-rouge"><div class="highlight"><pre class="highlight"><code>curl <span class="nt">-X</span> POST <span class="s2">"</span><span class="nv">$PAPRIKA_HUB</span><span class="s2">/jobs"</span> <span class="nt">-H</span> <span class="s1">'Content-Type: application/json'</span> <span class="nt">-d</span> <span class="s1">'{
+  "url": "https://example.com",
+  "options": {"mode":"codegen-loop","goal":"メイン動画を再生してダウンロードして保存して","max_codegen_attempts":3}
+}'</span>
+</code></pre></div></div>
+
+<h2 id="ライブログwebsocket">ライブログ（WebSocket）</h2>
+
+<p>実行ログをリアルタイム受信できます:</p>
+
+<div class="language-plaintext highlighter-rouge"><div class="highlight"><pre class="highlight"><code>ws://localhost:8000/jobs/{job_id}/events?since=0
+</code></pre></div></div>
+
+<p>各メッセージは JSON 1 行（<code class="language-plaintext highlighter-rouge">{"type":"log"|"done"|"error","data": ... }</code>）。</p>
+
+<h2 id="その他">その他</h2>
+
+<table>
+  <thead>
+    <tr>
+      <th>メソッド・パス</th>
+      <th>用途</th>
+    </tr>
+  </thead>
+  <tbody>
+    <tr>
+      <td><code class="language-plaintext highlighter-rouge">GET /jobs</code></td>
+      <td>ジョブ一覧</td>
+    </tr>
+    <tr>
+      <td><code class="language-plaintext highlighter-rouge">GET /jobs/{id}/page.html</code></td>
+      <td>取得した HTML</td>
+    </tr>
+    <tr>
+      <td><code class="language-plaintext highlighter-rouge">GET /jobs/{id}/log.txt</code></td>
+      <td>実行ログ（全文）</td>
+    </tr>
+    <tr>
+      <td><code class="language-plaintext highlighter-rouge">DELETE /jobs/{id}</code></td>
+      <td>ジョブとファイルを削除</td>
+    </tr>
+    <tr>
+      <td><code class="language-plaintext highlighter-rouge">GET /workers</code></td>
+      <td>ワーカー（フリート）状況</td>
+    </tr>
+  </tbody>
+</table>
+
+<h2 id="retry-503">503 リトライ（重要）</h2>
+
+<p>満杯時の <code class="language-plaintext highlighter-rouge">503</code> は正常な背圧です。必ずバックオフ再試行を入れてください:</p>
+
+<div class="language-javascript highlighter-rouge"><div class="highlight"><pre class="highlight"><code><span class="k">async</span> <span class="kd">function</span> <span class="nx">submit</span><span class="p">(</span><span class="nx">body</span><span class="p">,</span> <span class="nx">hub</span> <span class="o">=</span> <span class="nx">process</span><span class="p">.</span><span class="nx">env</span><span class="p">.</span><span class="nx">PAPRIKA_HUB</span><span class="p">)</span> <span class="p">{</span>
+  <span class="k">for</span> <span class="p">(</span><span class="kd">let</span> <span class="nx">i</span> <span class="o">=</span> <span class="mi">0</span><span class="p">;</span> <span class="nx">i</span> <span class="o">&lt;</span> <span class="mi">6</span><span class="p">;</span> <span class="nx">i</span><span class="o">++</span><span class="p">)</span> <span class="p">{</span>
+    <span class="kd">const</span> <span class="nx">r</span> <span class="o">=</span> <span class="k">await</span> <span class="nx">fetch</span><span class="p">(</span><span class="s2">`</span><span class="p">${</span><span class="nx">hub</span><span class="p">}</span><span class="s2">/jobs`</span><span class="p">,</span> <span class="p">{</span>
+      <span class="na">method</span><span class="p">:</span> <span class="dl">'</span><span class="s1">POST</span><span class="dl">'</span><span class="p">,</span>
+      <span class="na">headers</span><span class="p">:</span> <span class="p">{</span> <span class="dl">'</span><span class="s1">Content-Type</span><span class="dl">'</span><span class="p">:</span> <span class="dl">'</span><span class="s1">application/json</span><span class="dl">'</span> <span class="p">},</span>
+      <span class="na">body</span><span class="p">:</span> <span class="nx">JSON</span><span class="p">.</span><span class="nx">stringify</span><span class="p">(</span><span class="nx">body</span><span class="p">),</span>
+    <span class="p">});</span>
+    <span class="k">if</span> <span class="p">(</span><span class="nx">r</span><span class="p">.</span><span class="nx">status</span> <span class="o">!==</span> <span class="mi">503</span><span class="p">)</span> <span class="k">return</span> <span class="nx">r</span><span class="p">.</span><span class="nx">json</span><span class="p">();</span>
+    <span class="k">await</span> <span class="k">new</span> <span class="nb">Promise</span><span class="p">(</span><span class="nx">s</span> <span class="o">=&gt;</span> <span class="nx">setTimeout</span><span class="p">(</span><span class="nx">s</span><span class="p">,</span> <span class="mi">1000</span> <span class="o">*</span> <span class="mi">2</span> <span class="o">**</span> <span class="nx">i</span><span class="p">));</span> <span class="c1">// 1,2,4,8,16,32s</span>
+  <span class="p">}</span>
+  <span class="k">throw</span> <span class="k">new</span> <span class="nb">Error</span><span class="p">(</span><span class="dl">'</span><span class="s1">fleet busy — retried 6x</span><span class="dl">'</span><span class="p">);</span>
+<span class="p">}</span>
+</code></pre></div></div>
+
+<h2 id="主な-optionsよく使うもの">主な <code class="language-plaintext highlighter-rouge">options</code>（よく使うもの）</h2>
+
+<table>
+  <thead>
+    <tr>
+      <th>キー</th>
+      <th>既定</th>
+      <th>説明</th>
+    </tr>
+  </thead>
+  <tbody>
+    <tr>
+      <td><code class="language-plaintext highlighter-rouge">mode</code></td>
+      <td><code class="language-plaintext highlighter-rouge">fetch</code></td>
+      <td><code class="language-plaintext highlighter-rouge">fetch</code>（高速・レシピ）/ <code class="language-plaintext highlighter-rouge">codegen-loop</code>（AI）/ <code class="language-plaintext highlighter-rouge">rerun</code>（コード直接実行）</td>
+    </tr>
+    <tr>
+      <td><code class="language-plaintext highlighter-rouge">download_video</code></td>
+      <td><code class="language-plaintext highlighter-rouge">false</code></td>
+      <td>通信トレース + yt-dlp で動画を取得</td>
+    </tr>
+    <tr>
+      <td><code class="language-plaintext highlighter-rouge">capture_assets</code></td>
+      <td><code class="language-plaintext highlighter-rouge">true</code></td>
+      <td>取得物をサーバに保存</td>
+    </tr>
+    <tr>
+      <td><code class="language-plaintext highlighter-rouge">scroll</code></td>
+      <td><code class="language-plaintext highlighter-rouge">false</code></td>
+      <td>最後までスクロールして遅延ロード（lazy）を拾う</td>
+    </tr>
+    <tr>
+      <td><code class="language-plaintext highlighter-rouge">headless</code></td>
+      <td><code class="language-plaintext highlighter-rouge">false</code></td>
+      <td>画面を出さずに実行</td>
+    </tr>
+    <tr>
+      <td><code class="language-plaintext highlighter-rouge">min_asset_size_bytes</code></td>
+      <td><code class="language-plaintext highlighter-rouge">0</code></td>
+      <td>これ未満のアセットを除外（<code class="language-plaintext highlighter-rouge">0</code> = 制限なし）</td>
+    </tr>
+    <tr>
+      <td><code class="language-plaintext highlighter-rouge">use_profile</code></td>
+      <td><code class="language-plaintext highlighter-rouge">null</code></td>
+      <td>アップロード済み Chrome プロファイル名</td>
+    </tr>
+    <tr>
+      <td><code class="language-plaintext highlighter-rouge">goal</code></td>
+      <td><code class="language-plaintext highlighter-rouge">null</code></td>
+      <td><code class="language-plaintext highlighter-rouge">codegen-loop</code> 時の目標（自然言語、必須）</td>
+    </tr>
+    <tr>
+      <td><code class="language-plaintext highlighter-rouge">max_codegen_attempts</code></td>
+      <td><code class="language-plaintext highlighter-rouge">3</code></td>
+      <td><code class="language-plaintext highlighter-rouge">codegen-loop</code> の再試行回数</td>
+    </tr>
+    <tr>
+      <td><code class="language-plaintext highlighter-rouge">attempt_timeout_s</code></td>
+      <td><code class="language-plaintext highlighter-rouge">180</code></td>
+      <td>1 試行のタイムアウト（秒）</td>
+    </tr>
+  </tbody>
+</table>
+
+<p><strong><code class="language-plaintext highlighter-rouge">options</code> の全フィールド・型・既定値・制約は <a href="job-options.html">JobOptions リファレンス</a> に集約しています。</strong></p>
+
+  </main>
+</div>
+<script>
+// Build the "このページ" sidebar from the rendered <h2> headings (each gets an
+// id from kramdown auto_ids). No headings -> drop the sidebar column so the
+// content fills the full width instead of sitting in the narrow sidebar slot.
+(function () {
+  var toc = document.getElementById('doc-toc');
+  var heads = document.querySelectorAll('.content h2[id]');
+  if (!toc) return;
+  if (!heads.length) {
+    var aside = document.querySelector('.sidebar');
+    var layout = document.querySelector('.layout');
+    if (aside) aside.style.display = 'none';
+    if (layout) layout.style.gridTemplateColumns = '1fr';
+    return;
+  }
+  heads.forEach(function (h) {
+    var li = document.createElement('li');
+    var a = document.createElement('a');
+    a.href = '#' + h.id;
+    a.textContent = h.textContent;
+    li.appendChild(a);
+    toc.appendChild(li);
+  });
+})();
+</script>
+</body>
+</html>

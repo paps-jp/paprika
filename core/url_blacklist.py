@@ -79,14 +79,20 @@ class _CompiledPattern:
             if pat.endswith(r"\Z"):
                 pat = pat[:-2]
             # Anchors: default = "substring" (no anchor on either side).
+            # Do NOT wrap the unanchored body in ".*" -- re.search() already
+            # matches anywhere, so a leading/trailing ".*" is REDUNDANT and,
+            # placed adjacent to the ".*" that glob "*" expands to (under
+            # re.DOTALL), produces CATASTROPHIC backtracking on long URLs.
+            # This froze the worker's asyncio loop inside a single
+            # re.search() on paps.jp's googleads/doubleclick URLs -> hub WS
+            # keepalive timeout -> job failed "disconnected before finished".
+            # (Diagnosed with py-spy: 6/6 samples stuck at
+            # url_blacklist.py _regex.search.) search() makes the wrapping
+            # unnecessary, so dropping it is behaviour-preserving.
             if anchored_start:
                 pat = r"\A" + pat
-            else:
-                pat = ".*" + pat
             if anchored_end:
                 pat = pat + r"\Z"
-            else:
-                pat = pat + ".*"
             self._kind = "regex"
             self._regex = re.compile(pat, re.IGNORECASE | re.DOTALL)
             self._lower_substring = ""

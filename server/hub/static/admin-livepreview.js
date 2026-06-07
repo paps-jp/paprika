@@ -198,12 +198,28 @@ function buildTile(workerId, laneIdx, novncUrl) {
     // refreshes silently swap pixels from here on out. Idempotent
     // (no-op if already removed) so re-firing on every poll is fine.
     wrap.classList.remove('loading');
+    // Mark that this tile now has a real painted frame. Once set, the CSS
+    // suppresses the OPAQUE loading stripe (.ssitem.loading:not(.has-frame))
+    // so any later 'loading' state (e.g. a worker self-updating, or warming
+    // between pushes) keeps the LAST good screenshot visible underneath and
+    // only overlays the small spinner -- instead of blanking to the diagonal
+    // stripe. The new frame still swaps in only once fully decoded (the probe
+    // in ssApplyPreviewFrame), so the tile never flashes empty.
+    wrap.classList.add('has-frame');
   });
   return { wrap, img, err, sub, badge };
 }
 
 function syncScreenshotGrid(workers) {
   const grid = document.getElementById('ssGrid');
+  // Track workers mid self-update (pending_update_to set = draining to apply a
+  // new version, then restarting). While restarting they can't capture, so the
+  // grid shows a "更新中…" Loading state for them instead of the alarming
+  // "warming…" dark box -- it's a normal rollout, not a fault. Refreshed every
+  // tick from the live workers list; read in ssApplyPreviewFrame.
+  window._ssUpdatingWorkers = new Set(
+    (workers || []).filter(w => w && w.pending_update_to).map(w => w.worker_id)
+  );
   const want = new Set();
   for (const w of workers) {
     const cap = Math.max(1, w.capacity || 1);
@@ -521,6 +537,21 @@ function ssApplyPreviewFrame(rec) {
     // it neutrally -- and if we already have a (cached) frame, just keep it
     // rather than overlaying text, so the grid doesn't flash on every poll.
     const warming = rec.error === 'warming';
+    // Worker is self-updating (drain -> restart -> new version): capture is
+    // paused mid-restart, so show a Loading state ("更新中…") instead of
+    // "warming…" / "capture failed". It's a normal rollout, not a fault, and
+    // recovers on its own once the worker reconnects and resumes pushing.
+    const updating = warming && window._ssUpdatingWorkers
+      && window._ssUpdatingWorkers.has(rec.wid);
+    if (updating) {
+      if (tile.err) {
+        tile.err.textContent = '更新中…';
+        tile.err.style.color = '#9aa0a6';
+        tile.err.style.display = 'block';
+      }
+      tile.wrap.classList.add('loading');   // diagonal stripe + spinner = Loading
+      return;
+    }
     if (tile.err) {
       if (warming && tile.img && tile.img.src) {
         tile.err.style.display = 'none';

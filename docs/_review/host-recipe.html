@@ -1,0 +1,330 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+<meta charset="utf-8">
+<title>Host レシピ — ホスト固有設定の自動化 — Paprika</title>
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<link rel="stylesheet" href="/paprika/style.css">
+<script src="https://code.iconify.design/iconify-icon/2.1.0/iconify-icon.min.js"></script>
+<meta name="description" content="ホストごとに「ナビ後に決まった操作（クリック・入力・スクロール・待機）を実行する」プレイブックを登録して fetch を高速化。アクションの形・ログインレシピ・自動再ログイン・複数 Hub 間の共有を解説。">
+<link rel="canonical" href="https://paps-jp.github.io/paprika/host-recipe.html">
+<meta property="og:type" content="article">
+<meta property="og:site_name" content="Paprika">
+<meta property="og:title" content="Host レシピ — ホスト固有設定の自動化 — Paprika">
+<meta property="og:description" content="ホストごとに「ナビ後に決まった操作（クリック・入力・スクロール・待機）を実行する」プレイブックを登録して fetch を高速化。アクションの形・ログインレシピ・自動再ログイン・複数 Hub 間の共有を解説。">
+<meta property="og:url" content="https://paps-jp.github.io/paprika/host-recipe.html">
+<meta property="og:locale" content="ja_JP">
+</head>
+<body>
+
+<nav class="topnav">
+  <a class="brand" href="index.html"><span class="logo"><img src="icon.svg" alt=""></span> Paprika</a>
+  <span class="links">
+    <span class="dropdown">
+      <a class="dropdown-toggle" href="why-paprika.html">はじめに ▾</a>
+      <span class="dropdown-menu">
+        <a href="why-paprika.html">なぜ Paprika?</a>
+        <a href="intro.html">Client インストール</a>
+        <a href="quickstart.html">Server インストール</a>
+      </span>
+    </span>
+    <span class="dropdown">
+      <a class="dropdown-toggle" href="guides.html">学ぶ ▾</a>
+      <span class="dropdown-menu">
+        <a href="guides.html">ガイド</a>
+        <a href="examples.html">サンプル</a>
+        <a href="usecases.html">ユースケース</a>
+        <a href="video.html">動画</a>
+        <a href="faq.html">FAQ</a>
+      </span>
+    </span>
+    <span class="dropdown">
+      <a class="dropdown-toggle active" href="api.html">リファレンス ▾</a>
+      <span class="dropdown-menu">
+        <a href="api.html">API</a>
+        <a href="http-api.html">HTTP API</a>
+        <a href="cli.html">CLI</a>
+        <a href="job-options.html">JobOptions</a>
+        <a href="walk.html">walk（巡回）</a>
+        <a href="locator.html">Locator（要素指定）</a>
+        <a href="ws-events.html">WebSocket（ライブログ）</a>
+        <a href="errors.html">エラー一覧</a>
+        <a href="bridge-extension.html">Bridge 拡張</a>
+        <a href="profile.html">use_profile</a>
+        <a href="host-recipe.html" class="active">Host レシピ</a>
+        <a href="admin.html">管理画面</a>
+      </span>
+    </span>
+    <a href="operations.html">運用</a>
+    <a href="architecture.html">設計</a>
+  </span>
+  <a class="gh" href="search.html" title="サイト内検索" aria-label="サイト内検索" style="padding:5px 10px; margin-right:6px;"><iconify-icon icon="lucide:search" style="font-size:1.05rem; vertical-align:-3px;"></iconify-icon></a>
+  <a class="gh" href="https://github.com/paps-jp/paprika">GitHub ↗</a>
+</nav>
+
+<div class="layout">
+  <aside class="sidebar">
+    <h4>このページ</h4>
+    <ul id="doc-toc"></ul>
+  </aside>
+  <main class="content">
+    <h1>Host レシピ — ホスト固有設定の自動化</h1>
+    <p class="lead">ホストごとに「ナビ後に決まった操作（クリック・入力・スクロール・待機）を実行する」プレイブックを登録して fetch を高速化。アクションの形・ログインレシピ・自動再ログイン・複数 Hub 間の共有を解説。</p>
+    <p><strong>Host レシピ</strong> は、特定のホスト（サイト）にアクセスしたとき「ナビゲーション後に決まった操作を実行する」<strong>プレイブック</strong>です。クリック・入力・待機・スクロールといった<strong>決定的な手順</strong>を登録しておくと、<code class="language-plaintext highlighter-rouge">fetch</code> モードが<strong>LLM 不要</strong>で同じことを毎回安定して再現できます。</p>
+
+<p><img class="shot" src="img/cap-knowledge.png" alt="管理画面の AI Knowledge / Hosts タブ — ホスト固有設定の管理" /></p>
+<p class="shot-cap">登録されたレシピや Cookie、ログイン手順は管理画面の <strong>AI Knowledge</strong> / <strong>Hosts</strong> タブから確認・編集できます。</p>
+
+<blockquote>
+  <p>ログイン継続の他の選択肢: <a href="bridge-extension.html">Bridge 拡張</a>（Cookie 手動 push）、<a href="profile.html"><code class="language-plaintext highlighter-rouge">use_profile</code></a>（フルプロファイル）。</p>
+</blockquote>
+
+<h2 id="何ができるか">何ができるか</h2>
+
+<ul>
+  <li>ホストごとに <strong>URL パターン</strong>（glob）と<strong>アクション列</strong>を登録</li>
+  <li>ジョブが該当ホストにアクセスすると、Hub が最適マッチのレシピを選び、<strong>Worker のナビ直後に実行</strong></li>
+  <li>ログイン手順を登録しておけば、Cookie 失効時に<strong>自動再ログイン</strong>で救える</li>
+  <li>失敗したらレシピ無しのフェッチに<strong>フォールバック</strong></li>
+</ul>
+
+<h2 id="レシピのスキーマ">レシピのスキーマ</h2>
+
+<div class="language-json highlighter-rouge"><div class="highlight"><pre class="highlight"><code><span class="p">{</span><span class="w">
+  </span><span class="nl">"pattern"</span><span class="p">:</span><span class="w">     </span><span class="s2">"/items/*"</span><span class="p">,</span><span class="w">
+  </span><span class="nl">"description"</span><span class="p">:</span><span class="w"> </span><span class="s2">"商品ページの年代確認を通す"</span><span class="p">,</span><span class="w">
+  </span><span class="nl">"actions"</span><span class="p">:</span><span class="w"> </span><span class="p">[</span><span class="w">
+    </span><span class="p">{</span><span class="nl">"kind"</span><span class="p">:</span><span class="s2">"wait"</span><span class="p">,</span><span class="w">  </span><span class="nl">"selector"</span><span class="p">:</span><span class="s2">".loaded"</span><span class="p">,</span><span class="w">  </span><span class="nl">"timeout_s"</span><span class="p">:</span><span class="w"> </span><span class="mi">5</span><span class="p">},</span><span class="w">
+    </span><span class="p">{</span><span class="nl">"kind"</span><span class="p">:</span><span class="s2">"click"</span><span class="p">,</span><span class="w"> </span><span class="nl">"selector"</span><span class="p">:</span><span class="s2">"button#agree"</span><span class="p">},</span><span class="w">
+    </span><span class="p">{</span><span class="nl">"kind"</span><span class="p">:</span><span class="s2">"scroll"</span><span class="p">,</span><span class="nl">"amount"</span><span class="p">:</span><span class="w"> </span><span class="mi">1000</span><span class="p">}</span><span class="w">
+  </span><span class="p">],</span><span class="w">
+  </span><span class="nl">"created_by"</span><span class="p">:</span><span class="w">  </span><span class="s2">"operator"</span><span class="p">,</span><span class="w">
+  </span><span class="nl">"created_from_job"</span><span class="p">:</span><span class="w"> </span><span class="kc">null</span><span class="w">
+</span><span class="p">}</span><span class="w">
+</span></code></pre></div></div>
+
+<p>主要フィールド:</p>
+
+<table>
+  <thead>
+    <tr>
+      <th>フィールド</th>
+      <th>既定</th>
+      <th>意味</th>
+    </tr>
+  </thead>
+  <tbody>
+    <tr>
+      <td><code class="language-plaintext highlighter-rouge">pattern</code></td>
+      <td><code class="language-plaintext highlighter-rouge">"*"</code></td>
+      <td>URL パスの <strong>glob</strong>（複数ヒットは最長一致が勝つ）</td>
+    </tr>
+    <tr>
+      <td><code class="language-plaintext highlighter-rouge">description</code></td>
+      <td><code class="language-plaintext highlighter-rouge">""</code></td>
+      <td>人間向けメモ</td>
+    </tr>
+    <tr>
+      <td><code class="language-plaintext highlighter-rouge">actions</code></td>
+      <td><code class="language-plaintext highlighter-rouge">[]</code></td>
+      <td>実行する操作の列（<a href="#actions">後述</a>）</td>
+    </tr>
+    <tr>
+      <td><code class="language-plaintext highlighter-rouge">goal</code></td>
+      <td><code class="language-plaintext highlighter-rouge">null</code></td>
+      <td>（将来）LLM agent のゴール</td>
+    </tr>
+    <tr>
+      <td><code class="language-plaintext highlighter-rouge">code</code></td>
+      <td><code class="language-plaintext highlighter-rouge">null</code></td>
+      <td>（将来）Python スニペット</td>
+    </tr>
+    <tr>
+      <td><code class="language-plaintext highlighter-rouge">timeout_s</code></td>
+      <td><code class="language-plaintext highlighter-rouge">30.0</code></td>
+      <td>レシピ全体のタイムアウト</td>
+    </tr>
+    <tr>
+      <td><code class="language-plaintext highlighter-rouge">created_by</code></td>
+      <td><code class="language-plaintext highlighter-rouge">"operator"</code></td>
+      <td><code class="language-plaintext highlighter-rouge">operator</code> / <code class="language-plaintext highlighter-rouge">ai</code></td>
+    </tr>
+  </tbody>
+</table>
+
+<h2 id="actions">アクションの種類</h2>
+
+<p>各アクションは <code class="language-plaintext highlighter-rouge">kind</code> と種類別フィールドで指定します。</p>
+
+<table>
+  <thead>
+    <tr>
+      <th><code class="language-plaintext highlighter-rouge">kind</code></th>
+      <th>例</th>
+      <th>用途</th>
+    </tr>
+  </thead>
+  <tbody>
+    <tr>
+      <td><code class="language-plaintext highlighter-rouge">wait</code></td>
+      <td><code class="language-plaintext highlighter-rouge">{"kind":"wait","selector":".loaded","timeout_s":5}</code></td>
+      <td>要素表示まで待つ</td>
+    </tr>
+    <tr>
+      <td><code class="language-plaintext highlighter-rouge">click</code></td>
+      <td><code class="language-plaintext highlighter-rouge">{"kind":"click","selector":"button#agree"}</code></td>
+      <td>クリック</td>
+    </tr>
+    <tr>
+      <td><code class="language-plaintext highlighter-rouge">fill</code></td>
+      <td><code class="language-plaintext highlighter-rouge">{"kind":"fill","selector":"#email","text":"alice@..."}</code></td>
+      <td>テキスト入力</td>
+    </tr>
+    <tr>
+      <td><code class="language-plaintext highlighter-rouge">type</code></td>
+      <td><code class="language-plaintext highlighter-rouge">{"kind":"type","text":"Hello"}</code></td>
+      <td>キー入力</td>
+    </tr>
+    <tr>
+      <td><code class="language-plaintext highlighter-rouge">press</code></td>
+      <td><code class="language-plaintext highlighter-rouge">{"kind":"press","key":"Enter"}</code></td>
+      <td>単一キー押下</td>
+    </tr>
+    <tr>
+      <td><code class="language-plaintext highlighter-rouge">scroll</code></td>
+      <td><code class="language-plaintext highlighter-rouge">{"kind":"scroll","amount":1000}</code></td>
+      <td>スクロール</td>
+    </tr>
+    <tr>
+      <td><code class="language-plaintext highlighter-rouge">navigate</code></td>
+      <td><code class="language-plaintext highlighter-rouge">{"kind":"navigate","url":"https://..."}</code></td>
+      <td>別 URL へ</td>
+    </tr>
+    <tr>
+      <td><code class="language-plaintext highlighter-rouge">evaluate</code></td>
+      <td><code class="language-plaintext highlighter-rouge">{"kind":"evaluate","code":"document.title"}</code></td>
+      <td>JS 実行</td>
+    </tr>
+  </tbody>
+</table>
+
+<h2 id="登録http-api">登録（HTTP API）</h2>
+
+<div class="language-bash highlighter-rouge"><div class="highlight"><pre class="highlight"><code>curl <span class="nt">-X</span> POST <span class="s2">"</span><span class="nv">$PAPRIKA_HUB</span><span class="s2">/hosts/example.com/recipes"</span> <span class="se">\</span>
+  <span class="nt">-H</span> <span class="s1">'Content-Type: application/json'</span> <span class="se">\</span>
+  <span class="nt">-d</span> <span class="s1">'{
+    "pattern": "/items/*",
+    "description": "確認ダイアログを通す",
+    "actions": [
+      {"kind":"wait", "selector":"#agree","timeout_s":5},
+      {"kind":"click","selector":"#agree"}
+    ]
+  }'</span>
+</code></pre></div></div>
+
+<p>ホストが未登録でも自動で作成されます。</p>
+
+<h2 id="確認更新">確認・更新</h2>
+
+<div class="language-bash highlighter-rouge"><div class="highlight"><pre class="highlight"><code><span class="c"># ホストの全レシピ + 設定</span>
+curl <span class="s2">"</span><span class="nv">$PAPRIKA_HUB</span><span class="s2">/hosts/example.com"</span>
+
+<span class="c"># 全ホスト</span>
+curl <span class="s2">"</span><span class="nv">$PAPRIKA_HUB</span><span class="s2">/hosts"</span>
+</code></pre></div></div>
+
+<p>レシピは <strong>追加</strong>されます。古いものを消したいときは <code class="language-plaintext highlighter-rouge">PUT /hosts/{host}</code> でレシピ全体を置換するか、管理画面の <strong>Hosts</strong> タブから編集してください。</p>
+
+<h2 id="ジョブからの利用">ジョブからの利用</h2>
+
+<p>レシピが登録済みのホストには、<strong>fetch ジョブが自動でレシピを適用</strong>します。明示的に外したい場合は <code class="language-plaintext highlighter-rouge">fetch_strategy: "normal"</code> を指定:</p>
+
+<div class="language-bash highlighter-rouge"><div class="highlight"><pre class="highlight"><code>curl <span class="nt">-X</span> POST <span class="s2">"</span><span class="nv">$PAPRIKA_HUB</span><span class="s2">/jobs"</span> <span class="nt">-H</span> <span class="s1">'Content-Type: application/json'</span> <span class="nt">-d</span> <span class="s1">'{
+  "url":"https://example.com/items/123",
+  "options":{"mode":"fetch","fetch_strategy":"normal"}
+}'</span>
+</code></pre></div></div>
+
+<h2 id="login-recipe">ログインレシピ → 自動再ログイン</h2>
+
+<p>ログイン手順を特別なレシピ（<strong>login_recipe</strong>）として登録すると、ホストの Cookie が失効したときに <strong>fetch 投入の直前に自動再ログイン</strong>します。</p>
+
+<div class="language-bash highlighter-rouge"><div class="highlight"><pre class="highlight"><code>curl <span class="nt">-X</span> PUT <span class="s2">"</span><span class="nv">$PAPRIKA_HUB</span><span class="s2">/hosts/market.example.com/login_recipe"</span> <span class="se">\</span>
+  <span class="nt">-H</span> <span class="s1">'Content-Type: application/json'</span> <span class="se">\</span>
+  <span class="nt">-d</span> <span class="s1">'{
+    "actions": [
+      {"kind":"navigate","url":"https://market.example.com/login"},
+      {"kind":"fill","selector":"#email","text":"alice@..."},
+      {"kind":"fill","selector":"#password","text":"secret"},
+      {"kind":"click","selector":"button[type=submit]"}
+    ]
+  }'</span>
+</code></pre></div></div>
+
+<p>セッション Cookie の TTL を過ぎたジョブが投入されると、Hub がこのレシピを実行し、新しい Cookie を保存してから本来のジョブを進めます。</p>
+
+<blockquote>
+  <p>認証情報は環境変数 / シークレットストア経由で渡し、レシピに<strong>直接書かない</strong>運用を推奨します。</p>
+</blockquote>
+
+<h2 id="ai-モードで観察--保存する流れ">AI モードで「観察 → 保存」する流れ</h2>
+
+<p>AI モード（<code class="language-plaintext highlighter-rouge">codegen-loop</code>）でうまくいった操作は、<strong>そのまま Host レシピに保存</strong>して次回以降決定的に再生できます（<strong>Phase 2c</strong>: 管理画面の Live パネル → 「recipe として保存」）。</p>
+
+<div class="language-text highlighter-rouge"><div class="highlight"><pre class="highlight"><code>未知サイト
+  └─ codegen-loop で観察＆操作（LLM）
+        └─ うまくいった action 列を Host レシピに保存
+              └─ 次回からは fetch + 保存済みレシピで決定的に実行（LLM 不要）
+</code></pre></div></div>
+
+<h2 id="複数-hub-間の共有">複数 Hub 間の共有</h2>
+
+<p>ホスト設定（Cookie・レシピ・login_recipe・popup_policy・notes）は <strong>MariaDB で共有</strong>されます。1 つの Hub で登録すれば<strong>他のどの Hub からも同じレシピが使われます</strong>（<a href="architecture-hub.html">Hub の仕組み</a>）。</p>
+
+<h2 id="トラブルシュート">トラブルシュート</h2>
+
+<ul>
+  <li><strong>レシピが効かない</strong> → <code class="language-plaintext highlighter-rouge">pattern</code> が URL パスにマッチしているか確認（一致は <strong>glob・最長一致</strong>）。</li>
+  <li><strong>途中で止まる</strong> → <code class="language-plaintext highlighter-rouge">actions</code> のセレクタが見つかっていない可能性。<code class="language-plaintext highlighter-rouge">wait</code> を入れる。<code class="language-plaintext highlighter-rouge">timeout_s</code> を伸ばす。</li>
+  <li><strong>動作の確認</strong> → 管理画面の <strong>Live パネル</strong>でログを確認。失敗時はレシピ無しのフェッチに<strong>フォールバック</strong>します。</li>
+  <li><strong>書きづらい</strong> → まず AI モード（<code class="language-plaintext highlighter-rouge">codegen-loop</code>）で動かして、成功した action 列を Host レシピとして保存する流れが楽です。</li>
+</ul>
+
+<h2 id="関連">関連</h2>
+
+<ul>
+  <li><a href="bridge-extension.html">Bridge 拡張</a></li>
+  <li><a href="profile.html">プロファイル <code class="language-plaintext highlighter-rouge">use_profile</code></a></li>
+  <li><a href="/paprika/api.html">API リファレンス</a></li>
+  <li><a href="/paprika/admin.html">管理画面ガイド: Hosts</a></li>
+</ul>
+
+  </main>
+</div>
+<script>
+// Build the "このページ" sidebar from the rendered <h2> headings (each gets an
+// id from kramdown auto_ids). No headings -> drop the sidebar column so the
+// content fills the full width instead of sitting in the narrow sidebar slot.
+(function () {
+  var toc = document.getElementById('doc-toc');
+  var heads = document.querySelectorAll('.content h2[id]');
+  if (!toc) return;
+  if (!heads.length) {
+    var aside = document.querySelector('.sidebar');
+    var layout = document.querySelector('.layout');
+    if (aside) aside.style.display = 'none';
+    if (layout) layout.style.gridTemplateColumns = '1fr';
+    return;
+  }
+  heads.forEach(function (h) {
+    var li = document.createElement('li');
+    var a = document.createElement('a');
+    a.href = '#' + h.id;
+    a.textContent = h.textContent;
+    li.appendChild(a);
+    toc.appendChild(li);
+  });
+})();
+</script>
+</body>
+</html>

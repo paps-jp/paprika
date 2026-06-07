@@ -1,0 +1,328 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+<meta charset="utf-8">
+<title>エラーリファレンス（HTTP ステータス） — Paprika</title>
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<link rel="stylesheet" href="/paprika/style.css">
+<script src="https://code.iconify.design/iconify-icon/2.1.0/iconify-icon.min.js"></script>
+<meta name="description" content="Paprika の HTTP API が返すエラーコード一覧 — 400/404/409/422/502/503/504 の意味、典型的な発生条件、クライアント側でやるべきこと(リトライ・修正・諦め)。">
+<link rel="canonical" href="https://paps-jp.github.io/paprika/errors.html">
+<meta property="og:type" content="article">
+<meta property="og:site_name" content="Paprika">
+<meta property="og:title" content="エラーリファレンス（HTTP ステータス） — Paprika">
+<meta property="og:description" content="Paprika の HTTP API が返すエラーコード一覧 — 400/404/409/422/502/503/504 の意味、典型的な発生条件、クライアント側でやるべきこと(リトライ・修正・諦め)。">
+<meta property="og:url" content="https://paps-jp.github.io/paprika/errors.html">
+<meta property="og:locale" content="ja_JP">
+</head>
+<body>
+
+<nav class="topnav">
+  <a class="brand" href="index.html"><span class="logo"><img src="icon.svg" alt=""></span> Paprika</a>
+  <span class="links">
+    <span class="dropdown">
+      <a class="dropdown-toggle" href="why-paprika.html">はじめに ▾</a>
+      <span class="dropdown-menu">
+        <a href="why-paprika.html">なぜ Paprika?</a>
+        <a href="intro.html">Client インストール</a>
+        <a href="quickstart.html">Server インストール</a>
+      </span>
+    </span>
+    <span class="dropdown">
+      <a class="dropdown-toggle" href="guides.html">学ぶ ▾</a>
+      <span class="dropdown-menu">
+        <a href="guides.html">ガイド</a>
+        <a href="examples.html">サンプル</a>
+        <a href="usecases.html">ユースケース</a>
+        <a href="video.html">動画</a>
+        <a href="faq.html">FAQ</a>
+      </span>
+    </span>
+    <span class="dropdown">
+      <a class="dropdown-toggle active" href="api.html">リファレンス ▾</a>
+      <span class="dropdown-menu">
+        <a href="api.html">API</a>
+        <a href="http-api.html">HTTP API</a>
+        <a href="cli.html">CLI</a>
+        <a href="job-options.html">JobOptions</a>
+        <a href="walk.html">walk（巡回）</a>
+        <a href="locator.html">Locator（要素指定）</a>
+        <a href="ws-events.html">WebSocket（ライブログ）</a>
+        <a href="errors.html" class="active">エラー一覧</a>
+        <a href="bridge-extension.html">Bridge 拡張</a>
+        <a href="profile.html">use_profile</a>
+        <a href="host-recipe.html">Host レシピ</a>
+        <a href="admin.html">管理画面</a>
+      </span>
+    </span>
+    <a href="operations.html">運用</a>
+    <a href="architecture.html">設計</a>
+  </span>
+  <a class="gh" href="search.html" title="サイト内検索" aria-label="サイト内検索" style="padding:5px 10px; margin-right:6px;"><iconify-icon icon="lucide:search" style="font-size:1.05rem; vertical-align:-3px;"></iconify-icon></a>
+  <a class="gh" href="https://github.com/paps-jp/paprika">GitHub ↗</a>
+</nav>
+
+<div class="layout">
+  <aside class="sidebar">
+    <h4>このページ</h4>
+    <ul id="doc-toc"></ul>
+  </aside>
+  <main class="content">
+    <h1>エラーリファレンス（HTTP ステータス）</h1>
+    <p class="lead">Paprika の HTTP API が返すエラーコード一覧 — 400/404/409/422/502/503/504 の意味、典型的な発生条件、クライアント側でやるべきこと(リトライ・修正・諦め)。</p>
+    <p>Paprika の HTTP API が返すエラーコード（<strong>ステータス</strong>）と、それぞれの典型的な原因・<strong>クライアント側でやるべきこと</strong>をまとめます。</p>
+
+<blockquote>
+  <p>SDK は多くの一過性エラーを <strong>自動でリトライ</strong>します（特に <code class="language-plaintext highlighter-rouge">503</code>）。素の HTTP で叩く場合は自分で実装してください（<a href="http-api.html#retry-503">HTTP API: 503 リトライ</a>）。</p>
+</blockquote>
+
+<h2 id="早見表">早見表</h2>
+
+<table>
+  <thead>
+    <tr>
+      <th>コード</th>
+      <th>意味</th>
+      <th>クライアントの対応</th>
+    </tr>
+  </thead>
+  <tbody>
+    <tr>
+      <td><strong>400</strong> Bad Request</td>
+      <td>リクエストのスキーマ違反</td>
+      <td>リクエストを直す（再試行しない）</td>
+    </tr>
+    <tr>
+      <td><strong>404</strong> Not Found</td>
+      <td>ジョブ / セッション / リソースが存在しない</td>
+      <td>存在確認の見直し</td>
+    </tr>
+    <tr>
+      <td><strong>409</strong> Conflict</td>
+      <td>状態が操作と矛盾（例: 接続中の Worker を削除）</td>
+      <td>状態を整えてから再実行</td>
+    </tr>
+    <tr>
+      <td><strong>422</strong> Unprocessable Entity</td>
+      <td>Pydantic バリデーション失敗</td>
+      <td>フィールド値を直す</td>
+    </tr>
+    <tr>
+      <td><strong>502</strong> Bad Gateway</td>
+      <td>Worker / ピア Hub への中継失敗</td>
+      <td>しばらく置いて再試行</td>
+    </tr>
+    <tr>
+      <td><strong>503</strong> Service Unavailable</td>
+      <td>フリート満杯 / 一時的に受けられない</td>
+      <td><strong>指数バックオフで再試行</strong>（必須）</td>
+    </tr>
+    <tr>
+      <td><strong>504</strong> Gateway Timeout</td>
+      <td>アクション・転送のタイムアウト</td>
+      <td>タイムアウト見直し or 再試行</td>
+    </tr>
+  </tbody>
+</table>
+
+<h2 id="400-bad-request--リクエストが不正">400 Bad Request — リクエストが不正</h2>
+
+<p>JSON スキーマの違反や、必須フィールドの欠落で出ます。<strong>再試行しても直りません</strong> — 内容を直してください。</p>
+
+<p>代表例（実コードから）:</p>
+
+<ul>
+  <li><code class="language-plaintext highlighter-rouge">"body must be a JSON object"</code></li>
+  <li><code class="language-plaintext highlighter-rouge">"'url' must be a string"</code></li>
+  <li><code class="language-plaintext highlighter-rouge">"codegen-loop mode requires 'goal'"</code>（<code class="language-plaintext highlighter-rouge">mode: "codegen-loop"</code> で <code class="language-plaintext highlighter-rouge">goal</code> が無い）</li>
+  <li><code class="language-plaintext highlighter-rouge">"'actions' must be a list of action dicts"</code>（Host レシピの形式違反）</li>
+  <li><code class="language-plaintext highlighter-rouge">"invalid profile name"</code>（プロファイル名の文字種違反）</li>
+</ul>
+
+<blockquote>
+  <p><code class="language-plaintext highlighter-rouge">400</code> の <code class="language-plaintext highlighter-rouge">detail</code> に<strong>理由がそのまま入ります</strong>。<code class="language-plaintext highlighter-rouge">curl</code> なら <code class="language-plaintext highlighter-rouge">-i</code> を付けて確認するか、エラーログから拾ってください。</p>
+</blockquote>
+
+<h2 id="404-not-found--存在しない">404 Not Found — 存在しない</h2>
+
+<div class="language-json highlighter-rouge"><div class="highlight"><pre class="highlight"><code><span class="p">{</span><span class="w"> </span><span class="nl">"detail"</span><span class="p">:</span><span class="w"> </span><span class="s2">"job not found"</span><span class="w"> </span><span class="p">}</span><span class="w">
+</span></code></pre></div></div>
+
+<ul>
+  <li>ジョブ ID / セッション ID が間違っている</li>
+  <li>ジョブを <code class="language-plaintext highlighter-rouge">DELETE</code> した後の参照</li>
+  <li>セッションが TTL で reap された後の参照（<a href="architecture-worker.html">Worker・Lane の仕組み</a>）</li>
+  <li>アセットファイル名のタイポ</li>
+</ul>
+
+<h2 id="409-conflict--状態の矛盾">409 Conflict — 状態の矛盾</h2>
+
+<p>操作と現在の状態が噛み合いません。</p>
+
+<ul>
+  <li><strong>接続中の Worker を <code class="language-plaintext highlighter-rouge">DELETE /workers/{id}</code> しようとした</strong> — 先に <code class="language-plaintext highlighter-rouge">status=drain</code> にして切断する</li>
+  <li>セッションがまだクロージング中</li>
+</ul>
+
+<h2 id="422-unprocessable-entity--pydantic-バリデーション失敗">422 Unprocessable Entity — Pydantic バリデーション失敗</h2>
+
+<p><a href="job-options.html">JobOptions</a> の型・範囲制約で落ちたとき:</p>
+
+<div class="language-json highlighter-rouge"><div class="highlight"><pre class="highlight"><code><span class="p">{</span><span class="w">
+  </span><span class="nl">"detail"</span><span class="p">:</span><span class="w"> </span><span class="p">[</span><span class="w">
+    </span><span class="p">{</span><span class="nl">"loc"</span><span class="p">:</span><span class="w"> </span><span class="p">[</span><span class="s2">"body"</span><span class="p">,</span><span class="w"> </span><span class="s2">"options"</span><span class="p">,</span><span class="w"> </span><span class="s2">"max_codegen_attempts"</span><span class="p">],</span><span class="w"> </span><span class="nl">"msg"</span><span class="p">:</span><span class="w"> </span><span class="s2">"ensure this value is less than or equal to 10"</span><span class="p">}</span><span class="w">
+  </span><span class="p">]</span><span class="w">
+</span><span class="p">}</span><span class="w">
+</span></code></pre></div></div>
+
+<p>代表的な制約（<a href="job-options.html">JobOptions リファレンス</a> より）:</p>
+
+<table>
+  <thead>
+    <tr>
+      <th>フィールド</th>
+      <th>制約</th>
+    </tr>
+  </thead>
+  <tbody>
+    <tr>
+      <td><code class="language-plaintext highlighter-rouge">max_codegen_attempts</code></td>
+      <td>1 ≤ n ≤ 10</td>
+    </tr>
+    <tr>
+      <td><code class="language-plaintext highlighter-rouge">attempt_timeout_s</code></td>
+      <td>30 ≤ n ≤ 864000（10 日）</td>
+    </tr>
+    <tr>
+      <td><code class="language-plaintext highlighter-rouge">code</code></td>
+      <td>≤ 200 KB</td>
+    </tr>
+    <tr>
+      <td><code class="language-plaintext highlighter-rouge">min_asset_size_bytes</code></td>
+      <td>≥ 0</td>
+    </tr>
+    <tr>
+      <td><code class="language-plaintext highlighter-rouge">mode = "codegen-loop"</code></td>
+      <td><code class="language-plaintext highlighter-rouge">goal</code> 必須</td>
+    </tr>
+    <tr>
+      <td><code class="language-plaintext highlighter-rouge">mode = "rerun"</code></td>
+      <td><code class="language-plaintext highlighter-rouge">rerun_from</code> か <code class="language-plaintext highlighter-rouge">code</code> のいずれか必須</td>
+    </tr>
+  </tbody>
+</table>
+
+<h2 id="502-bad-gateway--中継失敗">502 Bad Gateway — 中継失敗</h2>
+
+<p>Hub から <strong>Worker</strong> や <strong>ピア Hub</strong> への中継が失敗したときに出ます。</p>
+
+<ul>
+  <li><code class="language-plaintext highlighter-rouge">worker '...' is no longer connected</code>（Worker が接続切れ）</li>
+  <li><code class="language-plaintext highlighter-rouge">hub forward to '...' failed: ...</code>（マルチ Hub 構成でピア Hub への転送が失敗）</li>
+  <li><code class="language-plaintext highlighter-rouge">screenshot send failed: ...</code></li>
+</ul>
+
+<p>ほとんどが<strong>一過性</strong>なので、しばらく置いて再試行で直ります。続くようなら管理画面で Worker / ピア Hub の状態を確認してください。</p>
+
+<h2 id="503-service-unavailable--フリート満杯">503 Service Unavailable — フリート満杯</h2>
+
+<p><strong>最も重要なエラー</strong>です。Hub は満杯時に在庫待ちせず即 <code class="language-plaintext highlighter-rouge">503</code> を返します。</p>
+
+<div class="language-json highlighter-rouge"><div class="highlight"><pre class="highlight"><code><span class="p">{</span><span class="w"> </span><span class="nl">"detail"</span><span class="p">:</span><span class="w"> </span><span class="s2">"no worker available (fleet at capacity); retry with backoff"</span><span class="w"> </span><span class="p">}</span><span class="w">
+</span></code></pre></div></div>
+
+<p>クライアントは <strong>必ず指数バックオフ再試行</strong>を入れてください（SDK は自動）:</p>
+
+<div class="language-javascript highlighter-rouge"><div class="highlight"><pre class="highlight"><code><span class="k">async</span> <span class="kd">function</span> <span class="nx">submit</span><span class="p">(</span><span class="nx">body</span><span class="p">,</span> <span class="nx">hub</span><span class="p">)</span> <span class="p">{</span>
+  <span class="k">for</span> <span class="p">(</span><span class="kd">let</span> <span class="nx">i</span> <span class="o">=</span> <span class="mi">0</span><span class="p">;</span> <span class="nx">i</span> <span class="o">&lt;</span> <span class="mi">6</span><span class="p">;</span> <span class="nx">i</span><span class="o">++</span><span class="p">)</span> <span class="p">{</span>
+    <span class="kd">const</span> <span class="nx">r</span> <span class="o">=</span> <span class="k">await</span> <span class="nx">fetch</span><span class="p">(</span><span class="s2">`</span><span class="p">${</span><span class="nx">hub</span><span class="p">}</span><span class="s2">/jobs`</span><span class="p">,</span> <span class="p">{</span>
+      <span class="na">method</span><span class="p">:</span> <span class="dl">'</span><span class="s1">POST</span><span class="dl">'</span><span class="p">,</span>
+      <span class="na">headers</span><span class="p">:</span> <span class="p">{</span> <span class="dl">'</span><span class="s1">Content-Type</span><span class="dl">'</span><span class="p">:</span> <span class="dl">'</span><span class="s1">application/json</span><span class="dl">'</span> <span class="p">},</span>
+      <span class="na">body</span><span class="p">:</span> <span class="nx">JSON</span><span class="p">.</span><span class="nx">stringify</span><span class="p">(</span><span class="nx">body</span><span class="p">),</span>
+    <span class="p">});</span>
+    <span class="k">if</span> <span class="p">(</span><span class="nx">r</span><span class="p">.</span><span class="nx">status</span> <span class="o">!==</span> <span class="mi">503</span><span class="p">)</span> <span class="k">return</span> <span class="nx">r</span><span class="p">.</span><span class="nx">json</span><span class="p">();</span>
+    <span class="k">await</span> <span class="k">new</span> <span class="nb">Promise</span><span class="p">(</span><span class="nx">s</span> <span class="o">=&gt;</span> <span class="nx">setTimeout</span><span class="p">(</span><span class="nx">s</span><span class="p">,</span> <span class="mi">1000</span> <span class="o">*</span> <span class="mi">2</span> <span class="o">**</span> <span class="nx">i</span><span class="p">));</span> <span class="c1">// 1,2,4,8,16,32s</span>
+  <span class="p">}</span>
+  <span class="k">throw</span> <span class="k">new</span> <span class="nb">Error</span><span class="p">(</span><span class="dl">'</span><span class="s1">fleet busy — retried 6x</span><span class="dl">'</span><span class="p">);</span>
+<span class="p">}</span>
+</code></pre></div></div>
+
+<p>詳細は <a href="http-api.html#retry-503">HTTP API: 503 リトライ</a>、構成は <a href="architecture-hub.html">Hub の仕組み</a> と <a href="/paprika/scaling.html">Hub スケーリング</a> を参照。</p>
+
+<h2 id="504-gateway-timeout--タイムアウト">504 Gateway Timeout — タイムアウト</h2>
+
+<ul>
+  <li><code class="language-plaintext highlighter-rouge">session action timed out</code>（セッション操作が時間切れ）</li>
+  <li>Worker への RPC タイムアウト</li>
+</ul>
+
+<p>短時間の再試行で直ることもあります。長すぎるアクションは <a href="job-options.html#mode"><code class="language-plaintext highlighter-rouge">attempt_timeout_s</code></a> を伸ばすか、処理を分割してください。</p>
+
+<h2 id="トラブルシュートの流れ">トラブルシュートの流れ</h2>
+
+<ol>
+  <li><strong>レスポンスボディの <code class="language-plaintext highlighter-rouge">detail</code></strong> を読む（理由が日本語または英語で入っています）</li>
+  <li><code class="language-plaintext highlighter-rouge">400</code> / <code class="language-plaintext highlighter-rouge">422</code> なら<strong>入力を直す</strong>（リトライしない）</li>
+  <li><code class="language-plaintext highlighter-rouge">503</code> なら<strong>指数バックオフ再試行</strong></li>
+  <li><code class="language-plaintext highlighter-rouge">404</code> なら<strong>ID を確認</strong>（ジョブが消えていないか、セッションが reap されていないか）</li>
+  <li><code class="language-plaintext highlighter-rouge">409</code> なら<strong>状態を整える</strong>（drain にしてから削除など）</li>
+  <li><code class="language-plaintext highlighter-rouge">502</code> / <code class="language-plaintext highlighter-rouge">504</code> は<strong>しばらく待って再試行</strong></li>
+  <li>それでも続く場合は管理画面の <strong>Live パネル</strong>（ジョブ単位のログ）や <strong>Workers タブ</strong>で状況を確認</li>
+</ol>
+
+<h2 id="sdk-で受け取る">SDK で受け取る</h2>
+
+<p>SDK は HTTP エラーを Python 例外にマッピングします。</p>
+
+<div class="language-python highlighter-rouge"><div class="highlight"><pre class="highlight"><code><span class="kn">from</span> <span class="nn">paprika_client.errors</span> <span class="kn">import</span> <span class="p">(</span>
+    <span class="n">JobSubmitError</span><span class="p">,</span>        <span class="c1"># 400 / 422 / 503 投入時
+</span>    <span class="n">JobTimeoutError</span><span class="p">,</span>       <span class="c1"># クライアント側ポーリング上限超過
+</span>    <span class="n">PaprikaActionError</span><span class="p">,</span>    <span class="c1"># Page/Locator/Session 操作の失敗
+</span><span class="p">)</span>
+
+<span class="k">try</span><span class="p">:</span>
+    <span class="n">job</span> <span class="o">=</span> <span class="k">await</span> <span class="n">cli</span><span class="p">.</span><span class="n">fetch</span><span class="p">(</span><span class="s">"https://..."</span><span class="p">,</span> <span class="n">scroll</span><span class="o">=</span><span class="bp">True</span><span class="p">)</span>
+<span class="k">except</span> <span class="n">JobSubmitError</span> <span class="k">as</span> <span class="n">e</span><span class="p">:</span>
+    <span class="k">print</span><span class="p">(</span><span class="s">"投入失敗:"</span><span class="p">,</span> <span class="n">e</span><span class="p">)</span>
+<span class="k">except</span> <span class="n">JobTimeoutError</span><span class="p">:</span>
+    <span class="k">print</span><span class="p">(</span><span class="s">"時間内に終わらず"</span><span class="p">)</span>
+</code></pre></div></div>
+
+<h2 id="関連">関連</h2>
+
+<ul>
+  <li><a href="http-api.html">HTTP API</a></li>
+  <li><a href="job-options.html">JobOptions</a> — バリデーション制約</li>
+  <li><a href="faq.html">FAQ</a> — よくあるハマりどころ</li>
+  <li><a href="architecture-hub.html">Hub の仕組み</a> — <code class="language-plaintext highlighter-rouge">503</code> の背圧設計</li>
+</ul>
+
+  </main>
+</div>
+<script>
+// Build the "このページ" sidebar from the rendered <h2> headings (each gets an
+// id from kramdown auto_ids). No headings -> drop the sidebar column so the
+// content fills the full width instead of sitting in the narrow sidebar slot.
+(function () {
+  var toc = document.getElementById('doc-toc');
+  var heads = document.querySelectorAll('.content h2[id]');
+  if (!toc) return;
+  if (!heads.length) {
+    var aside = document.querySelector('.sidebar');
+    var layout = document.querySelector('.layout');
+    if (aside) aside.style.display = 'none';
+    if (layout) layout.style.gridTemplateColumns = '1fr';
+    return;
+  }
+  heads.forEach(function (h) {
+    var li = document.createElement('li');
+    var a = document.createElement('a');
+    a.href = '#' + h.id;
+    a.textContent = h.textContent;
+    li.appendChild(a);
+    toc.appendChild(li);
+  });
+})();
+</script>
+</body>
+</html>

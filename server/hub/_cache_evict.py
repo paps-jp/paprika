@@ -7,11 +7,14 @@ and reads fall back to MinIO via :func:`server.hub.objstore.ensure_local`.
 
 Nothing else bounds the local disk -- ``ensure_local`` only ever ADDS files and
 the crawler writes continuously -- so without this loop the cache disk fills and
-never drains. This loop keeps usage under a high-water mark by deleting the
-OLDEST job dirs, but ONLY after guaranteeing every file is durable in MinIO: it
-calls ``mirror_dir`` (idempotent; also backfills any silently-failed best-effort
-mirror + un-mirrored sidecars) then verifies ``prefix_exists`` BEFORE ``rmtree``.
-So eviction can never lose data; evicted artifacts are transparently re-fetched
+never drains. This loop keeps usage bounded by deleting the OLDEST job dirs, but
+ONLY after confirming every file is already durable in MinIO. Durability is
+established at asset-SAVE time -- the asset POST handlers ``mirror_file`` both the
+asset AND its ``.meta`` sidecar as they're written -- so here we only verify
+``prefix_exists`` BEFORE ``rmtree`` (one cheap list call, NOT a re-mirror of every
+multi-GB file, so a pass stays fast enough to keep up). A dir that can't be
+confirmed durable is KEPT for the host-cron second stage to reclaim later. So
+eviction can never lose data; evicted artifacts are transparently re-fetched
 from MinIO on the next read.
 
 Gated behind ``PAPRIKA_CACHE_EVICT_ENABLED`` (default OFF) so it is completely
@@ -25,6 +28,7 @@ import logging
 import os
 import re
 import shutil
+import time
 
 from server.hub import objstore
 from server.hub._state import get_storage_dir
@@ -56,6 +60,15 @@ _INTERVAL_S = _num("PAPRIKA_CACHE_EVICT_INTERVAL_S", 60.0)
 # a pure settings change (no env/compose edit, no restart; get_storage_dir reads
 # the setting live).
 _MAX_DISK_GB = _num("PAPRIKA_CACHE_EVICT_MAX_DISK_GB", 1024.0)
+# Steady-state "keep local clean": once a job dir is older than this AND durable
+# in MinIO, evict it regardless of disk pressure -- so the local cache holds only
+# the last few minutes of jobs (reads transparently re-fetch from MinIO via
+# objstore.ensure_local). Mirroring uploads the .meta sidecars too, so metadata
+# reaches MinIO before the local copy is dropped.
+_MIN_AGE_S = _num("PAPRIKA_CACHE_EVICT_MIN_AGE_S", 180.0)
+# Hard floor: never evict a dir younger than this even under disk pressure --
+# protects an actively-writing in-flight job whose dir just crossed the LOW mark.
+_HARD_MIN_AGE_S = _num("PAPRIKA_CACHE_EVICT_HARD_MIN_AGE_S", 60.0)
 # Only ever delete dirs whose name looks like a job id (hex). Protects sibling
 # trees under the storage root -- oprec/, and (if data_dir==storage_dir) the
 # hub-internal hosts/skills/conventions/engines metadata -- from eviction.
@@ -87,7 +100,23 @@ def _scan_jobs_by_mtime(root) -> list[tuple[float, str, str]]:
 
 
 async def _evict_once() -> tuple[int, float]:
-    """One eviction pass. Returns (dirs_deleted, disk_pct_after)."""
+    """One eviction pass. Deletes each evictable job dir's local copy ONLY after
+    confirming it is durable in MinIO. Assets + their ``.meta`` sidecars are
+    mirrored at asset-save time, so this is a cheap ``prefix_exists`` check (not a
+    re-mirror) -- the local cache stays clean without losing data. Returns
+    (dirs_deleted, disk_pct_after).
+
+    Two triggers, both verify-before-delete (never lose data):
+      * AGE -- any dir older than ``_MIN_AGE_S`` is evicted regardless of disk
+        usage. This is the steady-state "keep local clean" behaviour: local
+        holds only the last few minutes of jobs; reads re-fetch from MinIO via
+        :func:`objstore.ensure_local`.
+      * PRESSURE -- while disk is above ``_LOW_PCT`` we also evict younger dirs
+        (down to ``_HARD_MIN_AGE_S``) to relieve a fill faster.
+
+    A dir that can't be confirmed durable (MinIO down / upload failed) is KEPT;
+    the periodic host cron is the second-stage fallback that reclaims it later.
+    """
     root = get_storage_dir()
     try:
         if not root.is_dir():
@@ -99,30 +128,36 @@ async def _evict_once() -> tuple[int, float]:
         # storage_dir is a big NAS/disk (the pre-cutover SMB mount), not a
         # bounded local cache -> nothing to evict here. Auto-inert until cutover.
         return 0, pct
-    if pct < _HIGH_PCT:
-        return 0, pct
     if not objstore.enabled():
         # No durable copy to fall back to -> NEVER evict (would be data loss).
-        log.warning(
-            "cache-evict: disk at %.0f%% but objstore disabled -- not evicting "
-            "(no durable MinIO copy). storage_dir=%s",
-            pct, root,
-        )
+        if pct >= _HIGH_PCT:
+            log.warning(
+                "cache-evict: disk at %.0f%% but objstore disabled -- cannot "
+                "evict (no durable MinIO copy). storage_dir=%s",
+                pct, root,
+            )
         return 0, pct
-    candidates = await asyncio.to_thread(_scan_jobs_by_mtime, root)
+    candidates = await asyncio.to_thread(_scan_jobs_by_mtime, root)  # oldest first
+    now = time.time()
     deleted = 0
-    for _mtime, name, path in candidates:
+    for mtime, name, path in candidates:
+        age = now - mtime
+        if age < _HARD_MIN_AGE_S:
+            break  # too recent (likely in-flight); oldest-first -> rest younger
         pct, _u, _t = await asyncio.to_thread(_disk_pct, root)
-        if pct <= _LOW_PCT:
-            break
-        # Guarantee the whole job dir is in MinIO before dropping the local copy.
+        if age < _MIN_AGE_S and pct <= _LOW_PCT:
+            break  # young-ish and no disk pressure -> done (remaining younger)
+        # Durability is established at asset-save time -- the asset POST handlers
+        # mirror_file BOTH the asset AND its .meta sidecar as they're written --
+        # so here we only CONFIRM the dir is in MinIO before dropping the local
+        # copy. A single cheap list call, not a re-mirror of every (multi-GB)
+        # file, so a full pass stays fast enough to keep up with the fleet.
         try:
-            await objstore.mirror_dir(path)
             safe = await objstore.prefix_exists(name)
         except Exception:
             safe = False
         if not safe:
-            log.warning("cache-evict: skip %s (not confirmed durable in MinIO)", name)
+            log.warning("cache-evict: keep %s (not confirmed durable; cron will retry)", name)
             continue
         try:
             await asyncio.to_thread(shutil.rmtree, path, True)
@@ -130,9 +165,10 @@ async def _evict_once() -> tuple[int, float]:
         except Exception:
             log.warning("cache-evict: rmtree(%s) failed", path, exc_info=True)
     if deleted:
+        pct = (await asyncio.to_thread(_disk_pct, root))[0]
         log.info(
-            "cache-evict: removed %d cached job dir(s) (re-fetchable from MinIO); "
-            "disk now %.0f%%",
+            "cache-evict: mirrored + removed %d cached job dir(s) (durable in "
+            "MinIO, incl .meta metadata); disk now %.0f%%",
             deleted, pct,
         )
     return deleted, pct

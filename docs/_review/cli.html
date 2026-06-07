@@ -1,0 +1,335 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+<meta charset="utf-8">
+<title>paprika-client CLI — Paprika</title>
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<link rel="stylesheet" href="/paprika/style.css">
+<script src="https://code.iconify.design/iconify-icon/2.1.0/iconify-icon.min.js"></script>
+<meta name="description" content="paprika-client CLI コマンドの完全リファレンス — upload-profile / list-profiles / set-default-profile / delete-profile の全引数と典型ワークフロー。">
+<link rel="canonical" href="https://paps-jp.github.io/paprika/cli.html">
+<meta property="og:type" content="article">
+<meta property="og:site_name" content="Paprika">
+<meta property="og:title" content="paprika-client CLI — Paprika">
+<meta property="og:description" content="paprika-client CLI コマンドの完全リファレンス — upload-profile / list-profiles / set-default-profile / delete-profile の全引数と典型ワークフロー。">
+<meta property="og:url" content="https://paps-jp.github.io/paprika/cli.html">
+<meta property="og:locale" content="ja_JP">
+</head>
+<body>
+
+<nav class="topnav">
+  <a class="brand" href="index.html"><span class="logo"><img src="icon.svg" alt=""></span> Paprika</a>
+  <span class="links">
+    <span class="dropdown">
+      <a class="dropdown-toggle" href="why-paprika.html">はじめに ▾</a>
+      <span class="dropdown-menu">
+        <a href="why-paprika.html">なぜ Paprika?</a>
+        <a href="intro.html">Client インストール</a>
+        <a href="quickstart.html">Server インストール</a>
+      </span>
+    </span>
+    <span class="dropdown">
+      <a class="dropdown-toggle" href="guides.html">学ぶ ▾</a>
+      <span class="dropdown-menu">
+        <a href="guides.html">ガイド</a>
+        <a href="examples.html">サンプル</a>
+        <a href="usecases.html">ユースケース</a>
+        <a href="video.html">動画</a>
+        <a href="faq.html">FAQ</a>
+      </span>
+    </span>
+    <span class="dropdown">
+      <a class="dropdown-toggle active" href="api.html">リファレンス ▾</a>
+      <span class="dropdown-menu">
+        <a href="api.html">API</a>
+        <a href="http-api.html">HTTP API</a>
+        <a href="cli.html" class="active">CLI</a>
+        <a href="job-options.html">JobOptions</a>
+        <a href="walk.html">walk（巡回）</a>
+        <a href="locator.html">Locator（要素指定）</a>
+        <a href="ws-events.html">WebSocket（ライブログ）</a>
+        <a href="errors.html">エラー一覧</a>
+        <a href="bridge-extension.html">Bridge 拡張</a>
+        <a href="profile.html">use_profile</a>
+        <a href="host-recipe.html">Host レシピ</a>
+        <a href="admin.html">管理画面</a>
+      </span>
+    </span>
+    <a href="operations.html">運用</a>
+    <a href="architecture.html">設計</a>
+  </span>
+  <a class="gh" href="search.html" title="サイト内検索" aria-label="サイト内検索" style="padding:5px 10px; margin-right:6px;"><iconify-icon icon="lucide:search" style="font-size:1.05rem; vertical-align:-3px;"></iconify-icon></a>
+  <a class="gh" href="https://github.com/paps-jp/paprika">GitHub ↗</a>
+</nav>
+
+<div class="layout">
+  <aside class="sidebar">
+    <h4>このページ</h4>
+    <ul id="doc-toc"></ul>
+  </aside>
+  <main class="content">
+    <h1>paprika-client CLI</h1>
+    <p class="lead">paprika-client CLI コマンドの完全リファレンス — upload-profile / list-profiles / set-default-profile / delete-profile の全引数と典型ワークフロー。</p>
+    <p><code class="language-plaintext highlighter-rouge">paprika-client</code> パッケージは Python SDK のほかに、<strong>Hub の管理を CLI でこなすためのサブコマンド群</strong>を提供します。主にローカル Chrome の <strong>プロファイル登録</strong>（ログイン状態の持ち込み）に使います。</p>
+
+<blockquote>
+  <p>プロファイルの仕組みと使い方は <a href="profile.html"><code class="language-plaintext highlighter-rouge">use_profile</code> リファレンス</a> を参照。</p>
+</blockquote>
+
+<h2 id="インストール">インストール</h2>
+
+<div class="language-bash highlighter-rouge"><div class="highlight"><pre class="highlight"><code>pip <span class="nb">install </span>paprika-client
+</code></pre></div></div>
+
+<p>成功すると <code class="language-plaintext highlighter-rouge">paprika-client</code> コマンドが PATH に追加されます。</p>
+
+<h2 id="グローバル引数">グローバル引数</h2>
+
+<p>すべてのサブコマンドに先行して指定できます。</p>
+
+<table>
+  <thead>
+    <tr>
+      <th>引数</th>
+      <th>既定</th>
+      <th>説明</th>
+    </tr>
+  </thead>
+  <tbody>
+    <tr>
+      <td><code class="language-plaintext highlighter-rouge">--hub &lt;URL&gt;</code></td>
+      <td><code class="language-plaintext highlighter-rouge">$PAPRIKA_HUB</code> または <code class="language-plaintext highlighter-rouge">http://localhost:8000</code></td>
+      <td>操作対象の Hub の URL</td>
+    </tr>
+  </tbody>
+</table>
+
+<div class="language-bash highlighter-rouge"><div class="highlight"><pre class="highlight"><code>paprika-client <span class="nt">--hub</span> http://paprika.lan:8000 list-profiles
+<span class="c"># あるいは環境変数で</span>
+<span class="nb">export </span><span class="nv">PAPRIKA_HUB</span><span class="o">=</span>http://paprika.lan:8000
+paprika-client list-profiles
+</code></pre></div></div>
+
+<h2 id="サブコマンド一覧">サブコマンド一覧</h2>
+
+<table>
+  <thead>
+    <tr>
+      <th>サブコマンド</th>
+      <th>用途</th>
+    </tr>
+  </thead>
+  <tbody>
+    <tr>
+      <td><a href="#upload-profile"><code class="language-plaintext highlighter-rouge">upload-profile</code></a></td>
+      <td>手元の Chrome プロファイルを <strong>スナップショット</strong>して Hub にアップロード</td>
+    </tr>
+    <tr>
+      <td><a href="#list-profiles"><code class="language-plaintext highlighter-rouge">list-profiles</code></a></td>
+      <td>Hub に登録済みのプロファイル一覧</td>
+    </tr>
+    <tr>
+      <td><a href="#set-default-profile"><code class="language-plaintext highlighter-rouge">set-default-profile</code></a></td>
+      <td>既定プロファイルを設定 / 解除</td>
+    </tr>
+    <tr>
+      <td><a href="#delete-profile"><code class="language-plaintext highlighter-rouge">delete-profile</code></a></td>
+      <td>登録済みプロファイルを削除</td>
+    </tr>
+  </tbody>
+</table>
+
+<h2 id="upload-profile"><code class="language-plaintext highlighter-rouge">upload-profile</code></h2>
+
+<p>手元の Chrome の <strong>User Data フォルダ</strong> のうち、指定プロファイル（既定 <code class="language-plaintext highlighter-rouge">Default/</code>）をスナップショットして Hub に登録します。以後 <code class="language-plaintext highlighter-rouge">options.use_profile=&lt;name&gt;</code> でジョブが利用できます。</p>
+
+<div class="language-bash highlighter-rouge"><div class="highlight"><pre class="highlight"><code>paprika-client upload-profile <span class="nt">--name</span> &lt;name&gt; <span class="o">[</span>options]
+</code></pre></div></div>
+
+<table>
+  <thead>
+    <tr>
+      <th>引数</th>
+      <th>必須</th>
+      <th>既定</th>
+      <th>説明</th>
+    </tr>
+  </thead>
+  <tbody>
+    <tr>
+      <td><code class="language-plaintext highlighter-rouge">--name</code></td>
+      <td>✅</td>
+      <td>—</td>
+      <td>Hub に登録する名前。<code class="language-plaintext highlighter-rouge">options.use_profile</code> で参照する</td>
+    </tr>
+    <tr>
+      <td><code class="language-plaintext highlighter-rouge">--chrome-profile</code></td>
+      <td> </td>
+      <td><code class="language-plaintext highlighter-rouge">Default</code></td>
+      <td>スナップショット対象のローカル Chrome プロファイル名。マルチプロファイル環境では <code class="language-plaintext highlighter-rouge">chrome://version</code> の <strong>「プロファイル パス」</strong> を確認</td>
+    </tr>
+    <tr>
+      <td><code class="language-plaintext highlighter-rouge">--include &lt;name&gt;</code></td>
+      <td> </td>
+      <td>—</td>
+      <td>既定のセットに<strong>追加で同梱</strong>するファイル / ディレクトリ名（<code class="language-plaintext highlighter-rouge">Bookmarks</code> / <code class="language-plaintext highlighter-rouge">History</code> など）。<strong>繰り返し可</strong></td>
+    </tr>
+    <tr>
+      <td><code class="language-plaintext highlighter-rouge">--note &lt;text&gt;</code></td>
+      <td> </td>
+      <td>—</td>
+      <td>管理画面で表示する自由メモ</td>
+    </tr>
+    <tr>
+      <td><code class="language-plaintext highlighter-rouge">--no-decrypt-cookies</code></td>
+      <td> </td>
+      <td><code class="language-plaintext highlighter-rouge">false</code></td>
+      <td>操作者側での <strong>Cookie 復号をスキップ</strong>。同じ Chrome キーリングバックエンド（両方とも <code class="language-plaintext highlighter-rouge">peanuts</code>）の Linux→Linux のときだけ使う。通常は付けない</td>
+    </tr>
+  </tbody>
+</table>
+
+<h3 id="例">例</h3>
+
+<div class="language-bash highlighter-rouge"><div class="highlight"><pre class="highlight"><code><span class="c"># 普段使いの Chrome (Default プロファイル) をスナップショットして 'work' で登録</span>
+paprika-client upload-profile <span class="nt">--name</span> work
+
+<span class="c"># 別プロファイル（Profile 1）を 'paps-staging' として登録、メモ付き</span>
+paprika-client upload-profile <span class="se">\</span>
+  <span class="nt">--name</span> paps-staging <span class="se">\</span>
+  <span class="nt">--chrome-profile</span> <span class="s2">"Profile 1"</span> <span class="se">\</span>
+  <span class="nt">--note</span> <span class="s2">"paps 検証用アカウント"</span>
+
+<span class="c"># 既定セットに加えて Bookmarks / History も同梱</span>
+paprika-client upload-profile <span class="nt">--name</span> browse <span class="se">\</span>
+  <span class="nt">--include</span> Bookmarks <span class="nt">--include</span> History
+</code></pre></div></div>
+
+<h3 id="cookie-の扱いchrome-v20-app-bound-暗号化">Cookie の扱い（Chrome v20 App-Bound 暗号化）</h3>
+
+<p>Chrome 127+ は <strong>App-Bound 暗号化（v20）</strong> で Cookie を暗号化します。<code class="language-plaintext highlighter-rouge">upload-profile</code> は既定で <strong>操作者側で復号</strong>して plaintext を <code class="language-plaintext highlighter-rouge">value</code> に詰めるので、Linux ワーカー上の Chrome がそのまま読めます。</p>
+
+<p>別経路として <strong>Bridge 拡張</strong>（<a href="bridge-extension.html">Bridge 拡張</a>）で <code class="language-plaintext highlighter-rouge">chrome.cookies.getAll()</code> 経由で Cookie だけ送る方法もあります（軽量・ログイン状態の更新が手軽）。</p>
+
+<h2 id="list-profiles"><code class="language-plaintext highlighter-rouge">list-profiles</code></h2>
+
+<p>Hub に登録済みのプロファイル一覧を表示します。</p>
+
+<div class="language-bash highlighter-rouge"><div class="highlight"><pre class="highlight"><code>paprika-client list-profiles
+</code></pre></div></div>
+
+<p>出力例（タブ区切り）:</p>
+
+<div class="language-text highlighter-rouge"><div class="highlight"><pre class="highlight"><code>NAME            SIZE       UPDATED                  NOTE
+work            45.2 MB    2026-06-05T12:34:56Z     (default)
+paps-staging    38.1 MB    2026-06-04T09:00:00Z     paps 検証用アカウント
+browse          61.8 MB    2026-06-02T22:15:30Z
+</code></pre></div></div>
+
+<p><code class="language-plaintext highlighter-rouge">NOTE</code> の <code class="language-plaintext highlighter-rouge">(default)</code> は <a href="#set-default-profile">既定プロファイル</a>を意味します。</p>
+
+<h2 id="set-default-profile"><code class="language-plaintext highlighter-rouge">set-default-profile</code></h2>
+
+<p><code class="language-plaintext highlighter-rouge">options.use_profile</code> を省略したジョブに自動適用する <strong>既定プロファイル</strong>を設定 / 解除します。</p>
+
+<div class="language-bash highlighter-rouge"><div class="highlight"><pre class="highlight"><code><span class="c"># 設定</span>
+paprika-client set-default-profile <span class="nt">--name</span> work
+
+<span class="c"># 解除（--name を省略）</span>
+paprika-client set-default-profile
+</code></pre></div></div>
+
+<table>
+  <thead>
+    <tr>
+      <th>引数</th>
+      <th>既定</th>
+      <th>説明</th>
+    </tr>
+  </thead>
+  <tbody>
+    <tr>
+      <td><code class="language-plaintext highlighter-rouge">--name &lt;name&gt;</code></td>
+      <td>（無指定で解除）</td>
+      <td>既定にするプロファイル名。省略すると現在の既定を<strong>解除</strong></td>
+    </tr>
+  </tbody>
+</table>
+
+<h2 id="delete-profile"><code class="language-plaintext highlighter-rouge">delete-profile</code></h2>
+
+<p>Hub からプロファイルを削除します。</p>
+
+<div class="language-bash highlighter-rouge"><div class="highlight"><pre class="highlight"><code>paprika-client delete-profile <span class="nt">--name</span> &lt;name&gt;
+</code></pre></div></div>
+
+<table>
+  <thead>
+    <tr>
+      <th>引数</th>
+      <th>必須</th>
+      <th>説明</th>
+    </tr>
+  </thead>
+  <tbody>
+    <tr>
+      <td><code class="language-plaintext highlighter-rouge">--name &lt;name&gt;</code></td>
+      <td>✅</td>
+      <td>削除するプロファイル名</td>
+    </tr>
+  </tbody>
+</table>
+
+<h2 id="典型ワークフロー">典型ワークフロー</h2>
+
+<div class="language-bash highlighter-rouge"><div class="highlight"><pre class="highlight"><code><span class="c"># 1) 普段使いの Chrome をアップロード</span>
+paprika-client upload-profile <span class="nt">--name</span> work <span class="nt">--note</span> <span class="s2">"office account"</span>
+
+<span class="c"># 2) 既定に設定（以後 use_profile 省略ジョブが自動で work を使う）</span>
+paprika-client set-default-profile <span class="nt">--name</span> work
+
+<span class="c"># 3) 後で確認</span>
+paprika-client list-profiles
+
+<span class="c"># 4) いらなくなったら削除</span>
+paprika-client delete-profile <span class="nt">--name</span> work
+</code></pre></div></div>
+
+<h2 id="関連">関連</h2>
+
+<ul>
+  <li><a href="profile.html"><code class="language-plaintext highlighter-rouge">use_profile</code> リファレンス</a> — プロファイルの仕組み・正規化・複数 Hub 間共有</li>
+  <li><a href="bridge-extension.html">Bridge 拡張</a> — 軽量に Cookie だけ送る別経路</li>
+  <li><a href="host-recipe.html">Host レシピ</a> — ログインを自動化（期限切れの自動再ログインも）</li>
+  <li><a href="job-options.html">JobOptions</a> — <code class="language-plaintext highlighter-rouge">use_profile</code> を指定するオプション</li>
+</ul>
+
+  </main>
+</div>
+<script>
+// Build the "このページ" sidebar from the rendered <h2> headings (each gets an
+// id from kramdown auto_ids). No headings -> drop the sidebar column so the
+// content fills the full width instead of sitting in the narrow sidebar slot.
+(function () {
+  var toc = document.getElementById('doc-toc');
+  var heads = document.querySelectorAll('.content h2[id]');
+  if (!toc) return;
+  if (!heads.length) {
+    var aside = document.querySelector('.sidebar');
+    var layout = document.querySelector('.layout');
+    if (aside) aside.style.display = 'none';
+    if (layout) layout.style.gridTemplateColumns = '1fr';
+    return;
+  }
+  heads.forEach(function (h) {
+    var li = document.createElement('li');
+    var a = document.createElement('a');
+    a.href = '#' + h.id;
+    a.textContent = h.textContent;
+    li.appendChild(a);
+    toc.appendChild(li);
+  });
+})();
+</script>
+</body>
+</html>

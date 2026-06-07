@@ -1,0 +1,295 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+<meta charset="utf-8">
+<title>Worker 自己回復(self-healing) — Paprika</title>
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<link rel="stylesheet" href="style.css">
+<meta name="description" content="Paprika worker の自己回復（self-healing）設計。起動時にCPUコアへレーン数を自動調整、hub 接続が切れてもその場で無期限に再接続（自滅しない）、N ジョブごとに drain して自動リサイクル、hub 側は心拍の途絶えた worker を自動 reap。worker のライフサイクル図と設定一覧。">
+<link rel="canonical" href="https://paps-jp.github.io/paprika/worker-resilience.html">
+</head>
+<body>
+
+<nav class="topnav">
+  <a class="brand" href="index.html"><span class="logo"><img src="icon.svg" alt=""></span> Paprika</a>
+  <span class="links">
+    <span class="dropdown">
+      <a class="dropdown-toggle" href="why-paprika.html">はじめに ▾</a>
+      <span class="dropdown-menu">
+        <a href="why-paprika.html">なぜ Paprika?</a>
+        <a href="intro.html">Client インストール</a>
+        <a href="quickstart.html">Server インストール</a>
+      </span>
+    </span>
+    <span class="dropdown">
+      <a class="dropdown-toggle" href="guides.html">学ぶ ▾</a>
+      <span class="dropdown-menu">
+        <a href="guides.html">ガイド</a>
+        <a href="examples.html">サンプル</a>
+        <a href="usecases.html">ユースケース</a>
+        <a href="video.html">動画</a>
+        <a href="faq.html">FAQ</a>
+      </span>
+    </span>
+    <span class="dropdown">
+      <a class="dropdown-toggle" href="api.html">リファレンス ▾</a>
+      <span class="dropdown-menu">
+        <a href="api.html">API</a>
+        <a href="http-api.html">HTTP API</a>
+        <a href="cli.html">CLI</a>
+        <a href="job-options.html">JobOptions</a>
+        <a href="walk.html">walk（巡回）</a>
+        <a href="locator.html">Locator（要素指定）</a>
+        <a href="ws-events.html">WebSocket（ライブログ）</a>
+        <a href="errors.html">エラー一覧</a>
+        <a href="bridge-extension.html">Bridge 拡張</a>
+        <a href="profile.html">use_profile</a>
+        <a href="host-recipe.html">Host レシピ</a>
+        <a href="admin.html">管理画面</a>
+      </span>
+    </span>
+    <a href="operations.html" class="active">運用</a>
+    <a href="architecture.html">設計</a>
+  </span>
+  <a class="gh" href="search.html" title="サイト内検索" aria-label="サイト内検索" style="padding:5px 10px; margin-right:6px;"><iconify-icon icon="lucide:search" style="font-size:1.05rem; vertical-align:-3px;"></iconify-icon></a>
+  <a class="gh" href="https://github.com/paps-jp/paprika">GitHub ↗</a>
+</nav>
+
+
+<div class="layout">
+  <aside class="sidebar">
+    <h4>Worker 自己回復</h4>
+    <ul>
+      <li><a href="#overview">概要</a></li>
+      <li><a href="#lifecycle">ライフサイクル図</a></li>
+      <li><a href="#states">状態の意味</a></li>
+      <li><a href="#autosize">① 自動サイジング</a></li>
+      <li><a href="#selfheal">② 接続断は再接続で耐える</a></li>
+      <li><a href="#recycle">③ 定期リサイクル</a></li>
+      <li><a href="#reap">④ stale 自動掃除</a></li>
+      <li><a href="#config">設定一覧</a></li>
+      <li><a href="#verify">確認コマンド</a></li>
+    </ul>
+  </aside>
+
+  <main class="content">
+
+  <h1>Worker 自己回復（self-healing）</h1>
+  <p class="lead">
+    各 worker は「壊れたら自分で気づいて作り直す」自己回復ループを持つ。
+    <strong>起動時に CPU コアへレーン数を自動調整</strong>し、<strong>hub との接続が切れてもその場で再接続し続け</strong>、
+    <strong>一定ジョブ数ごとに drain して自動リサイクル</strong>、さらに <strong>hub 側が応答の途絶えた worker を自動で掃除</strong>する。
+    手動の再起動・登録削除は不要。
+  </p>
+
+  <!-- ============================================================= -->
+  <h2 id="lifecycle">ライフサイクル図</h2>
+  <p>起動 → 登録 → 実行 のメイン経路。WS が切れても <code>RECONNECTING</code> で<strong>無期限に再接続</strong>（自滅はしない）。
+  終了は <strong>N ジョブ後の drain リサイクル</strong>のみで、<code>EXIT</code> を経て docker が作り直す循環。</p>
+
+  <svg viewBox="0 0 940 470" role="img" aria-label="Worker ライフサイクル図" style="display:block;margin:18px auto;max-width:100%;height:auto;font-family:ui-monospace,Consolas,monospace;">
+    <defs>
+      <marker id="ah" markerWidth="10" markerHeight="10" refX="8" refY="3" orient="auto"><path d="M0,0 L8,3 L0,6 Z" fill="#59636e"/></marker>
+      <marker id="ahb" markerWidth="10" markerHeight="10" refX="8" refY="3" orient="auto"><path d="M0,0 L8,3 L0,6 Z" fill="#0969da"/></marker>
+      <marker id="ahr" markerWidth="10" markerHeight="10" refX="8" refY="3" orient="auto"><path d="M0,0 L8,3 L0,6 Z" fill="#b35900"/></marker>
+    </defs>
+
+    <!-- top pipeline -->
+    <rect x="24" y="40" width="116" height="48" rx="9" fill="#f3f0f0" stroke="#b9a9a9"/>
+    <text x="82" y="60" text-anchor="middle" font-size="12.5">① docker</text>
+    <text x="82" y="76" text-anchor="middle" font-size="12.5">run / restart</text>
+
+    <rect x="170" y="40" width="150" height="48" rx="9" fill="#eef1f5" stroke="#cdd6e0"/>
+    <text x="245" y="60" text-anchor="middle" font-size="12.5">② STARTING</text>
+    <text x="245" y="77" text-anchor="middle" font-size="10.5" fill="#59636e">コア検出→レーン数決定</text>
+
+    <rect x="350" y="40" width="150" height="48" rx="9" fill="#eef1f5" stroke="#cdd6e0"/>
+    <text x="425" y="60" text-anchor="middle" font-size="12.5">③ REGISTER</text>
+    <text x="425" y="77" text-anchor="middle" font-size="10.5" fill="#59636e">hub 登録・心拍開始</text>
+
+    <!-- RUNNING container -->
+    <rect x="555" y="28" width="360" height="150" rx="12" fill="#f4faff" stroke="#91c5ee" stroke-width="2"/>
+    <text x="735" y="50" text-anchor="middle" font-size="13" fill="#0969da" font-weight="700">④ RUNNING（接続中・ジョブ処理）</text>
+    <rect x="575" y="64" width="320" height="30" rx="7" fill="#fff" stroke="#0969da"/>
+    <text x="735" y="84" text-anchor="middle" font-size="11.5">ジョブ受信 → lane 取得（生存確認）→ 実行 → 解放</text>
+    <rect x="575" y="100" width="155" height="28" rx="7" fill="#fff" stroke="#91c5ee"/>
+    <text x="652" y="119" text-anchor="middle" font-size="11">15s ごとに心拍</text>
+    <rect x="740" y="100" width="155" height="28" rx="7" fill="#fff" stroke="#91c5ee"/>
+    <text x="817" y="119" text-anchor="middle" font-size="11">jobs_done++ を計数</text>
+    <rect x="575" y="134" width="320" height="30" rx="7" fill="#fff" stroke="#91c5ee"/>
+    <text x="735" y="154" text-anchor="middle" font-size="11">lane の Chrome は watchdog が常時監視・自動復旧</text>
+
+    <!-- pipeline arrows -->
+    <line x1="140" y1="64" x2="168" y2="64" stroke="#59636e" stroke-width="1.6" marker-end="url(#ah)"/>
+    <line x1="320" y1="64" x2="348" y2="64" stroke="#59636e" stroke-width="1.6" marker-end="url(#ah)"/>
+    <line x1="500" y1="64" x2="553" y2="78" stroke="#59636e" stroke-width="1.6" marker-end="url(#ah)"/>
+
+    <!-- branch boxes -->
+    <rect x="555" y="226" width="220" height="46" rx="9" fill="#fff8e6" stroke="#f5d77a"/>
+    <text x="665" y="245" text-anchor="middle" font-size="11.5">RECONNECTING</text>
+    <text x="665" y="262" text-anchor="middle" font-size="10" fill="#7a5">WS 断 → 無期限に再接続（自滅しない）</text>
+
+    <rect x="555" y="300" width="220" height="46" rx="9" fill="#fff8e6" stroke="#f5d77a"/>
+    <text x="665" y="319" text-anchor="middle" font-size="11.5">DRAINING</text>
+    <text x="665" y="336" text-anchor="middle" font-size="10" fill="#7a5">新規受付停止・実行中のみ完了</text>
+
+    <!-- EXIT -->
+    <rect x="824" y="252" width="92" height="66" rx="10" fill="#fdecea" stroke="#e8a4a0"/>
+    <text x="870" y="282" text-anchor="middle" font-size="12.5" fill="#b35900">EXIT</text>
+    <text x="870" y="300" text-anchor="middle" font-size="10" fill="#b35900">自滅</text>
+
+    <!-- RUNNING -> RECONNECTING and back -->
+    <line x1="640" y1="178" x2="640" y2="224" stroke="#0969da" stroke-width="1.5" marker-end="url(#ahb)"/>
+    <text x="600" y="205" font-size="10" fill="#0969da">WS断</text>
+    <line x1="695" y1="224" x2="695" y2="180" stroke="#0969da" stroke-width="1.5" marker-end="url(#ahb)"/>
+    <text x="702" y="205" font-size="10" fill="#0969da">復帰</text>
+
+    <!-- RUNNING -> DRAINING -->
+    <path d="M 845 178 Q 845 290 778 323" fill="none" stroke="#0969da" stroke-width="1.5" marker-end="url(#ahb)"/>
+    <text x="848" y="230" font-size="10" fill="#0969da">jobs≥N / 停止指示</text>
+
+    <!-- (RECONNECTING never exits to EXIT: reconnect-in-place, no self-exit) -->
+
+    <!-- DRAINING -> EXIT -->
+    <path d="M 775 318 Q 805 312 822 300" fill="none" stroke="#b35900" stroke-width="1.6" marker-end="url(#ahr)"/>
+    <text x="782" y="338" font-size="10" fill="#b35900">完了後</text>
+
+    <!-- EXIT -> docker (restart loop) -->
+    <path d="M 870 318 Q 870 430 470 430 Q 90 430 82 90" fill="none" stroke="#b35900" stroke-width="1.8" stroke-dasharray="5,4" marker-end="url(#ahr)"/>
+    <text x="430" y="448" text-anchor="middle" font-size="11" fill="#b35900">docker restart: unless-stopped が新しいプロセスとして作り直す（state クリーン・新規登録）</text>
+
+    <!-- Hub reaper -->
+    <rect x="180" y="170" width="330" height="150" rx="10" fill="#ecf7e9" stroke="#99c98a"/>
+    <text x="345" y="192" text-anchor="middle" font-size="12.5" fill="#2a7" font-weight="700">Hub（並行）</text>
+    <rect x="200" y="206" width="290" height="44" rx="7" fill="#fff" stroke="#99c98a"/>
+    <text x="345" y="224" text-anchor="middle" font-size="10.5">登録・心拍を受信し active 一覧を維持</text>
+    <text x="345" y="240" text-anchor="middle" font-size="10.5">再接続時は orphan ジョブを reconcile</text>
+    <rect x="200" y="258" width="290" height="50" rx="7" fill="#fff" stroke="#99c98a"/>
+    <text x="345" y="277" text-anchor="middle" font-size="10.5" font-weight="700">⑤ reaper（定期）</text>
+    <text x="345" y="294" text-anchor="middle" font-size="10">心拍 STALE 超過 &amp; 未接続 → 登録を自動削除</text>
+  </svg>
+
+  <!-- ============================================================= -->
+  <h2 id="states">状態の意味</h2>
+  <table>
+    <tr><th>状態</th><th>意味</th><th>抜け方</th></tr>
+    <tr><td><code>STARTING</code></td><td>起動。CPU コア数を見てレーン数を決め、各レーンの Chrome を立ち上げる。</td><td>→ REGISTER</td></tr>
+    <tr><td><code>REGISTER</code></td><td>hub へ WebSocket 接続し、capacity（=レーン数）を登録。心拍を開始。</td><td>→ RUNNING（失敗時はバックオフで再接続を継続）</td></tr>
+    <tr><td><code>RUNNING</code></td><td>接続中。ジョブを受けて lane で実行、15s ごとに心拍、完了数を計数。</td><td>WS断→RECONNECTING ／ N到達→DRAINING</td></tr>
+    <tr><td><code>RECONNECTING</code></td><td>hub との WS が切れ、バックオフで再接続を試行。</td><td>復帰→RUNNING（<strong>無期限に再接続・自滅しない</strong>）</td></tr>
+    <tr><td><code>DRAINING</code></td><td>新規ジョブの受付を止め（capacity=0）、実行中のジョブだけ完了させる。</td><td>→ EXIT</td></tr>
+    <tr><td><code>EXIT</code></td><td>リサイクル（drain 完了後）にプロセスを終了。docker の <code>restart: unless-stopped</code> が新しいプロセスとして作り直す。</td><td>→ docker → STARTING</td></tr>
+  </table>
+
+  <!-- ============================================================= -->
+  <h2 id="autosize">① 同時実行の自動サイジング</h2>
+  <p>
+    起動時に worker が使える CPU コア数からレーン数（同時実行数）を自動で決める。
+    1 レーン ≒ Chrome 1 つ＋付随処理で <code>WORKER_LANE_CORES</code> コアを消費する前提でコア予算を割る。
+  </p>
+  <p class="callout tip">
+    <strong>式：</strong> <code>lanes = clamp( ⌊ WORKER_CPU_BUDGET ÷ WORKER_LANE_CORES ⌋ , 1 , WORKER_MAX_LANES )</code><br>
+    <code>MAX_CONCURRENT</code> を明示した場合はそれを優先（自動算出を無効化）。
+  </p>
+  <table>
+    <tr><th>CPU 予算</th><th>LANE_CORES</th><th>MAX_LANES</th><th>→ レーン数</th></tr>
+    <tr><td>2</td><td>4</td><td>2</td><td>1</td></tr>
+    <tr><td>4</td><td>4</td><td>2</td><td>1</td></tr>
+    <tr><td>8</td><td>4</td><td>2</td><td>2（上限で頭打ち）</td></tr>
+    <tr><td>32</td><td>4</td><td>2</td><td>2（上限で頭打ち＝現状維持）</td></tr>
+  </table>
+  <p class="callout warn">
+    <strong>共有ホスト注意：</strong> 複数 worker が 1 物理ホストを共有する場合、<code>nproc</code>（見かけのコア数）ではなく
+    <strong>その worker の公平取り分</strong>を <code>WORKER_CPU_BUDGET</code> に設定する（例: ホスト32コアを worker 8台で割るなら 4）。
+    ホストに余力がある（CPU 使用率が低い）なら <code>WORKER_MAX_LANES</code> を上げてレーンを増やせる。
+  </p>
+
+  <!-- ============================================================= -->
+  <h2 id="selfheal">② 接続断は「その場で再接続」で耐える</h2>
+  <p>
+    hub との WS が切れると worker はバックオフ（最大15s）で<strong>無期限に再接続を試み続ける</strong>（<code>RECONNECTING</code>）。
+    復帰すれば in-flight を畳んで <code>RUNNING</code> に戻る。<strong>プロセスは自滅しない。</strong>
+    残ったゴースト登録は hub 側の <a href="#reap">④ reaper</a> が自動で掃除するため、その場再接続でも登録は溜まらない。
+  </p>
+  <p class="callout warn">
+    <strong>「接続失敗で自滅→再起動」（Selenium の SHUTDOWN_ON_FAILURE 相当）は意図的に採用していません。</strong>
+    試験導入したところ、<strong>重い動画DLでイベントループが一時的に飢餓</strong>になり心拍が数十秒途絶えただけの「生きている worker」まで
+    “接続失敗”と誤判定して落とし、しかも全台一斉デプロイと噛んで<strong>再起動ストーム</strong>を起こした。
+    そのため<strong>その場再接続（reconnect-in-place）を既定</strong>に戻している。
+    将来再導入するなら、心拍遅延ではなく <strong>「一度も登録できていない＝真の接続失敗」だけ</strong>を条件にすること
+    （<code>WORKER_RECONNECT_GIVEUP_S</code> は将来用に予約。現在は無効）。
+  </p>
+
+  <!-- ============================================================= -->
+  <h2 id="recycle">③ N ジョブごとに自動リサイクル</h2>
+  <p>
+    完了ジョブ数が <code>WORKER_RECYCLE_AFTER_JOBS</code>（既定 200）に達すると、worker は <code>DRAINING</code> に入る。
+    <strong>新規ジョブの受付を止め、実行中のジョブだけ完了</strong>させてから自滅 → 再起動する。
+  </p>
+  <ul>
+    <li>長時間稼働で溜まるリソース（プロセス残骸・メモリ・一時ファイル）を定期的にリセット。</li>
+    <li>drain なので<strong>実行中のジョブは中断されない</strong>（完了を待ってから落ちる）。</li>
+    <li><code>0</code> を指定すると無効化（リサイクルしない）。</li>
+  </ul>
+
+  <!-- ============================================================= -->
+  <h2 id="reap">④ hub 側 stale worker の自動掃除（reaper）</h2>
+  <p>
+    hub は定期タスクで worker 登録を走査し、<strong>心拍が <code>WORKER_STALE_REAP_S</code>（既定 300 秒）以上途絶え、かつ
+    生きた WS 接続を持たない</strong>登録を自動で削除する。
+  </p>
+  <ul>
+    <li>再起動などで残った古い登録（ゴースト）が<strong>放置されず自動で消える</strong>。手動削除は不要。</li>
+    <li>接続中の worker は対象外（生きた WS があれば消さない）。</li>
+    <li>管理画面の worker 一覧が実体と一致し続ける。</li>
+  </ul>
+
+  <!-- ============================================================= -->
+  <h2 id="config">設定一覧</h2>
+  <h3>Worker 側</h3>
+  <table>
+    <tr><th>環境変数</th><th>既定</th><th>説明</th></tr>
+    <tr><td><code>MAX_CONCURRENT</code></td><td>（自動）</td><td>レーン数を明示。設定すると自動サイジングを無効化。</td></tr>
+    <tr><td><code>WORKER_CPU_BUDGET</code></td><td><code>nproc</code></td><td>自動サイジングに使う「この worker の実効コア数」。共有ホストでは公平取り分を設定。</td></tr>
+    <tr><td><code>WORKER_LANE_CORES</code></td><td><code>4</code></td><td>1 レーンが要するコア目安。</td></tr>
+    <tr><td><code>WORKER_MAX_LANES</code></td><td><code>2</code></td><td>自動サイジングの上限（既定は現状維持の 2。余力があれば上げる）。</td></tr>
+    <tr><td><code>WORKER_RECONNECT_GIVEUP_S</code></td><td>—（無効）</td><td>将来用に予約。現在は<strong>未使用</strong>（自滅は不採用 → <a href="#selfheal">②</a> 参照）。</td></tr>
+    <tr><td><code>WORKER_RECYCLE_AFTER_JOBS</code></td><td><code>200</code></td><td>完了ジョブ数がこれに達したら drain→自滅→再起動。<code>0</code> で無効。</td></tr>
+  </table>
+  <h3>Hub 側</h3>
+  <table>
+    <tr><th>環境変数</th><th>既定</th><th>説明</th></tr>
+    <tr><td><code>WORKER_STALE_REAP_S</code></td><td><code>300</code></td><td>心拍がこの秒数途絶え、かつ未接続の登録を reaper が自動削除。</td></tr>
+    <tr><td><code>WORKER_REAP_INTERVAL_S</code></td><td><code>60</code></td><td>reaper の実行間隔。</td></tr>
+  </table>
+  <p class="callout info">
+    既存の <code>ping_interval=30 / ping_timeout=120</code>（WS キープアライブ）、<code>WORKER_TTL=120</code>（active 判定）、
+    各レーンの Chrome watchdog はこれまで通り併用される。本ページの 4 機能はそれらの上に重なる<strong>上位の自己回復層</strong>。
+  </p>
+
+  <!-- ============================================================= -->
+  <h2 id="verify">確認コマンド</h2>
+  <pre><code># 起動時に決まったレーン数（worker ログ）
+docker logs &lt;worker&gt; 2>&1 | grep -iE "lanes|MAX_CONCURRENT|cpu budget"
+
+# 自滅→再起動が起きたか（docker の再起動回数）
+docker inspect -f '{{.RestartCount}} {{.State.StartedAt}}' &lt;worker&gt;
+
+# リサイクルの発生（drain ログ）
+docker logs &lt;worker&gt; 2>&1 | grep -iE "drain|recycle|jobs_done"
+
+# hub の reaper が掃除した記録
+docker logs paprika-hub-1 2>&1 | grep -iE "reap|forgot|stale worker"
+
+# active 一覧（ゴーストが残っていないこと）
+curl -s http://&lt;hub&gt;:8000/workers | python -c "import sys,json;w=json.load(sys.stdin).get('workers',[]);print('active',sum(1 for x in w if (x.get('status')or x.get('state'))=='active'),'/ total',len(w))"</code></pre>
+
+  <div class="see-also">
+    関連: <a href="scaling.html">Hub スケーリング</a> ・ <a href="operations.html">サーバー構成</a> ・ <a href="worker-autodeploy.html">ワーカー自動デプロイ</a>
+  </div>
+
+  </main>
+</div>
+
+</body>
+</html>

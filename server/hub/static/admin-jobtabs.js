@@ -962,13 +962,24 @@ async function ljpNetRefresh() {
           _sid: e.session_id || '(stored)',
         });
       }
-      LJP_NET.cache = flat;
+      // Job finished, sessions reaped. The worker-dumped /network is the
+      // authoritative source WHEN it has entries -- but fetch jobs don't POST a
+      // per-session network dump, so /network is often empty even though the
+      // live [[paprika:netcap]] stream already filled LJP_NET.cache (and
+      // re-opening a finished job replays that SAME marker from the persisted
+      // log.txt back into the cache via ljpNetIngest). So DON'T overwrite a
+      // non-empty live/replayed cache with an empty stored dump -- only replace
+      // when the dump actually has entries. (LJP_NET.cache is reset per job in
+      // ljpReset(), so a kept cache never leaks across jobs.)
+      if (flat.length > 0) LJP_NET.cache = flat;
+      const shown = LJP_NET.cache.length;
       const cnt0 = document.getElementById('ljpNetCount');
-      if (cnt0) cnt0.textContent = String(flat.length);
+      if (cnt0) cnt0.textContent = String(shown);
       ljpNetRender();
       if (status) {
-        status.textContent = flat.length
-          ? (flat.length + ' item(s) · from saved dump · ' + new Date().toLocaleTimeString())
+        status.textContent = shown
+          ? (shown + ' item(s) · ' + (flat.length ? 'from saved dump' : 'from live capture')
+             + ' · ' + new Date().toLocaleTimeString())
           : 'no active session and no saved network log';
       }
       return;

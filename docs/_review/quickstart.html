@@ -1,0 +1,290 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+<meta charset="utf-8">
+<title>Server インストール（セルフホスト） — Paprika</title>
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<link rel="stylesheet" href="/paprika/style.css">
+<script src="https://code.iconify.design/iconify-icon/2.1.0/iconify-icon.min.js"></script>
+<meta name="description" content="docker compose で Paprika を自分の環境に立ち上げる最短手順 — Hub + Worker + Redis 一式を起動、最初のジョブを投げ、結果を取得。動作確認まで 5 分。">
+<link rel="canonical" href="https://paps-jp.github.io/paprika/quickstart.html">
+<meta property="og:type" content="article">
+<meta property="og:site_name" content="Paprika">
+<meta property="og:title" content="Server インストール（セルフホスト） — Paprika">
+<meta property="og:description" content="docker compose で Paprika を自分の環境に立ち上げる最短手順 — Hub + Worker + Redis 一式を起動、最初のジョブを投げ、結果を取得。動作確認まで 5 分。">
+<meta property="og:url" content="https://paps-jp.github.io/paprika/quickstart.html">
+<meta property="og:locale" content="ja_JP">
+</head>
+<body>
+
+<nav class="topnav">
+  <a class="brand" href="index.html"><span class="logo"><img src="icon.svg" alt=""></span> Paprika</a>
+  <span class="links">
+    <span class="dropdown">
+      <a class="dropdown-toggle active" href="why-paprika.html">はじめに ▾</a>
+      <span class="dropdown-menu">
+        <a href="why-paprika.html">なぜ Paprika?</a>
+        <a href="intro.html">Client インストール</a>
+        <a href="quickstart.html" class="active">Server インストール</a>
+      </span>
+    </span>
+    <span class="dropdown">
+      <a class="dropdown-toggle" href="guides.html">学ぶ ▾</a>
+      <span class="dropdown-menu">
+        <a href="guides.html">ガイド</a>
+        <a href="examples.html">サンプル</a>
+        <a href="usecases.html">ユースケース</a>
+        <a href="video.html">動画</a>
+        <a href="faq.html">FAQ</a>
+      </span>
+    </span>
+    <span class="dropdown">
+      <a class="dropdown-toggle" href="api.html">リファレンス ▾</a>
+      <span class="dropdown-menu">
+        <a href="api.html">API</a>
+        <a href="http-api.html">HTTP API</a>
+        <a href="cli.html">CLI</a>
+        <a href="job-options.html">JobOptions</a>
+        <a href="walk.html">walk（巡回）</a>
+        <a href="locator.html">Locator（要素指定）</a>
+        <a href="ws-events.html">WebSocket（ライブログ）</a>
+        <a href="errors.html">エラー一覧</a>
+        <a href="bridge-extension.html">Bridge 拡張</a>
+        <a href="profile.html">use_profile</a>
+        <a href="host-recipe.html">Host レシピ</a>
+        <a href="admin.html">管理画面</a>
+      </span>
+    </span>
+    <a href="operations.html">運用</a>
+    <a href="architecture.html">設計</a>
+  </span>
+  <a class="gh" href="search.html" title="サイト内検索" aria-label="サイト内検索" style="padding:5px 10px; margin-right:6px;"><iconify-icon icon="lucide:search" style="font-size:1.05rem; vertical-align:-3px;"></iconify-icon></a>
+  <a class="gh" href="https://github.com/paps-jp/paprika">GitHub ↗</a>
+</nav>
+
+<div class="layout">
+  <aside class="sidebar">
+    <h4>このページ</h4>
+    <ul id="doc-toc"></ul>
+  </aside>
+  <main class="content">
+    <h1>Server インストール（セルフホスト）</h1>
+    <p class="lead">docker compose で Paprika を自分の環境に立ち上げる最短手順 — Hub + Worker + Redis 一式を起動、最初のジョブを投げ、結果を取得。動作確認まで 5 分。</p>
+    <p>Paprika の <strong>サーバー側</strong>（Hub + Worker + Redis 一式）を自分の環境に立ち上げる手順です。<code class="language-plaintext highlighter-rouge">docker compose up</code> で一式を起動し、最初のジョブを投げて結果を取るまで <strong>5 分</strong>で動作確認できます。</p>
+
+<blockquote>
+  <p>クライアント側（SDK）から接続するだけなら <a href="/paprika/intro.html">Client インストール</a> へ。概念は <a href="architecture.html">アーキテクチャ概要</a>、API は <a href="http-api.html">HTTP API</a> を参照。</p>
+</blockquote>
+
+<h2 id="必要なもの">必要なもの</h2>
+
+<ul>
+  <li><strong>Docker</strong> + <strong>Docker Compose</strong>（v2 系。<code class="language-plaintext highlighter-rouge">docker compose</code> コマンドで動くもの）</li>
+  <li><strong>Git</strong></li>
+  <li><strong>メモリ目安</strong>: ワーカー 1 Lane あたり 約 500 MB〜1 GB（既定 2 Lane = 1〜2 GB を確保）</li>
+</ul>
+
+<blockquote>
+  <p>対応 OS: <strong>Linux</strong> / <strong>macOS</strong>。GitHub Pages 配信のこのドキュメントでは Windows 手順は扱いません。</p>
+</blockquote>
+
+<h2 id="1-リポジトリを取得">1. リポジトリを取得</h2>
+
+<div class="language-bash highlighter-rouge"><div class="highlight"><pre class="highlight"><code>git clone https://github.com/paps-jp/paprika.git
+<span class="nb">cd </span>paprika
+</code></pre></div></div>
+
+<h2 id="2-設定ファイルを作る">2. 設定ファイルを作る</h2>
+
+<div class="language-bash highlighter-rouge"><div class="highlight"><pre class="highlight"><code><span class="nb">cp</span> .env.example .env
+</code></pre></div></div>
+
+<p>最初は <strong>そのまま</strong>で動きます（同一ホストで Hub と Worker を立てる構成のため）。別ホストにワーカーを足すときだけ、後で <code class="language-plaintext highlighter-rouge">.env</code> を編集します（<a href="#add-worker">ワーカーを別ホストに追加</a>）。</p>
+
+<h2 id="3-起動">3. 起動</h2>
+
+<div class="language-bash highlighter-rouge"><div class="highlight"><pre class="highlight"><code>docker compose up <span class="nt">-d</span> <span class="nt">--build</span>
+</code></pre></div></div>
+
+<p>立ち上がるサービス:</p>
+
+<table>
+  <thead>
+    <tr>
+      <th>サービス</th>
+      <th>役割</th>
+      <th>ポート</th>
+    </tr>
+  </thead>
+  <tbody>
+    <tr>
+      <td><strong>redis</strong></td>
+      <td>揮発状態の共有（複数 Hub 構成の基盤）</td>
+      <td>6379</td>
+    </tr>
+    <tr>
+      <td><strong>hub</strong></td>
+      <td>API ・ 管理画面 ・ Worker 制御</td>
+      <td><strong>8000</strong></td>
+    </tr>
+    <tr>
+      <td><strong>worker</strong></td>
+      <td>ブラウザ Lane × N（既定 2）</td>
+      <td>（内部）</td>
+    </tr>
+    <tr>
+      <td><strong>agent</strong></td>
+      <td>ジョブログ等のサイドカー</td>
+      <td>（内部）</td>
+    </tr>
+  </tbody>
+</table>
+
+<blockquote>
+  <p>既定で <strong>Lane = 2</strong>（= 同時実行 2 ジョブ）。後で <code class="language-plaintext highlighter-rouge">.env</code> の <code class="language-plaintext highlighter-rouge">LANE_POOL</code> / <code class="language-plaintext highlighter-rouge">MAX_CONCURRENT</code> を増やせます。</p>
+</blockquote>
+
+<h2 id="4-動いているか確認">4. 動いているか確認</h2>
+
+<div class="language-bash highlighter-rouge"><div class="highlight"><pre class="highlight"><code>curl http://localhost:8000/health
+</code></pre></div></div>
+
+<p><code class="language-plaintext highlighter-rouge">status: ok</code> と接続中のワーカー数が返れば成功です。<strong>管理画面</strong>は次の URL でも開けます。</p>
+
+<div class="language-text highlighter-rouge"><div class="highlight"><pre class="highlight"><code>http://localhost:8000/
+</code></pre></div></div>
+
+<p><img class="shot" src="img/admin-submit.png" alt="Paprika 管理画面の Submit タブ" /></p>
+<p class="shot-cap">起動直後の管理画面（実行タブ）。URL を入れて押すだけでジョブを投入できます。</p>
+
+<h2 id="5-最初のジョブを投げる">5. 最初のジョブを投げる</h2>
+
+<div class="language-bash highlighter-rouge"><div class="highlight"><pre class="highlight"><code>curl <span class="nt">-X</span> POST http://localhost:8000/jobs <span class="se">\</span>
+  <span class="nt">-H</span> <span class="s1">'Content-Type: application/json'</span> <span class="se">\</span>
+  <span class="nt">-d</span> <span class="s1">'{"url":"https://example.com","options":{"mode":"fetch","capture_assets":true}}'</span>
+</code></pre></div></div>
+
+<p>返ってきた <code class="language-plaintext highlighter-rouge">job_id</code> を控えます。</p>
+
+<p>完了を待ちます:</p>
+
+<div class="language-bash highlighter-rouge"><div class="highlight"><pre class="highlight"><code><span class="nv">JID</span><span class="o">=</span>&lt;job_id&gt;
+<span class="k">while</span> :<span class="p">;</span> <span class="k">do
+  </span><span class="nv">s</span><span class="o">=</span><span class="si">$(</span>curl <span class="nt">-s</span> <span class="s2">"http://localhost:8000/jobs/</span><span class="nv">$JID</span><span class="s2">"</span> | python <span class="nt">-c</span> <span class="s1">'import sys,json;print(json.load(sys.stdin)["status"])'</span><span class="si">)</span>
+  <span class="nb">echo</span> <span class="s2">"</span><span class="nv">$s</span><span class="s2">"</span><span class="p">;</span> <span class="k">case</span> <span class="s2">"</span><span class="nv">$s</span><span class="s2">"</span> <span class="k">in </span>completed|failed|cancelled<span class="p">)</span> <span class="nb">break</span><span class="p">;;</span> <span class="k">esac</span><span class="p">;</span> <span class="nb">sleep </span>2
+<span class="k">done</span>
+</code></pre></div></div>
+
+<p>取れたものを見ます:</p>
+
+<div class="language-bash highlighter-rouge"><div class="highlight"><pre class="highlight"><code>curl <span class="nt">-s</span> <span class="s2">"http://localhost:8000/jobs/</span><span class="nv">$JID</span><span class="s2">/assets.json"</span>
+</code></pre></div></div>
+
+<p>API の詳しい使い方は <a href="http-api.html">HTTP API</a> を、SDK は <a href="/paprika/intro.html">Client インストール</a> を参照。</p>
+
+<h2 id="6-sdk-から叩く任意">6. SDK から叩く（任意）</h2>
+
+<div class="language-bash highlighter-rouge"><div class="highlight"><pre class="highlight"><code>pip <span class="nb">install </span>paprika-client
+<span class="nb">export </span><span class="nv">PAPRIKA_HUB</span><span class="o">=</span>http://localhost:8000
+</code></pre></div></div>
+
+<div class="language-python highlighter-rouge"><div class="highlight"><pre class="highlight"><code><span class="kn">import</span> <span class="nn">asyncio</span>
+<span class="kn">from</span> <span class="nn">paprika_client</span> <span class="kn">import</span> <span class="n">paprika</span>
+
+<span class="k">async</span> <span class="k">def</span> <span class="nf">main</span><span class="p">():</span>
+    <span class="k">async</span> <span class="k">with</span> <span class="n">paprika</span><span class="p">()</span> <span class="k">as</span> <span class="n">cli</span><span class="p">:</span>
+        <span class="n">result</span> <span class="o">=</span> <span class="k">await</span> <span class="n">cli</span><span class="p">.</span><span class="n">fetch</span><span class="p">(</span><span class="s">"https://example.com"</span><span class="p">)</span>
+        <span class="k">print</span><span class="p">(</span><span class="n">result</span><span class="p">.</span><span class="n">assets</span><span class="p">)</span>
+
+<span class="n">asyncio</span><span class="p">.</span><span class="n">run</span><span class="p">(</span><span class="n">main</span><span class="p">())</span>
+</code></pre></div></div>
+
+<h2 id="add-worker">ワーカーを別ホストに追加</h2>
+
+<p>同じ Hub に <strong>別マシンのワーカー</strong> をぶら下げてスケールできます。ワーカー側ホストで:</p>
+
+<div class="language-bash highlighter-rouge"><div class="highlight"><pre class="highlight"><code>git clone https://github.com/paps-jp/paprika.git
+<span class="nb">cd </span>paprika
+<span class="nb">cp</span> .env.example .env
+</code></pre></div></div>
+
+<p><code class="language-plaintext highlighter-rouge">.env</code> を編集:</p>
+
+<div class="language-ini highlighter-rouge"><div class="highlight"><pre class="highlight"><code><span class="c"># Hub の場所
+</span><span class="py">HUB_URL</span><span class="p">=</span><span class="s">ws://&lt;hub-host&gt;:8000</span>
+
+<span class="c"># このワーカーの LAN IP / DNS。noVNC ライブ画面のリンク生成に使う
+</span><span class="py">NOVNC_PUBLIC_HOST</span><span class="p">=</span><span class="s">&lt;this-host-lan-ip&gt;</span>
+</code></pre></div></div>
+
+<p>起動:</p>
+
+<div class="language-bash highlighter-rouge"><div class="highlight"><pre class="highlight"><code>docker compose <span class="nt">-f</span> docker-compose-worker.yml up <span class="nt">-d</span> <span class="nt">--build</span>
+</code></pre></div></div>
+
+<p>Hub の管理画面で <strong>ワーカー一覧</strong>に出てくれば成功です。</p>
+
+<h2 id="よく使う操作">よく使う操作</h2>
+
+<div class="language-bash highlighter-rouge"><div class="highlight"><pre class="highlight"><code><span class="c"># ログを見る</span>
+docker compose logs hub <span class="nt">--tail</span> 50
+docker compose logs worker <span class="nt">--tail</span> 50
+
+<span class="c"># 設定変更を反映</span>
+docker compose restart hub
+
+<span class="c"># 一旦止める / 再開</span>
+docker compose down
+docker compose up <span class="nt">-d</span>
+</code></pre></div></div>
+
+<p>ワーカー側コードを変えたとき: 普段は <strong>ハブを再起動するだけで OK</strong>。ワーカーは次のハンドシェイクで自動更新します（<a href="/paprika/worker-autodeploy.html">ワーカー自動デプロイ</a>）。</p>
+
+<h2 id="うまく動かないとき">うまく動かないとき</h2>
+
+<ul>
+  <li><strong><code class="language-plaintext highlighter-rouge">/health</code> が応答しない</strong> — <code class="language-plaintext highlighter-rouge">docker compose logs hub</code> を確認。8000 番が他で使われていないか。</li>
+  <li><strong>ジョブが <code class="language-plaintext highlighter-rouge">queued</code> のまま</strong> — ワーカーが繋がっていません。<code class="language-plaintext highlighter-rouge">docker compose logs worker</code> を確認。</li>
+  <li><strong><code class="language-plaintext highlighter-rouge">503 fleet at capacity</code></strong> — ワーカーが満杯です。<code class="language-plaintext highlighter-rouge">LANE_POOL</code> を増やすか、別ホストにワーカーを足す。クライアントは指数バックオフ再試行を（<a href="faq.html#retry-503">FAQ: 503</a>）。</li>
+  <li><strong>ライブ画面（noVNC）が映らない</strong> — <code class="language-plaintext highlighter-rouge">NOVNC_PUBLIC_HOST</code> がそのワーカーの <strong>LAN IP / DNS</strong> になっているか確認。</li>
+</ul>
+
+<h2 id="次のステップ">次のステップ</h2>
+
+<ul>
+  <li><a href="/paprika/intro.html">Client インストール</a> — 概念と基本操作</li>
+  <li><a href="/paprika/guides.html">ガイド</a> — 画像/動画取得、ログイン、<code class="language-plaintext highlighter-rouge">walk</code> など実用パターン</li>
+  <li><a href="http-api.html">HTTP API</a> — 任意の言語から叩く</li>
+  <li><a href="/paprika/operations.html">サーバー構成</a> — 本格運用への 3 つのパターン</li>
+  <li><a href="/paprika/scaling.html">Hub スケーリング</a> — 複数 Hub に水平スケール</li>
+</ul>
+
+  </main>
+</div>
+<script>
+// Build the "このページ" sidebar from the rendered <h2> headings (each gets an
+// id from kramdown auto_ids). No headings -> drop the sidebar column so the
+// content fills the full width instead of sitting in the narrow sidebar slot.
+(function () {
+  var toc = document.getElementById('doc-toc');
+  var heads = document.querySelectorAll('.content h2[id]');
+  if (!toc) return;
+  if (!heads.length) {
+    var aside = document.querySelector('.sidebar');
+    var layout = document.querySelector('.layout');
+    if (aside) aside.style.display = 'none';
+    if (layout) layout.style.gridTemplateColumns = '1fr';
+    return;
+  }
+  heads.forEach(function (h) {
+    var li = document.createElement('li');
+    var a = document.createElement('a');
+    a.href = '#' + h.id;
+    a.textContent = h.textContent;
+    li.appendChild(a);
+    toc.appendChild(li);
+  });
+})();
+</script>
+</body>
+</html>

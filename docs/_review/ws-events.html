@@ -1,0 +1,284 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+<meta charset="utf-8">
+<title>WebSocket — ライブログ /jobs/{id}/events — Paprika</title>
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<link rel="stylesheet" href="/paprika/style.css">
+<script src="https://code.iconify.design/iconify-icon/2.1.0/iconify-icon.min.js"></script>
+<meta name="description" content="ジョブの実行ログをリアルタイムで受信する WebSocket /jobs/{id}/events の仕様 — メッセージ型(log/done/error)、since= による途中接続、再接続戦略、JS/Python の実装例。">
+<link rel="canonical" href="https://paps-jp.github.io/paprika/ws-events.html">
+<meta property="og:type" content="article">
+<meta property="og:site_name" content="Paprika">
+<meta property="og:title" content="WebSocket — ライブログ /jobs/{id}/events — Paprika">
+<meta property="og:description" content="ジョブの実行ログをリアルタイムで受信する WebSocket /jobs/{id}/events の仕様 — メッセージ型(log/done/error)、since= による途中接続、再接続戦略、JS/Python の実装例。">
+<meta property="og:url" content="https://paps-jp.github.io/paprika/ws-events.html">
+<meta property="og:locale" content="ja_JP">
+</head>
+<body>
+
+<nav class="topnav">
+  <a class="brand" href="index.html"><span class="logo"><img src="icon.svg" alt=""></span> Paprika</a>
+  <span class="links">
+    <span class="dropdown">
+      <a class="dropdown-toggle" href="why-paprika.html">はじめに ▾</a>
+      <span class="dropdown-menu">
+        <a href="why-paprika.html">なぜ Paprika?</a>
+        <a href="intro.html">Client インストール</a>
+        <a href="quickstart.html">Server インストール</a>
+      </span>
+    </span>
+    <span class="dropdown">
+      <a class="dropdown-toggle" href="guides.html">学ぶ ▾</a>
+      <span class="dropdown-menu">
+        <a href="guides.html">ガイド</a>
+        <a href="examples.html">サンプル</a>
+        <a href="usecases.html">ユースケース</a>
+        <a href="video.html">動画</a>
+        <a href="faq.html">FAQ</a>
+      </span>
+    </span>
+    <span class="dropdown">
+      <a class="dropdown-toggle active" href="api.html">リファレンス ▾</a>
+      <span class="dropdown-menu">
+        <a href="api.html">API</a>
+        <a href="http-api.html">HTTP API</a>
+        <a href="cli.html">CLI</a>
+        <a href="job-options.html">JobOptions</a>
+        <a href="walk.html">walk（巡回）</a>
+        <a href="locator.html">Locator（要素指定）</a>
+        <a href="ws-events.html" class="active">WebSocket（ライブログ）</a>
+        <a href="errors.html">エラー一覧</a>
+        <a href="bridge-extension.html">Bridge 拡張</a>
+        <a href="profile.html">use_profile</a>
+        <a href="host-recipe.html">Host レシピ</a>
+        <a href="admin.html">管理画面</a>
+      </span>
+    </span>
+    <a href="operations.html">運用</a>
+    <a href="architecture.html">設計</a>
+  </span>
+  <a class="gh" href="search.html" title="サイト内検索" aria-label="サイト内検索" style="padding:5px 10px; margin-right:6px;"><iconify-icon icon="lucide:search" style="font-size:1.05rem; vertical-align:-3px;"></iconify-icon></a>
+  <a class="gh" href="https://github.com/paps-jp/paprika">GitHub ↗</a>
+</nav>
+
+<div class="layout">
+  <aside class="sidebar">
+    <h4>このページ</h4>
+    <ul id="doc-toc"></ul>
+  </aside>
+  <main class="content">
+    <h1>WebSocket — ライブログ /jobs/{id}/events</h1>
+    <p class="lead">ジョブの実行ログをリアルタイムで受信する WebSocket /jobs/{id}/events の仕様 — メッセージ型(log/done/error)、since= による途中接続、再接続戦略、JS/Python の実装例。</p>
+    <p>実行中のジョブのログを <strong>リアルタイムで受信</strong>する WebSocket です。完了を待つだけならポーリング（<a href="http-api.html">HTTP API</a>）で十分ですが、<strong>長時間ジョブ</strong>や<strong>ライブ表示</strong>にはこちらが向きます。</p>
+
+<h2 id="接続">接続</h2>
+
+<div class="language-plaintext highlighter-rouge"><div class="highlight"><pre class="highlight"><code>ws://localhost:8000/jobs/{job_id}/events?since=N
+wss://your-hub.example/jobs/{job_id}/events?since=N
+</code></pre></div></div>
+
+<ul>
+  <li><code class="language-plaintext highlighter-rouge">since=N</code>（任意、整数）: ログを <strong>N 行目から</strong>送ってほしい。再接続時に使う（<a href="#reconnect">後述</a>）。既定 <code class="language-plaintext highlighter-rouge">0</code>。</li>
+  <li>認証: 既定で<strong>認証なし</strong>（private LAN 前提）。外部公開時は手前にリバプロを。</li>
+</ul>
+
+<h2 id="メッセージの形">メッセージの形</h2>
+
+<p>各メッセージは <strong>JSON 1 行</strong>。共通形は <code class="language-plaintext highlighter-rouge">{ "type": &lt;kind&gt;, "data": { ... } }</code>。</p>
+
+<table>
+  <thead>
+    <tr>
+      <th><code class="language-plaintext highlighter-rouge">type</code></th>
+      <th><code class="language-plaintext highlighter-rouge">data</code></th>
+      <th>意味</th>
+    </tr>
+  </thead>
+  <tbody>
+    <tr>
+      <td><code class="language-plaintext highlighter-rouge">log</code></td>
+      <td><code class="language-plaintext highlighter-rouge">{ "line": "&lt;text&gt;" }</code></td>
+      <td>ログ行が 1 つ流れた</td>
+    </tr>
+    <tr>
+      <td><code class="language-plaintext highlighter-rouge">done</code></td>
+      <td><code class="language-plaintext highlighter-rouge">{ "status": "completed" \| "failed" \| "cancelled" }</code></td>
+      <td>ジョブが終端に達した（この後 WS は閉じる）</td>
+    </tr>
+    <tr>
+      <td><code class="language-plaintext highlighter-rouge">error</code></td>
+      <td><code class="language-plaintext highlighter-rouge">{ "message": "&lt;reason&gt;" }</code></td>
+      <td>サーバ側のエラー（接続時 <code class="language-plaintext highlighter-rouge">job not found</code> 等）</td>
+    </tr>
+  </tbody>
+</table>
+
+<p><code class="language-plaintext highlighter-rouge">status</code> の値は <code class="language-plaintext highlighter-rouge">GET /jobs/{id}</code> の <code class="language-plaintext highlighter-rouge">status</code> と同じ意味です。</p>
+
+<h2 id="最小例javascript--ブラウザ">最小例（JavaScript / ブラウザ）</h2>
+
+<div class="language-javascript highlighter-rouge"><div class="highlight"><pre class="highlight"><code><span class="kd">const</span> <span class="nx">ws</span> <span class="o">=</span> <span class="k">new</span> <span class="nx">WebSocket</span><span class="p">(</span><span class="s2">`ws://localhost:8000/jobs/</span><span class="p">${</span><span class="nx">jobId</span><span class="p">}</span><span class="s2">/events?since=0`</span><span class="p">);</span>
+<span class="nx">ws</span><span class="p">.</span><span class="nx">onmessage</span> <span class="o">=</span> <span class="p">(</span><span class="nx">e</span><span class="p">)</span> <span class="o">=&gt;</span> <span class="p">{</span>
+  <span class="kd">const</span> <span class="nx">ev</span> <span class="o">=</span> <span class="nx">JSON</span><span class="p">.</span><span class="nx">parse</span><span class="p">(</span><span class="nx">e</span><span class="p">.</span><span class="nx">data</span><span class="p">);</span>
+  <span class="k">if</span> <span class="p">(</span><span class="nx">ev</span><span class="p">.</span><span class="nx">type</span> <span class="o">===</span> <span class="dl">"</span><span class="s2">log</span><span class="dl">"</span><span class="p">)</span>   <span class="nx">console</span><span class="p">.</span><span class="nx">log</span><span class="p">(</span><span class="nx">ev</span><span class="p">.</span><span class="nx">data</span><span class="p">.</span><span class="nx">line</span><span class="p">);</span>
+  <span class="k">if</span> <span class="p">(</span><span class="nx">ev</span><span class="p">.</span><span class="nx">type</span> <span class="o">===</span> <span class="dl">"</span><span class="s2">done</span><span class="dl">"</span><span class="p">)</span>  <span class="nx">console</span><span class="p">.</span><span class="nx">log</span><span class="p">(</span><span class="dl">"</span><span class="s2">ended:</span><span class="dl">"</span><span class="p">,</span> <span class="nx">ev</span><span class="p">.</span><span class="nx">data</span><span class="p">.</span><span class="nx">status</span><span class="p">);</span>
+  <span class="k">if</span> <span class="p">(</span><span class="nx">ev</span><span class="p">.</span><span class="nx">type</span> <span class="o">===</span> <span class="dl">"</span><span class="s2">error</span><span class="dl">"</span><span class="p">)</span> <span class="nx">console</span><span class="p">.</span><span class="nx">warn</span><span class="p">(</span><span class="dl">"</span><span class="s2">error:</span><span class="dl">"</span><span class="p">,</span> <span class="nx">ev</span><span class="p">.</span><span class="nx">data</span><span class="p">.</span><span class="nx">message</span><span class="p">);</span>
+<span class="p">};</span>
+<span class="nx">ws</span><span class="p">.</span><span class="nx">onclose</span> <span class="o">=</span> <span class="p">()</span> <span class="o">=&gt;</span> <span class="nx">console</span><span class="p">.</span><span class="nx">log</span><span class="p">(</span><span class="dl">"</span><span class="s2">disconnected</span><span class="dl">"</span><span class="p">);</span>
+</code></pre></div></div>
+
+<h2 id="最小例python--websockets">最小例（Python / <code class="language-plaintext highlighter-rouge">websockets</code>）</h2>
+
+<div class="language-python highlighter-rouge"><div class="highlight"><pre class="highlight"><code><span class="kn">import</span> <span class="nn">asyncio</span><span class="p">,</span> <span class="n">json</span><span class="p">,</span> <span class="n">websockets</span>
+
+<span class="k">async</span> <span class="k">def</span> <span class="nf">tail</span><span class="p">(</span><span class="n">job_id</span><span class="p">:</span> <span class="nb">str</span><span class="p">):</span>
+    <span class="n">url</span> <span class="o">=</span> <span class="sa">f</span><span class="s">"ws://localhost:8000/jobs/</span><span class="si">{</span><span class="n">job_id</span><span class="si">}</span><span class="s">/events?since=0"</span>
+    <span class="k">async</span> <span class="k">with</span> <span class="n">websockets</span><span class="p">.</span><span class="n">connect</span><span class="p">(</span><span class="n">url</span><span class="p">)</span> <span class="k">as</span> <span class="n">ws</span><span class="p">:</span>
+        <span class="k">async</span> <span class="k">for</span> <span class="n">raw</span> <span class="ow">in</span> <span class="n">ws</span><span class="p">:</span>
+            <span class="n">ev</span> <span class="o">=</span> <span class="n">json</span><span class="p">.</span><span class="n">loads</span><span class="p">(</span><span class="n">raw</span><span class="p">)</span>
+            <span class="k">if</span> <span class="n">ev</span><span class="p">[</span><span class="s">"type"</span><span class="p">]</span> <span class="o">==</span> <span class="s">"log"</span><span class="p">:</span>
+                <span class="k">print</span><span class="p">(</span><span class="n">ev</span><span class="p">[</span><span class="s">"data"</span><span class="p">][</span><span class="s">"line"</span><span class="p">])</span>
+            <span class="k">elif</span> <span class="n">ev</span><span class="p">[</span><span class="s">"type"</span><span class="p">]</span> <span class="o">==</span> <span class="s">"done"</span><span class="p">:</span>
+                <span class="k">print</span><span class="p">(</span><span class="s">"ended:"</span><span class="p">,</span> <span class="n">ev</span><span class="p">[</span><span class="s">"data"</span><span class="p">][</span><span class="s">"status"</span><span class="p">])</span>
+                <span class="k">break</span>
+
+<span class="n">asyncio</span><span class="p">.</span><span class="n">run</span><span class="p">(</span><span class="n">tail</span><span class="p">(</span><span class="s">"ccea8ea9dc2a"</span><span class="p">))</span>
+</code></pre></div></div>
+
+<h2 id="reconnect">再接続戦略</h2>
+
+<p>ネットワークが切れたら <strong>指数バックオフで再接続</strong> し、<strong><code class="language-plaintext highlighter-rouge">since=&lt;受信済み行数&gt;</code></strong> で続きから受け取ります。サーバは過去のログを保持しているので <strong>抜けなく追従</strong>できます。</p>
+
+<div class="language-javascript highlighter-rouge"><div class="highlight"><pre class="highlight"><code><span class="kd">let</span> <span class="nx">seen</span> <span class="o">=</span> <span class="mi">0</span><span class="p">;</span>
+<span class="kd">function</span> <span class="nx">connect</span><span class="p">()</span> <span class="p">{</span>
+  <span class="kd">const</span> <span class="nx">ws</span> <span class="o">=</span> <span class="k">new</span> <span class="nx">WebSocket</span><span class="p">(</span><span class="s2">`ws://localhost:8000/jobs/</span><span class="p">${</span><span class="nx">jobId</span><span class="p">}</span><span class="s2">/events?since=</span><span class="p">${</span><span class="nx">seen</span><span class="p">}</span><span class="s2">`</span><span class="p">);</span>
+  <span class="kd">let</span> <span class="nx">backoff</span> <span class="o">=</span> <span class="mi">1000</span><span class="p">;</span>
+  <span class="nx">ws</span><span class="p">.</span><span class="nx">onmessage</span> <span class="o">=</span> <span class="p">(</span><span class="nx">e</span><span class="p">)</span> <span class="o">=&gt;</span> <span class="p">{</span>
+    <span class="kd">const</span> <span class="nx">ev</span> <span class="o">=</span> <span class="nx">JSON</span><span class="p">.</span><span class="nx">parse</span><span class="p">(</span><span class="nx">e</span><span class="p">.</span><span class="nx">data</span><span class="p">);</span>
+    <span class="k">if</span> <span class="p">(</span><span class="nx">ev</span><span class="p">.</span><span class="nx">type</span> <span class="o">===</span> <span class="dl">"</span><span class="s2">log</span><span class="dl">"</span><span class="p">)</span> <span class="p">{</span> <span class="nx">seen</span><span class="o">++</span><span class="p">;</span> <span class="nx">render</span><span class="p">(</span><span class="nx">ev</span><span class="p">.</span><span class="nx">data</span><span class="p">.</span><span class="nx">line</span><span class="p">);</span> <span class="p">}</span>
+    <span class="k">if</span> <span class="p">(</span><span class="nx">ev</span><span class="p">.</span><span class="nx">type</span> <span class="o">===</span> <span class="dl">"</span><span class="s2">done</span><span class="dl">"</span><span class="p">)</span> <span class="p">{</span> <span class="nx">ws</span><span class="p">.</span><span class="nx">close</span><span class="p">();</span> <span class="nx">finalize</span><span class="p">(</span><span class="nx">ev</span><span class="p">.</span><span class="nx">data</span><span class="p">.</span><span class="nx">status</span><span class="p">);</span> <span class="p">}</span>
+  <span class="p">};</span>
+  <span class="nx">ws</span><span class="p">.</span><span class="nx">onopen</span>  <span class="o">=</span> <span class="p">()</span> <span class="o">=&gt;</span> <span class="p">{</span> <span class="nx">backoff</span> <span class="o">=</span> <span class="mi">1000</span><span class="p">;</span> <span class="p">};</span>
+  <span class="nx">ws</span><span class="p">.</span><span class="nx">onclose</span> <span class="o">=</span> <span class="p">()</span> <span class="o">=&gt;</span> <span class="p">{</span>
+    <span class="nx">setTimeout</span><span class="p">(</span><span class="nx">connect</span><span class="p">,</span> <span class="nx">backoff</span><span class="p">);</span>
+    <span class="nx">backoff</span> <span class="o">=</span> <span class="nb">Math</span><span class="p">.</span><span class="nx">min</span><span class="p">(</span><span class="nx">backoff</span> <span class="o">*</span> <span class="mi">2</span><span class="p">,</span> <span class="mi">15000</span><span class="p">);</span>   <span class="c1">// 1s, 2s, 4s, ..., 15s 上限</span>
+  <span class="p">};</span>
+<span class="p">}</span>
+<span class="nx">connect</span><span class="p">();</span>
+</code></pre></div></div>
+
+<p>ポイント:</p>
+
+<ul>
+  <li><code class="language-plaintext highlighter-rouge">since=</code> を <strong>クライアント側で必ず保持</strong>してから再接続。</li>
+  <li><code class="language-plaintext highlighter-rouge">done</code> を受け取ったら<strong>再接続しない</strong>（次は出ません）。</li>
+</ul>
+
+<h2 id="サーバ側の動き参考">サーバ側の動き（参考）</h2>
+
+<ul>
+  <li>ハブはジョブごとに<strong>過去ログを保持</strong>しており、新規 WS 接続時に <code class="language-plaintext highlighter-rouge">since</code> 以降をまとめて送ったあと、以降は新しい行を<strong>即座にプッシュ</strong>します。</li>
+  <li>ジョブが既に終了している場合は、<code class="language-plaintext highlighter-rouge">done</code> をすぐ送って閉じます。<code class="language-plaintext highlighter-rouge">status</code> で結果が分かります。</li>
+  <li>完了直前の最終ログが<strong>消えないように</strong>、<code class="language-plaintext highlighter-rouge">done</code> の直前に残バッファを flush します。</li>
+</ul>
+
+<h2 id="ログ以外管理画面向け">ログ以外（管理画面向け）</h2>
+
+<p><code class="language-plaintext highlighter-rouge">type: log</code> のうち、いくつかの<strong>特殊プレフィックス</strong>でハブが付け足す行があります（管理画面の Live パネル用、操作者向け）:</p>
+
+<table>
+  <thead>
+    <tr>
+      <th>プレフィックス</th>
+      <th>用途</th>
+    </tr>
+  </thead>
+  <tbody>
+    <tr>
+      <td><code class="language-plaintext highlighter-rouge">[[paprika:progress]] {...}</code></td>
+      <td>ダウンロード進捗（プログレスバーに表示）</td>
+    </tr>
+    <tr>
+      <td><code class="language-plaintext highlighter-rouge">[[paprika:netcap]] {...}</code></td>
+      <td>通信トレース・キャプチャの増分</td>
+    </tr>
+    <tr>
+      <td><code class="language-plaintext highlighter-rouge">[[paprika:asset]] ...</code></td>
+      <td>アセットが 1 件追加されたサイン</td>
+    </tr>
+    <tr>
+      <td><code class="language-plaintext highlighter-rouge">[[paprika:links]] ...</code></td>
+      <td>リンク一覧が更新されたサイン</td>
+    </tr>
+  </tbody>
+</table>
+
+<p>これらは管理画面では UI に反映されますが、自前のロガーで読むときは <strong><code class="language-plaintext highlighter-rouge">startswith("[[paprika:")</code> で除外</strong>するのがおすすめです。</p>
+
+<h2 id="いつ使う">いつ使う?</h2>
+
+<table>
+  <thead>
+    <tr>
+      <th>やりたいこと</th>
+      <th>推奨</th>
+    </tr>
+  </thead>
+  <tbody>
+    <tr>
+      <td>終了を待ちたいだけ</td>
+      <td><code class="language-plaintext highlighter-rouge">GET /jobs/{id}</code> のポーリング（<a href="http-api.html">HTTP API</a>）</td>
+    </tr>
+    <tr>
+      <td>長時間ジョブをライブで見たい</td>
+      <td><strong>このページ</strong></td>
+    </tr>
+    <tr>
+      <td>ダウンロード進捗を出したい</td>
+      <td><strong>このページ</strong>（<code class="language-plaintext highlighter-rouge">[[paprika:progress]]</code> を読む）</td>
+    </tr>
+    <tr>
+      <td>ブラウザ画面そのものを見たい</td>
+      <td><a href="/paprika/vnc-embed.html">VNC 埋め込み</a></td>
+    </tr>
+  </tbody>
+</table>
+
+<h2 id="関連">関連</h2>
+
+<ul>
+  <li><a href="http-api.html">HTTP API</a></li>
+  <li><a href="/paprika/api.html">API リファレンス</a></li>
+  <li><a href="/paprika/admin.html">管理画面ガイド</a></li>
+</ul>
+
+  </main>
+</div>
+<script>
+// Build the "このページ" sidebar from the rendered <h2> headings (each gets an
+// id from kramdown auto_ids). No headings -> drop the sidebar column so the
+// content fills the full width instead of sitting in the narrow sidebar slot.
+(function () {
+  var toc = document.getElementById('doc-toc');
+  var heads = document.querySelectorAll('.content h2[id]');
+  if (!toc) return;
+  if (!heads.length) {
+    var aside = document.querySelector('.sidebar');
+    var layout = document.querySelector('.layout');
+    if (aside) aside.style.display = 'none';
+    if (layout) layout.style.gridTemplateColumns = '1fr';
+    return;
+  }
+  heads.forEach(function (h) {
+    var li = document.createElement('li');
+    var a = document.createElement('a');
+    a.href = '#' + h.id;
+    a.textContent = h.textContent;
+    li.appendChild(a);
+    toc.appendChild(li);
+  });
+})();
+</script>
+</body>
+</html>

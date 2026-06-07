@@ -1592,7 +1592,15 @@ async def _handle_worker_message(worker, msg) -> None:
     assert state.store is not None and state.registry is not None
 
     if isinstance(msg, WorkerHeartbeat):
-        await state.registry.heartbeat(worker.worker_id, msg.in_flight)
+        await state.registry.heartbeat(
+            worker.worker_id,
+            msg.in_flight,
+            cpu_pct=msg.cpu_pct,
+            mem_pct=msg.mem_pct,
+            disk_pct=msg.disk_pct,
+            disk_free_gb=msg.disk_free_gb,
+            load1=msg.load1,
+        )
         # Mirror the cache snapshot onto the ConnectedWorker so
         # GET /workers can render it without an extra round-trip
         # to the worker. The list is short (typical operator has

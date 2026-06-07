@@ -499,6 +499,19 @@ class _SessionsMixin:
                 except Exception:
                     # Best-effort: the script can page.goto() to retry.
                     pass
+                # Wait for the initial page to reach DOM-ready BEFORE we ack
+                # the hub. Otherwise ``async with cli.session(url) as page:``
+                # returns while the page is still loading and the caller's
+                # first ``page.click(...)`` hits NO_MATCH on an unparsed DOM.
+                # Bounded by NAV_LOAD_TIMEOUT_S (kept under the hub's 60s
+                # start_session timeout, so this never trips it).
+                try:
+                    await browser_ops.wait_for_load(
+                        state.tab,
+                        lambda s: _logger.info(f"[session {sid}] {s}"),
+                    )
+                except Exception:
+                    pass
 
             ack.lane_idx = lane.lane_idx
             ack.novnc_url = lane.novnc_url

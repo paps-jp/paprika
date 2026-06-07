@@ -97,7 +97,7 @@ async function renderHosts() {
     // through to a Recipes tab is gone; open the host's modal to edit.
     const rcpCount = (h.fetch_recipes || []).length;
     const rcpBtn = rcpCount > 0
-      ? `<span class="pill" style="background:#fff7e6; border-color:#e8c97a; color:#7a5a14; padding:1px 8px; font-size:.78em;" title="${rcpCount} legacy fetch_recipes (browse removed in v2; managed via Host edit modal)"><iconify-icon icon="lucide:bento"></iconify-icon> ${rcpCount}</span>`
+      ? `<span class="pill" style="background:#fff7e6; border-color:#e8c97a; color:#7a5a14; padding:1px 8px; font-size:.78em;" title="${rcpCount} legacy fetch_recipes (browse removed in v2; managed via Host edit modal)"><iconify-icon icon="lucide:bookmark-plus"></iconify-icon> ${rcpCount}</span>`
       : `<span style="color:#999; font-size:.78em;">—</span>`;
     return `
       <tr>

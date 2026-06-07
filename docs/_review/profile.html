@@ -1,0 +1,253 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+<meta charset="utf-8">
+<title>use_profile — Chrome プロファイルの持ち込み — Paprika</title>
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<link rel="stylesheet" href="/paprika/style.css">
+<script src="https://code.iconify.design/iconify-icon/2.1.0/iconify-icon.min.js"></script>
+<meta name="description" content="ログイン状態を含む Chrome の User Data フォルダ(プロファイル)をアップロードしてジョブに使う方法。tar.gz 形式・Default/ 正規化・既定プロファイル・複数 Hub 間の共有を解説。">
+<link rel="canonical" href="https://paps-jp.github.io/paprika/profile.html">
+<meta property="og:type" content="article">
+<meta property="og:site_name" content="Paprika">
+<meta property="og:title" content="use_profile — Chrome プロファイルの持ち込み — Paprika">
+<meta property="og:description" content="ログイン状態を含む Chrome の User Data フォルダ(プロファイル)をアップロードしてジョブに使う方法。tar.gz 形式・Default/ 正規化・既定プロファイル・複数 Hub 間の共有を解説。">
+<meta property="og:url" content="https://paps-jp.github.io/paprika/profile.html">
+<meta property="og:locale" content="ja_JP">
+</head>
+<body>
+
+<nav class="topnav">
+  <a class="brand" href="index.html"><span class="logo"><img src="icon.svg" alt=""></span> Paprika</a>
+  <span class="links">
+    <span class="dropdown">
+      <a class="dropdown-toggle" href="why-paprika.html">はじめに ▾</a>
+      <span class="dropdown-menu">
+        <a href="why-paprika.html">なぜ Paprika?</a>
+        <a href="intro.html">Client インストール</a>
+        <a href="quickstart.html">Server インストール</a>
+      </span>
+    </span>
+    <span class="dropdown">
+      <a class="dropdown-toggle" href="guides.html">学ぶ ▾</a>
+      <span class="dropdown-menu">
+        <a href="guides.html">ガイド</a>
+        <a href="examples.html">サンプル</a>
+        <a href="usecases.html">ユースケース</a>
+        <a href="video.html">動画</a>
+        <a href="faq.html">FAQ</a>
+      </span>
+    </span>
+    <span class="dropdown">
+      <a class="dropdown-toggle active" href="api.html">リファレンス ▾</a>
+      <span class="dropdown-menu">
+        <a href="api.html">API</a>
+        <a href="http-api.html">HTTP API</a>
+        <a href="cli.html">CLI</a>
+        <a href="job-options.html">JobOptions</a>
+        <a href="walk.html">walk（巡回）</a>
+        <a href="locator.html">Locator（要素指定）</a>
+        <a href="ws-events.html">WebSocket（ライブログ）</a>
+        <a href="errors.html">エラー一覧</a>
+        <a href="bridge-extension.html">Bridge 拡張</a>
+        <a href="profile.html" class="active">use_profile</a>
+        <a href="host-recipe.html">Host レシピ</a>
+        <a href="admin.html">管理画面</a>
+      </span>
+    </span>
+    <a href="operations.html">運用</a>
+    <a href="architecture.html">設計</a>
+  </span>
+  <a class="gh" href="search.html" title="サイト内検索" aria-label="サイト内検索" style="padding:5px 10px; margin-right:6px;"><iconify-icon icon="lucide:search" style="font-size:1.05rem; vertical-align:-3px;"></iconify-icon></a>
+  <a class="gh" href="https://github.com/paps-jp/paprika">GitHub ↗</a>
+</nav>
+
+<div class="layout">
+  <aside class="sidebar">
+    <h4>このページ</h4>
+    <ul id="doc-toc"></ul>
+  </aside>
+  <main class="content">
+    <h1>use_profile — Chrome プロファイルの持ち込み</h1>
+    <p class="lead">ログイン状態を含む Chrome の User Data フォルダ(プロファイル)をアップロードしてジョブに使う方法。tar.gz 形式・Default/ 正規化・既定プロファイル・複数 Hub 間の共有を解説。</p>
+    <p><code class="language-plaintext highlighter-rouge">use_profile</code> は、自分の <strong>Chrome の User Data フォルダ（プロファイル）をアップロード</strong>して、そのログイン状態を含むまま Paprika のジョブに使う仕組みです。Cookie だけでなく <strong>autofill / 保存パスワード / 拡張機能 / 設定</strong>まで丸ごと持ち込めます。</p>
+
+<blockquote>
+  <p><strong>uBlock Origin / Bitwarden / MetaMask など普段使っている Chrome 拡張</strong>もそのまま動きます。広告ブロック付きで収集、保存パスワードで自動ログイン、Web3 サインなど、<strong>手元の Chrome と同じ環境</strong>でジョブが走らせられます。</p>
+</blockquote>
+
+<blockquote>
+  <p>軽い用途（Cookie だけ）なら <a href="bridge-extension.html">Bridge 拡張</a> のほうが手軽です。期限切れの自動更新は <a href="host-recipe.html">Host レシピ</a> を参照。</p>
+</blockquote>
+
+<h2 id="いつ使うか">いつ使うか</h2>
+
+<table>
+  <thead>
+    <tr>
+      <th>シナリオ</th>
+      <th>推奨</th>
+    </tr>
+  </thead>
+  <tbody>
+    <tr>
+      <td>Cookie だけで足りる</td>
+      <td><a href="bridge-extension.html">Bridge 拡張</a></td>
+    </tr>
+    <tr>
+      <td><strong>autofill / 保存パスワード / 拡張機能</strong> も欲しい</td>
+      <td><strong><code class="language-plaintext highlighter-rouge">use_profile</code></strong>（このページ）</td>
+    </tr>
+    <tr>
+      <td>何度もログインし直したくない</td>
+      <td><strong><code class="language-plaintext highlighter-rouge">use_profile</code></strong> + <a href="host-recipe.html">Host レシピ</a></td>
+    </tr>
+  </tbody>
+</table>
+
+<h2 id="アップロードする中身">アップロードする中身</h2>
+
+<p>Chrome の <strong>User Data 配下の 1 プロファイル</strong>（典型は <code class="language-plaintext highlighter-rouge">Default/</code>）。Paprika は以下の形を受け付けます:</p>
+
+<table>
+  <thead>
+    <tr>
+      <th>形</th>
+      <th>説明</th>
+    </tr>
+  </thead>
+  <tbody>
+    <tr>
+      <td><code class="language-plaintext highlighter-rouge">Default/...</code> を含む tar.gz</td>
+      <td>既定。<strong>Hub がそのまま採用</strong></td>
+    </tr>
+    <tr>
+      <td><code class="language-plaintext highlighter-rouge">Profile N/...</code> を含む tar.gz</td>
+      <td><strong><code class="language-plaintext highlighter-rouge">Default/</code> に正規化</strong>して受け付け</td>
+    </tr>
+    <tr>
+      <td>Cookies などが<strong>ルートに直接</strong></td>
+      <td><strong><code class="language-plaintext highlighter-rouge">Default/</code> で包んで</strong>正規化</td>
+    </tr>
+  </tbody>
+</table>
+
+<blockquote>
+  <p>必要なら <code class="language-plaintext highlighter-rouge">Local State</code>（ルート直下）も同梱できます。</p>
+</blockquote>
+
+<h2 id="アップロード">アップロード</h2>
+
+<h3 id="cli推奨">CLI（推奨）</h3>
+
+<div class="language-bash highlighter-rouge"><div class="highlight"><pre class="highlight"><code>paprika-client upload-profile &lt;name&gt; &lt;path/to/profile_dir_or_tarball&gt;
+</code></pre></div></div>
+
+<p>例:</p>
+
+<div class="language-bash highlighter-rouge"><div class="highlight"><pre class="highlight"><code><span class="c"># Linux/Mac: User Data の 1 プロファイルを直接渡す</span>
+paprika-client upload-profile work ~/.config/google-chrome/Default
+<span class="c"># tar.gz を渡してもOK</span>
+paprika-client upload-profile work ./profile-snapshot.tar.gz
+</code></pre></div></div>
+
+<h3 id="http-api">HTTP API</h3>
+
+<div class="language-bash highlighter-rouge"><div class="highlight"><pre class="highlight"><code>curl <span class="nt">-X</span> POST <span class="s2">"</span><span class="nv">$PAPRIKA_HUB</span><span class="s2">/profiles/work"</span> <span class="se">\</span>
+  <span class="nt">-H</span> <span class="s1">'Content-Type: application/x-tar'</span> <span class="nt">--data-binary</span> @profile.tar.gz
+</code></pre></div></div>
+
+<p><code class="language-plaintext highlighter-rouge">name</code> は a-z0-9 と <code class="language-plaintext highlighter-rouge">-</code> <code class="language-plaintext highlighter-rouge">_</code> で、サイト識別しやすいものを（例: <code class="language-plaintext highlighter-rouge">work</code> / <code class="language-plaintext highlighter-rouge">paps-staging</code> / <code class="language-plaintext highlighter-rouge">tw-bob</code>）。</p>
+
+<h2 id="ジョブから使う">ジョブから使う</h2>
+
+<div class="language-python highlighter-rouge"><div class="highlight"><pre class="highlight"><code><span class="n">job</span> <span class="o">=</span> <span class="k">await</span> <span class="n">cli</span><span class="p">.</span><span class="n">fetch</span><span class="p">(</span>
+    <span class="s">"https://example.com"</span><span class="p">,</span>
+    <span class="n">use_profile</span><span class="o">=</span><span class="s">"work"</span><span class="p">,</span>          <span class="c1"># 名前で指定
+</span><span class="p">)</span>
+</code></pre></div></div>
+
+<div class="language-bash highlighter-rouge"><div class="highlight"><pre class="highlight"><code>curl <span class="nt">-X</span> POST <span class="s2">"</span><span class="nv">$PAPRIKA_HUB</span><span class="s2">/jobs"</span> <span class="nt">-H</span> <span class="s1">'Content-Type: application/json'</span> <span class="nt">-d</span> <span class="s1">'{
+  "url":"https://example.com",
+  "options":{"mode":"fetch","use_profile":"work"}
+}'</span>
+</code></pre></div></div>
+
+<p>ジョブは <strong>その Worker の Lane に対し、プロファイルを差し込んだ状態</strong>で Chrome を立ち上げ、終わったら<strong>元の素の状態に戻します</strong>（Lane 自体は壊しません）。</p>
+
+<h2 id="既定プロファイル">既定プロファイル</h2>
+
+<p><code class="language-plaintext highlighter-rouge">options.use_profile</code> を<strong>省略したジョブ</strong>は、Hub に登録した「既定プロファイル」が（あれば）自動で使われます。常にログインで取りたいときに便利です。</p>
+
+<div class="language-bash highlighter-rouge"><div class="highlight"><pre class="highlight"><code><span class="c"># 既定を設定</span>
+curl <span class="nt">-X</span> POST <span class="s2">"</span><span class="nv">$PAPRIKA_HUB</span><span class="s2">/profiles/work/default"</span>
+
+<span class="c"># 確認</span>
+curl <span class="s2">"</span><span class="nv">$PAPRIKA_HUB</span><span class="s2">/profiles/default"</span>
+
+<span class="c"># 解除</span>
+curl <span class="nt">-X</span> DELETE <span class="s2">"</span><span class="nv">$PAPRIKA_HUB</span><span class="s2">/profiles/default"</span>
+</code></pre></div></div>
+
+<h2 id="一覧--削除">一覧 / 削除</h2>
+
+<div class="language-bash highlighter-rouge"><div class="highlight"><pre class="highlight"><code><span class="c"># 一覧</span>
+curl <span class="s2">"</span><span class="nv">$PAPRIKA_HUB</span><span class="s2">/profiles"</span>
+
+<span class="c"># 中身（メタ情報）</span>
+curl <span class="s2">"</span><span class="nv">$PAPRIKA_HUB</span><span class="s2">/profiles/work"</span>
+
+<span class="c"># 削除</span>
+curl <span class="nt">-X</span> DELETE <span class="s2">"</span><span class="nv">$PAPRIKA_HUB</span><span class="s2">/profiles/work"</span>
+</code></pre></div></div>
+
+<h2 id="複数-hub-間の共有">複数 Hub 間の共有</h2>
+
+<p>複数 Hub 構成では、プロファイルは <strong>MariaDB(メタ) + MinIO(本体)</strong> で共有され、<strong>どの Hub からも同じ名前で使えます</strong>。<code class="language-plaintext highlighter-rouge">work</code> を 1 Hub にアップロードすれば、別 Hub で投げたジョブからも <code class="language-plaintext highlighter-rouge">use_profile: "work"</code> で参照可能です（<a href="architecture-hub.html">Hub の仕組み</a>）。</p>
+
+<h2 id="注意">注意</h2>
+
+<ul>
+  <li>アップロードする tar.gz の <strong>先頭ディレクトリ名</strong>は気にしなくて構いません（Hub が <code class="language-plaintext highlighter-rouge">Default/</code> に正規化します）。</li>
+  <li><strong>拡張機能</strong>は通常の Chrome の場所だと Profile 移動後に無効化されることがあります（PreferenceVerifier）。Paprika 側は <code class="language-plaintext highlighter-rouge">--load-extension</code> で再注入して持ち込みます。</li>
+  <li>既定プロファイルは Hub 側の設定なので、<strong>運用全体に効く</strong>点に注意。</li>
+</ul>
+
+<h2 id="関連">関連</h2>
+
+<ul>
+  <li><a href="bridge-extension.html">Bridge 拡張</a></li>
+  <li><a href="host-recipe.html">Host レシピ</a></li>
+  <li><a href="/paprika/api.html">API リファレンス</a></li>
+  <li><a href="faq.html">FAQ: ログイン必須サイト</a></li>
+</ul>
+
+  </main>
+</div>
+<script>
+// Build the "このページ" sidebar from the rendered <h2> headings (each gets an
+// id from kramdown auto_ids). No headings -> drop the sidebar column so the
+// content fills the full width instead of sitting in the narrow sidebar slot.
+(function () {
+  var toc = document.getElementById('doc-toc');
+  var heads = document.querySelectorAll('.content h2[id]');
+  if (!toc) return;
+  if (!heads.length) {
+    var aside = document.querySelector('.sidebar');
+    var layout = document.querySelector('.layout');
+    if (aside) aside.style.display = 'none';
+    if (layout) layout.style.gridTemplateColumns = '1fr';
+    return;
+  }
+  heads.forEach(function (h) {
+    var li = document.createElement('li');
+    var a = document.createElement('a');
+    a.href = '#' + h.id;
+    a.textContent = h.textContent;
+    li.appendChild(a);
+    toc.appendChild(li);
+  });
+})();
+</script>
+</body>
+</html>
