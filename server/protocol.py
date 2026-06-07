@@ -325,6 +325,13 @@ class JobInfo(BaseModel):
         "completion as a historical reference (the session "
         "itself may already be closed).",
     )
+    # Phase 2 (tenancy): owner that submitted this job. "default" = the shared
+    # tenant (pre-tenancy rows + anything created while auth is off/optional).
+    # Used to scope GET /jobs* to the caller under enforce; admins see all.
+    owner_id: str = Field(
+        "default",
+        description="Owner (tenant) that submitted the job; 'default' = shared.",
+    )
 
 
 class JobResult(BaseModel):
@@ -444,6 +451,19 @@ class WorkerHeartbeat(BaseModel):
         "and /profiles responses so the admin UI can show "
         "which workers are ready for which profile.",
     )
+    # Host/CT resource snapshot taken at heartbeat time. All optional
+    # (default 0.0) so an older worker that doesn't send them still
+    # deserialises -- the admin UI just shows "—" for that row.
+    # cpu_pct + load1 reflect the LXC HOST (Proxmox node), since the CT
+    # shares its kernel and /proc/stat. mem_pct + disk_* reflect the CT
+    # itself (cgroup-limited mem + overlayfs root). The split is what an
+    # operator needs to distinguish "this CT is full" from "the underlying
+    # node is overloaded across all its CTs".
+    cpu_pct: float = 0.0
+    mem_pct: float = 0.0
+    disk_pct: float = 0.0
+    disk_free_gb: float = 0.0
+    load1: float = 0.0
 
 
 class WorkerJobAccepted(BaseModel):

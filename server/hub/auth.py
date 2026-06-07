@@ -114,6 +114,36 @@ ANONYMOUS = Principal(kind="anonymous", id="anonymous", role="anon")
 
 
 # ---------------------------------------------------------------------------
+# Tenancy helpers (Phase 2 — owner_id isolation)
+# ---------------------------------------------------------------------------
+# The shared tenant that owns all pre-tenancy data and everything created while
+# auth is off/optional. Isolation only bites under enforce for non-admin users,
+# so "default" keeps single-tenant behaviour intact until then.
+DEFAULT_OWNER = "default"
+
+
+def owner_of(request) -> str:
+    """Owner id to STAMP on data a request creates. A real user → their
+    ``principal.id`` (usr_…); SYSTEM / anonymous (auth off/optional) →
+    ``DEFAULT_OWNER`` (shared tenant)."""
+    p = getattr(getattr(request, "state", None), "principal", None) or ANONYMOUS
+    return p.id if p.kind == "user" else DEFAULT_OWNER
+
+
+def should_scope(principal: "Principal | None") -> bool:
+    """Whether reads/lists must be FILTERED to the caller's owner. Only under
+    ``enforce`` for a non-admin user — admin / system / anonymous (off/optional)
+    see everything, so this is a no-op for the live fleet until enforce + real
+    non-admin users exist."""
+    return (
+        current_mode() == AuthMode.ENFORCE
+        and principal is not None
+        and principal.kind == "user"
+        and not principal.is_admin
+    )
+
+
+# ---------------------------------------------------------------------------
 # Crypto helpers
 # ---------------------------------------------------------------------------
 
@@ -646,6 +676,7 @@ def _parse_dt_for_sql(iso: str):
 
 __all__ = [
     "AuthMode", "current_mode", "Principal", "SYSTEM", "ANONYMOUS",
+    "DEFAULT_OWNER", "owner_of", "should_scope",
     "AuthStore", "hash_password", "verify_password",
     "generate_api_key", "hash_api_key_secret", "parse_api_key",
     "SESSION_COOKIE", "sign_session", "verify_session", "get_session_secret",

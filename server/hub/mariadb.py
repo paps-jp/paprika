@@ -44,6 +44,7 @@ _TABLES: list[tuple[str, str]] = [
             worker_id     VARCHAR(128),
             lane_idx      INT,
             session_id    VARCHAR(128),
+            owner_id      VARCHAR(64)   NOT NULL DEFAULT 'default',
             created_at    DATETIME(3),
             started_at    DATETIME(3),
             completed_at  DATETIME(3),
@@ -60,7 +61,8 @@ _TABLES: list[tuple[str, str]] = [
             -- the single-column status/mode index; at 2,000+ rows the
             -- difference is ~500ms vs <10ms per query.
             INDEX idx_status_created (status, created_at),
-            INDEX idx_mode_created   (mode, created_at)
+            INDEX idx_mode_created   (mode, created_at),
+            INDEX idx_owner_created  (owner_id, created_at)
         ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci
         """,
     ),
@@ -397,6 +399,9 @@ async def ensure_schema(pool: Any) -> list[str]:
     # Apply additive migrations after CREATE TABLE so they target the
     # current schema. Run separately so a single failing migration
     # doesn't block the rest.
+    # Columns BEFORE indexes so an index that references a freshly-added
+    # column (e.g. jobs.owner_id) finds it.
+    await _apply_column_migrations(pool)
     await _apply_index_migrations(pool)
     return created
 
@@ -417,6 +422,8 @@ _REQUIRED_INDEXES: list[tuple[str, str, str]] = [
     ("jobs", "idx_status_created", "(status, created_at)"),
     # Same shape for "WHERE mode=X ORDER BY created_at DESC LIMIT N".
     ("jobs", "idx_mode_created", "(mode, created_at)"),
+    # Phase 2 tenancy: "WHERE owner_id=X ORDER BY created_at DESC".
+    ("jobs", "idx_owner_created", "(owner_id, created_at)"),
 ]
 
 
@@ -436,6 +443,40 @@ async def _apply_index_migrations(pool: Any) -> None:
                 except Exception as e:
                     log.warning(
                         "index migration %s.%s failed: %s", table, name, e,
+                    )
+
+
+# ---------------------------------------------------------------------------
+# Additive column migrations (idempotent)
+# ---------------------------------------------------------------------------
+#
+# Like the index migrations: ``CREATE TABLE IF NOT EXISTS`` never alters an
+# existing table, so columns newly added to the DDL above are absent on legacy
+# DBs. This adds them via ``ADD COLUMN IF NOT EXISTS`` (MariaDB 10.0.2+). Each
+# entry is (table, column, "<type + default>"). Called BEFORE the index
+# migrations so an index referencing a freshly-added column finds it.
+
+_REQUIRED_COLUMNS: list[tuple[str, str, str]] = [
+    # Phase 2 tenancy: owner that submitted the job. Existing rows backfill to
+    # the shared 'default' tenant via the column DEFAULT.
+    ("jobs", "owner_id", "VARCHAR(64) NOT NULL DEFAULT 'default'"),
+]
+
+
+async def _apply_column_migrations(pool: Any) -> None:
+    """Idempotently add any columns in ``_REQUIRED_COLUMNS`` missing from the
+    live schema. Safe on every startup (ADD COLUMN IF NOT EXISTS); failures are
+    logged, not propagated."""
+    async with pool.acquire() as conn:
+        async with conn.cursor() as cur:
+            for table, col, spec in _REQUIRED_COLUMNS:
+                try:
+                    await cur.execute(
+                        f"ALTER TABLE `{table}` ADD COLUMN IF NOT EXISTS `{col}` {spec}"
+                    )
+                except Exception as e:
+                    log.warning(
+                        "column migration %s.%s failed: %s", table, col, e,
                     )
 
 

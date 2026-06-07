@@ -100,10 +100,10 @@ class MariaDBJobStore:
                 await cur.execute(
                     """INSERT INTO jobs
                        (job_id, status, url, mode, goal, options,
-                        worker_id, lane_idx, session_id,
+                        worker_id, lane_idx, session_id, owner_id,
                         created_at, started_at, completed_at,
                         error, progress)
-                       VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)
+                       VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)
                        ON DUPLICATE KEY UPDATE
                          status=VALUES(status), url=VALUES(url),
                          mode=VALUES(mode), goal=VALUES(goal),
@@ -125,6 +125,7 @@ class MariaDBJobStore:
                         info.worker_id,
                         info.lane_idx,
                         info.session_id,
+                        getattr(info, "owner_id", None) or "default",
                         _parse_dt(info.created_at),
                         _parse_dt(info.started_at),
                         _parse_dt(info.completed_at),
@@ -141,12 +142,55 @@ class MariaDBJobStore:
                 await cur.execute(
                     "SELECT job_id, status, url, mode, goal, options, "
                     "worker_id, lane_idx, session_id, "
-                    "created_at, started_at, completed_at, error, progress "
+                    "created_at, started_at, completed_at, error, progress, "
+                    "owner_id "
                     "FROM jobs WHERE job_id=%s", (job_id,))
                 row = await cur.fetchone()
         if not row:
             return None
         return _row_to_job_info(row)
+
+    async def claim_queued_job(
+        self, job_id: str, worker_id: str, started_at: Any
+    ) -> bool:
+        """Atomically transition a job ``queued`` -> ``running`` for redrive
+        dispatch. Returns True iff THIS call won the claim (the UPDATE matched
+        a still-``queued``, still-UNASSIGNED row).
+
+        Cross-hub safe: when several hubs' redrive loops race for the same
+        queued job, only ONE hub's UPDATE matches and flips it -- the losers
+        get rowcount 0 and skip. This is the dispatch mutex for
+        server/hub/_redrive.py (no Redis lease needed; the SoT row IS the lock).
+        The ``worker_id IS NULL`` guard ALSO makes it safe against a live
+        ``POST /jobs`` handler: POST records a ``worker_id`` the instant it
+        hands a job to a worker (even while status is still ``queued``, before
+        the worker reports ``running``), so this claim can never steal a job
+        that POST already dispatched. The caller sends the worker assignment
+        only on a True return, and calls :meth:`release_claimed_job` to revert
+        if that send fails."""
+        async with self._pool.acquire() as conn:
+            async with conn.cursor() as cur:
+                await cur.execute(
+                    "UPDATE jobs SET status='running', worker_id=%s, "
+                    "started_at=%s WHERE job_id=%s AND status='queued' "
+                    "AND worker_id IS NULL",
+                    (worker_id, _parse_dt(started_at), job_id),
+                )
+                return cur.rowcount == 1
+
+    async def release_claimed_job(self, job_id: str) -> bool:
+        """Revert a redrive claim (``running`` -> ``queued``) when the worker
+        send failed, so a later pass can retry it. Only flips a row that is
+        still ``running`` -- if the worker already picked it up and the job
+        moved on (completed/failed), this is a no-op (rowcount 0)."""
+        async with self._pool.acquire() as conn:
+            async with conn.cursor() as cur:
+                await cur.execute(
+                    "UPDATE jobs SET status='queued', worker_id=NULL, "
+                    "started_at=NULL WHERE job_id=%s AND status='running'",
+                    (job_id,),
+                )
+                return cur.rowcount == 1
 
     async def list_job_ids(
         self, offset: int = 0, limit: int = 0
@@ -192,6 +236,7 @@ class MariaDBJobStore:
         status: list[str] | None = None,
         mode: list[str] | None = None,
         url_substr: str | None = None,
+        owner_id: str | None = None,
     ) -> tuple[list[Any], int]:
         """Return (infos, total_matching) in a single hydration query.
 
@@ -216,6 +261,9 @@ class MariaDBJobStore:
         if url_substr:
             clauses.append("url LIKE %s")
             params.append(f"%{url_substr}%")
+        if owner_id:
+            clauses.append("owner_id = %s")
+            params.append(owner_id)
 
         where_sql = ("WHERE " + " AND ".join(clauses)) if clauses else ""
 
@@ -233,7 +281,8 @@ class MariaDBJobStore:
                 select_cols = (
                     "job_id, status, url, mode, goal, options, "
                     "worker_id, lane_idx, session_id, "
-                    "created_at, started_at, completed_at, error, progress"
+                    "created_at, started_at, completed_at, error, progress, "
+                    "owner_id"
                 )
                 if limit > 0:
                     page_sql = (
@@ -675,4 +724,5 @@ def _row_to_job_info(row: tuple) -> Any:
         worker_id=row[6],
         lane_idx=row[7],
         session_id=row[8],
+        owner_id=(row[14] if len(row) > 14 else None) or "default",
     )

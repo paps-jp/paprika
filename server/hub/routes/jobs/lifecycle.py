@@ -47,6 +47,25 @@ log = logging.getLogger(__name__)
 
 from server.hub.routes.jobs._base import *  # noqa: F401,F403 (router + helpers)
 
+def _scope_owner(request) -> str | None:
+    """Owner id to filter job reads by, or None when the caller sees everything
+    (Phase 2 tenancy). Only a non-admin user under enforce is scoped; admin /
+    system / off / optional return None = unfiltered (non-breaking)."""
+    from server.hub.auth import owner_of, should_scope
+    p = getattr(getattr(request, "state", None), "principal", None)
+    return owner_of(request) if should_scope(p) else None
+
+
+async def _require_owned_job_info(job_id: str, request):
+    """Fetch a job (404 if absent), then 404 again for a scoped caller that
+    doesn't own it — so other tenants can't even confirm a job exists."""
+    info = await _require_job_info(job_id)
+    _own = _scope_owner(request)
+    if _own is not None and getattr(info, "owner_id", "default") != _own:
+        raise HTTPException(404, "job not found")
+    return info
+
+
 @router.get("/jobs")
 async def list_jobs(
     request: Request,
@@ -116,6 +135,7 @@ async def list_jobs(
             status=status_list,
             mode=mode_list,
             url_substr=q,
+            owner_id=_scope_owner(request),
         )
         page = [_proxy_info(i, request) for i in infos]
         return {
@@ -131,7 +151,8 @@ async def list_jobs(
     # hydrate-then-filter-in-Python approach. Equivalent behaviour,
     # acceptable cost when N is small.
     # ------------------------------------------------------------------
-    has_filter = bool(status or mode or q)
+    _own = _scope_owner(request)
+    has_filter = bool(status or mode or q or _own)
     if has_filter or lim == 0:
         ids = await state.store.list_job_ids()
         total_in_store = len(ids)
@@ -161,6 +182,8 @@ async def list_jobs(
     if q:
         ql = q.lower()
         infos = [i for i in infos if ql in (i.url or "").lower()]
+    if _own is not None:
+        infos = [i for i in infos if getattr(i, "owner_id", "default") == _own]
 
     filtered_total = len(infos)
 
@@ -357,6 +380,11 @@ async def get_jobs_summary() -> dict:
 @router.get("/jobs/{job_id}", response_model=JobInfo)
 async def get_job(job_id: str, request: Request) -> JobInfo:
     info = await _require_job_info(job_id)
+    # Phase 2 tenancy: a scoped (non-admin, enforce) caller may only read its
+    # own jobs; others 404 (not 403, to avoid confirming existence).
+    _own = _scope_owner(request)
+    if _own is not None and getattr(info, "owner_id", "default") != _own:
+        raise HTTPException(404, "job not found")
     # Rewrite novnc_url to point at the hub's noVNC proxy so external
     # clients don't need to reach individual worker LAN IPs. See
     # ``_hub_proxied_novnc_url`` and the /jobs/{id}/novnc/* endpoints
@@ -365,8 +393,8 @@ async def get_job(job_id: str, request: Request) -> JobInfo:
 
 
 @router.get("/jobs/{job_id}/result", response_model=JobResult)
-async def get_job_result(job_id: str) -> JobResult:
-    info = await _require_job_info(job_id)
+async def get_job_result(job_id: str, request: Request) -> JobResult:
+    info = await _require_owned_job_info(job_id, request)
     if info.status not in (JobStatus.completed, JobStatus.failed, JobStatus.cancelled):
         raise HTTPException(409, f"job not finished (status={info.status})")
     result = await state.store.get_job_result(job_id)
@@ -378,7 +406,7 @@ async def get_job_result(job_id: str) -> JobResult:
 
 
 @router.get("/jobs/{job_id}/visited")
-async def get_job_visited(job_id: str) -> dict:
+async def get_job_visited(job_id: str, request: Request) -> dict:
     """Return the list of canonical URLs the agent visited during the job.
 
     Mostly empty for plain-fetch jobs; populated for agent-mode jobs
@@ -386,7 +414,7 @@ async def get_job_visited(job_id: str) -> dict:
     JobResult.visited_urls, broken out so dashboards / scripts can hit
     a stable JSON shape without parsing the full result object.
     """
-    info = await _require_job_info(job_id)
+    info = await _require_owned_job_info(job_id, request)
     result = await state.store.get_job_result(job_id)
     urls = list(result.visited_urls) if result else []
     return {
@@ -398,7 +426,7 @@ async def get_job_visited(job_id: str) -> dict:
 
 
 @router.post("/jobs/{job_id}/cancel")
-async def cancel_job(job_id: str) -> dict:
+async def cancel_job(job_id: str, request: Request) -> dict:
     """Cancel an in-flight job. Cancels the orchestrator task (which
     propagates to execute_in_sandbox -> the docker runner subprocess
     gets killed), then marks the job as ``cancelled`` and broadcasts a
@@ -406,7 +434,7 @@ async def cancel_job(job_id: str) -> dict:
 
     Idempotent: cancelling an already-finished job is a no-op
     returning ``{cancelled: false}``."""
-    info = await _require_job_info(job_id)
+    info = await _require_owned_job_info(job_id, request)
     if info.status not in (JobStatus.queued, JobStatus.running):
         return {
             "job_id": job_id,
@@ -452,8 +480,13 @@ async def cancel_job(job_id: str) -> dict:
 
 
 @router.delete("/jobs/{job_id}")
-async def delete_job(job_id: str) -> dict:
+async def delete_job(job_id: str, request: Request) -> dict:
     assert state.store is not None
+    _own = _scope_owner(request)
+    if _own is not None:
+        _i = await state.store.get_job_info(job_id)
+        if _i is not None and getattr(_i, "owner_id", "default") != _own:
+            raise HTTPException(404, "job not found")
     t = state.local_tasks.pop(job_id, None)
     if t and not t.done():
         t.cancel()
@@ -597,6 +630,41 @@ async def cleanup_jobs_legacy(body: dict) -> dict:
     return await cleanup_jobs(body)
 
 
+async def _fleet_has_spare_capacity() -> bool:
+    """True if a worker-dispatched (fetch) job can be placed right now -- THIS
+    hub has a free lane, or (failing that) a peer hub does.
+
+    Used by the at-capacity gate in ``create_job`` to 503 BEFORE issuing a
+    job_id, rather than persisting a phantom ``queued`` row that just waits
+    behind the fleet's long-running (legitimate, slow) video downloads. Mirrors
+    the dispatch's own pick_worker + cross-hub logic.
+
+    Grace policy: if the local registry is momentarily EMPTY (the hub-restart
+    reconnect window) wait briefly for workers to re-announce; but if workers
+    ARE connected and simply all-busy, that's genuinely full -> reject fast
+    (don't hold the request behind a 20-minute download)."""
+    reg = state.registry
+    if reg is None:
+        return False
+    if reg.pick_worker() is not None:
+        return True
+    # Empty registry => probably the reconnect window; give it a short grace.
+    if not reg.alive_workers():
+        deadline = time.monotonic() + min(JOB_DISPATCH_GRACE_S, 5.0)
+        while time.monotonic() < deadline:
+            await asyncio.sleep(_JOB_DISPATCH_POLL_S)
+            if reg.pick_worker() is not None:
+                return True
+    # Locally full -> only "has capacity" if a peer hub has a free lane (the
+    # dispatch below would cross-hub forward to it).
+    try:
+        if state.hubs is not None and await _peer_hub_with_spare_capacity():
+            return True
+    except Exception:
+        pass
+    return False
+
+
 @router.post("/jobs", response_model=JobInfo)
 async def create_job(req: JobRequest, request: Request) -> JobInfo:
     if not req.url:
@@ -614,6 +682,58 @@ async def create_job(req: JobRequest, request: Request) -> JobInfo:
     assert_public_url(req.url)
     assert state.store is not None and state.registry is not None
 
+    # Same-URL dedup (operator policy 2026-06-06): if the EXACT same URL is
+    # already queued or running as a fetch, reject this submission with a 409.
+    # The top source of duplicate lanes was clients re-submitting a slow/long
+    # fetch (e.g. a 20-min video download) while the first is still in flight --
+    # two lanes then burn on the same work. The DB-side url LIKE narrows to the
+    # 0-2 candidate rows; the exact `j.url == req.url` filter is the real test.
+    # Scope: fetch only (codegen-loop/rerun differ by goal/script even on the
+    # same URL; attach_to_job is intentionally tied to another job).
+    if (req.options.mode or "fetch") == "fetch" and not req.options.attach_to_job:
+        try:
+            _active, _ = await state.store.list_job_infos(
+                status=["queued", "running"], url_substr=req.url, limit=100
+            )
+        except Exception:
+            _active = []
+        _dup = next(
+            (
+                j for j in _active
+                if j.url == req.url
+                and (j.options.mode if j.options else "fetch") == "fetch"
+            ),
+            None,
+        )
+        if _dup is not None:
+            _st = _dup.status.value if hasattr(_dup.status, "value") else str(_dup.status)
+            # No job_id is issued for the duplicate -- we reject BEFORE creating
+            # one, and (per operator policy) the error must not carry a job_id at
+            # all (not even the existing job's), to match the at-capacity 503.
+            raise HTTPException(
+                409,
+                f"a fetch job for this URL is already {_st}; "
+                f"not creating a duplicate (retry after it finishes)",
+            )
+
+    # At-capacity gate (operator policy 2026-06-06): when the fleet is full,
+    # REJECT worker-dispatched (fetch) jobs up front with a 503 -- do NOT issue
+    # a job_id or persist a queued row. The fleet's lanes are routinely tied up
+    # by legitimate but SLOW video downloads (yt-dlp, 100MB+ at ~70KiB/s ≈ 20
+    # min), so a phantom queued job would just wait behind them. A clean "full,
+    # retry" error lets the client back off instead. Skipped for:
+    #   * codegen-loop / rerun -- hub-orchestrated (GPU-gated, no worker lane);
+    #   * attach_to_job (pinned) -- targets one specific worker regardless of
+    #     its in_flight, so the fleet-wide capacity check doesn't apply.
+    if (
+        (req.options.mode or "fetch") not in ("codegen-loop", "rerun")
+        and not req.options.attach_to_job
+        and not await _fleet_has_spare_capacity()
+    ):
+        raise HTTPException(
+            503, "fleet at capacity (all lanes busy); retry with backoff"
+        )
+
     # v2 Phase 5: HostKnowledge consultation.
     # If we have learned knowledge for this URL's host, apply hints
     # before the job is dispatched. Today this just tweaks JobOptions
@@ -624,6 +744,7 @@ async def create_job(req: JobRequest, request: Request) -> JobInfo:
     _hk_consultation = _consult_host_knowledge(req.url, req.options)
 
     job_id = uuid.uuid4().hex[:12]
+    from server.hub.auth import owner_of
     info = JobInfo(
         job_id=job_id,
         status=JobStatus.queued,
@@ -631,6 +752,7 @@ async def create_job(req: JobRequest, request: Request) -> JobInfo:
         options=req.options,
         created_at=datetime.utcnow(),
         progress=JobProgress(phase="queued"),
+        owner_id=owner_of(request),
     )
     await state.store.save_job_info(info)
 
@@ -1194,12 +1316,19 @@ async def create_job(req: JobRequest, request: Request) -> JobInfo:
     # surfaces fleet capacity. Mark the JobInfo as failed so the admin
     # history shows the rejection rather than leaving a phantom queued
     # entry.
-    info.status = JobStatus.failed
-    info.error = "no worker available (fleet at capacity)"
-    info.progress.phase = "failed"
-    info.completed_at = datetime.utcnow()
+    # Reached only in the rare race where capacity existed at the at-capacity
+    # gate (top of create_job) but vanished before we could place the job (the
+    # picked worker filled up / the send failed AND no peer had room). Honour
+    # the "no phantom job_id when full" policy: drop the row + dir we eagerly
+    # created so the client just sees a clean 503 with nothing left behind
+    # (instead of a lingering failed "fleet at capacity" job in the admin list).
     try:
-        await state.store.save_job_info(info)
+        await state.store.delete_job(job_id)
+    except Exception:
+        pass
+    try:
+        import shutil
+        shutil.rmtree(get_storage_dir() / job_id, ignore_errors=True)
     except Exception:
         pass
     raise HTTPException(
