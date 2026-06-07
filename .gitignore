@@ -99,3 +99,5 @@ extracted-from-*
 orig.png
 orig.jpg
 *.scratch
+# Operator scratch dir: ad-hoc probe / cmp / deploy / test one-offs.
+_vfix/
