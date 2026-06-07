@@ -89,7 +89,10 @@ async def navigate(tab, url: str, log: LogFn) -> str:
     # close the hub->worker DNS-rebind/TOCTOU gap. No-op for public URLs and
     # when PAPRIKA_ALLOW_PRIVATE_URLS=1 (LAN fleets).
     from core.ssrf_guard import navigation_block_reason
-    _ssrf = navigation_block_reason(url)
+    # navigation_block_reason may do a blocking socket.getaddrinfo() to resolve
+    # a hostname; run it OFF the event loop so a slow DNS lookup can't stall the
+    # worker's asyncio loop (shared across lanes) -> hub WS keepalive timeout.
+    _ssrf = await asyncio.to_thread(navigation_block_reason, url)
     if _ssrf:
         log(f"  [agent] navigate {url!r}: BLOCKED by SSRF guard: {_ssrf}")
         return f"ERR: blocked by SSRF guard: {_ssrf}"
