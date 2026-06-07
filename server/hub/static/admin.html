@@ -1039,7 +1039,6 @@ asyncio.run(main())"
 </div>
 
 <div class="panel" data-panel="workers">
-  <section>
     <!-- Workers panel sub-tabs: Worker / Hub / Feature.
          * Workers — the per-worker control-plane table (existing UI)
          * Hubs    — multi-hub presence (Redis-backed heartbeat,
@@ -1047,7 +1046,7 @@ asyncio.run(main())"
                      visible with last_seen)
          * 機能    — admin operations that used to live in deploy.sh
                      (currently: self-restart this hub). -->
-    <div id="workersSubtabs" class="ai-subtabs" role="tablist" style="margin-bottom:10px;">
+    <div id="workersSubtabs" class="ai-subtabs" role="tablist">
       <button type="button" class="ai-subtab active" data-workers-subtab="workers" role="tab" aria-selected="true">
         <iconify-icon icon="lucide:cpu"></iconify-icon>
         <span data-i18n="workers.subtab.workers">ワーカー</span>
@@ -1065,7 +1064,7 @@ asyncio.run(main())"
     </div>
 
     <!-- Workers sub-pane: existing table (unchanged behaviour). -->
-    <div class="workers-subpane" data-workers-subpane="workers">
+    <div class="workers-subpane ai-subpane" data-workers-subpane="workers">
       <h2 style="margin-top:0;"><span data-i18n="tab.workers">Workers</span> (<span id="workerCount">0</span>)</h2>
       <table id="workersTable"><thead>
         <tr>
@@ -1086,7 +1085,7 @@ asyncio.run(main())"
     <!-- Hubs sub-pane: multi-hub presence list. Each hub heartbeats
          itself into shared Redis every 30s (TTL 90s); offline rows
          (TTL-expired but still in index) stay visible. -->
-    <div class="workers-subpane" data-workers-subpane="hubs" style="display:none;">
+    <div class="workers-subpane ai-subpane" data-workers-subpane="hubs" style="display:none;">
       <h2 style="margin-top:0;">
         <span data-i18n="hubs.heading">ハブ</span>
         (<span id="hubsCount">0</span>)
@@ -1117,7 +1116,7 @@ asyncio.run(main())"
          (process exits 42, docker restart policy brings it back up
          on the latest bind-mounted code -- so `git pull` on the host
          + this button = "apply update without SSH"). -->
-    <div class="workers-subpane" data-workers-subpane="features" style="display:none;">
+    <div class="workers-subpane ai-subpane" data-workers-subpane="features" style="display:none;">
       <h2 style="margin-top:0;" data-i18n="features.heading">機能</h2>
       <p class="help" style="margin:4px 0 12px; font-size:.88em; color:#666;" data-i18n="features.intro">
         これまで <code>scripts/deploy.sh</code> を SSH 経由で叩いていた
@@ -1143,28 +1142,16 @@ asyncio.run(main())"
         </div>
       </div>
     </div>
-  </section>
 </div>
 
 <div class="panel" data-panel="jobs">
-  <section>
-    <h2><span data-i18n="tab.jobs">Recent jobs</span>
-      <span class="hctrl flat-actions">
-        <span class="menu-wrap" style="display:inline-block; position:relative;">
-          <button id="jobsColsBtn" class="pill" style="--la-bg:#eef0ff; --la-bd:#6a8ec7; --la-fg:#3a5ca8;" title="表示する列を選ぶ"><iconify-icon icon="lucide:columns-3"></iconify-icon> <span data-i18n="jobs.cols">columns</span> <span class="caret">▾</span></button>
-          <div id="jobsColsMenu" class="menu" style="min-width:180px;"></div>
-        </span>
-        <button id="bulkCleanup" class="pill" style="--la-bg:#fff5e6; --la-bd:#e0a060; --la-fg:#7a4500;" title="Delete old completed jobs (kept last 10 always)"><iconify-icon icon="lucide:eraser"></iconify-icon> <span data-i18n="jobs.cleanup">cleanup old…</span></button>
-        <button id="bulkDelete" class="pill" style="--la-bg:#fee; --la-bd:#c88; --la-fg:#933;"><iconify-icon icon="lucide:trash-2"></iconify-icon> <span data-i18n="jobs.deleteall">delete all</span></button>
-      </span>
-    </h2>
     <!-- W: Status filter tabs (全部 / 成功 / エラー / 実行中).
          Designed to match the Submit form's ai-subtabs visual language.
          Filter is client-side: refresh() always loads the full job list
          (the API doesn't need a status query because the list is small
          and operator wants instant tab switching). State persists across
          refreshes via _jobsStatusFilter module var; reset = "all". -->
-    <div id="jobsStatusTabs" class="ai-subtabs" role="tablist" style="margin-bottom:10px;">
+    <div id="jobsStatusTabs" class="ai-subtabs" role="tablist">
       <button type="button" class="ai-subtab active" data-jobs-status="all" role="tab" aria-selected="true">
         <iconify-icon icon="lucide:list"></iconify-icon>
         <span data-i18n="jobs.tab.all">全部</span>
@@ -1186,6 +1173,17 @@ asyncio.run(main())"
         <span class="count" id="jobsCntRunning">0</span>
       </button>
     </div>
+    <div class="ai-subpane">
+    <h2 style="margin-top:0;"><span data-i18n="tab.jobs">Recent jobs</span>
+      <span class="hctrl flat-actions">
+        <span class="menu-wrap" style="display:inline-block; position:relative;">
+          <button id="jobsColsBtn" class="pill" style="--la-bg:#eef0ff; --la-bd:#6a8ec7; --la-fg:#3a5ca8;" title="表示する列を選ぶ"><iconify-icon icon="lucide:columns-3"></iconify-icon> <span data-i18n="jobs.cols">columns</span> <span class="caret">▾</span></button>
+          <div id="jobsColsMenu" class="menu" style="min-width:180px;"></div>
+        </span>
+        <button id="bulkCleanup" class="pill" style="--la-bg:#fff5e6; --la-bd:#e0a060; --la-fg:#7a4500;" title="Delete old completed jobs (kept last 10 always)"><iconify-icon icon="lucide:eraser"></iconify-icon> <span data-i18n="jobs.cleanup">cleanup old…</span></button>
+        <button id="bulkDelete" class="pill" style="--la-bg:#fee; --la-bd:#c88; --la-fg:#933;"><iconify-icon icon="lucide:trash-2"></iconify-icon> <span data-i18n="jobs.deleteall">delete all</span></button>
+      </span>
+    </h2>
     <table id="jobsTable"><thead>
       <tr><th data-col="id" data-i18n="jobs.th.id">id</th><th data-col="mode" data-i18n="jobs.th.mode">mode</th><th data-col="status" data-i18n="jobs.th.status">status</th><th data-col="url">URL</th><th data-col="worker" data-i18n="jobs.th.worker">worker/lane</th><th data-col="started" data-i18n="jobs.th.started">started</th><th data-col="ended" data-i18n="jobs.th.ended">ended</th><th data-col="duration" data-i18n="jobs.th.duration">duration</th><th data-col="actions" data-i18n="jobs.th.actions">actions</th></tr>
     </thead><tbody><tr><td colspan=9 class="empty" data-i18n="jobs.empty">no jobs yet</td></tr></tbody></table>
@@ -1194,7 +1192,7 @@ asyncio.run(main())"
          the live data. Page size is operator-set via the select on
          the right, persisted in localStorage. -->
     <div id="jobsPager" style="margin-top:10px; display:flex; gap:8px; align-items:center; font-size:.88em;"></div>
-  </section>
+    </div>
 </div>
 
 <div class="panel" data-panel="sessions">
