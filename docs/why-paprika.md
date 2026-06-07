@@ -6,16 +6,9 @@ active: why-paprika
 ---
 
 <div class="tldr">
-  <span class="tldr-label">概要</span>
-  <ul>
-    <li><strong>Playwright スタイル API + 分散フリート + AI</strong>を 1 つに統合したプラットフォーム。書き味はほぼ Playwright のまま、複数ホストの Chrome を Hub が束ねて並列ジョブを捌く。</li>
-    <li><strong>収集に最適化</strong>: ブラウザが読み込んだバイト列を passive 回収（再 GET しない）、yt-dlp 連携で動画も統合取得、画像/動画/HTML を <code>meta.json</code> で返す。</li>
-    <li><strong>AI モード (<code>codegen-loop</code>)</strong>: <code>goal</code> を自然言語で渡せば LLM がスクリプト生成・実行・失敗時に再生成。成功したスクリプトは <code>mode: rerun</code> で決定的に再利用。</li>
-    <li>E2E テストや 1 台のスクリプトで足りる用途には Playwright / Selenium が素直。複数ホスト・長時間運用の <strong>収集ワークロード</strong>のとき Paprika が活きる。</li>
-  </ul>
+<span class="tldr-label">概要</span>
+<p><strong>Playwright スタイル API + 分散フリート + AI</strong> を 1 つに統合した、<strong>収集ワークロード</strong>向けプラットフォーム。複数ホストの Chrome を Hub が束ねて並列に動かし、未知サイトは LLM がスクリプトを生成、画像/動画はブラウザが読み込んだバイト列をそのまま回収します。</p>
 </div>
-
-**Playwright と書き味は同じまま、フリート（複数ホストの Chrome）と AI で動かす**。Paprika は「ブラウザ自動化のフレームワーク」ではなく、**収集ワークロードを丸ごと面倒見るプラットフォーム**です。
 
 <video class="shot" width="1096" height="664" autoplay loop muted playsinline preload="metadata" aria-label="Paprika 管理画面で複数の Chrome Lane が同時にページを取得している様子">
   <source src="img/admin-live.webm" type="video/webm">
@@ -26,54 +19,52 @@ active: why-paprika
 
 > 採用判断のためのページです。導入は [Server インストール](quickstart.html)、SDK の使い方は [Client インストール](intro.html)、内部構造は [アーキテクチャ概要](architecture.html) を参照。
 
-## 何が違うのか（要点）
+## 5 つの差分
 
-- **Playwright 風 API**（`locator` / `get_by_*` / `fill` / `press` / `wait_for` …）。書き味は Playwright とほぼ同じ。
-- **分散フリート**: 複数ホストの Chrome（**Lane**）を Hub が束ね、ジョブを **WebSocket でディスパッチ**。1 台でも、100 台でも同じ API。
-- **AI コード生成**（`codegen-loop`）: URL と自然言語の **`goal` だけ**渡せば、LLM がスクリプトを生成・実行・失敗時に再生成。成功したスクリプトは **そのまま `mode: rerun` で再利用**できる（次回からは LLM 不要・決定的）。
-- **収集に最適化**: スクロール・ネットワークトレース・**`yt-dlp` 連携**で動画も画像と同じ感覚で取得（[動画の仕組み](guides.html#video-mechanism)）。
-- **二度取りしない**: **ブラウザが実際に読み込んだレスポンス**をそのまま回収（CDP `Network.responseReceived` を passive にサブスクライブ）。`<img src= loading="lazy">` を見て **URL から再取得しない**ので、(a) 帯域・サーバ負荷が半分、(b) **Cookie / Referer / 認証ヘッダーが必要な画像**もそのまま取れる、(c) **JS で動的に差し込まれた画像・lazy-load・CSS `background-image`・iframe 内**もまとめて拾えます。
-- **Chrome 拡張で JS 注入**: 同梱の `paprika-agent` 拡張（`userScripts` 権限）で **任意の JS を全ページに常駐注入**。CDP 単独では届かない領域（リクエストヘッダ書き換え・Content Settings・Proxy・downloads）まで操作できます。
-- **普段使いの Chrome 拡張をそのまま持ち込み**: `--load-extension` で **既存の拡張（uBlock Origin / Bitwarden 等）が動く**。広告抜きで収集、Bitwarden で自動ログインなど、**手作業の Chrome と同じ環境**でジョブが動かせます。
-- **既存の Chrome プロファイル流用**: 普段使いの Chrome の **User Data フォルダをそのままアップロード**（[`use_profile`](auth.html#use-profile)）。Cookie / 保存パスワード / autofill / 拡張機能まで一式持ち込めるので、**ログイン済みの状態でいきなり収集を始められます**。
-- **ライブ可観測性**: 各 Chrome に **noVNC ライブ画面**が紐づき、管理画面で何が起きているか目で確認できる。
-- **検出されにくい起動**: `nodriver` を採用し、`navigator.webdriver` などの典型的なシグナルを出さない。
+Paprika が Playwright / Selenium と本質的に違うところは 5 つです。
 
-## Playwright / Selenium との比較
+- **分散フリート** — 複数ホストの Chrome（**Lane**）を Hub が束ね、ジョブを WebSocket でディスパッチ。1 台でも 100 台でも同じ API で書ける。
+- **AI コード生成（`codegen-loop`）** — URL と自然言語の `goal` だけ渡せば、LLM がスクリプトを生成・実行・失敗時に再生成。成功したスクリプトは `mode: rerun` で次回から決定的に再利用。
+- **二度取りしない passive 回収** — ブラウザが実際に読み込んだレスポンスを CDP の `Network.responseReceived` で横取り。`<img>` URL から再 GET しないので、帯域半分、認証/Referer 必須の画像も、JS で差し込まれた lazy-load・`background-image`・iframe 内も全部拾える。
+- **収集に最適化** — `yt-dlp` + 通信トレース統合で動画も画像と同じ感覚で取得、スクロール・最小サイズ・遅延ロード対策が既定機能。管理画面・ライブ noVNC が標準付属。
+- **普段使い Chrome の環境ごと持ち込み** — `--load-extension` で既存拡張 (uBlock / Bitwarden 等) が動き、`use_profile` で User Data フォルダごとアップロードできるので、**ログイン済みの状態でいきなり収集**を始められます。
+
+書き味は Playwright とほぼ同じ（`locator` / `get_by_*` / `fill` / `press` / `wait_for` …）。違うのは「Hub に接続している」点と、結果が「ジョブ」単位で積み上がる点だけです。
+
+## Playwright / Selenium との詳細比較
+
+重要度順:
 
 | 観点 | Paprika | Playwright | Selenium |
 |---|---|---|---|
 | **対象** | **収集ワークロードのプラットフォーム** | ブラウザ自動化のライブラリ | ブラウザ自動化のライブラリ |
-| **API スタイル** | Playwright 風（同じ書き味） | Playwright | WebDriver |
-| **分散実行** | **標準で分散**（Hub + N ワーカー × M レーン） | 自前で Grid/k8s を組む | Selenium Grid |
-| **ジョブモデル** | **REST/SDK で投入 → 完了待ち → アセット回収** | 自分でプロセス管理 | 自分でプロセス管理 |
-| **AI 駆動** | **`codegen-loop`（生成→実行→再生成）** | なし | なし |
-| **動画取得** | **`yt-dlp` + 通信トレース統合** | 手作業で連携 | 手作業で連携 |
-| **画像/アセット収集** | **既定機能**（min size / scroll / lazy 対応） | 自分で書く | 自分で書く |
+| **分散実行** | **標準で分散**（Hub + N ワーカー × M レーン） | 自前で Grid / k8s を組む | Selenium Grid |
 | **取得方式** | **ブラウザが読み込んだものを passive 回収**（再 GET なし） | URL を取り出して再 GET | URL を取り出して再 GET |
-| **ライブ可観測性** | **noVNC + 管理画面** | デバッガ / 録画 | スクリーンショット |
-| **ログイン継続** | **Bridge 拡張 / `use_profile` / Host レシピ** | 自前で Cookie / storage 注入 | 同左 |
-| **既存 Chrome 拡張**（uBlock / Bitwarden 等） | **そのまま動く**（`--load-extension`） | 自前でビルドして読込 | 自前でビルドして読込 |
-| **Chrome プロファイル流用**（Cookie / autofill / 拡張ごと） | **アップロードして直に使う** | 別途エクスポート＆注入 | 別途エクスポート＆注入 |
-| **JS 注入の範囲** | **拡張権限まで使える**（userScripts / declarativeNetRequest） | `addInitScript`(=ページコンテキスト) のみ | `execute_script` のみ |
+| **AI 駆動** | **`codegen-loop`（生成→実行→再生成）** | なし | なし |
+| **画像 / アセット収集** | **既定機能**（min size / scroll / lazy 対応） | 自分で書く | 自分で書く |
+| **動画取得** | **`yt-dlp` + 通信トレース統合** | 手作業で連携 | 手作業で連携 |
+| **ライブ可観測性 / 管理画面** | **noVNC + 管理画面が標準付属** | デバッガ / 録画 | スクリーンショット |
+| **ログイン継続** | **Bridge 拡張 / `use_profile` / Host レシピ** | 自前で Cookie / storage 注入 | 自前で Cookie / storage 注入 |
+| **既存 Chrome 拡張・プロファイル** | **そのまま動く**（`--load-extension` / User Data ごと） | 別途エクスポート＆注入 | 別途エクスポート＆注入 |
+| **API スタイル** | Playwright 風（同じ書き味） | Playwright | WebDriver |
+| **ジョブモデル** | **REST/SDK で投入 → 完了待ち → アセット回収** | 自分でプロセス管理 | 自分でプロセス管理 |
+| **JS 注入の範囲** | **拡張権限まで使える**（userScripts / declarativeNetRequest） | `addInitScript`（ページコンテキスト）のみ | `execute_script` のみ |
 | **検出回避** | **`nodriver`**（webdriver シグナルを抑える） | パッチが必要 | パッチが必要 |
-| **管理画面** | **既定で付属** | 自前 | 自前 |
 
-> Playwright や Selenium が悪い、という話ではありません。**「複数台で長く回す収集ワークロード」**が用途のとき、その上に組むべき配管が**標準で揃っている**のが Paprika の立ち位置です。
+> Playwright や Selenium が悪い、という話ではありません。**「複数台で長く回す収集ワークロード」** が用途のとき、その上に組むべき配管が **標準で揃っている** のが Paprika の立ち位置です。
 
-## こんなときに Paprika
+## いつ Paprika / いつ Playwright か
 
-- **複数サイト × 複数ホスト**で **数千〜数百万ページ**を収集したい
-- **画像 / 動画 / リンク**をまとめて回収したい（HLS/DASH 含む）
-- **未知サイト**にとりあえず投げて、AI に拾ってもらいたい
-- ログイン継続・年代/確認画面・ポップアップなどの **「ブラウザならではの障壁」** を乗り越えたい
-- 何が起きているか **目で見える**運用にしたい
-
-## こんなときは Playwright / Selenium が素直
-
-- **アプリの E2E テスト**（CI で 1 台 / 短時間 / 結果は pass/fail）
-- 1 つのスクリプトを **自前のジョブキュー** で十分に回せる
-- ブラウザ自動化を **既存システムに組み込む**ライブラリとして使いたい
+| やりたいこと | おすすめ |
+|---|---|
+| 複数サイト × 複数ホストで数千〜数百万ページを収集 | **Paprika** |
+| 画像 / 動画 / リンクをまとめて回収（HLS/DASH 含む） | **Paprika** |
+| 未知サイトにとりあえず投げて AI に拾ってもらう | **Paprika** |
+| ログイン継続・年代/確認画面・ポップアップを乗り越える | **Paprika** |
+| 何が起きているか目で見える運用にしたい | **Paprika** |
+| アプリの E2E テスト（CI で 1 台 / 短時間） | Playwright / Selenium |
+| 1 つのスクリプトを自前のジョブキューで十分に回せる | Playwright / Selenium |
+| ブラウザ自動化を既存システムに組み込むライブラリとして使う | Playwright / Selenium |
 
 ## 移行の見当（Playwright を書いている人向け）
 
@@ -99,18 +90,38 @@ async with cli.session("https://...") as page:
 
 ## いま無いもの（正直に）
 
-- **DRM 動画は取得不可・かつ取得を試みてはいけません**（Widevine / FairPlay / PlayReady。Netflix・Amazon Prime Video・Disney+ などの有料配信が該当）。Paprika は **DRM の回避・解除は一切行いません**。これは技術的な仕様であると同時に、**法的・倫理的に許されないため**です。
-  - **著作権法 第30条第1項第2号** — 技術的保護手段（DRM）を回避して行う複製は、私的使用目的であっても**違法**です。
-  - **著作権法 第120条の2** — DRM 解除を目的とするツールの提供・公衆送信は**刑事罰**の対象です。
-  - **不正アクセス禁止法** — 配信プラットフォームのアクセス制御を破る形で行う場合、**不正アクセス行為**に該当する可能性があります。
-  - 米国 DMCA 1201 条、EU 著作権指令 6 条など、**国際的にも DRM 回避は禁止**されています。
-  - **DRM を回避する目的での Paprika 利用は固く禁止**します。発覚した場合、サポートの対象外となるだけでなく、利用者本人の法的責任となります。
-- 既定で **認証なし**（private LAN 想定）。外部公開する場合はリバプロ + 認証を手前に置いてください。
+- **DRM 動画は取得不可、かつ取得を試みてはいけません** — Widevine / FairPlay / PlayReady などで保護された配信（Netflix・Amazon Prime Video・Disney+ など）は復号鍵がブラウザの保護領域（CDM）にあり、Paprika は DRM の回避・解除を一切行いません。著作権法第30条第1項第2号・第120条の2、不正アクセス禁止法、DMCA §1201、EU 著作権指令 第6条 で世界的に禁止されています。詳しくは [動画の取得と配信のしくみ](guides.html#video-mechanism) を参照。
+- **既定で認証なし**（private LAN 想定）。外部公開する場合はリバプロ + 認証を手前に置いてください。
 - **Windows ワーカー**は Linux フリートと別経路（noVNC ではなく CDP screencast）。
 
 ## 次のステップ
 
-- [Server インストール](quickstart.html) — まず動かしてみる（5 分）
-- [Client インストール](intro.html) — SDK で接続する
-- [ユースケース集](usecases.html) — 目的別の通し
-- [アーキテクチャ概要](architecture.html) — 内部構造の地図
+<div class="learning-paths">
+  <div class="learning-path">
+    <h3>動かしてみる</h3>
+    <p class="who">まず手元で動くかを 5 分で確認</p>
+    <ol>
+      <li><a href="quickstart.html">Server インストール</a></li>
+      <li><a href="admin.html">管理画面で URL を投げる</a></li>
+      <li><a href="usecases.html">ユースケース集</a></li>
+    </ol>
+  </div>
+  <div class="learning-path">
+    <h3>SDK で書く</h3>
+    <p class="who">スクリプトから自動化したい</p>
+    <ol>
+      <li><a href="intro.html">Client インストール</a></li>
+      <li><a href="examples.html">サンプル集</a></li>
+      <li><a href="api.html">API リファレンス</a></li>
+    </ol>
+  </div>
+  <div class="learning-path">
+    <h3>内部を知る</h3>
+    <p class="who">なぜそう動くか・どこを変えれば良いか</p>
+    <ol>
+      <li><a href="architecture.html">アーキテクチャ概要</a></li>
+      <li><a href="architecture.html#hub">Hub の仕組み</a></li>
+      <li><a href="architecture.html#worker">Worker の仕組み</a></li>
+    </ol>
+  </div>
+</div>
