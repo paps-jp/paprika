@@ -273,9 +273,16 @@
   a.ssitem:hover { transform: translateY(-2px); box-shadow: 0 4px 14px rgba(0,0,0,.35); outline-color: #c0392b; }
   a.ssitem:hover .ssopen { opacity: 1; }
   .ssitem img { display: block; width: 100%; height: 100%; object-fit: contain; background: #000; }
-  .sslabel { position: absolute; top: 4px; left: 6px; font-size: .72rem; color: #fff; padding: 1px 6px; background: rgba(0,0,0,.55); border-radius: 3px; pointer-events: none; }
+  /* Never paint the browser's broken-image placeholder. A freshly-built tile's
+     <img> has NO src until ssApplyPreviewFrame sets a decoded data: URL, and a
+     src-less <img alt=…> otherwise renders the ugly broken-image icon (top-left)
+     on the black tile. Hide it until it has a real frame; the diagonal loading
+     stripe below covers the tile in the meantime, and the img reveals itself the
+     moment a decoded frame is assigned. */
+  .ssitem img:not([src]), .ssitem img[src=""] { display: none; }
+  .sslabel { position: absolute; top: 4px; left: 6px; font-size: .72rem; color: #fff; padding: 1px 6px; background: rgba(0,0,0,.55); border-radius: 3px; pointer-events: none; z-index: 3; }
   .ssopen { position: absolute; top: 4px; right: 6px; font-size: .7rem; color: #fff; padding: 1px 6px; background: rgba(192,57,43,.85); border-radius: 3px; opacity: 0; transition: opacity .15s; pointer-events: none; }
-  .sserr { position: absolute; bottom: 4px; left: 6px; right: 6px; font-size: .7rem; color: #ffb4b4; padding: 2px 6px; background: rgba(120,0,0,.7); border-radius: 3px; pointer-events: none; }
+  .sserr { position: absolute; bottom: 4px; left: 6px; right: 6px; font-size: .7rem; color: #ffb4b4; padding: 2px 6px; background: rgba(120,0,0,.7); border-radius: 3px; pointer-events: none; z-index: 3; }
   /* Status badge: RUNNING (red pulsing dot) or IDLE (grey).
      Sits on the bottom-right so it doesn't fight with .sslabel /
      .ssopen up top, or the .sserr error stripe on the bottom-left.  */
@@ -285,6 +292,7 @@
     padding: 2px 8px; border-radius: 10px;
     color: #fff; pointer-events: none;
     display: flex; align-items: center; gap: 4px;
+    z-index: 3;
   }
   .ssbadge.running   { background: rgba(192,57,43,.85); }
   /* KEEPALIVE: crawl finished but session is alive for the operator
@@ -303,12 +311,16 @@
     0%, 100% { opacity: 1; }
     50%      { opacity: 0.3; }
   }
-  /* Loading overlay -- shown on FIRST image load only (we add the
-     .loading class at tile-build time and remove it on the first
-     img 'load' / 'error' event). Polling refreshes silently swap
-     the painted pixels without flashing the spinner, since the
-     class is no longer there. */
-  .ssitem.loading::before {
+  /* Opaque diagonal loading stripe -- shown whenever a tile has NOT yet painted
+     its first real frame (:not(.has-frame)), INDEPENDENT of the JS `loading`
+     toggle. Keying it on has-frame (not .loading) keeps the stripe up through
+     'warming…' / 'capture failed' / self-update states too, so a no-frame tile
+     never falls back to a black box + the browser's broken-image icon. Once a
+     tile shows a screenshot, has-frame is set (admin-livepreview.js img 'load')
+     and this stripe is suppressed -- a later 'loading' state then keeps the LAST
+     good frame visible and shows just the spinner over it. New frames swap in
+     only after an off-screen decode (probe in ssApplyPreviewFrame), no flash. */
+  .ssitem:not(.has-frame)::before {
     content: '';
     position: absolute; inset: 0;
     background: linear-gradient(135deg, #1a1a22 25%, #222 25%, #222 50%, #1a1a22 50%, #1a1a22 75%, #222 75%);
