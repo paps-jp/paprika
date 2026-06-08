@@ -2172,8 +2172,16 @@ async def _handle_worker_message(worker, msg) -> None:
             from server.hub.codegen import (
                 _schedule_engine_usage_db,
                 _slug_for_model,
+                _slug_for_worker_agent,
             )
-            slug = (msg.engine_slug or "").strip() or _slug_for_model(msg.model or "")
+            # explicit slug -> model match -> operator-flagged worker-agent
+            # engine (covers page.agent /act, whose AGENT_MODEL_NAME usually
+            # matches no registered engine model).
+            slug = (
+                (msg.engine_slug or "").strip()
+                or _slug_for_model(msg.model or "")
+                or _slug_for_worker_agent()
+            )
             if slug:
                 reg = getattr(state, "engine_usage", None)
                 if reg is not None:

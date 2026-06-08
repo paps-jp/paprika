@@ -321,6 +321,38 @@ def _slug_for_model(model: str) -> str:
     return ""
 
 
+def _slug_for_worker_agent() -> str:
+    """Slug of the worker page.agent (/act) backend engine, used to attribute
+    worker /act usage whose model matches no registered engine.
+
+    Resolution: an engine the operator explicitly flagged
+    ``use_for_worker_agent`` wins; otherwise fall back to the engine whose
+    ``protocol`` is ``agent-service`` -- that IS the page.agent backend
+    (the agent_service the worker's AGENT_URL points at). The protocol
+    fallback is cross-hub-consistent (protocol is shared via MariaDB) and
+    needs no extra config, so attribution works out of the box; the flag is
+    an operator override once it is persisted. Returns "" when neither
+    resolves."""
+    try:
+        from server.hub._state import state
+        reg = getattr(state, "engines", None)
+        if reg is None:
+            return ""
+        agent_service_slug = ""
+        for rec in reg.list_all():
+            if getattr(rec, "use_for_worker_agent", False):
+                return getattr(rec, "slug", "") or ""  # explicit flag wins
+            if (
+                (getattr(rec, "protocol", "") or "") == "agent-service"
+                and not agent_service_slug
+            ):
+                agent_service_slug = getattr(rec, "slug", "") or ""
+        return agent_service_slug
+    except Exception:
+        pass
+    return ""
+
+
 async def _engine_usage_db_write(pool, date_str, slug, prompt, completion) -> None:
     try:
         from server.hub.mariadb import engine_usage_record

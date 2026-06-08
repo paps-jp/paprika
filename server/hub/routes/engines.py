@@ -157,6 +157,8 @@ def _engine_to_dict(rec: EngineRecord, usage_map: dict | None = None) -> dict:
         # Whether the Submit form's "コード生成 LLM" dropdown shows this
         # engine. Operator-driven opt-in; see EngineRecord.use_for_codegen.
         "use_for_codegen": rec.use_for_codegen,
+        # Whether worker page.agent (/act) usage is attributed to this engine.
+        "use_for_worker_agent": rec.use_for_worker_agent,
         # Daily quota caps + today's usage. 0 = no cap on that limb.
         # Counters reset at UTC midnight. See EngineUsageRegistry.
         "daily_token_budget": rec.daily_token_budget,

@@ -151,6 +151,15 @@ class EngineRecord:
     # from_json() derives the default from that legacy rule when the
     # JSON predates this field; explicit values in saved records win.
     use_for_codegen: bool = False
+    # Whether worker-side page.agent (/act -- the agent_service vision
+    # loop) token usage is attributed to THIS engine in #engines. The
+    # worker reports its AGENT_MODEL_NAME (e.g. qwen2.5-vl-72b) which often
+    # matches no registered engine's model, so the hub folds those reports
+    # into whichever engine the operator flags here. from_json() defaults
+    # it True for the ``agent-service`` engine (that IS the worker-agent
+    # backend), so attribution works fleet-wide out of the box without any
+    # cross-hub config push; operators can re-point it via the Engines tab.
+    use_for_worker_agent: bool = False
     # Daily quota caps. Each is independently enforced before every
     # LLM call routed through this engine; the call is rejected with
     # a clear error when the limit would be exceeded. Set to 0 to
@@ -213,6 +222,15 @@ class EngineRecord:
                     str(d.get("kind") or "chat") in ("chat", "vision-chat")
                     and str(d.get("protocol") or "openai") == "openai"
                 )
+            ),
+            # Back-compat: records written before this field existed get it
+            # derived from protocol -- the agent-service engine IS the
+            # worker page.agent backend, so it's the natural default target
+            # for worker /act usage. Explicit saved values win.
+            use_for_worker_agent=(
+                bool(d["use_for_worker_agent"])
+                if "use_for_worker_agent" in d
+                else (str(d.get("protocol") or "openai") == "agent-service")
             ),
             daily_token_budget=int(d.get("daily_token_budget") or 0),
             daily_request_budget=int(d.get("daily_request_budget") or 0),

@@ -781,6 +781,7 @@ function fillEngineForm(rec) {
   document.getElementById('engineHeaders').value = JSON.stringify(rec.headers || {}, null, 2);
   document.getElementById('enginePromoted').checked = !!rec.promoted;
   document.getElementById('engineUseForCodegen').checked = !!rec.use_for_codegen;
+  { const _wa = document.getElementById('engineUseForWorkerAgent'); if (_wa) _wa.checked = !!rec.use_for_worker_agent; }
   // Daily quota (0 = unlimited). Empty input = treat as 0 for save.
   document.getElementById('engineDailyTokenBudget').value =
     (rec.daily_token_budget || 0) || '';
@@ -865,6 +866,7 @@ async function saveEngine() {
     timeout_s: parseInt(document.getElementById('engineTimeout').value, 10) || 60,
     promoted: document.getElementById('enginePromoted').checked,
     use_for_codegen: document.getElementById('engineUseForCodegen').checked,
+    use_for_worker_agent: (document.getElementById('engineUseForWorkerAgent') || {}).checked || false,
     daily_token_budget:
       parseInt(document.getElementById('engineDailyTokenBudget').value, 10) || 0,
     daily_request_budget:

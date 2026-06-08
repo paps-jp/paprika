@@ -1764,6 +1764,9 @@ curl 'http://paprika.lan/extensions/ublock-lite/download' --output ublock-lite.t
             <label style="font-weight:600;">コード生成LLM</label>
             <label style="cursor:pointer;" title="Submit フォームの「コード生成 LLM」セレクタに表示。チェックを入れた engine だけが選択肢として並ぶ。"><input type="checkbox" id="engineUseForCodegen"> Submit の「コード生成 LLM」セレクタに表示する</label>
 
+            <label style="font-weight:600;">worker エージェント</label>
+            <label style="cursor:pointer;" title="worker 側 page.agent (/act = agent_service ビジョンループ) のトークン使用を #engines でこの engine に計上する。worker は AGENT_MODEL_NAME を報告するが登録 model と一致しないことが多いため、ここで指定した engine に集約する。agent-service プロトコルの engine が既定で ON。"><input type="checkbox" id="engineUseForWorkerAgent"> worker の page.agent 使用をこの engine に計上する</label>
+
             <label style="font-weight:600; align-self:start; padding-top:5px;">Daily quota</label>
             <div style="display:flex; flex-direction:column; gap:6px;">
               <div style="display:flex; gap:8px; align-items:center; flex-wrap:wrap;">
