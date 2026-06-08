@@ -133,6 +133,17 @@ async def _act_ask(agent, ctx: "_ActionCtx") -> None:
                     .get("content", "")
                     .strip()
                 )
+                try:
+                    _u = data.get("usage") or {}
+                    await agent.report_engine_usage(
+                        model=llm_model,
+                        engine_slug=("" if requested_engine in ("auto", "") else requested_engine),
+                        prompt_tokens=_u.get("prompt_tokens"),
+                        completion_tokens=_u.get("completion_tokens"),
+                        source="ask",
+                    )
+                except Exception:
+                    pass
         except Exception as e:
             _slog(
                 f"ask: LLM call failed via "
@@ -353,6 +364,17 @@ async def _act_extract_observe(agent, ctx: "_ActionCtx") -> None:
                     .get("content", "")
                     .strip()
                 )
+                try:
+                    _u = data.get("usage") or {}
+                    await agent.report_engine_usage(
+                        model=llm_model,
+                        engine_slug=("" if requested_engine in ("auto", "") else requested_engine),
+                        prompt_tokens=_u.get("prompt_tokens"),
+                        completion_tokens=_u.get("completion_tokens"),
+                        source=kind,
+                    )
+                except Exception:
+                    pass
         except Exception as e:
             _slog(
                 f"{kind}: LLM call failed via "

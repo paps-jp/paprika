@@ -211,6 +211,20 @@ _TABLES: list[tuple[str, str]] = [
         """,
     ),
     (
+        "engine_usage",
+        """
+        CREATE TABLE IF NOT EXISTS engine_usage (
+            usage_date          DATE          NOT NULL,
+            slug                VARCHAR(128)  NOT NULL,
+            prompt_tokens       BIGINT        NOT NULL DEFAULT 0,
+            completion_tokens   BIGINT        NOT NULL DEFAULT 0,
+            requests            BIGINT        NOT NULL DEFAULT 0,
+            updated_at          DATETIME(3),
+            PRIMARY KEY (usage_date, slug)
+        ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci
+        """,
+    ),
+    (
         "presets",
         """
         CREATE TABLE IF NOT EXISTS presets (
@@ -1988,6 +2002,81 @@ async def load_settings(pool: Any) -> dict:
                     out[str(k)] = json.loads(v) if v is not None else None
                 except Exception:
                     out[str(k)] = v
+    return out
+
+
+# ---------------------------------------------------------------------------
+# Engine token-usage: cross-hub shared daily counters in MariaDB.
+#
+# The per-hub JSON file ({data_dir}/engines/_usage.json) is a single-writer
+# local counter, so the #engines tab only ever saw the usage of whichever hub
+# nginx happened to route to. This table is the SHARED source of truth: every
+# hub increments the same (usage_date, slug) row via an atomic UPSERT, so a
+# read is already the fleet-wide total -- no per-hub rows, no SUM, no
+# aggregation race. Self-created (idempotent) so it works even before
+# ensure_schema has run.
+# ---------------------------------------------------------------------------
+
+_ENGINE_USAGE_DDL = (
+    "CREATE TABLE IF NOT EXISTS engine_usage ("
+    "usage_date DATE NOT NULL, slug VARCHAR(128) NOT NULL, "
+    "prompt_tokens BIGINT NOT NULL DEFAULT 0, "
+    "completion_tokens BIGINT NOT NULL DEFAULT 0, "
+    "requests BIGINT NOT NULL DEFAULT 0, "
+    "updated_at DATETIME(3), "
+    "PRIMARY KEY (usage_date, slug)"
+    ") ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci"
+)
+
+
+async def engine_usage_record(
+    pool: Any, date_str: str, slug: str, prompt: int, completion: int
+) -> None:
+    """Atomically add (prompt, completion, +1 request) to the shared
+    (date, slug) counter. Cross-hub safe: concurrent increments from any
+    number of hubs accumulate into the one row, so the row IS the fleet
+    total."""
+    if not slug:
+        return
+    async with pool.acquire() as conn:
+        async with conn.cursor() as cur:
+            await cur.execute(_ENGINE_USAGE_DDL)
+            await cur.execute(
+                "INSERT INTO engine_usage "
+                "(usage_date, slug, prompt_tokens, completion_tokens, requests, updated_at) "
+                "VALUES (%s, %s, %s, %s, 1, UTC_TIMESTAMP(3)) "
+                "ON DUPLICATE KEY UPDATE "
+                "prompt_tokens = prompt_tokens + VALUES(prompt_tokens), "
+                "completion_tokens = completion_tokens + VALUES(completion_tokens), "
+                "requests = requests + 1, "
+                "updated_at = VALUES(updated_at)",
+                (str(date_str), str(slug), max(0, int(prompt or 0)), max(0, int(completion or 0))),
+            )
+
+
+async def load_engine_usage(pool: Any, days: int = 14) -> dict:
+    """Return the shared per-day, per-slug counters for the last ``days``
+    days as ``{date_str: {slug: {prompt, completion, requests}}}``.
+    Empty dict when the table is empty / unreadable."""
+    out: dict = {}
+    async with pool.acquire() as conn:
+        async with conn.cursor() as cur:
+            await cur.execute(_ENGINE_USAGE_DDL)
+            await cur.execute(
+                "SELECT usage_date, slug, prompt_tokens, completion_tokens, requests "
+                "FROM engine_usage "
+                "WHERE usage_date >= (UTC_DATE() - INTERVAL %s DAY) "
+                "ORDER BY usage_date",
+                (max(1, int(days)),),
+            )
+            for row in await cur.fetchall():
+                d, slug, p, c, r = row[0], row[1], row[2], row[3], row[4]
+                ds = d.isoformat() if hasattr(d, "isoformat") else str(d)
+                out.setdefault(ds, {})[str(slug)] = {
+                    "prompt": int(p or 0),
+                    "completion": int(c or 0),
+                    "requests": int(r or 0),
+                }
     return out
 
 

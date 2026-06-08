@@ -928,6 +928,20 @@ class _SessionsMixin:
                 payload = r.json()
             except Exception as e:
                 return ({"kind": "unknown"}, f"ERR: qwen /act: {e}")
+            # Report this step's token usage to the hub so qwen's agent-loop
+            # traffic shows in #engines. agent-service /act returns no usage
+            # block today -> tokens 0 (still counts the request); real tokens
+            # arrive once agent_service surfaces `usage` in ActResponse.
+            try:
+                _u = payload.get("usage") or {}
+                await self.report_engine_usage(
+                    model=agent_llm_model,
+                    prompt_tokens=_u.get("prompt_tokens"),
+                    completion_tokens=_u.get("completion_tokens"),
+                    source="agent",
+                )
+            except Exception:
+                pass
             return (payload.get("action") or {"kind": "unknown"}, None)
 
         async def _ask_cogagent(

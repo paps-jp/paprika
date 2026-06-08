@@ -294,28 +294,97 @@ def check_engine_quota(target: "LLMTarget") -> None:
         print(f"[engine-quota] {result.warning}", file=_sys.stderr)
 
 
+def _slug_for_model(model: str) -> str:
+    """Resolve a registered engine slug whose ``model`` matches ``model``.
+
+    Hub-side LLM calls that go through the env-default targets
+    (``_env_default_target`` / perception's ``_default_target``) carry an
+    EMPTY ``engine_slug``, so their token usage was silently dropped --
+    qwen's vision/codegen traffic never showed up in #engines even while
+    the GPU ran hot. Matching by model name attributes that usage to the
+    registered engine that serves the same model (e.g. codegen's
+    ``qwen3.5`` -> the ``qwen`` engine) WITHOUT changing which endpoint
+    the call actually hits. Returns "" when nothing matches.
+    """
+    if not model:
+        return ""
+    try:
+        from server.hub._state import state
+        reg = getattr(state, "engines", None)
+        if reg is None:
+            return ""
+        for rec in reg.list_all():
+            if (getattr(rec, "model", "") or "") == model:
+                return getattr(rec, "slug", "") or ""
+    except Exception:
+        pass
+    return ""
+
+
+async def _engine_usage_db_write(pool, date_str, slug, prompt, completion) -> None:
+    try:
+        from server.hub.mariadb import engine_usage_record
+        await engine_usage_record(pool, date_str, slug, prompt, completion)
+    except Exception:
+        pass
+
+
+def _schedule_engine_usage_db(slug: str, prompt: int, completion: int) -> None:
+    """Best-effort cross-hub write-through of one usage increment to the
+    shared MariaDB counter. No-op when MariaDB isn't configured or no
+    event loop is running (called from a non-async context)."""
+    from server.hub._state import state
+    pool = getattr(state, "mariadb_pool", None)
+    if pool is None:
+        return
+    try:
+        import asyncio
+        loop = asyncio.get_running_loop()
+    except RuntimeError:
+        return
+    try:
+        from server.hub.engines import _today_utc
+        loop.create_task(
+            _engine_usage_db_write(pool, _today_utc(), slug, int(prompt), int(completion))
+        )
+    except Exception:
+        pass
+
+
 def record_engine_usage(target: "LLMTarget", usage_payload: dict) -> None:
-    """Add the (prompt_tokens, completion_tokens) numbers from an
-    OpenAI-shape usage block to today's per-engine counter.
+    """Charge an OpenAI-shape ``usage`` block to today's per-engine
+    counters: the per-hub in-memory/JSON counter (quota check + the
+    no-MariaDB fallback) AND the shared MariaDB counter (what #engines
+    reads, aggregated across all hubs).
 
     ``usage_payload`` is the ``usage`` object from a chat-completions
     response: ``{prompt_tokens, completion_tokens, total_tokens, ...}``.
     Missing / zero values are tolerated -- we just increment by 0.
+
+    Attribution: when ``target.engine_slug`` is empty (env-default
+    targets), the slug is resolved by matching ``target.model`` against
+    the registry, so qwen's hub-side traffic is attributed rather than
+    dropped.
     """
     slug = getattr(target, "engine_slug", "") or ""
     if not slug:
-        return
-    from server.hub._state import state
-    reg = getattr(state, "engine_usage", None)
-    if reg is None:
+        slug = _slug_for_model(getattr(target, "model", "") or "")
+    if not slug:
         return
     prompt = int((usage_payload or {}).get("prompt_tokens") or 0)
     completion = int((usage_payload or {}).get("completion_tokens") or 0)
-    try:
-        reg.record(slug, prompt, completion)
-    except Exception:
-        # Counter writes are best-effort; don't crash the job for it.
-        pass
+    # Per-hub counter -- quota.check_quota() reads this; also the fallback
+    # when MariaDB isn't configured.
+    from server.hub._state import state
+    reg = getattr(state, "engine_usage", None)
+    if reg is not None:
+        try:
+            reg.record(slug, prompt, completion)
+        except Exception:
+            # Counter writes are best-effort; don't crash the job for it.
+            pass
+    # Shared cross-hub counter (the #engines source of truth).
+    _schedule_engine_usage_db(slug, prompt, completion)
 
 
 def resolve_engine_target(

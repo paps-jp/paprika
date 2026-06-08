@@ -744,9 +744,30 @@ class WorkerSessionAnnounce(BaseModel):
     sessions: list[SessionStateSnapshot] = Field(default_factory=list)
 
 
+class WorkerEngineUsage(BaseModel):
+    """Worker -> hub: token usage from ONE worker-side LLM call (page.ask /
+    observe / extract / agent). The hub attributes it to an engine and
+    folds it into the shared ``engine_usage`` counter (MariaDB), so the
+    qwen vision/agent traffic that runs on the worker -- which never
+    reaches the hub's own ``record_engine_usage`` -- finally shows up in
+    #engines. The worker reports the model name (and the engine slug when
+    it knows it); the hub resolves the slug from the model when
+    ``engine_slug`` is empty (the same model-match attribution the hub-side
+    env-default path uses). prompt/completion may be 0 (e.g. an
+    agent-service /act call that returns no usage block) -- the request is
+    still counted."""
+    type: Literal["engine_usage"] = "engine_usage"
+    model: str = ""
+    engine_slug: str = ""
+    prompt_tokens: int = 0
+    completion_tokens: int = 0
+    source: str = ""  # "ask" | "observe" | "extract" | "agent" (debug/future)
+
+
 WorkerToHubMsg = Annotated[
     Union[
         WorkerRegister,
+        WorkerEngineUsage,
         WorkerHeartbeat,
         WorkerJobAccepted,
         WorkerJobProgress,

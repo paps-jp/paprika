@@ -288,6 +288,36 @@ class WorkerAgent(
         async with self._send_lock:
             await ws.send(encode_msg(msg))
 
+    async def report_engine_usage(
+        self,
+        *,
+        model: str = "",
+        prompt_tokens: int = 0,
+        completion_tokens: int = 0,
+        engine_slug: str = "",
+        source: str = "",
+    ) -> None:
+        """Best-effort: tell the hub how many tokens a worker-side LLM call
+        used, so it lands in the shared engine_usage counter (the qwen
+        vision/agent traffic the hub can't see on its own). Needs SOME
+        identity (model or slug); tokens may be 0 (still counts a request).
+        Never raises -- usage accounting must not break a session action."""
+        try:
+            if not (model or engine_slug):
+                return
+            from server.protocol import WorkerEngineUsage
+            await self._send(
+                WorkerEngineUsage(
+                    model=str(model or ""),
+                    engine_slug=str(engine_slug or ""),
+                    prompt_tokens=max(0, int(prompt_tokens or 0)),
+                    completion_tokens=max(0, int(completion_tokens or 0)),
+                    source=str(source or ""),
+                )
+            )
+        except Exception:
+            pass
+
     @property
     def capabilities(self) -> WorkerCapabilities:
         # If this worker runs a lane pool, expose each lane's noVNC URL so

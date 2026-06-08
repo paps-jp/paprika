@@ -932,6 +932,7 @@ from server.protocol import (
     WorkerJobAccepted,
     WorkerJobComplete,
     WorkerJobFailed,
+    WorkerEngineUsage,
     WorkerJobLog,
     WorkerJobProgress,
     WorkerPreviewFrame,
@@ -2055,6 +2056,33 @@ async def _handle_worker_message(worker, msg) -> None:
             await state.registry.preview_put_frame(
                 worker.worker_id, msg.lane_idx, msg.jpeg_b64, msg.ts, msg.width,
             )
+        return
+
+    if isinstance(msg, WorkerEngineUsage):
+        # Worker-side LLM call (page.ask / observe / extract / agent) -> fold
+        # its token usage into the shared engine_usage counter so qwen's
+        # vision/agent traffic (which never reaches the hub's own
+        # record_engine_usage) shows up in #engines. Resolve the slug from
+        # the model when the worker didn't name one (same model-match
+        # attribution the hub-side env-default path uses). Best-effort.
+        try:
+            from server.hub.codegen import (
+                _schedule_engine_usage_db,
+                _slug_for_model,
+            )
+            slug = (msg.engine_slug or "").strip() or _slug_for_model(msg.model or "")
+            if slug:
+                reg = getattr(state, "engine_usage", None)
+                if reg is not None:
+                    try:
+                        reg.record(slug, msg.prompt_tokens or 0, msg.completion_tokens or 0)
+                    except Exception:
+                        pass
+                _schedule_engine_usage_db(
+                    slug, msg.prompt_tokens or 0, msg.completion_tokens or 0
+                )
+        except Exception:
+            pass
         return
 
     if isinstance(msg, WorkerSessionStartAck):

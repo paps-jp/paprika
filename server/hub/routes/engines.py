@@ -108,8 +108,13 @@ def _looks_like_secret(s: str) -> bool:
     return False
 
 
-def _engine_to_dict(rec: EngineRecord) -> dict:
+def _engine_to_dict(rec: EngineRecord, usage_map: dict | None = None) -> dict:
     """Project EngineRecord to the API shape.
+
+    ``usage_map`` (optional) is the pre-fetched cross-hub usage from
+    MariaDB, shaped ``{slug: {"today": {...}, "history": {date: {...}}}}``.
+    When provided, token counts come from the shared store (fleet-wide);
+    when None, they fall back to this hub's local counter.
 
     Secrets handling:
       * ``api_key`` (literal value) is NEVER returned. ``api_key_set``
@@ -156,15 +161,15 @@ def _engine_to_dict(rec: EngineRecord) -> dict:
         # Counters reset at UTC midnight. See EngineUsageRegistry.
         "daily_token_budget": rec.daily_token_budget,
         "daily_request_budget": rec.daily_request_budget,
-        "usage_today": _usage_today_for(rec.slug),
+        "usage_today": _usage_today_for(rec.slug, usage_map),
         # Pricing (¥ per 1M tokens) — 0 = 課金なし (自前 GPU 等)。
         "cost_input_per_1m_jpy": rec.cost_input_per_1m_jpy,
         "cost_output_per_1m_jpy": rec.cost_output_per_1m_jpy,
         # 本日の累計コスト (¥)。usage_today × pricing で算出。
-        "cost_today_jpy": _cost_today_jpy_for(rec),
+        "cost_today_jpy": _cost_today_jpy_for(rec, usage_map),
         # 過去 14 日の日次トークン + 円換算履歴。Chart 表示用。
         # 形式: [{"date": "2026-06-01", "prompt": N, "completion": M, "requests": K, "cost_jpy": ¥}]
-        "cost_history": _cost_history_for(rec),
+        "cost_history": _cost_history_for(rec, usage_map),
         "notes": rec.notes,
         "builtin": rec.builtin,
         "created_at": rec.created_at,
@@ -172,17 +177,22 @@ def _engine_to_dict(rec: EngineRecord) -> dict:
     }
 
 
-def _usage_today_for(slug: str) -> dict:
+def _usage_today_for(slug: str, usage_map: dict | None = None) -> dict:
     """Read today's prompt/completion/request counters for ``slug``.
-    Returns zero-valued dict when no data yet today or the usage
-    registry isn't initialised."""
+
+    Prefers the cross-hub ``usage_map`` (pre-fetched from MariaDB) when
+    provided; otherwise falls back to this hub's local counter. Returns a
+    zero-valued dict when there's no data."""
+    _zero = {"prompt": 0, "completion": 0, "requests": 0}
+    if usage_map is not None:
+        return dict((usage_map.get(slug) or {}).get("today") or _zero)
     reg = getattr(state, "engine_usage", None)
     if reg is None:
-        return {"prompt": 0, "completion": 0, "requests": 0}
+        return dict(_zero)
     try:
         return reg.get_today(slug)
     except Exception:
-        return {"prompt": 0, "completion": 0, "requests": 0}
+        return dict(_zero)
 
 
 def _calc_cost_jpy(prompt: int, completion: int, rec: EngineRecord) -> float:
@@ -198,23 +208,27 @@ def _calc_cost_jpy(prompt: int, completion: int, rec: EngineRecord) -> float:
     return round(cost, 2)
 
 
-def _cost_today_jpy_for(rec: EngineRecord) -> float:
+def _cost_today_jpy_for(rec: EngineRecord, usage_map: dict | None = None) -> float:
     """Today's ¥ cost for this engine. Reads usage_today × pricing."""
-    u = _usage_today_for(rec.slug)
+    u = _usage_today_for(rec.slug, usage_map)
     return _calc_cost_jpy(u.get("prompt", 0), u.get("completion", 0), rec)
 
 
-def _cost_history_for(rec: EngineRecord) -> list:
+def _cost_history_for(rec: EngineRecord, usage_map: dict | None = None) -> list:
     """Per-day token + ¥ history for this engine.
     Returns sorted ascending by date so a chart can render directly.
-    Empty list when no history or the usage registry isn't initialised."""
-    reg = getattr(state, "engine_usage", None)
-    if reg is None:
-        return []
-    try:
-        hist = reg.get_history(rec.slug)
-    except Exception:
-        return []
+    Prefers the cross-hub ``usage_map`` (MariaDB) when provided; otherwise
+    falls back to this hub's local counter. Empty list when no history."""
+    if usage_map is not None:
+        hist = (usage_map.get(rec.slug) or {}).get("history") or {}
+    else:
+        reg = getattr(state, "engine_usage", None)
+        if reg is None:
+            return []
+        try:
+            hist = reg.get_history(rec.slug)
+        except Exception:
+            return []
     out: list = []
     for date_str, row in sorted(hist.items()):
         prompt = int(row.get("prompt", 0) or 0)
@@ -226,6 +240,32 @@ def _cost_history_for(rec: EngineRecord) -> list:
             "requests": int(row.get("requests", 0) or 0),
             "cost_jpy": _calc_cost_jpy(prompt, completion, rec),
         })
+    return out
+
+
+async def _load_engine_usage_map() -> dict | None:
+    """Pre-fetch the cross-hub (MariaDB) token usage once and reshape to
+    ``{slug: {"today": {...}, "history": {date: {...}}}}`` for
+    ``_engine_to_dict``. Returns None when MariaDB isn't configured /
+    unreadable, so callers transparently fall back to this hub's local
+    counter (single GET = one query, not one-per-engine)."""
+    pool = getattr(state, "mariadb_pool", None)
+    if pool is None:
+        return None
+    try:
+        from server.hub.mariadb import load_engine_usage
+        from server.hub.engines import _today_utc, _USAGE_HISTORY_DAYS
+        data = await load_engine_usage(pool, days=_USAGE_HISTORY_DAYS)
+    except Exception:
+        return None
+    today = _today_utc()
+    out: dict = {}
+    for date_str, by_slug in (data or {}).items():
+        for slug, row in (by_slug or {}).items():
+            e = out.setdefault(slug, {"today": None, "history": {}})
+            e["history"][date_str] = row
+            if date_str == today:
+                e["today"] = row
     return out
 
 
@@ -312,7 +352,8 @@ async def list_engines() -> dict:
     never returned -- only the env-var name and a flag indicating
     whether that env is currently set on the hub."""
     er = _require_engines()
-    items = [_engine_to_dict(r) for r in er.list_all()]
+    usage_map = await _load_engine_usage_map()
+    items = [_engine_to_dict(r, usage_map) for r in er.list_all()]
     return {"count": len(items), "engines": items}
 
 
@@ -322,7 +363,8 @@ async def get_engine(slug: str) -> dict:
     rec = er.get(slug)
     if rec is None:
         raise HTTPException(404, f"engine '{slug}' not found")
-    return _engine_to_dict(rec)
+    usage_map = await _load_engine_usage_map()
+    return _engine_to_dict(rec, usage_map)
 
 
 @router.put("/engines/{slug}")
