@@ -15,6 +15,7 @@ import logging
 import os
 import tarfile
 import time
+from datetime import datetime, timezone
 from pathlib import Path
 
 from fastapi import APIRouter, HTTPException, Request, Response
@@ -83,6 +84,108 @@ async def list_workers() -> dict:
             # Mirror to the legacy alias the admin UI still reads.
             w["slot_novnc_urls"] = rewritten
     return payload
+
+
+@router.get("/workers/capacity")
+async def workers_capacity() -> dict:
+    """How many fetches the fleet can run AT ONCE (concurrent-fetch capacity).
+
+    A fetch -- like every job -- runs on one worker *lane* (a worker's
+    ``capacity`` = its ``max_concurrent`` lanes), and fetch shares lanes with
+    all modes, so **max simultaneous fetches = total eligible lanes**.
+
+    * ``max_concurrent`` -- the HARD ceiling (sum of active workers' lanes).
+    * ``recommended_concurrency`` -- what a client should actually cap at:
+      ``round(max_concurrent * load_factor)`` (``load_factor`` env
+      ``PAPRIKA_FETCH_LOAD_FACTOR``, default 0.8 = 80% of capacity). Reserves
+      headroom for worker churn / bursts / non-fetch jobs (keeps the fleet out
+      of saturation). This is the number to use, not the raw ``max_concurrent``.
+    * ``available`` -- free lanes you can start RIGHT NOW without queuing;
+      beyond it, new jobs queue (redrive) or ``POST /jobs`` returns 503. This is
+      the number a client should cap its parallel fetches at.
+    * ``running`` -- lanes busy now.
+
+    Fleet-wide (all hubs, via the same cross-hub aggregation ``/workers`` uses,
+    so it survives a single hub's Redis hiccup). ``available`` mirrors the
+    dispatcher's eligibility (:meth:`pick_worker`): alive + status ``active`` +
+    has a Chrome lane + disk < 90%. Lightweight: no per-job hydration."""
+    now_iso = datetime.now(timezone.utc).isoformat(timespec="seconds").replace(
+        "+00:00", "Z"
+    )
+    # Recommended concurrency = a FRACTION of the hard ceiling (the "load
+    # factor"), leaving headroom for worker churn (a rolling deploy drops
+    # eligible capacity ~20-25%), fast-turnover/transient lane use, the
+    # occasional non-fetch job, and burst absorption. Tunable via env
+    # PAPRIKA_FETCH_LOAD_FACTOR (0..1, default 0.8 = recommend 80% of capacity).
+    try:
+        load_factor = float(os.environ.get("PAPRIKA_FETCH_LOAD_FACTOR") or 0.8)
+    except (TypeError, ValueError):
+        load_factor = 0.8
+    load_factor = max(0.05, min(load_factor, 1.0))
+    if state.registry is None:
+        return {
+            "max_concurrent": 0, "recommended_concurrency": 0, "available": 0,
+            "running": 0, "utilization_pct": 0, "load_factor": load_factor,
+            "lanes": {"total": 0, "busy": 0, "free": 0},
+            "workers": {"eligible": 0, "active": 0, "alive": 0},
+            "queued": None, "note": "no worker registry", "as_of": now_iso,
+        }
+    payload = await state.registry.stats_async()
+    workers = payload.get("workers", [])
+
+    def _cap(w) -> int:
+        c = w.get("capacity")
+        return int(c) if isinstance(c, (int, float)) and c and c > 0 else 1
+
+    # Fleet ceiling / current load = active + alive workers.
+    active = [
+        w for w in workers
+        if w.get("alive") and (w.get("status") or "active") == "active"
+    ]
+    max_concurrent = sum(_cap(w) for w in active)
+    running = sum(int(w.get("in_flight") or 0) for w in active)
+
+    # Dispatchable-now = active workers that ALSO have a usable Chrome lane and
+    # aren't disk-pressured (mirrors pick_worker, so we never over-promise).
+    def _dispatchable(w) -> bool:
+        return (
+            len(w.get("lane_novnc_urls") or []) > 0
+            or len(w.get("slot_novnc_urls") or []) > 0
+            or bool(w.get("novnc_url"))
+        ) and float(w.get("disk_pct") or 0.0) < 90.0
+
+    eligible = [w for w in active if _dispatchable(w)]
+    available = sum(max(0, _cap(w) - int(w.get("in_flight") or 0)) for w in eligible)
+
+    # Best-effort queued backlog (one indexed COUNT; never fail the endpoint).
+    queued = None
+    try:
+        _lji = getattr(state.store, "list_job_infos", None)
+        if callable(_lji):
+            _, queued = await _lji(status=["queued"], limit=1)
+    except Exception:
+        queued = None
+
+    return {
+        "max_concurrent": max_concurrent,
+        "recommended_concurrency": round(max_concurrent * load_factor),
+        "load_factor": load_factor,
+        "available": available,
+        "running": running,
+        "utilization_pct": round(100 * running / max_concurrent) if max_concurrent else 0,
+        "lanes": {"total": max_concurrent, "busy": running, "free": available},
+        "workers": {
+            "eligible": len(eligible),
+            "active": len(active),
+            "alive": sum(1 for w in workers if w.get("alive")),
+        },
+        "queued": queued,
+        "note": (
+            "1 fetch = 1 lane; any free lane runs a fetch. Cap parallel fetches "
+            "at `available`; beyond it, jobs queue (redrive) or POST /jobs 503s."
+        ),
+        "as_of": now_iso,
+    }
 
 
 @router.get("/workers/hosts")

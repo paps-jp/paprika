@@ -251,6 +251,42 @@ class PaprikaClient:
         data = await self._json("GET", "/workers")
         return data.get("workers", [])
 
+    async def capacity(self) -> dict:
+        """GET /workers/capacity -- the fleet's concurrent-fetch capacity.
+
+        Returns a dict::
+
+            {
+              "max_concurrent":          122,  # hard ceiling = total fleet lanes
+              "recommended_concurrency":  98,  # cap your parallel fetches at THIS
+              "load_factor":             0.8,  # recommended = round(max * load_factor)
+              "available":                60,  # free lanes right now
+              "running":                  62,
+              "utilization_pct":          51,
+              "lanes":   {"total": 122, "busy": 62, "free": 60},
+              "workers": {"eligible": 61, "active": 61, "alive": 61},
+              "queued":  13,
+              "as_of":   "2026-06-08T...Z",
+            }
+
+        ``recommended_concurrency`` is the number to throttle to (1 fetch = 1
+        lane; it reserves headroom for worker churn / bursts so you stay out of
+        503-at-capacity). :meth:`fetch_many` uses it automatically. Cheap and
+        fleet-wide (aggregated across all hubs)."""
+        return await self._json("GET", "/workers/capacity")
+
+    async def recommended_concurrency(self, *, default: int = 8) -> int:
+        """The fleet's recommended max concurrent fetches
+        (``capacity()['recommended_concurrency']``). Falls back to ``default``
+        if the hub is an older build without the endpoint, or on any error."""
+        try:
+            v = (await self.capacity()).get("recommended_concurrency")
+            if isinstance(v, (int, float)) and v >= 1:
+                return int(v)
+        except Exception:
+            pass
+        return int(default)
+
     async def list_sessions(self) -> list[dict]:
         data = await self._json("GET", "/sessions")
         return data.get("sessions", [])
@@ -463,6 +499,63 @@ class PaprikaClient:
         return await self.wait_job(
             info.job_id, poll_interval=poll_interval, timeout=timeout,
         )
+
+    async def fetch_many(
+        self,
+        urls,
+        *,
+        concurrency: Optional[int] = None,
+        return_exceptions: bool = True,
+        on_result=None,
+        **fetch_kwargs: Any,
+    ) -> list:
+        """Fetch many URLs concurrently, CAPPED at the fleet's recommended
+        concurrency so you don't saturate it / hit 503-at-capacity.
+
+        ``concurrency=None`` (default) reads the cap ONCE from
+        ``GET /workers/capacity`` (``recommended_concurrency`` = a fraction of
+        the fleet's total lanes); pass an int to override. Each URL runs through
+        :meth:`fetch`, so extra kwargs (``scroll=`` / ``download_video=`` /
+        ``use_profile=`` / ``timeout=`` …) flow through. Results come back in the
+        SAME order as ``urls``; a failed fetch is stored as its exception when
+        ``return_exceptions=True`` (default), else the first failure is raised.
+        ``on_result(url, result)`` is an optional per-completion callback (e.g.
+        for a progress bar).
+
+        Note: the cap is read once at the start (static). For a very long batch
+        that should track fleet changes, call ``fetch_many`` per chunk or pass an
+        explicit ``concurrency``.
+
+            urls = [...]
+            results = await cli.fetch_many(urls)            # auto-throttled
+            ok = [r for r in results if not isinstance(r, Exception)]
+        """
+        urls = list(urls)
+        if not urls:
+            return []
+        if concurrency is None:
+            concurrency = await self.recommended_concurrency()
+        concurrency = max(1, int(concurrency))
+        sem = asyncio.Semaphore(concurrency)
+        results: list = [None] * len(urls)
+
+        async def _one(i: int, u: str) -> None:
+            async with sem:
+                try:
+                    r = await self.fetch(u, **fetch_kwargs)
+                except Exception as e:  # noqa: BLE001
+                    if not return_exceptions:
+                        raise
+                    r = e
+                results[i] = r
+                if on_result is not None:
+                    try:
+                        on_result(u, r)
+                    except Exception:
+                        pass
+
+        await asyncio.gather(*(_one(i, u) for i, u in enumerate(urls)))
+        return results
 
     # -- assets (image / media retrieval) -----------------------------------
 

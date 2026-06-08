@@ -171,6 +171,9 @@ async with async_paprika.connect() as cli:
 | `cli.job_assets(id, kind=, details=)` | `GET /jobs/{id}/assets.json` | captured assets |
 | `cli.job_images(id)` | (assets, `kind="image"`) | shorthand |
 | `cli.download_job_assets(id, dir)` | `GET /jobs/{id}/assets/*` | save to disk |
+| `cli.capacity()` | `GET /workers/capacity` | fleet concurrent-fetch capacity |
+| `cli.recommended_concurrency()` | (capacity) | int: how many fetches to run in parallel |
+| `cli.fetch_many(urls, concurrency=None, …)` | many `fetch()` | batch fetch, auto-throttled |
 
 `**opts` flow into `JobOptions` (`mode=`, `scroll=`, `scroll_max=`,
 `use_profile=`, `cookies_from=`, `goal=` for codegen / vision modes, …).
@@ -178,6 +181,38 @@ async with async_paprika.connect() as cli:
 > Anything not wrapped here (hosts / profiles / engines / settings / …)
 > is still reachable via `await cli._json("GET", "/hosts")` etc. — the
 > same thin HTTP helper every wrapper uses.
+
+### Capacity-aware batch fetch
+
+The fleet has a finite number of lanes (one fetch = one lane). Ask it how many
+concurrent fetches it can take, and let `fetch_many` cap the parallelism for you
+so you don't saturate it / hit `503`:
+
+```python
+cap = await cli.capacity()
+# {max_concurrent: 122, recommended_concurrency: 98, load_factor: 0.8,
+#  available: 60, running: 62, utilization_pct: 51, lanes: {...}, queued: 13}
+
+# fan out -- concurrency=None => auto = recommended_concurrency (a margined
+# fraction of the ceiling that leaves headroom for worker churn / bursts):
+results = await cli.fetch_many(urls, scroll=True)         # auto-throttled
+ok = [r for r in results if not isinstance(r, Exception)]
+```
+
+`recommended_concurrency` (= `round(max_concurrent * load_factor)`; the server's
+`load_factor` defaults to 0.8 / 80%) is the number to throttle to. `fetch_many`
+returns results in URL order; a failed fetch comes back as its exception (set
+`return_exceptions=False` to raise instead). Pass an explicit `concurrency=` to
+override, and `on_result=lambda url, r: ...` for progress.
+
+A complete runnable demo is in
+[`examples/capacity_fetch.py`](examples/capacity_fetch.py):
+
+```bash
+python examples/capacity_fetch.py --show-capacity                  # just the numbers
+python examples/capacity_fetch.py https://en.wikipedia.org/wiki/Cat ...
+N=$(paprika-client capacity -q)     # CLI: just recommended_concurrency, for scripts
+```
 
 ### Keep the session alive after the script exits
 

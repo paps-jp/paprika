@@ -373,6 +373,32 @@ def _cmd_auth_key_revoke(args: argparse.Namespace) -> int:
     return 0
 
 
+# ---------------------------------------------------------------- capacity
+
+def _cmd_capacity(args: argparse.Namespace) -> int:
+    """GET /workers/capacity -- the fleet's concurrent-fetch capacity."""
+    import httpx  # lazy so --help stays fast
+    import json
+    hub = _resolve_hub(args.hub)
+    try:
+        r = httpx.get(
+            f"{hub}/workers/capacity", headers=_auth_headers(args), timeout=30,
+        )
+    except Exception as e:  # noqa: BLE001
+        print(f"error: {e}", file=sys.stderr)
+        return 1
+    if r.status_code != 200:
+        print(f"error {r.status_code}: {r.text}", file=sys.stderr)
+        return 1
+    d = r.json()
+    if getattr(args, "quiet", False):
+        # just the number, for scripting: N=$(paprika-client capacity -q)
+        print(d.get("recommended_concurrency"))
+    else:
+        print(json.dumps(d, indent=2))
+    return 0
+
+
 # ---------------------------------------------------------------- main
 
 def main(argv: Optional[list[str]] = None) -> int:
@@ -481,6 +507,16 @@ def main(argv: Optional[list[str]] = None) -> int:
     kr = sub.add_parser("auth-key-revoke", help="Revoke an API key by id")
     kr.add_argument("id", help="Key id (key_...) to revoke")
     kr.set_defaults(func=_cmd_auth_key_revoke)
+
+    cap = sub.add_parser(
+        "capacity",
+        help="Fleet concurrent-fetch capacity (max / recommended / available)",
+    )
+    cap.add_argument(
+        "-q", "--quiet", action="store_true",
+        help="Print ONLY recommended_concurrency (for scripting)",
+    )
+    cap.set_defaults(func=_cmd_capacity)
 
     args = p.parse_args(argv)
     return args.func(args)
