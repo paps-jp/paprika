@@ -224,7 +224,8 @@ class _RunMixin:
             _logger.info(
                 f"[worker {self.worker_id}] loop-watchdog armed "
                 f"(wedge {self._wd_threshold_s:.0f}s, link-stuck "
-                f"{self._wd_link_threshold_s:.0f}s, check {self._wd_check_s:.0f}s)"
+                f"{self._wd_link_threshold_s:.0f}s, inbound "
+                f"{self._wd_inbound_threshold_s:.0f}s, check {self._wd_check_s:.0f}s)"
             )
         async with make_async_client(timeout=60.0) as http:
             self._http = http
@@ -283,6 +284,10 @@ class _RunMixin:
                     return
                 finally:
                     self._ws = None
+                    # Disarm the inbound-liveness arm across the disconnect; it
+                    # re-enables on the first frame of the next connection
+                    # (self-enabling -> no reconnect-window false-fire).
+                    self._last_inbound_ok = 0.0
                     # P2 (session survival): do NOT force-end sessions on a
                     # transient WS drop. This loop reconnects in place, and the
                     # hub now PERSISTS full session state in Redis and REBUILDS a
@@ -334,6 +339,15 @@ class _RunMixin:
         ack = decode_hub_msg(raw)
         if not isinstance(ack, HubRegistered):
             raise RuntimeError(f"unexpected ack: {ack}")
+        # The HubRegistered ack is a real inbound frame from the hub. Stamp the
+        # inbound-liveness clock NOW so the watchdog's ghost arm is enabled from
+        # the moment the link is up. Without this, if the proxied WS ghosts
+        # (stays ESTABLISHED to nginx but no hub consumes us) BEFORE the first
+        # frame of the async-for recv loop below, _last_inbound_ok stays 0.0
+        # (reset on the prior disconnect) and the `> 0` guard disables the arm
+        # forever -> the worker lingers as a ghost: absent from /workers yet
+        # never self-exiting (observed fleet-wide 2026-06-08).
+        self._last_inbound_ok = time.monotonic()
 
         # Clone-collision: the hub detected our worker_id is already
         # held by a different host (different client IP, original still
@@ -510,6 +524,11 @@ class _RunMixin:
         preview_task = asyncio.create_task(self._preview_capture_loop())
         try:
             async for raw in self._ws:
+                # Any frame from the hub -- even an undecodable one -- proves a
+                # hub is still consuming/serving this link at the APPLICATION
+                # layer (uvicorn/nginx answer protocol pings themselves, so a
+                # live WS alone does not). Drives the inbound-liveness arm (v3).
+                self._last_inbound_ok = time.monotonic()
                 try:
                     msg = decode_hub_msg(raw)
                 except Exception as e:
@@ -629,6 +648,32 @@ class _RunMixin:
                         f"heartbeat for {link_stale:.0f}s (> "
                         f"{self._wd_link_threshold_s:.0f}s) while the loop still "
                         f"ticks -- coroutines wedged -> "
+                        f"exit({WORKER_EXIT_CODE_VERSION_MISMATCH})"
+                    )
+                except Exception:
+                    pass
+                os._exit(WORKER_EXIT_CODE_VERSION_MISMATCH)
+            # v3: INBOUND-silence arm. The link arm above trusts our SEND
+            # succeeding; on a stale proxied WS the send keeps "succeeding" into
+            # nginx while no hub consumes us (the ghost). _last_inbound_ok is
+            # stamped only on a frame RECEIVED from the hub. If we BELIEVE we are
+            # connected (self._ws set) yet have heard nothing back past the
+            # threshold, no hub is serving this link -> exit + reconnect re-homes
+            # us via the consistent hash. The >0 guard + reset-on-disconnect keep
+            # idle-on-old-hub and reconnect windows from false-firing.
+            if (
+                self._wd_inbound_threshold_s > 0
+                and self._ws is not None
+                and self._last_inbound_ok > 0
+                and (time.monotonic() - self._last_inbound_ok) > self._wd_inbound_threshold_s
+            ):
+                inb_stale = time.monotonic() - self._last_inbound_ok
+                try:
+                    _logger.critical(
+                        f"[worker {self.worker_id}] hub link GHOST: no inbound "
+                        f"frame for {inb_stale:.0f}s (> "
+                        f"{self._wd_inbound_threshold_s:.0f}s) while connected -- "
+                        f"no hub consuming us -> "
                         f"exit({WORKER_EXIT_CODE_VERSION_MISMATCH})"
                     )
                 except Exception:
