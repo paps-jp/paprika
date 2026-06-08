@@ -241,6 +241,30 @@ class WorkerAgent(
             if _wd_link_base > 0
             else 0.0
         )
+        # v3 -- INBOUND liveness. _last_link_ok only proves our SENDS succeed,
+        # which on a stale proxied WS (worker<->nginx alive, nginx<->hub upstream
+        # dead/wedged) keep "succeeding" while no hub consumes us -> a reaped
+        # ghost the pong + link arms both miss. _last_inbound_ok is the monotonic
+        # time of the last frame RECEIVED from the hub (the hub now echoes
+        # HubExpectedVersion every heartbeat). Inbound silence past this threshold
+        # while we believe we are connected => no hub serves us => exit + the
+        # reconnect re-homes us via the consistent hash. Self-enabling: 0 (off)
+        # until the first inbound, reset to 0 on every disconnect, so a
+        # not-yet-upgraded hub or a reconnect window never false-fires. Default
+        # ~5min (> the 120s ping_timeout stall window, << multi-hour ghosts).
+        # 0 disables this arm.
+        self._last_inbound_ok = 0.0
+        try:
+            _wd_inb_base = float(
+                os.environ.get("PAPRIKA_WORKER_WATCHDOG_INBOUND_THRESHOLD_S", "300")
+            )
+        except (TypeError, ValueError):
+            _wd_inb_base = 300.0
+        self._wd_inbound_threshold_s = (
+            max(180.0, _wd_inb_base) + random.uniform(0.0, 60.0)
+            if _wd_inb_base > 0
+            else 0.0
+        )
         # Active session_id -> SessionState. Sessions hold the
         # nodriver browser/tab attached to a Lane between actions.
         self._sessions: dict[str, SessionState] = {}

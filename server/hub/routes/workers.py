@@ -1723,9 +1723,19 @@ async def _handle_worker_message(worker, msg) -> None:
         try:
             if not getattr(worker, "pending_update_to", None):
                 _exp = _hub_version()
-                _caps = getattr(worker, "capabilities", None)
-                _wv = (getattr(_caps, "version", "") or "") if _caps else ""
-                if _exp and _wv and _wv != _exp:
+                # Echo the expected version on EVERY heartbeat (not only on a
+                # version MISMATCH). For an up-to-date worker this is a cheap,
+                # idempotent application-layer liveness ACK -- proof that THIS hub
+                # is actually consuming the worker's heartbeats. uvicorn/nginx
+                # answer protocol WS pings on their own, so a live ping/pong does
+                # NOT prove the hub app still serves the link -- that gap is how a
+                # stale proxied WS turns a worker into a reaped "ghost". The
+                # worker inbound-liveness watchdog keys on receiving this; a hub
+                # that stops consuming stops echoing, so the worker notices and
+                # self-restarts onto a healthy hub. Out-of-date workers still
+                # self-update (versions differ); matched ones no-op in
+                # _maybe_begin_self_update.
+                if _exp:
                     await worker.send(
                         HubExpectedVersion(expected_worker_version=_exp)
                     )
