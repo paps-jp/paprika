@@ -517,6 +517,38 @@ async def resolve_engine(slug: str, body: Optional[dict] = None) -> dict:
     return _resolve_engine_payload(rec)
 
 
+@router.post("/engines/worker-agent/resolve")
+async def resolve_worker_agent_engine(body: Optional[dict] = None) -> dict:
+    """Worker-internal: resolve the engine the operator selected as the
+    page.agent backend (Settings ``worker_agent_engine_slug``).
+
+    Returns the resolved engine payload (endpoint/model/protocol/api_key/
+    slug). **404 when no engine is selected** -> the worker treats that as
+    "page.agent is disabled" and refuses the agent loop. Gated by
+    WORKER_SECRET like the other resolve endpoints."""
+    body = body or {}
+    _check_worker_secret(str(body.get("secret") or ""))
+    slug = ""
+    try:
+        if state.settings is not None:
+            slug = (state.settings.get("worker_agent_engine_slug", "") or "").strip()
+    except Exception:
+        slug = ""
+    if not slug:
+        raise HTTPException(
+            404,
+            "no engine selected for page.agent — tick 'use this engine for "
+            "page.agent' on an engine in the Engines tab",
+        )
+    er = _require_engines()
+    rec = er.get(slug)
+    if rec is None:
+        raise HTTPException(
+            404, f"page.agent engine '{slug}' not found (was it deleted?)"
+        )
+    return _resolve_engine_payload(rec)
+
+
 @router.post("/engines/auto/{kind}/resolve")
 async def resolve_engine_auto(kind: str, body: Optional[dict] = None) -> dict:
     """Same shape as ``/engines/{slug}/resolve`` but picks the

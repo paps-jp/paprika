@@ -781,7 +781,14 @@ function fillEngineForm(rec) {
   document.getElementById('engineHeaders').value = JSON.stringify(rec.headers || {}, null, 2);
   document.getElementById('enginePromoted').checked = !!rec.promoted;
   document.getElementById('engineUseForCodegen').checked = !!rec.use_for_codegen;
-  { const _wa = document.getElementById('engineUseForWorkerAgent'); if (_wa) _wa.checked = !!rec.use_for_worker_agent; }
+  // page.agent backend selection lives in the shared setting
+  // worker_agent_engine_slug (not the engine record), so reflect THAT:
+  // checked iff this engine is the currently-selected page.agent backend.
+  { const _wa = document.getElementById('engineUseForWorkerAgent');
+    if (_wa) { _wa.checked = false;
+      fetch('/settings').then(r => r.json()).then(d => {
+        _wa.checked = (((d.values || {}).worker_agent_engine_slug || '') === rec.slug);
+      }).catch(() => {}); } }
   // Daily quota (0 = unlimited). Empty input = treat as 0 for save.
   document.getElementById('engineDailyTokenBudget').value =
     (rec.daily_token_budget || 0) || '';
@@ -866,7 +873,6 @@ async function saveEngine() {
     timeout_s: parseInt(document.getElementById('engineTimeout').value, 10) || 60,
     promoted: document.getElementById('enginePromoted').checked,
     use_for_codegen: document.getElementById('engineUseForCodegen').checked,
-    use_for_worker_agent: (document.getElementById('engineUseForWorkerAgent') || {}).checked || false,
     daily_token_budget:
       parseInt(document.getElementById('engineDailyTokenBudget').value, 10) || 0,
     daily_request_budget:
@@ -901,6 +907,28 @@ async function saveEngine() {
       if (stat) stat.textContent = `❌ ${r.status}: ${t.slice(0, 200)}`;
       return;
     }
+    // page.agent backend selection lives in a shared SETTING
+    // (worker_agent_engine_slug), NOT the engine record -- so it persists
+    // cross-hub and survives the startup MariaDB engine restore. Checking
+    // this engine selects it as the page.agent backend; unchecking clears
+    // the selection only when it WAS the selected one.
+    try {
+      const _wa = document.getElementById('engineUseForWorkerAgent');
+      if (_wa) {
+        const _sv = await (await fetch('/settings')).json();
+        const cur = ((_sv.values) || {}).worker_agent_engine_slug || '';
+        let next = cur;
+        if (_wa.checked) next = slug;
+        else if (cur === slug) next = '';
+        if (next !== cur) {
+          await fetch('/settings', {
+            method: 'PUT',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ worker_agent_engine_slug: next }),
+          });
+        }
+      }
+    } catch (e) { /* selection write is non-fatal */ }
     if (stat) stat.textContent = '✓ saved';
     ENGINES_STATE.isNew = false;
     ENGINES_STATE.selectedSlug = slug;

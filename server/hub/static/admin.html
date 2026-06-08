@@ -1764,8 +1764,8 @@ curl 'http://paprika.lan/extensions/ublock-lite/download' --output ublock-lite.t
             <label style="font-weight:600;">コード生成LLM</label>
             <label style="cursor:pointer;" title="Submit フォームの「コード生成 LLM」セレクタに表示。チェックを入れた engine だけが選択肢として並ぶ。"><input type="checkbox" id="engineUseForCodegen"> Submit の「コード生成 LLM」セレクタに表示する</label>
 
-            <label style="font-weight:600;">worker エージェント</label>
-            <label style="cursor:pointer;" title="worker 側 page.agent (/act = agent_service ビジョンループ) のトークン使用を #engines でこの engine に計上する。worker は AGENT_MODEL_NAME を報告するが登録 model と一致しないことが多いため、ここで指定した engine に集約する。agent-service プロトコルの engine が既定で ON。"><input type="checkbox" id="engineUseForWorkerAgent"> worker の page.agent 使用をこの engine に計上する</label>
+            <label style="font-weight:600;">page.agent エンジン</label>
+            <label style="cursor:pointer;" title="worker の page.agent（ビジョンエージェント /act ループ）のバックエンド AI をこの engine にする。チェックした engine が page.agent に使われる（実質1つだけ選択）。どの engine もチェックが無いと page.agent は使用不可になる。/act を駆動するため agent-service プロトコルの engine を推奨。"><input type="checkbox" id="engineUseForWorkerAgent"> この engine を page.agent のバックエンドにする（未選択なら page.agent 無効）</label>
 
             <label style="font-weight:600; align-self:start; padding-top:5px;">Daily quota</label>
             <div style="display:flex; flex-direction:column; gap:6px;">

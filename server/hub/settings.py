@@ -47,6 +47,14 @@ _SCHEMA: dict[str, tuple[Any, str]] = {
     # knob is a CSV subset of {video_dl, auth_gate}; empty = both.
     "auto_escalate_enabled": (False, "bool"),
     "auto_escalate_categories": ("video_dl,auth_gate", "str"),
+    # Which engine the worker's page.agent (vision-agent /act loop) uses as
+    # its backend AI. Set by the Engines tab "page.agent でこの engine を使う"
+    # checkbox. Empty = NO engine selected = page.agent is DISABLED. Shared
+    # cross-hub via the settings table so every hub + worker resolves the
+    # same backend; the worker resolves it via POST /engines/worker-agent/
+    # resolve. agent-service-protocol engines are the realistic targets
+    # (page.agent drives them via /act).
+    "worker_agent_engine_slug": ("", "str"),
     # How many skills the retriever picks per new job before injection.
     "skill_retrieval_top_k": (3, "int"),
     # Minimum byte size for a captured asset. Anything smaller than
