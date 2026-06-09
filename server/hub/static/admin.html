@@ -1708,6 +1708,21 @@ curl 'http://paprika.lan/extensions/ublock-lite/download' --output ublock-lite.t
               履歴データなし (このエンジンはまだ利用されていません)。
             </div>
           </div>
+          <!-- GPU 温度の時系列グラフ (現在値の遷移)。14日履歴チャートの直下に配置。
+               受付停止 / 開始 しきい線つき。データは GET /engines/{slug}/thermal を
+               4秒間隔ポーリング (admin-presets-engines.js _startEngineTempPoll)。
+               しきい値は下のフォーム「GPU温度スロットル」で設定。 -->
+          <div style="margin:0 0 14px; padding:10px 12px; background:#fafafb; border:1px solid #e0e0e8; border-radius:6px;">
+            <div style="display:flex; align-items:center; gap:8px; margin-bottom:6px; font-weight:600; color:#444;">
+              <iconify-icon icon="lucide:thermometer" style="vertical-align:middle;"></iconify-icon>
+              <span>GPU温度 — 現在値の遷移</span>
+            </div>
+            <div id="engineThermalNow" style="font-size:.82em; color:#888; margin-bottom:4px;">GPU温度: ─</div>
+            <canvas id="engineTempChart" style="max-height:200px; width:100%; display:none;"></canvas>
+            <div id="engineTempChartEmpty" style="font-size:.85em; color:#888; padding:8px 0; display:none;">
+              GPU温度データなし (温度URL未設定 / エクスポータ <code>:9402</code> 未到達)。
+            </div>
+          </div>
           <div style="display:grid; grid-template-columns:max-content 1fr; gap:8px 10px; align-items:center;">
             <label for="engineSlug" style="font-weight:600;">Slug</label>
             <input type="text" id="engineSlug" placeholder="claude-sonnet-3.5 (lowercase, kebab-case)" style="padding:5px 8px;">
@@ -1811,6 +1826,32 @@ curl 'http://paprika.lan/extensions/ublock-lite/download' --output ublock-lite.t
               <div id="engineCostToday" style="font-size:.82em; color:#666;">本日のコスト: 読み込み中…</div>
               <div style="font-size:.75em; color:#888;">
                 参考レート (2026 年時点・¥150/USD 換算): DeepSeek-R1 ¥85/¥330、GPT-5 ¥375/¥1500、Claude Sonnet ¥450/¥2250、自前 GPU ¥0/¥0
+              </div>
+            </div>
+
+            <!-- GPU 温度スロットル (ローカルGPUエンジン): 受付停止温度 / 開始温度
+                 + 現在温度の時系列グラフ。0 / 空 = 無効 (クラウド等)。温度URLは
+                 空欄なら endpoint ホストの :9402 を自動使用。 -->
+            <label style="font-weight:600; align-self:start; padding-top:5px;">GPU温度スロットル</label>
+            <div style="display:flex; flex-direction:column; gap:6px;">
+              <div style="display:flex; gap:8px; align-items:center; flex-wrap:wrap;">
+                <label style="display:flex; align-items:center; gap:6px;" title="このエンジンのGPUがこの温度(℃)以上になると、新しいLLM/Agent呼び出しの受付を停止する。0 = 無効 (クラウド等)。">
+                  <span>受付停止温度</span>
+                  <input type="number" id="engineGpuTempStop" min="0" max="120" step="1" placeholder="0 (=無効)" style="padding:4px 6px; width:110px;">
+                  <span style="font-size:.85em; color:#888;">℃</span>
+                </label>
+                <label style="display:flex; align-items:center; gap:6px;" title="GPUがこの温度(℃)以下に冷えたら受付を再開 (ヒステリシス)。停止温度より十分低く。空なら自動で 停止-15℃。">
+                  <span>開始温度</span>
+                  <input type="number" id="engineGpuTempResume" min="0" max="120" step="1" placeholder="(空=停止-15)" style="padding:4px 6px; width:110px;">
+                  <span style="font-size:.85em; color:#888;">℃</span>
+                </label>
+              </div>
+              <div style="font-size:.75em; color:#888;">
+                各GPUボックスで <code>scripts/gpu_temp_exporter.py</code> を起動 (温度URL空欄なら
+                endpoint ホストの <code>:9402</code> を自動使用)。停止中はこのエンジンへの
+                codegen / perception / judge / page.agent 呼び出しが拒否され、同種の冷えたエンジンへ
+                フェイルオーバ (全台停止なら 503)。温度が読めない時は安全側で受付停止 (fail-safe)。
+                現在値のグラフは上部「GPU温度 — 現在値の遷移」を参照。
               </div>
             </div>
 

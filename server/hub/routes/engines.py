@@ -410,6 +410,20 @@ async def get_engine(slug: str) -> dict:
     return d
 
 
+@router.get("/engines/{slug}/thermal")
+async def get_engine_thermal(slug: str) -> dict:
+    """Lightweight live thermal snapshot for one engine: ``{configured,
+    temp_c, accepting, stop_c, resume_c, exporter_url}``. The admin UI polls
+    this every few seconds to draw the live GPU-temperature graph without the
+    heavier /engines/{slug} usage aggregation."""
+    er = _require_engines()
+    rec = er.get(slug)
+    if rec is None:
+        raise HTTPException(404, f"engine '{slug}' not found")
+    from server.hub import thermal
+    return await thermal.engine_thermal_snapshot(rec)
+
+
 @router.put("/engines/{slug}")
 async def upsert_engine(slug: str, body: dict) -> dict:
     """Create or update an engine record.

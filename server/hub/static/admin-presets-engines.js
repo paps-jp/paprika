@@ -833,6 +833,12 @@ function fillEngineForm(rec) {
   }
   // 14-day chart (token bars + cost line). Lazy-load Chart.js once.
   _renderEngineCostChart(rec.cost_history || []);
+  // GPU thermal throttle (受付停止温度 / 開始温度) + live current-temp graph.
+  { const s = document.getElementById('engineGpuTempStop');
+    const rs = document.getElementById('engineGpuTempResume');
+    if (s)  s.value  = (rec.gpu_temp_stop_c   || 0) || '';
+    if (rs) rs.value = (rec.gpu_temp_resume_c || 0) || ''; }
+  _startEngineTempPoll(ENGINES_STATE.isNew ? '' : (rec.slug || ''));
   document.getElementById('engineNotes').value = rec.notes || '';
   document.getElementById('engineDeleteBtn').disabled = false;
   document.getElementById('engineDeleteBtn').title = '削除';
@@ -848,6 +854,106 @@ function fillEngineForm(rec) {
   }
   const stat = document.getElementById('engineStatus');
   if (stat) stat.textContent = '';
+}
+
+// --- Live GPU-temperature graph per engine (thermal throttle) --------------
+// Polls GET /engines/{slug}/thermal every few seconds and plots the current
+// temp over time, with the 受付停止 / 開始 thresholds as dashed lines. The
+// series is client-side (resets on engine switch); colour reflects accepting
+// vs throttled state.
+let _engineTempChartInstance = null;
+let _engineTempPollTimer = null;
+let _engineTempSeries = [];   // [{label, temp}]
+
+function _stopEngineTempPoll() {
+  if (_engineTempPollTimer) { clearInterval(_engineTempPollTimer); _engineTempPollTimer = null; }
+  if (_engineTempChartInstance) { try { _engineTempChartInstance.destroy(); } catch (_) {} _engineTempChartInstance = null; }
+  _engineTempSeries = [];
+}
+
+function _renderEngineTempChart(stopC, resumeC) {
+  const canvas = document.getElementById('engineTempChart');
+  if (!canvas || typeof Chart === 'undefined') return;
+  const labels = _engineTempSeries.map(p => p.label);
+  const temps  = _engineTempSeries.map(p => p.temp);
+  const stopLine   = labels.map(() => (stopC > 0 ? stopC : null));
+  const resumeLine = labels.map(() => (resumeC > 0 ? resumeC : null));
+  if (_engineTempChartInstance) {
+    const c = _engineTempChartInstance;
+    c.data.labels = labels;
+    c.data.datasets[0].data = temps;
+    c.data.datasets[1].data = stopLine;
+    c.data.datasets[2].data = resumeLine;
+    c.update('none');
+    return;
+  }
+  _engineTempChartInstance = new Chart(canvas, {
+    type: 'line',
+    data: { labels, datasets: [
+      { label: 'GPU温度 ℃', data: temps, borderColor: 'rgba(192,80,32,1)',
+        backgroundColor: 'rgba(192,80,32,0.12)', fill: true, tension: 0.3,
+        pointRadius: 0, borderWidth: 2 },
+      { label: '受付停止', data: stopLine, borderColor: 'rgba(192,32,32,0.85)',
+        borderDash: [6, 4], pointRadius: 0, borderWidth: 1, fill: false },
+      { label: '開始', data: resumeLine, borderColor: 'rgba(32,128,64,0.85)',
+        borderDash: [6, 4], pointRadius: 0, borderWidth: 1, fill: false },
+    ] },
+    options: {
+      animation: false, responsive: true, maintainAspectRatio: false,
+      scales: {
+        y: { suggestedMin: 30, suggestedMax: 90, title: { display: true, text: '℃' } },
+        x: { ticks: { maxTicksLimit: 6, font: { size: 9 } } },
+      },
+      plugins: { legend: { display: true, labels: { boxWidth: 10, font: { size: 10 } } } },
+    },
+  });
+}
+
+async function _pollEngineTempOnce(slug) {
+  const nowEl = document.getElementById('engineThermalNow');
+  const canvas = document.getElementById('engineTempChart');
+  const empty = document.getElementById('engineTempChartEmpty');
+  try {
+    const r = await fetch('/engines/' + encodeURIComponent(slug) + '/thermal');
+    if (!r.ok) return;
+    const t = await r.json();
+    if (!t.configured) {
+      if (nowEl) { nowEl.textContent = 'GPU温度スロットル: 無効 (受付停止温度=0)'; nowEl.style.color = '#888'; }
+      if (canvas) canvas.style.display = 'none';
+      if (empty) empty.style.display = 'none';
+      return;
+    }
+    if (t.temp_c == null) {
+      if (nowEl) { nowEl.textContent = 'GPU温度: 取得不可 ─ エクスポータ未到達 → fail-safe で受付停止'; nowEl.style.color = '#c00'; }
+      if (canvas) canvas.style.display = 'none';
+      if (empty) empty.style.display = '';
+      return;
+    }
+    if (empty) empty.style.display = 'none';
+    if (canvas) canvas.style.display = '';
+    const label = new Date().toLocaleTimeString('ja-JP', { hour12: false });
+    _engineTempSeries.push({ label, temp: t.temp_c });
+    if (_engineTempSeries.length > 90) _engineTempSeries.shift();   // ~6min @4s
+    if (nowEl) {
+      nowEl.textContent = `GPU温度: ${t.temp_c}℃ ─ ${t.accepting ? '受付中' : '受付停止中'} `
+        + `(停止 ${t.stop_c || 0}℃ / 開始 ${t.resume_c || 0}℃)`;
+      nowEl.style.color = t.accepting ? '#196b2c' : '#c00';
+    }
+    _renderEngineTempChart(t.stop_c || 0, t.resume_c || 0);
+  } catch (_) {}
+}
+
+function _startEngineTempPoll(slug) {
+  _stopEngineTempPoll();
+  const nowEl = document.getElementById('engineThermalNow');
+  if (!slug) {
+    if (nowEl) { nowEl.textContent = 'GPU温度: ─ (保存後に表示)'; nowEl.style.color = '#888'; }
+    const canvas = document.getElementById('engineTempChart');
+    if (canvas) canvas.style.display = 'none';
+    return;
+  }
+  _pollEngineTempOnce(slug);
+  _engineTempPollTimer = setInterval(() => _pollEngineTempOnce(slug), 4000);
 }
 
 async function saveEngine() {
@@ -882,6 +988,12 @@ async function saveEngine() {
       parseFloat(document.getElementById('engineCostInputJpy').value) || 0,
     cost_output_per_1m_jpy:
       parseFloat(document.getElementById('engineCostOutputJpy').value) || 0,
+    // GPU thermal throttle. 0 = off (cloud engines). resume blank/<=0 ->
+    // hub defaults it to stop-15℃.
+    gpu_temp_stop_c:
+      parseFloat(document.getElementById('engineGpuTempStop').value) || 0,
+    gpu_temp_resume_c:
+      parseFloat(document.getElementById('engineGpuTempResume').value) || 0,
     notes: document.getElementById('engineNotes').value,
   };
   // Direct API key: only include in body if the user typed something
@@ -959,6 +1071,7 @@ async function deleteEngine() {
     renderEnginesList();
     document.getElementById('enginesDetailEmpty').style.display = '';
     document.getElementById('enginesDetailForm').style.display = 'none';
+    _stopEngineTempPoll();
   } catch (e) {
     if (stat) stat.textContent = `❌ ${e.message}`;
   }
