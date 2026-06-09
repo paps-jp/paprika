@@ -227,6 +227,18 @@ def _run_all(args) -> int:
 
 
 def _run_worker(args) -> int:
+    # Bypass docker's flaky embedded DNS (127.0.0.11) BEFORE any hostname
+    # resolution or Chrome lane spawns -- see server/worker/dns_fix.py. The
+    # embedded resolver intermittently HANGS on cold lookups (~10-20% at
+    # 4-16s), tripping the SSRF guard's pre-navigate resolve and slowing
+    # Chrome's navigation. No-op unless the container is on 127.0.0.11;
+    # disable with PAPRIKA_WORKER_DNS=off, customise with =ip1,ip2.
+    try:
+        from server.worker import dns_fix
+        dns_fix.apply()
+    except Exception as e:
+        log.warning("dns_fix: init failed (continuing): %s", e)
+
     from server.worker.agent import WorkerAgent, default_worker_id
 
     worker_id = args.worker_id or default_worker_id()
