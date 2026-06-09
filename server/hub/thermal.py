@@ -41,6 +41,12 @@ _temp_cache: dict = {}
 # hubs read the same exporter per box, so their latches converge.
 _latch: dict = {}
 
+# url -> {"ts": float, "hist": list}. The rolling 1-hour temp history is
+# owned by the exporter (one process per box = one consistent series every
+# hub reads); we just cache the HTTP read briefly.
+_HIST_CACHE_S = float(os.environ.get("PAPRIKA_GPU_HIST_CACHE_S", "4.0"))
+_hist_cache: dict = {}
+
 
 def exporter_url_for(rec) -> str:
     """Temp-exporter URL for an engine: explicit ``gpu_temp_url`` else
@@ -85,6 +91,32 @@ async def read_temp(url: str) -> float | None:
         if c and (now - c["ts"]) < _STALE_OK_S:
             return c["temp"]
         return None
+
+
+async def read_history(url: str) -> list:
+    """Rolling 1-hour temperature history ``[[ts, temp], ...]`` from the
+    exporter's ``/history`` endpoint, cached ``_HIST_CACHE_S``. Empty list
+    when there's no URL, the exporter is unreachable, or it predates the
+    history endpoint (older exporter -> UI falls back to live accumulation)."""
+    if not url:
+        return []
+    now = time.time()
+    c = _hist_cache.get(url)
+    if c and (now - c["ts"]) < _HIST_CACHE_S:
+        return c["hist"]
+    hurl = url.rstrip("/") + "/history"
+    try:
+        async with httpx.AsyncClient(timeout=3.0) as cli:
+            r = await cli.get(hurl)
+            hist = (r.json() or {}).get("history") or []
+        if not isinstance(hist, list):
+            hist = []
+        _hist_cache[url] = {"ts": now, "hist": hist}
+        return hist
+    except Exception:
+        if c and (now - c["ts"]) < _STALE_OK_S:
+            return c["hist"]
+        return []
 
 
 def _resume_for(stop: float, resume: float) -> float:
@@ -144,7 +176,10 @@ async def engine_thermal_snapshot(rec) -> dict:
     url = exporter_url_for(rec)
     temp = await read_temp(url)
     accepting = await engine_thermal_ok(rec)
+    history = await read_history(url)
     return {
         "configured": True, "temp_c": temp, "accepting": accepting,
         "stop_c": stop, "resume_c": resume, "exporter_url": url,
+        # Rolling 1-hour series [[ts, temp], ...] for the live UI graph.
+        "history": history,
     }

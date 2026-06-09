@@ -164,6 +164,7 @@ async function openHostModal(host) {
   const cookiesArea = document.getElementById('hostModalCookies');
   const notesInput = document.getElementById('hostModalNotes');
   const popupSel = document.getElementById('hostModalPopupPolicy');
+  const noVideoEl = document.getElementById('hostModalNoVideo');
   const delBtn = document.getElementById('hostModalDelete');
   if (host) {
     _entityHashSync('hosts', host);
@@ -178,10 +179,12 @@ async function openHostModal(host) {
         cookiesArea.value = JSON.stringify(rec.cookies || [], null, 2);
         notesInput.value = rec.notes || '';
         if (popupSel) popupSel.value = rec.popup_policy || 'kill';
+        if (noVideoEl) noVideoEl.checked = !!rec.no_video;
       } else {
         cookiesArea.value = '[]';
         notesInput.value = '';
         if (popupSel) popupSel.value = 'kill';
+        if (noVideoEl) noVideoEl.checked = false;
       }
     } catch (e) {
       cookiesArea.value = '[]';
@@ -195,6 +198,7 @@ async function openHostModal(host) {
     cookiesArea.value = '[]';
     notesInput.value = '';
     if (popupSel) popupSel.value = 'kill';
+    if (noVideoEl) noVideoEl.checked = false;
     delBtn.style.display = 'none';
   }
   _openHostModal();
@@ -228,10 +232,12 @@ async function saveHostModal() {
   // the field from the PUT preserves the existing patterns (managed
   // separately via the "📋 dedup" modal).
   const popupSel = document.getElementById('hostModalPopupPolicy');
+  const noVideoEl = document.getElementById('hostModalNoVideo');
   const body = {
     cookies: cookies,
     notes: (notesInput.value || '').trim() || null,
     popup_policy: popupSel ? popupSel.value : 'kill',
+    no_video: noVideoEl ? !!noVideoEl.checked : false,
   };
   try {
     const r = await fetch(HOST_ONE_URL(host), {

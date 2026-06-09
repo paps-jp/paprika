@@ -931,9 +931,21 @@ async function _pollEngineTempOnce(slug) {
     }
     if (empty) empty.style.display = 'none';
     if (canvas) canvas.style.display = '';
-    const label = new Date().toLocaleTimeString('ja-JP', { hour12: false });
-    _engineTempSeries.push({ label, temp: t.temp_c });
-    if (_engineTempSeries.length > 90) _engineTempSeries.shift();   // ~6min @4s
+    const hist = Array.isArray(t.history) ? t.history : [];
+    if (hist.length) {
+      // Server-owned rolling 1-hour history (one consistent series per GPU
+      // box). Show the past hour immediately on open + keep extending live;
+      // the rightmost point is the current in-progress value.
+      _engineTempSeries = hist.map(p => ({
+        label: new Date((p[0] || 0) * 1000).toLocaleTimeString('ja-JP', { hour12: false }),
+        temp: p[1],
+      }));
+    } else {
+      // Fallback: exporter predates /history -> accumulate client-side.
+      const label = new Date().toLocaleTimeString('ja-JP', { hour12: false });
+      _engineTempSeries.push({ label, temp: t.temp_c });
+      if (_engineTempSeries.length > 900) _engineTempSeries.shift();
+    }
     if (nowEl) {
       nowEl.textContent = `GPU温度: ${t.temp_c}℃ ─ ${t.accepting ? '受付中' : '受付停止中'} `
         + `(停止 ${t.stop_c || 0}℃ / 開始 ${t.resume_c || 0}℃)`;

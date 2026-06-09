@@ -1311,6 +1311,10 @@ asyncio.run(main())"
           main tab がそのまま動画ページに遷移するので、後続の <code>page.download_video()</code> が効きます。
         </small>
       </label>
+      <label style="display:flex; align-items:center; gap:8px; cursor:pointer;">
+        <input type="checkbox" id="hostModalNoVideo">
+        <span><strong>動画なし（確実）</strong> <small style="font-weight:normal; color:#888;">— このサイトに動画は無いと断定。<code>download_video</code> fetch を AI エスカレーションしない（存在しない動画を探さない）</small></span>
+      </label>
       <div style="display:flex; gap:6px; flex-wrap:wrap; color:#666; font-size:0.85em;">
         <span>使える CDP フィールド:</span>
         <code>name</code> <code>value</code> <code>domain</code> <code>path</code>

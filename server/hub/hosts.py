@@ -157,6 +157,12 @@ class HostRecord:
     # (auth.owner_can_use) is a no-op until enforce + a non-admin owner.
     owner_id: str = "default"
     shared: bool = True
+    # Operator-registered fact: this host has NO video content. When True a
+    # ``download_video`` fetch on this host is NOT auto-escalated into the AI
+    # codegen-loop -- we don't spend GPU/AI hunting a video that's confirmed
+    # absent. Curated / operator-asserted (set via PUT /hosts/{host} or the
+    # #hosts edit modal). Read by server/hub/_escalate.py classify_completed.
+    no_video: bool = False
 
     def to_json(self) -> dict:
         return asdict(self)
@@ -232,6 +238,7 @@ class HostRecord:
             ],
             owner_id=str(d.get("owner_id") or "default"),
             shared=bool(d.get("shared", True)),
+            no_video=bool(d.get("no_video") or False),
         )
 
 
@@ -501,6 +508,7 @@ class HostRegistry(JsonRecordRegistry[HostRecord]):
         fetch_recipes: list | None = None,
         owner_id: str | None = None,
         shared: bool | None = None,
+        no_video: bool | None = None,
     ) -> HostRecord:
         h = _normalise_host(host)
         if not h:
@@ -572,6 +580,12 @@ class HostRegistry(JsonRecordRegistry[HostRecord]):
             merged_shared = existing.shared if existing else True
         else:
             merged_shared = bool(shared)
+        # no_video: explicit None preserves existing (cookie-only / auto-save
+        # re-saves never clear the operator's "this host has no video" flag).
+        if no_video is None:
+            merged_no_video = existing.no_video if existing else False
+        else:
+            merged_no_video = bool(no_video)
 
         rec = HostRecord(
             host=h,
@@ -590,6 +604,7 @@ class HostRegistry(JsonRecordRegistry[HostRecord]):
             fetch_recipes=merged_fetch_recipes,
             owner_id=merged_owner,
             shared=merged_shared,
+            no_video=merged_no_video,
         )
         self._write(rec)
         return rec
