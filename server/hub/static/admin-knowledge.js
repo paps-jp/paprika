@@ -220,12 +220,17 @@
       ? '<button class="aibtn" data-act="demote" data-kind="' + kind + '" data-slug="' + slug + '">demote</button>'
       : '<button class="aibtn" data-act="promote" data-kind="' + kind + '" data-slug="' + slug + '">promote</button>';
     const delBtn = '<button class="aibtn del" data-act="delete" data-kind="' + kind + '" data-slug="' + slug + '">delete</button>';
+    // Skills ARE code -- give each one a button to view its code_template.
+    const codeBtn = kind === 'skills'
+      ? '<button class="aibtn" data-act="code" data-kind="skills" data-slug="' + slug + '" title="このスキルのコード(code_template)を表示"><iconify-icon icon="lucide:code-2"></iconify-icon> コード</button>'
+      : '';
     return '<tr title="' + desc + '"><td><code>' + slug + '</code></td><td>' + tierBadge + '</td>' +
       '<td class="num">' + (x.use_count || 0) + '</td><td class="num">' + (x.success_count || 0) + '</td>' +
-      '<td>' + bar + '</td><td>' + tierBtn + delBtn + '</td></tr>';
+      '<td>' + bar + '</td><td>' + codeBtn + tierBtn + delBtn + '</td></tr>';
   }
 
   async function aiAction(kind, slug, act) {
+    if (act === 'code') { openSkillCode(slug); return; }
     if (act === 'delete' && !confirm('Delete ' + kind + ' "' + slug + '"?')) return;
     const enc = encodeURIComponent(slug);
     const method = act === 'delete' ? 'DELETE' : 'POST';
@@ -235,6 +240,43 @@
       if (!r.ok) { alert(act + ' failed: HTTP ' + r.status); return; }
     } catch (e) { alert(act + ' failed: ' + e); return; }
     loadSkillsConventions();
+  }
+
+  // ---- Skill code viewer (a skill = reusable code_template) -----------
+  let _skillCodeCurrent = '';
+  async function openSkillCode(slug) {
+    const modal = document.getElementById('skillCodeModal');
+    if (!modal) return;
+    const $ = (id) => document.getElementById(id);
+    $('skillCodeTitle').textContent = slug;
+    $('skillCodeMeta').textContent = '';
+    $('skillCodeDesc').innerHTML = '';
+    $('skillCodeBody').textContent = '読み込み中…';
+    $('skillCodeInstr').textContent = '';
+    $('skillCodeProv').textContent = '';
+    _skillCodeCurrent = '';
+    modal.style.display = 'flex';
+    try {
+      const r = await fetch('/skills/' + encodeURIComponent(slug));
+      if (!r.ok) { $('skillCodeBody').textContent = '取得失敗 (HTTP ' + r.status + ')'; return; }
+      const s = await r.json();
+      $('skillCodeTitle').textContent = (s.name || s.slug || slug);
+      const p = s.success_rate == null ? '—' : Math.round(s.success_rate * 100) + '%';
+      $('skillCodeMeta').textContent = (s.tier || 'auto') + ' · fitness ' + p +
+        ' (' + (s.success_count || 0) + '/' + (s.use_count || 0) + ')';
+      let dh = '';
+      if (s.description) dh += '<div style="margin-bottom:6px; color:#333;">' + _esc(s.description) + '</div>';
+      if ((s.applicable_when || []).length) dh += '<div style="font-size:.85em; color:#555;"><b>使う条件:</b> ' + s.applicable_when.map(_esc).join(' ／ ') + '</div>';
+      if ((s.tags || []).length) dh += '<div style="margin-top:5px;">' + s.tags.map(function (t) { return '<span class="aibadge tier-auto" style="margin-right:4px;">' + _esc(t) + '</span>'; }).join('') + '</div>';
+      $('skillCodeDesc').innerHTML = dh;
+      _skillCodeCurrent = s.code_template || '';
+      $('skillCodeBody').textContent = _skillCodeCurrent || '(コードなし)';
+      $('skillCodeInstr').textContent = s.llm_instructions || '(指示文なし)';
+      const prov = (s.extracted_from || []);
+      if (prov.length) $('skillCodeProv').textContent = '由来ジョブ (' + prov.length + '): ' + prov.slice(0, 8).map(_esc).join(', ') + (prov.length > 8 ? ' …' : '');
+    } catch (e) {
+      $('skillCodeBody').textContent = '取得失敗: ' + (e && e.message ? e.message : e);
+    }
   }
 
   // ---- Grooming sub-tab: retire + dedup candidates + auto toggles ----
@@ -323,7 +365,7 @@
     const short = jid.slice(0, 8);
     const name = _esc(x.name || '');
     return '<tr>' +
-      '<td><a href="#jobs/' + jid + '" style="font-family:monospace;font-size:.83em;" title="' + jid + '">' + short + '…</a></td>' +
+      '<td><a href="#live/' + jid + '" style="font-family:monospace;font-size:.83em;" title="' + jid + '">' + short + '…</a></td>' +
       '<td style="font-size:.83em;font-family:monospace;max-width:220px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;" title="' + name + '">' + name + '</td>' +
       '<td style="text-align:center;">' + validMark + '</td>' +
       '<td class="num">' + dur + '</td>' +
@@ -617,6 +659,19 @@
         if (!b) return;
         aiAction(b.dataset.kind, b.dataset.slug, b.dataset.act);
       });
+    });
+    // Skill code viewer modal: close / copy / click-outside.
+    const _scm = document.getElementById('skillCodeModal');
+    const _scClose = document.getElementById('skillCodeClose');
+    const _scCopy = document.getElementById('skillCodeCopy');
+    if (_scClose && _scm) _scClose.addEventListener('click', () => { _scm.style.display = 'none'; });
+    if (_scm) _scm.addEventListener('click', (e) => { if (e.target === _scm) _scm.style.display = 'none'; });
+    if (_scCopy) _scCopy.addEventListener('click', async () => {
+      try {
+        await navigator.clipboard.writeText(_skillCodeCurrent || '');
+        const old = _scCopy.innerHTML; _scCopy.textContent = '✓ copied';
+        setTimeout(() => { _scCopy.innerHTML = old; }, 1200);
+      } catch (e) {}
     });
     // AI tab: load the currently-active sub-tab's data on activation.
     document.querySelectorAll('[data-tab="ai"]').forEach(btn => {

@@ -116,7 +116,7 @@ _TABLES: list[tuple[str, str]] = [
             fetch_recipes       JSON,
             owner_id            VARCHAR(64)  NOT NULL DEFAULT 'default',
             shared              TINYINT(1)   NOT NULL DEFAULT 1,
-            no_video            TINYINT(1)   NOT NULL DEFAULT 0,
+            excluded            TINYINT(1)   NOT NULL DEFAULT 0,
             created_at          DATETIME(3),
             updated_at          DATETIME(3),
             last_used_at        DATETIME(3),
@@ -491,7 +491,7 @@ _REQUIRED_COLUMNS: list[tuple[str, str, str]] = [
     ("profiles", "shared", "TINYINT(1) NOT NULL DEFAULT 1"),
     ("hosts", "owner_id", "VARCHAR(64) NOT NULL DEFAULT 'default'"),
     ("hosts", "shared", "TINYINT(1) NOT NULL DEFAULT 1"),
-    ("hosts", "no_video", "TINYINT(1) NOT NULL DEFAULT 0"),
+    ("hosts", "excluded", "TINYINT(1) NOT NULL DEFAULT 0"),
 ]
 
 
@@ -1242,7 +1242,7 @@ async def restore_hosts(pool: Any, host_registry: Any) -> int:
                 "popup_policy, login_url, login_goal, login_check, "
                 "login_refresh_ttl_s, last_login_at, fetch_recipes, "
                 "created_at, updated_at, last_used_at, owner_id, shared, "
-                "no_video "
+                "excluded "
                 "FROM hosts"
             )
             rows = await cur.fetchall()
@@ -1286,7 +1286,7 @@ async def restore_hosts(pool: Any, host_registry: Any) -> int:
                 # registry so a restart / peer hub keeps tenant attribution.
                 owner_id=row[14] or "default",
                 shared=bool(row[15]) if row[15] is not None else True,
-                no_video=bool(row[16]) if len(row) > 16 and row[16] is not None else False,
+                excluded=bool(row[16]) if len(row) > 16 and row[16] is not None else False,
             )
             restored += 1
         except Exception as e:
@@ -1943,7 +1943,7 @@ async def upsert_host_row(pool: Any, rec: Any) -> None:
         _json_dumps(recipe_dicts),
         str(d.get("owner_id") or "default"),
         1 if d.get("shared", True) else 0,
-        1 if d.get("no_video") else 0,
+        1 if d.get("excluded") else 0,
         _parse_dt(d.get("created_at")),
         _parse_dt(d.get("updated_at")),
         _parse_dt(d.get("last_used_at")),
@@ -1956,7 +1956,7 @@ async def upsert_host_row(pool: Any, rec: Any) -> None:
                     popup_policy, login_url, login_goal,
                     login_check, login_refresh_ttl_s,
                     last_login_at, fetch_recipes, owner_id, shared,
-                    no_video, created_at, updated_at, last_used_at)
+                    excluded, created_at, updated_at, last_used_at)
                    VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)
                    ON DUPLICATE KEY UPDATE
                      cookies=VALUES(cookies), notes=VALUES(notes),
@@ -1968,7 +1968,7 @@ async def upsert_host_row(pool: Any, rec: Any) -> None:
                      last_login_at=VALUES(last_login_at),
                      fetch_recipes=VALUES(fetch_recipes),
                      owner_id=VALUES(owner_id), shared=VALUES(shared),
-                     no_video=VALUES(no_video),
+                     excluded=VALUES(excluded),
                      updated_at=VALUES(updated_at),
                      last_used_at=VALUES(last_used_at)""",
                 params,

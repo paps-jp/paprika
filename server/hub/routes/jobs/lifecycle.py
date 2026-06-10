@@ -515,6 +515,28 @@ async def cancel_job(job_id: str, request: Request) -> dict:
     return {"job_id": job_id, "cancelled": True, "task_was_running": cancelled_task}
 
 
+@router.post("/jobs/{job_id}/resolve-review")
+async def resolve_review_job(job_id: str, request: Request) -> dict:
+    """Resolve a 課題(review) job back to ``completed`` and clear its
+    ``review_reason`` -- removing it from the #jobs 課題 sub-tab. The fetch
+    itself already completed (課題 is a hub-side re-bucketing of a completed
+    fetch via _review.classify_review), so ``completed`` is its natural
+    terminal status. Used by the 課題 row's 「対象外」 button (which also
+    registers the host as ``excluded``). No-op for non-review jobs."""
+    info = await _require_owned_job_info(job_id, request)
+    if info.status != JobStatus.review:
+        return {"job_id": job_id, "resolved": False, "reason": f"job is {info.status}"}
+    info.status = JobStatus.completed
+    if hasattr(info, "review_reason"):
+        info.review_reason = None
+    await state.store.save_job_info(info)
+    try:
+        await state.store.publish_log(job_id, "[user] 課題 → completed (host を対象外に登録)")
+    except Exception:
+        pass
+    return {"job_id": job_id, "resolved": True, "status": "completed"}
+
+
 @router.delete("/jobs/{job_id}")
 async def delete_job(job_id: str, request: Request) -> dict:
     assert state.store is not None

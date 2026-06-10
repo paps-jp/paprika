@@ -670,7 +670,7 @@ async function refresh() {
         <tr data-job-id="${jid}">
           <td data-col="id"><code>${esc(j.job_id.substring(0,10))}</code></td>
           <td data-col="mode"><span class="badge">${modeLabel}</span></td>
-          <td data-col="status"><span class="badge ${esc(j.status)}"${j.status === 'review' ? ` title="${esc((j.progress && j.progress.last_log) || '課題: ログイン/年齢確認/同意などの全面オーバーレイでコンテンツが取得できていない可能性')}"` : ''}>${esc(_JOB_STATUS_LABEL[j.status] || j.status)}</span></td>
+          <td data-col="status"><span class="badge ${esc(j.status)}"${j.status === 'review' ? ` title="${esc((j.progress && j.progress.last_log) || '課題: ログイン/年齢確認/同意などの全面オーバーレイでコンテンツが取得できていない可能性')}"` : ''}>${esc(_JOB_STATUS_LABEL[j.status] || j.status)}</span>${j.status === 'review' ? `<button class="pill" style="margin-left:6px; padding:1px 8px; font-size:.78em; --la-bg:#fff3f0; --la-bd:#e0a99a; --la-fg:#a23c2a;" onclick="excludeHostAndResolve('${jid}','${encodeURIComponent(j.url||'')}',this)" title="このサイト(host)を対象外に登録し、このジョブを課題から外して completed にします（cookie 保持）"><iconify-icon icon="lucide:ban"></iconify-icon> 対象外</button>` : ''}</td>
           <td data-col="url" class="url" title="${esc(j.url)}"><a href="${esc(j.url)}" target="_blank">${esc(j.url)}</a></td>
           <td data-col="worker">${j.worker_id ? `<code>${esc(j.worker_id)}</code>${canAttach ? ` <small>#${laneIdx}</small>` : ''}` : '<span class="empty">—</span>'}</td>
           <td data-col="started">${startedCell}</td>
@@ -757,6 +757,37 @@ let _jobsStatusFilter = 'all';
 // Status badge labels. Most statuses show their raw value; ``review`` shows
 // the friendlier 課題 (its CSS class stays `review`, see .badge.review).
 const _JOB_STATUS_LABEL = { review: '課題' };
+
+// 課題(review) 行の「対象外」ボタン: そのジョブの host を 対象外(excluded) に
+// 登録し (将来の fetch は 課題判定も AI エスカレーションもスキップ)、さらに
+// THIS job を review->completed に変えて 課題サブタブから外す。GET->PUT で
+// host の cookie は保持。Backend: PUT /hosts/{host} + POST /jobs/{id}/resolve-review。
+async function excludeHostAndResolve(jobId, urlEnc, btn) {
+  let host = '';
+  try { host = new URL(decodeURIComponent(urlEnc || '')).hostname.replace(/^www\./, ''); } catch (_) {}
+  if (!host) { alert('host を取得できませんでした'); return; }
+  if (!confirm(`${host} を「対象外」に登録し、このジョブを課題から外して完了(completed)にします。\n\n今後このサイトは「課題」にも出ず、AI エスカレーションもされません。\n（cookie 等の設定は保持されます）`)) return;
+  if (btn) btn.disabled = true;
+  try {
+    // 1) host を 対象外 登録（cookie を消さないよう GET->PUT）
+    let cookies = [];
+    try { const g = await fetch('/hosts/' + encodeURIComponent(host)); if (g.ok) { const d = await g.json(); cookies = d.cookies || []; } } catch (_) {}
+    const hr = await fetch('/hosts/' + encodeURIComponent(host), {
+      method: 'PUT', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ cookies, excluded: true }),
+    });
+    if (!hr.ok) { alert(`ホストの対象外登録に失敗 (HTTP ${hr.status})`); if (btn) btn.disabled = false; return; }
+    // 2) このジョブを review -> completed
+    const rr = await fetch('/jobs/' + encodeURIComponent(jobId) + '/resolve-review', { method: 'POST' });
+    if (!rr.ok) { alert(`ステータス変更に失敗 (HTTP ${rr.status})`); if (btn) btn.disabled = false; return; }
+    // 3) 課題一覧から行を即削除（次回更新でも completed なので戻らない）
+    const tr = btn && btn.closest ? btn.closest('tr') : null;
+    if (tr) tr.remove();
+  } catch (e) {
+    alert('処理に失敗しました: ' + e.message);
+    if (btn) btn.disabled = false;
+  }
+}
 const JOBS_PAGE_SIZE_KEY = 'paprika.jobs.pageSize';
 const JOBS_PAGE_SIZE_OPTIONS = [10, 20, 50, 100, 200];
 

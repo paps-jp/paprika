@@ -1312,8 +1312,8 @@ asyncio.run(main())"
         </small>
       </label>
       <label style="display:flex; align-items:center; gap:8px; cursor:pointer;">
-        <input type="checkbox" id="hostModalNoVideo">
-        <span><strong>動画なし（確実）</strong> <small style="font-weight:normal; color:#888;">— このサイトに動画は無いと断定。<code>download_video</code> fetch を AI エスカレーションしない（存在しない動画を探さない）</small></span>
+        <input type="checkbox" id="hostModalExcluded">
+        <span><strong>対象外（このサイトは何もしない）</strong> <small style="font-weight:normal; color:#888;">— 「課題(review)」判定も AI エスカレーションも対象から外す。確実に動画が無い／そっとしておきたいサイト向け</small></span>
       </label>
       <div style="display:flex; gap:6px; flex-wrap:wrap; color:#666; font-size:0.85em;">
         <span>使える CDP フィールド:</span>
@@ -1330,6 +1330,27 @@ asyncio.run(main())"
       <button id="hostModalDelete" class="pill" style="--la-bg:#fee; --la-bd:#c88; --la-fg:#933; margin-right:auto; display:none;"><iconify-icon icon="lucide:trash-2"></iconify-icon> delete</button>
       <button id="hostModalCancel" class="pill" style="--la-bg:#f5f5fa; --la-bd:#bbc; --la-fg:#444;">cancel</button>
       <button id="hostModalSave" class="pill" style="--la-bg:#eef8ee; --la-bd:#7ab68a; --la-fg:#196b2c;"><iconify-icon icon="lucide:save"></iconify-icon> save</button>
+    </div>
+  </div>
+</div>
+
+<!-- Skill code viewer: a skill's code_template + llm_instructions (read-only) -->
+<div id="skillCodeModal" style="display:none; position:fixed; inset:0; background:rgba(0,0,0,0.6); z-index:1002; align-items:center; justify-content:center; padding:20px;">
+  <div style="background:#fff; max-width:980px; width:100%; max-height:90vh; border-radius:9px; overflow:hidden; display:flex; flex-direction:column;">
+    <div style="display:flex; align-items:center; gap:10px; padding:11px 15px; border-bottom:1px solid #eee; background:#fafafa;">
+      <iconify-icon icon="lucide:code-2" style="color:#2d6e8e;"></iconify-icon>
+      <strong id="skillCodeTitle" style="flex:1; min-width:0; overflow:hidden; text-overflow:ellipsis; white-space:nowrap;">skill</strong>
+      <span id="skillCodeMeta" style="font-size:.82em; color:#777; white-space:nowrap;"></span>
+      <button id="skillCodeCopy" class="pill" style="--la-bg:#eef8ff; --la-bd:#9bf; --la-fg:#16608f; font-size:.82em;"><iconify-icon icon="lucide:copy"></iconify-icon> copy</button>
+      <button id="skillCodeClose" style="background:transparent; border:none; cursor:pointer; font-size:1.3em; color:#666; padding:0 4px;" title="close">&#10005;</button>
+    </div>
+    <div style="overflow:auto; padding:14px 16px;">
+      <div id="skillCodeDesc" style="margin-bottom:10px; font-size:.92em;"></div>
+      <div style="font-weight:600; font-size:.86em; color:#444; margin:4px 0 4px;">code_template <span style="font-weight:normal; color:#999;">— 再利用される Python（codegen に注入される本体）</span></div>
+      <pre id="skillCodeBody" style="background:#0d1117; color:#e6edf3; padding:12px 14px; border-radius:6px; overflow:auto; font-family:ui-monospace,Consolas,monospace; font-size:12.5px; line-height:1.55; white-space:pre; max-height:44vh; margin:0;"></pre>
+      <div style="font-weight:600; font-size:.86em; color:#444; margin:12px 0 4px;">llm_instructions <span style="font-weight:normal; color:#999;">— プロンプト用の指示文（散文）</span></div>
+      <pre id="skillCodeInstr" style="background:#f6f8fa; border:1px solid #eaecef; padding:10px 12px; border-radius:6px; white-space:pre-wrap; word-break:break-word; font-size:13px; line-height:1.5; margin:0;"></pre>
+      <div id="skillCodeProv" style="font-size:.8em; color:#999; margin-top:10px;"></div>
     </div>
   </div>
 </div>

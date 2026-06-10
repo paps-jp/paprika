@@ -173,9 +173,9 @@ def _host_barriers(host: str | None) -> set[str]:
     return out
 
 
-def _host_no_video(host: str | None) -> bool:
+def _host_excluded(host: str | None) -> bool:
     """True iff the operator registered this host as having NO video
-    (``HostRecord.no_video``). Read from the live host registry. We never
+    (``HostRecord.excluded``). Read from the live host registry. We never
     spend AI hunting a video on a host the operator confirmed has none."""
     if not host:
         return False
@@ -184,7 +184,7 @@ def _host_no_video(host: str | None) -> bool:
         if reg is None:
             return False
         rec = reg.get(host)
-        return bool(rec is not None and getattr(rec, "no_video", False))
+        return bool(rec is not None and getattr(rec, "excluded", False))
     except Exception:
         return False
 
@@ -262,12 +262,6 @@ def classify_completed(info: JobInfo, result) -> str | None:
     """
     opts = info.options
     host = _host_of(info.url)
-
-    # Operator-registered "this host has no video" (HostRecord.no_video):
-    # never spend AI hunting a video that's confirmed absent. The captured
-    # page (images/text) is kept; we just don't auto-retry for a video.
-    if opts is not None and getattr(opts, "download_video", False) and _host_no_video(host):
-        return None
 
     # ---- video requested, evidence existed, nothing saved ----
     if opts is not None and getattr(opts, "download_video", False):
@@ -467,6 +461,10 @@ def _precheck(info: JobInfo) -> bool:
     opts = info.options
     if ((opts.mode if opts else None) or "fetch") != "fetch":
         return False  # only fetch escalates; no self-escalation loops
+    # Operator marked this host 対象外 (HostRecord.excluded = "do nothing"):
+    # no escalation of any category.
+    if _host_excluded(_host_of(info.url)):
+        return False
     if not _feature_on():
         return False
     if opts is not None and getattr(opts, "escalated_to", None):

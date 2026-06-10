@@ -194,6 +194,10 @@ function ljpRenderRunConfig(info) {
         <label>URL</label>
         <input type="text" value="${_esc(info.url || '')}" disabled>
       </div>
+      <div style="margin-top:8px; display:flex; align-items:center; gap:8px; flex-wrap:wrap;">
+        <button type="button" class="pill" id="jtExcludeHost" data-url="${_esc(info.url || '')}" style="--la-bg:#fff3f0; --la-bd:#e0a99a; --la-fg:#a23c2a;" title="このサイト(host)を「対象外」に登録。今後このサイトは課題判定もAIエスカレーションもされません（cookie 等は保持）。"><iconify-icon icon="lucide:ban"></iconify-icon> このサイトを対象外に</button>
+        <span id="jtExcludeHostMsg" style="font-size:.82em; color:#888;"></span>
+      </div>
       ${headerExtra}
     </div>
   `);
@@ -295,6 +299,39 @@ function ljpRenderRunConfig(info) {
 
   // Wrap everything in .fetch-options for the gradient background.
   host.innerHTML = `<div class="fetch-options" style="margin:0;">${blocks.join('')}</div>`;
+  const _exBtn = host.querySelector('#jtExcludeHost');
+  if (_exBtn) _exBtn.addEventListener('click', () => _excludeHostFromJob(_exBtn.dataset.url, _exBtn));
+}
+
+// One-click from a job: register its host as 対象外 (excluded = "do nothing").
+// GETs the current record first so cookies/recipes are preserved, then PUTs
+// excluded:true. Future fetches on this host skip 課題(review) classification
+// AND AI escalation. Backend: server/hub/_review.py + _escalate.py.
+async function _excludeHostFromJob(url, btn) {
+  const msg = document.getElementById('jtExcludeHostMsg');
+  let host = '';
+  try { host = new URL(url).hostname.replace(/^www\./, ''); } catch (_) {}
+  if (!host) { if (msg) { msg.textContent = 'host を取得できません'; msg.style.color = '#a00'; } return; }
+  if (!confirm(`${host} を「対象外（何もしない）」に登録しますか？\n今後このサイトは「課題」判定も AI エスカレーションもされなくなります（cookie 等は保持）。`)) return;
+  if (btn) btn.disabled = true;
+  if (msg) { msg.textContent = '登録中…'; msg.style.color = '#888'; }
+  try {
+    let cookies = [];
+    try {
+      const g = await fetch('/hosts/' + encodeURIComponent(host));
+      if (g.ok) { const d = await g.json(); cookies = d.cookies || []; }
+    } catch (_) {}
+    const r = await fetch('/hosts/' + encodeURIComponent(host), {
+      method: 'PUT', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ cookies: cookies, excluded: true }),
+    });
+    if (msg) {
+      msg.textContent = r.ok ? `✓ ${host} を対象外に登録しました` : `登録失敗 (${r.status})`;
+      msg.style.color = r.ok ? '#196b2c' : '#a00';
+    }
+  } catch (e) {
+    if (msg) { msg.textContent = '登録失敗: ' + e.message; msg.style.color = '#a00'; }
+  } finally { if (btn) btn.disabled = false; }
 }
 
 // --- Preview + Screenshot tab ---------------------------------------------

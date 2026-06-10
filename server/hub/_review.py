@@ -97,6 +97,15 @@ def classify_review(info, result) -> str | None:
         if not _feature_on():
             return None
 
+        # Operator marked this host 対象外 (HostRecord.excluded = "do nothing"):
+        # never bucket its fetches as 課題(review).
+        try:
+            from server.hub._escalate import _host_excluded, _host_of
+            if _host_excluded(_host_of(getattr(info, "url", ""))):
+                return None
+        except Exception:
+            pass
+
         occ = getattr(result, "occlusion", None) or {}
         if not occ or occ.get("error"):
             return None
