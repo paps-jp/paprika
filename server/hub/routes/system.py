@@ -184,18 +184,35 @@ async def health() -> dict:
     reasoning_engine: dict | None = None
     try:
         import os
-        distiller_slug = (
-            os.environ.get("PAPRIKA_R1_DISTILLER_ENGINE", "deepseek-r1")
-            or "deepseek-r1"
+        def _setting(key, *envs, default=""):
+            # Settings (live, abstracted) -> env(s) -> default. Mirrors
+            # distiller_r1._distiller_mode/_engine so /overview reflects the
+            # live toggle.
+            try:
+                if state.settings is not None:
+                    v = (state.settings.get(key, "") or "").strip()
+                    if v:
+                        return v
+            except Exception:
+                pass
+            for e in envs:
+                v = os.environ.get(e)
+                if v:
+                    return v
+            return default
+        distiller_slug = _setting(
+            "reasoning_distiller_engine",
+            "PAPRIKA_REASONING_DISTILLER_ENGINE", "PAPRIKA_R1_DISTILLER_ENGINE",
+            default="deepseek-r1",
         )
-        judge_mode = (
-            os.environ.get("PAPRIKA_R1_JUDGE_MODE", "off")
-            or "off"
-        )
-        distiller_mode = (
-            os.environ.get("PAPRIKA_R1_DISTILLER_MODE", "off")
-            or "off"
-        )
+        judge_mode = _setting(
+            "reasoning_judge_mode", "PAPRIKA_R1_JUDGE_MODE", default="off",
+        ).lower()
+        distiller_mode = _setting(
+            "reasoning_distiller_mode",
+            "PAPRIKA_REASONING_DISTILLER_MODE", "PAPRIKA_R1_DISTILLER_MODE",
+            default="off",
+        ).lower()
         # Try to resolve the engine record for richer info (model / endpoint).
         engine_info: dict = {"slug": distiller_slug}
         try:

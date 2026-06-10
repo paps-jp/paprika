@@ -368,6 +368,45 @@ def _should_run(
 # ---------------------------------------------------------------------------
 
 
+def _distiller_mode() -> str:
+    """Reasoning-distiller mode: ``off`` / ``on`` / ``new``. Abstracted from
+    the DeepSeek-specific name -- resolved Settings (live, cross-hub) first,
+    then the new ``PAPRIKA_REASONING_DISTILLER_MODE`` env, then the legacy
+    ``PAPRIKA_R1_DISTILLER_MODE`` (back-compat), then ``off``."""
+    try:
+        from server.hub._state import state
+        if state.settings is not None:
+            m = (state.settings.get("reasoning_distiller_mode", "") or "").lower().strip()
+            if m:
+                return m
+    except Exception:
+        pass
+    return (
+        os.environ.get("PAPRIKA_REASONING_DISTILLER_MODE")
+        or os.environ.get("PAPRIKA_R1_DISTILLER_MODE")
+        or "off"
+    ).lower().strip()
+
+
+def _distiller_engine_slug() -> str:
+    """Engine slug the reasoning distiller runs on (any reasoning engine, not
+    only DeepSeek-R1): Settings ``reasoning_distiller_engine`` → new env →
+    legacy ``PAPRIKA_R1_DISTILLER_ENGINE`` → ``deepseek-r1``."""
+    try:
+        from server.hub._state import state
+        if state.settings is not None:
+            s = (state.settings.get("reasoning_distiller_engine", "") or "").strip()
+            if s:
+                return s
+    except Exception:
+        pass
+    return (
+        os.environ.get("PAPRIKA_REASONING_DISTILLER_ENGINE")
+        or os.environ.get("PAPRIKA_R1_DISTILLER_ENGINE")
+        or "deepseek-r1"
+    )
+
+
 async def distill_for_job(
     *,
     host: str,
@@ -387,7 +426,7 @@ async def distill_for_job(
     Safe to call unconditionally: respects PAPRIKA_R1_DISTILLER_MODE
     (default ``off``), returns None when disabled.
     """
-    mode = (os.environ.get("PAPRIKA_R1_DISTILLER_MODE", "off") or "off").lower().strip()
+    mode = _distiller_mode()
     if mode not in ("on", "new"):
         return None
 
@@ -415,10 +454,7 @@ async def distill_for_job(
         from server.hub._state import state
         if state.engines is None:
             return None
-        engine_slug = (
-            os.environ.get("PAPRIKA_R1_DISTILLER_ENGINE", "deepseek-r1")
-            or "deepseek-r1"
-        )
+        engine_slug = _distiller_engine_slug()
         target: LLMTarget = resolve_engine_target(engine_slug, state.engines)
     except Exception as e:
         _log.info("[distiller-r1] engine resolve failed: %s", e)

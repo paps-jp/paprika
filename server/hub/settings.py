@@ -153,6 +153,13 @@ _SCHEMA: dict[str, tuple[Any, str]] = {
     # Engine slug registered in the Engines tab.  When empty, falls back
     # to env PAPRIKA_R1_DISTILLER_ENGINE (legacy compat) → "deepseek-r1".
     "reasoning_judge_engine": ("", "str"),
+    # Reasoning DISTILLER (deep HostKnowledge updates from job outcomes, incl.
+    # 課題/blocked pages via the eye's perception). Abstracted from the
+    # DeepSeek-specific "R1" name -- any reasoning engine. mode: off/on/new
+    # (new = run on a new-barrier or failed job; recommended steady state).
+    # engine: slug in the Engines tab; empty -> env -> "deepseek-r1".
+    "reasoning_distiller_mode": ("off", "str"),
+    "reasoning_distiller_engine": ("", "str"),
     # ---- Database: MariaDB -----------------------------------------------
     # External MariaDB / MySQL connection for persistent structured data.
     # When configured and reachable, the hub can migrate job state,
@@ -217,6 +224,8 @@ def _env_default(key: str, fallback: Any) -> Any:
         # Reasoning judge: settings.json -> env vars -> static default.
         "reasoning_judge_mode": ("PAPRIKA_R1_JUDGE_MODE", "str"),
         "reasoning_judge_engine": ("PAPRIKA_R1_DISTILLER_ENGINE", "str"),
+        "reasoning_distiller_mode": ("PAPRIKA_REASONING_DISTILLER_MODE", "str"),
+        "reasoning_distiller_engine": ("PAPRIKA_REASONING_DISTILLER_ENGINE", "str"),
         # MariaDB: settings.json -> env vars -> static default.
         "mariadb_host": ("PAPRIKA_MARIADB_HOST", "str"),
         "mariadb_port": ("PAPRIKA_MARIADB_PORT", "int"),
