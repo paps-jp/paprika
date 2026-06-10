@@ -47,6 +47,23 @@ _SCHEMA: dict[str, tuple[Any, str]] = {
     # knob is a CSV subset of {video_dl, auth_gate}; empty = both.
     "auto_escalate_enabled": (False, "bool"),
     "auto_escalate_categories": ("video_dl,auth_gate", "str"),
+    # When ON, the reasoning distiller translates a newly-learned, replayable
+    # barrier strategy (kind=click/sequence) into a per-host fetch_recipe so
+    # plain mode=fetch jobs replay it and get past the barrier (age gate /
+    # consent / login click). Conservative: present + confidence>=0.7 +
+    # scoped pattern + deduped + created_by="ai" (operator-visible/deletable).
+    # NB: auto recipes are permanent + have no self-heal yet (no failure
+    # feedback / retire), so the guards above matter. env kill-switch
+    # PAPRIKA_AUTO_RECIPE_FROM_BARRIER. See server/hub/distiller_r1.py.
+    "auto_recipe_from_barrier": (True, "bool"),
+    # Comma-separated engine slugs the operator has manually STOPPED (停止中).
+    # A stopped engine is skipped by every AI call (codegen / judge /
+    # distiller / perception / page.agent) -- enforced in
+    # codegen.check_engine_thermal + thermal.first_accepting, same as a
+    # thermal throttle, so callers fail over to another engine of the kind.
+    # Cross-hub + restart-safe via the settings table (no engines DB column).
+    # Toggled by POST /engines/{slug}/stop|resume.
+    "engines_disabled": ("", "str"),
     # 課題(review) auto-classification: when a `fetch` job COMPLETES but its
     # content was blocked by a full-screen login / age / consent / paywall
     # overlay (detected structurally by the worker's live-DOM occlusion probe),

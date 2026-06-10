@@ -1224,6 +1224,12 @@ const _entityDeepLinkOpeners = {
   hosts:       (id) => { if (typeof openHostModal === 'function') openHostModal(id); },
   presets:     (id) => { if (typeof openPresetEditModal === 'function') openPresetEditModal(id); },
   workers:     (id) => { if (typeof openWorkerDetailModal === 'function') openWorkerDetailModal(id); },
+  // #ai/<kind>/<slug> -> open a skill/host-knowledge entity on the AI tab.
+  // entityId carries the FULL "<kind>/<slug>" (everything after "#ai/"),
+  // since _parseHash's "(.+)" grabs the rest incl. slashes. Dispatch lives
+  // in admin-knowledge.js (window.aiOpenEntity) where the openers + the
+  // host-knowledge list are in scope. typeof-guarded so load order is moot.
+  ai:          (id) => { if (typeof aiOpenEntity === 'function') aiOpenEntity(id); },
 };
 
 // Write #<tab>/<id> into the address bar (shareable / survives reload).

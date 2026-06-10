@@ -174,8 +174,11 @@ def _should_generate_perception(
         and success is True
     ):
         return False, "fetch+success skip"
-    # Rule 2: probabilistic sampling.
-    if _PAPRIKA_PERCEPTION_SAMPLE_RATE < 1.0:
+    # Rule 2: probabilistic sampling -- successes only. A real FAILURE
+    # (success is False) ALWAYS perceives: the eye is most valuable on jobs
+    # that delivered nothing (the barriers we want to learn). success=None
+    # (back-compat callers) keeps the old sampler behaviour.
+    if _PAPRIKA_PERCEPTION_SAMPLE_RATE < 1.0 and success is not False:
         # Deterministic hash to 0.0-1.0 (first 8 hex chars / 0xffffffff).
         digest = hashlib.sha256(job_id.encode("utf-8")).hexdigest()
         bucket = int(digest[:8], 16) / 0xFFFFFFFF
@@ -406,7 +409,8 @@ async def generate_perception(
         # in /health.vision_inference. RTX 6000 Pro Max-Q is single-batch
         # for Qwen-VL-72B at int8, so this counter approximates the GPU
         # busy state when its value is >= 1.
-        with _VisionGauge():
+        from server.hub._ai_activity import track as _track
+        with _VisionGauge(), _track("vision", slug=getattr(tgt, "engine_slug", "")):
             async with httpx.AsyncClient(timeout=tgt.timeout) as client:
                 r = await client.post(tgt.url, json=body, headers=tgt.headers)
                 if r.status_code >= 400:
@@ -626,6 +630,18 @@ async def save_perception_for_job(
             e,
         )
         # Result is still useful as a return value even if persistence failed.
+
+    try:
+        from server.hub._ai_activity import record_event
+        from server.hub.distiller_light import host_from_url as _hfu
+        record_event(
+            "perceive",
+            f"{result.page_kind.value} · barriers={len(result.barriers)}",
+            host=_hfu(url) or "",
+            job_id=job_id,
+        )
+    except Exception:
+        pass
 
     # Surface a one-line summary in the job log if a logger was provided.
     if callable(log):

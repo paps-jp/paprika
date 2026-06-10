@@ -237,6 +237,34 @@ def _has_video_asset(result) -> bool:
     return False
 
 
+def real_fetch_success(status: str, download_video: bool, result) -> bool:
+    """Did a COMPLETED fetch actually deliver content?
+
+    Pure / in-memory (only ``getattr`` on the JobResult + ``_has_video_asset``)
+    -- safe to call on the WS handler. A completed fetch is a real success
+    UNLESS a video was requested and none was delivered (download_video set
+    but no video asset saved AND a video was detected / yt-dlp attempted &
+    all failed) -- the same signal ``classify_completed`` keys on for
+    ``video_dl``, so a job that auto-escalates is consistently NOT counted
+    as a success by the distillers. Overlay / auth walls are already
+    excluded upstream by the 課題(review) re-bucketing (status != completed),
+    so this only needs the video case. Returns False for any non-completed
+    status (failed / cancelled / review).
+    """
+    if (status or "") != "completed":
+        return False
+    if not download_video:
+        return True
+    if _has_video_asset(result):
+        return True
+    detected = bool(getattr(result, "video_detection", None)) or bool(
+        getattr(result, "video_urls_seen", None)
+    )
+    yt = list(getattr(result, "ytdlp_results", None) or [])
+    yt_all_failed = bool(yt) and all(not getattr(r, "ok", False) for r in yt)
+    return not (detected or yt_all_failed)
+
+
 def classify_completed(info: JobInfo, result) -> str | None:
     """Escalation category for a fetch that COMPLETED but didn't deliver.
 
@@ -596,6 +624,11 @@ async def _do_escalate(info: JobInfo, category: str, host: str | None) -> str | 
     # Spawn the hub-side codegen-loop orchestrator. request=None mirrors
     # the orphan-redispatch path (_jobrunner.redispatch_orphan_job); the
     # orchestrator self-registers in the GPU gate.
+    try:
+        from server.hub._ai_activity import record_event
+        record_event("escalate", f"{category} → codegen-loop", host=_host_of(info.url), job_id=new_id)
+    except Exception:
+        pass
     task = asyncio.create_task(_run_codegen_loop_job(None, new_info))
     try:
         state.local_tasks[new_id] = task

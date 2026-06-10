@@ -119,6 +119,11 @@ class _UploadsMixin:
         _meta_sidecar = workdir / "meta.json"
         if _meta_sidecar.exists():
             await self._upload_special(assign, _meta_sidecar, "meta.json")
+        # ② v2 eye: end-of-fetch screenshot sidecar (written only when the
+        # fetcher captured one). The hub's perception discovers {job}/final.jpg.
+        _shot_sidecar = workdir / "final.jpg"
+        if _shot_sidecar.exists():
+            await self._upload_special(assign, _shot_sidecar, "final.jpg")
         # Page URL = the URL the user told us to fetch. Every captured
         # asset is "on" this page from the gallery's point of view.
         page_url = assign.url or None

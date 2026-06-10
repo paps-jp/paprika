@@ -369,6 +369,66 @@ def pattern_from_url(url: str, *, generalize: bool = True) -> str:
     return p + "*"
 
 
+def strategy_to_recipe_actions(strategy: dict | None) -> list[dict] | None:
+    """Translate a learned HostKnowledge barrier ``strategy`` (a plain dict
+    as stored in HostKnowledge JSON) into HostRecipe ``actions`` a fetch job
+    can replay, or None when it isn't deterministically replayable.
+
+    Only ``kind=click`` (single-selector click) and ``kind=sequence`` (a
+    StrategyStep list) translate; ``tool`` (needs a plugin), ``manual``
+    (needs a human) and ``passive_capture`` (wait/scroll the fetcher already
+    does natively) return None. Action shapes mirror the recipe player in
+    server/worker/agent/recipe.py (click/fill/type/scroll/wait/navigate).
+    """
+    if not isinstance(strategy, dict):
+        return None
+    kind = strategy.get("kind")
+    if kind == "click":
+        sel = strategy.get("selector")
+        if isinstance(sel, str) and sel.strip():
+            return [{"kind": "click", "selector": sel.strip()}]
+        return None
+    if kind == "sequence":
+        actions: list[dict] = []
+        dropped_click = False
+        for step in (strategy.get("steps") or []):
+            if not isinstance(step, dict):
+                continue
+            act = (step.get("action") or "").strip().lower()
+            sel = step.get("selector")
+            if act == "click":
+                if isinstance(sel, str) and sel.strip():
+                    actions.append({"kind": "click", "selector": sel.strip()})
+                else:
+                    # the barrier-clearing click is the whole point -- a
+                    # selector-less click makes the sequence useless.
+                    dropped_click = True
+            elif act == "fill":
+                if isinstance(sel, str) and sel.strip():
+                    actions.append({"kind": "fill", "selector": sel.strip(), "value": step.get("text") or ""})
+            elif act == "type":
+                actions.append({"kind": "type", "text": step.get("text") or ""})
+            elif act == "scroll":
+                actions.append({"kind": "scroll", "direction": "down", "amount": 800})
+            elif act == "wait":
+                ms = step.get("ms")
+                try:
+                    secs = (float(ms) / 1000.0) if ms else 0.0
+                except (TypeError, ValueError):
+                    secs = 0.0
+                if secs > 0:
+                    actions.append({"kind": "wait", "seconds": secs})
+            elif act in ("navigate", "goto"):
+                url = step.get("url")
+                if isinstance(url, str) and url.strip():
+                    actions.append({"kind": "navigate", "url": url.strip()})
+            # unknown step actions are skipped
+        if dropped_click:
+            return None
+        return actions or None
+    return None
+
+
 def cookies_for_cdp(cookies: list[dict]) -> list[dict]:
     """Project + sanitise a stored cookie list into a form
     Network.setCookies will accept. Drops unknown keys, coerces obvious

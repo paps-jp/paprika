@@ -324,6 +324,12 @@ async def check_engine_thermal(target: "LLMTarget") -> None:
         rec = reg.get(slug)
         if rec is None:
             return
+        # Manual stop (停止中): the operator took this engine out of rotation.
+        # Refuse like a thermal throttle so the caller fails over to another
+        # engine of the same kind (or errors if none remain).
+        _dis = (state.settings.get("engines_disabled", "") or "") if state.settings is not None else ""
+        if slug in {s.strip() for s in _dis.split(",") if s.strip()}:
+            raise EngineThermalThrottled(f"engine '{slug}' is stopped by operator (停止中)")
         from server.hub import thermal
         if not await thermal.engine_thermal_ok(rec):
             stop = float(getattr(rec, "gpu_temp_stop_c", 0) or 0)
@@ -1431,7 +1437,9 @@ async def generate_script(
         max_iters = web_search.get_max_calls() + 1 if tools_active else 1
         for _iter in range(max_iters):
             body = dict(base_body, messages=messages)
-            r = await client.post(tgt.url, json=body, headers=tgt.headers)
+            from server.hub._ai_activity import track
+            with track("codegen", slug=getattr(tgt, "engine_slug", "")):
+                r = await client.post(tgt.url, json=body, headers=tgt.headers)
             if r.status_code >= 400:
                 # Surface the API's error body in the exception so the
                 # operator can see why OpenAI / Anthropic / vLLM

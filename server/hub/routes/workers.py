@@ -1964,8 +1964,9 @@ async def _handle_worker_message(worker, msg) -> None:
                     host_from_url,
                     record_job_outcome,
                 )
+                from server.hub._escalate import real_fetch_success
 
-                async def _perception_bg(jid: str, jurl: str, jstatus: str, jerror: str, jmode: str | None) -> None:
+                async def _perception_bg(jid: str, jurl: str, jstatus: str, jerror: str, jmode: str | None, jsuccess: bool) -> None:
                     try:
                         await asyncio.wait_for(
                             save_perception_for_job(
@@ -1974,7 +1975,7 @@ async def _handle_worker_message(worker, msg) -> None:
                                 data_dir=get_storage_dir(),
                                 log=None,
                                 mode=jmode,
-                                success=(jstatus == "completed"),
+                                success=jsuccess,
                             ),
                             timeout=90.0,
                         )
@@ -1995,9 +1996,12 @@ async def _handle_worker_message(worker, msg) -> None:
                         if h:
                             record_job_outcome(
                                 host=h,
-                                success=(jstatus == "completed"),
+                                success=jsuccess,
                                 job_id=jid,
-                                reason=(jerror or "")[:200] if jstatus != "completed" else "",
+                                reason=(
+                                    (jerror or "")[:200] if jstatus != "completed"
+                                    else ("" if jsuccess else "completed but no content (video requested, none downloaded)")
+                                ),
                                 data_dir=get_storage_dir(),
                             )
                     except Exception as e:
@@ -2028,13 +2032,14 @@ async def _handle_worker_message(worker, msg) -> None:
                                 host=h2,
                                 job_id=jid,
                                 goal=jurl,
-                                success=(jstatus == "completed"),
+                                success=jsuccess,
                                 error=jerror or "",
                                 perception=perception_dict,
                                 stdout_tail="",
                                 stderr_tail="",
                                 script="",
                                 data_dir=get_storage_dir(),
+                                url=jurl,
                             )
                     except Exception as e:
                         log.info(
@@ -2044,11 +2049,25 @@ async def _handle_worker_message(worker, msg) -> None:
                             e,
                         )
 
+                _jstatus = (
+                    info.status.value if hasattr(info.status, "value")
+                    else str(info.status)
+                )
+                # ① real success: a completed fetch that delivered no video
+                # (download_video set, none saved) is NOT a success -- the same
+                # signal the escalator keys on. Overlay/auth walls are already
+                # excluded (re-bucketed to review -> status != completed).
+                _jsuccess = real_fetch_success(
+                    _jstatus,
+                    bool(getattr(info.options, "download_video", False)) if info.options else False,
+                    msg.result,
+                )
                 asyncio.create_task(_perception_bg(
                     msg.job_id, info.url,
-                    info.status.value if hasattr(info.status, "value") else str(info.status),
+                    _jstatus,
                     info.error or "",
                     (info.options.mode if info.options else None),
+                    _jsuccess,
                 ))
             except Exception as e:
                 # Import failure / unexpected; never disrupt job completion.

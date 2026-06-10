@@ -533,6 +533,16 @@ class _JobExecMixin:
                 # Persist page.html + log to local workdir
                 page_path = workdir / "page.html"
                 page_path.write_text(result.html, encoding="utf-8")
+                # ② v2 eye: persist the end-of-fetch screenshot (if captured)
+                # to the workdir ROOT as final.jpg (NOT under assets/, else it
+                # would leak into the gallery). The hub's perception discovers
+                # root final.jpg; _upload_files ships it as a special file.
+                _shot = getattr(result, "screenshot", b"") or b""
+                if _shot:
+                    try:
+                        (workdir / "final.jpg").write_bytes(_shot)
+                    except Exception as _e:
+                        _log(f"  (final.jpg write failed: {type(_e).__name__}: {_e})")
                 # Sidecar: the live-DOM representative-image pick (true
                 # naturalWidth cascade). /jobs/{id}/meta prefers this over
                 # re-parsing page.html so the thumbnail is a real cover

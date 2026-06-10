@@ -1951,6 +1951,11 @@ class FetchResult:
     # (server/hub/_review.py). Structural + standards-based, NO site-specific
     # hardcoding. {} when the probe failed or wasn't run.
     occlusion: dict = field(default_factory=dict)
+    # ② v2 eye: a single small viewport JPEG captured at end-of-fetch so the
+    # hub's perception (vision LLM) has an image even on fetches that saved no
+    # assets (auth wall / video-DL-fail). Raw bytes (core has no workdir); the
+    # worker writes it to {job}/final.jpg. b"" when capture was off / failed.
+    screenshot: bytes = b""
 
 
 async def fetch(opts: FetchOptions) -> FetchResult:
@@ -2787,6 +2792,19 @@ async def fetch(opts: FetchOptions) -> FetchResult:
                 )
         except Exception as e:
             log(f"  (occlusion probe failed: {type(e).__name__}: {e})")
+
+        # ② v2 eye: capture one small viewport JPEG now, while tab is live and
+        # the DOM is final (settled / scrolled / recipe-applied -- same point
+        # as the occlusion probe). Stored on FetchResult.screenshot; the worker
+        # persists it as {job}/final.jpg for the hub's perception. Small by
+        # policy (jpeg q50, viewport-only) given fetch volume + the prior
+        # disk-full incident. Best-effort + env kill-switch.
+        if (os.environ.get("PAPRIKA_FETCH_SCREENSHOT", "1") or "1").strip().lower() not in ("0", "false", "no", "off"):
+            try:
+                _shot = await tab.send(cdp.page.capture_screenshot(format_="jpeg", quality=50))
+                result.screenshot = base64.b64decode(_shot)
+            except Exception as e:
+                log(f"  (screenshot capture failed: {type(e).__name__}: {e})")
 
         if assets_dir is not None:
             log(

@@ -261,6 +261,118 @@ async def health() -> dict:
     }
 
 
+@router.get("/ai/activity")
+async def ai_activity() -> dict:
+    """Live snapshot of what the AI engines are doing RIGHT NOW.
+
+    Cheap + in-memory: in-flight gauges (judge / distiller / codegen +
+    vision) and a recent-events ring from server/hub/_ai_activity.py, plus
+    the codegen-loop gate enriched with each running job's goal/host (only
+    0-2 jobs, so 0-2 store reads). Polled by the #ai 「稼働中」 tab. The
+    heavier per-engine state (temp / today tokens) stays on GET /engines,
+    which the tab polls at a slower cadence.
+    """
+    import time as _time
+
+    inflight: dict = {}
+    recent: list = []
+    try:
+        from server.hub._ai_activity import inflight_snapshot, recent_events
+        inflight = inflight_snapshot()
+        recent = recent_events(50)
+    except Exception:
+        inflight, recent = {}, []
+    # Vision/perception keeps its own gauge in perception_llm.
+    try:
+        from server.hub.perception_llm import get_vision_inference_stats
+        inflight["vision"] = get_vision_inference_stats()
+    except Exception:
+        pass
+
+    # Codegen-loop running jobs, enriched with goal/host (best-effort).
+    codegen_loop = None
+    try:
+        from server.hub._gpu_gate import snapshot as _gg_snapshot
+        gg = _gg_snapshot()
+        jobs = []
+        for jid in (gg.get("codegen_loop_jobs") or []):
+            entry = {"job_id": jid, "goal": "", "host": "", "url": "", "phase": ""}
+            try:
+                info = await state.store.get_job_info(jid)
+                if info is not None:
+                    opts = getattr(info, "options", None)
+                    entry["goal"] = ((getattr(opts, "goal", "") or "") if opts else "")[:160]
+                    entry["url"] = getattr(info, "url", "") or ""
+                    prog = getattr(info, "progress", None)
+                    entry["phase"] = (getattr(prog, "phase", "") or "") if prog else ""
+                    try:
+                        from urllib.parse import urlparse
+                        entry["host"] = urlparse(entry["url"]).hostname or ""
+                    except Exception:
+                        pass
+            except Exception:
+                pass
+            jobs.append(entry)
+        gg["codegen_loop_jobs"] = jobs
+        codegen_loop = gg
+    except Exception:
+        codegen_loop = None
+
+    # Reasoning config (modes + backend engine slug) -- same resolution as
+    # /health, so the tab can show whether distiller/judge are even enabled.
+    reasoning = None
+    try:
+        import os
+        def _s(key, *envs, default=""):
+            try:
+                if state.settings is not None:
+                    v = (state.settings.get(key, "") or "").strip()
+                    if v:
+                        return v
+            except Exception:
+                pass
+            for e in envs:
+                v = os.environ.get(e)
+                if v:
+                    return v
+            return default
+        reasoning = {
+            "distiller_mode": _s("reasoning_distiller_mode", "PAPRIKA_REASONING_DISTILLER_MODE", "PAPRIKA_R1_DISTILLER_MODE", default="off").lower(),
+            "judge_mode": _s("reasoning_judge_mode", "PAPRIKA_R1_JUDGE_MODE", default="off").lower(),
+            "distiller_engine": _s("reasoning_distiller_engine", "PAPRIKA_REASONING_DISTILLER_ENGINE", "PAPRIKA_R1_DISTILLER_ENGINE", default="deepseek-r1"),
+        }
+    except Exception:
+        reasoning = None
+
+    # Per-engine live state for the 稼働中 engine table (fast path; the
+    # slower GET /engines poll carries model / temp / today-tokens).
+    active_engines: list = []
+    disabled_engines: list = []
+    try:
+        from server.hub._ai_activity import active_engine_slugs
+        active_engines = active_engine_slugs()
+    except Exception:
+        pass
+    try:
+        if state.settings is not None:
+            _d = (state.settings.get("engines_disabled", "") or "")
+            disabled_engines = [s.strip() for s in _d.split(",") if s.strip()]
+    except Exception:
+        pass
+
+    return {
+        "inflight": inflight,
+        "codegen_loop": codegen_loop,
+        "reasoning": reasoning,
+        "recent": recent,
+        # 稼働中 (in-flight now) + 停止中 (operator-stopped) engine slugs.
+        "active_engines": active_engines,
+        "disabled_engines": disabled_engines,
+        # The hub clock is UTC; the client renders "Ns ago" against this
+        # server reference, not its own (JST) clock, to avoid skew.
+        "server_now": _time.time(),
+    }
+
 
 @router.get("/hubs")
 async def list_hubs() -> dict:

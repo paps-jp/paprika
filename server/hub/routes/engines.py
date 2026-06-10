@@ -203,7 +203,36 @@ def _engine_to_dict(rec: EngineRecord, usage_map: dict | None = None) -> dict:
         "builtin": rec.builtin,
         "created_at": rec.created_at,
         "updated_at": rec.updated_at,
+        # Manual stop/resume (停止中) -- via the engines_disabled setting.
+        # False = operator stopped it; skipped by every AI call.
+        "enabled": _engine_enabled(rec.slug),
+        # In-flight RIGHT NOW (稼働中): an AI call is using this engine slug.
+        # NB laggy at the /engines poll cadence; the live tab overlays the
+        # faster /ai/activity active_engines set.
+        "active": rec.slug in _active_engine_slugs_safe(),
     }
+
+
+def _engine_disabled_set() -> set:
+    """Slugs the operator has manually stopped (engines_disabled setting)."""
+    try:
+        from server.hub._state import state
+        cur = (state.settings.get("engines_disabled", "") or "") if state.settings is not None else ""
+        return {s.strip() for s in cur.split(",") if s.strip()}
+    except Exception:
+        return set()
+
+
+def _engine_enabled(slug: str) -> bool:
+    return slug not in _engine_disabled_set()
+
+
+def _active_engine_slugs_safe() -> set:
+    try:
+        from server.hub._ai_activity import active_engine_slugs
+        return set(active_engine_slugs())
+    except Exception:
+        return set()
 
 
 def _usage_today_for(slug: str, usage_map: dict | None = None) -> dict:
@@ -552,6 +581,54 @@ async def demote_engine(slug: str) -> dict:
     return _engine_to_dict(saved)
 
 
+async def _set_engine_enabled(slug: str, enabled: bool) -> None:
+    """Toggle an engine's manual stop state via the engines_disabled setting
+    (csv of stopped slugs). Cross-hub + restart-safe through the settings
+    write-through + broadcast -- NO engines DB column (avoids the fragile
+    position-dependent engines upsert)."""
+    from server.hub._state import state
+    reg = getattr(state, "settings", None)
+    if reg is None:
+        return
+    cur = (reg.get("engines_disabled", "") or "")
+    items = {s.strip() for s in cur.split(",") if s.strip()}
+    if enabled:
+        items.discard(slug)
+    else:
+        items.add(slug)
+    newcsv = ",".join(sorted(items))
+    reg.update({"engines_disabled": newcsv})
+    try:
+        from server.hub._invalidate import share_settings
+        await share_settings({"engines_disabled": newcsv})
+    except Exception:
+        log.debug("engines_disabled share failed", exc_info=True)
+
+
+@router.post("/engines/{slug}/stop")
+async def stop_engine(slug: str) -> dict:
+    """停止: take this engine OUT of all AI-call rotation (codegen / judge /
+    distiller / perception / page.agent skip it and fail over to another
+    engine of the same kind; if none remain, that kind errors -- operator's
+    call). Persisted via the engines_disabled setting (cross-hub, survives
+    restart). Reversible with /resume."""
+    er = _require_engines()
+    if er.get(slug) is None:
+        raise HTTPException(404, f"engine '{slug}' not found")
+    await _set_engine_enabled(slug, False)
+    return _engine_to_dict(er.get(slug))
+
+
+@router.post("/engines/{slug}/resume")
+async def resume_engine(slug: str) -> dict:
+    """再開: put this engine back into rotation (clears the manual stop)."""
+    er = _require_engines()
+    if er.get(slug) is None:
+        raise HTTPException(404, f"engine '{slug}' not found")
+    await _set_engine_enabled(slug, True)
+    return _engine_to_dict(er.get(slug))
+
+
 @router.post("/engines/{slug}/resolve")
 async def resolve_engine(slug: str, body: Optional[dict] = None) -> dict:
     """Worker-internal endpoint: return the full engine config with
@@ -617,6 +694,12 @@ async def resolve_worker_agent_engine(body: Optional[dict] = None) -> dict:
     if rec is None:
         raise HTTPException(
             404, f"page.agent engine '{slug}' not found (was it deleted?)"
+        )
+    # Manual stop (停止中): a stopped page.agent engine = page.agent disabled
+    # (404 -> the worker refuses the agent loop, same as 'no engine selected').
+    if not _engine_enabled(slug):
+        raise HTTPException(
+            404, f"page.agent engine '{slug}' is stopped by operator (停止中) — resume it or pick another"
         )
     from server.hub import thermal
     if not await thermal.engine_thermal_ok(rec):

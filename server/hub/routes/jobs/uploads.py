@@ -510,8 +510,8 @@ async def upload_special(
     """Upload a special file ('page.html', 'log.txt', or 'meta.json')."""
     if config.worker_secret and secret != config.worker_secret:
         raise HTTPException(401, "bad secret")
-    if kind not in ("page.html", "log.txt", "meta.json"):
-        raise HTTPException(400, "kind must be 'page.html', 'log.txt' or 'meta.json'")
+    if kind not in ("page.html", "log.txt", "meta.json", "final.jpg"):
+        raise HTTPException(400, "kind must be 'page.html', 'log.txt', 'meta.json' or 'final.jpg'")
     await _require_job_info(job_id)
     target = get_storage_dir() / job_id / kind
     target.parent.mkdir(parents=True, exist_ok=True)

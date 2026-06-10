@@ -154,6 +154,16 @@ async def first_accepting(recs):
     count as accepting. Lets a resolve path fail over between engines of the
     same kind and detect the all-throttled case."""
     for rec in recs:
+        # Manual stop (停止中): skip operator-stopped engines during failover,
+        # same as a throttled one (engines_disabled setting).
+        try:
+            slug = getattr(rec, "slug", "")
+            from server.hub._state import state
+            _dis = (state.settings.get("engines_disabled", "") or "") if state.settings is not None else ""
+            if slug and slug in {s.strip() for s in _dis.split(",") if s.strip()}:
+                continue
+        except Exception:
+            pass
         try:
             ok = await engine_thermal_ok(rec)
         except Exception:

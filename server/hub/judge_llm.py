@@ -372,8 +372,10 @@ async def judge_attempt(
         except EngineThermalThrottled as e:
             log.info(f"[judge] thermal gate refused: {e}")
             return None
+        from server.hub._ai_activity import track
         async with httpx.AsyncClient(timeout=tgt.timeout) as client:
-            r = await client.post(tgt.url, json=body, headers=tgt.headers)
+            with track("judge", slug=getattr(tgt, "engine_slug", "")):
+                r = await client.post(tgt.url, json=body, headers=tgt.headers)
             if r.status_code >= 400:
                 log.info(
                     f"[judge] LLM {r.status_code} from {tgt.url} model={tgt.model}: {r.text[:600]}",
@@ -654,8 +656,10 @@ async def judge_via_reasoning(
         except EngineThermalThrottled as e:
             log.info(f"[judge:reasoning] thermal gate refused: {e}")
             return None
+        from server.hub._ai_activity import track
         async with httpx.AsyncClient(timeout=target.timeout) as client:
-            r = await client.post(target.url, json=body, headers=target.headers)
+            with track("judge", slug=getattr(target, "engine_slug", "")):
+                r = await client.post(target.url, json=body, headers=target.headers)
             if r.status_code >= 400:
                 log.info(
                     f"[judge:reasoning] LLM {r.status_code} from {target.url} "

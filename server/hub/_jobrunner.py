@@ -687,6 +687,7 @@ async def _run_codegen_loop_job(request: Request, info: JobInfo) -> None:
                     stderr_tail=_stderr_tail,
                     script=_script,
                     data_dir=get_storage_dir(),
+                    url=info.url,
                 ),
                 timeout=120.0,
             )

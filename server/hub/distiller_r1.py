@@ -419,6 +419,7 @@ async def distill_for_job(
     stderr_tail: str,
     script: str,
     data_dir: Path,
+    url: str = "",
 ) -> dict | None:
     """Run R1 Distiller for one job. Returns the updated HostKnowledge dict
     on success (= R1 returned >=1 valid update), or None.
@@ -491,8 +492,10 @@ async def distill_for_job(
 
     t0 = time.time()
     try:
+        from server.hub._ai_activity import track
         async with httpx.AsyncClient(timeout=target.timeout) as client:
-            r = await client.post(target.url, json=body, headers=target.headers)
+            with track("distiller", slug=getattr(target, "engine_slug", "")):
+                r = await client.post(target.url, json=body, headers=target.headers)
             if r.status_code >= 400:
                 _log.info(
                     "[distiller-r1] LLM %d from %s: %s",
@@ -580,4 +583,120 @@ async def distill_for_job(
         elapsed_ms,
         ", ".join(applied),
     )
+    try:
+        from server.hub._ai_activity import record_event
+        record_event("distill", ", ".join(applied), host=host, job_id=job_id)
+    except Exception:
+        pass
+
+    # ④ Bridge: translate newly-learned actionable barrier strategies into
+    # fetch_recipes so plain mode=fetch jobs replay them and get past the
+    # barrier. Best-effort -- a recipe failure must never fail distillation.
+    try:
+        await _maybe_register_recipes_from_barriers(
+            host=host, new_knowledge=new_knowledge, applied=applied,
+            job_id=job_id, url=url,
+        )
+    except Exception as e:
+        _log.info("[distiller-r1] recipe bridge failed for %s: %s", host, e)
+
     return new_knowledge
+
+
+def _auto_recipe_enabled() -> bool:
+    """Gate for the barrier->fetch_recipe bridge: Settings
+    ``auto_recipe_from_barrier`` (cross-hub, default ON) then env
+    ``PAPRIKA_AUTO_RECIPE_FROM_BARRIER`` kill-switch (default on)."""
+    try:
+        from server.hub._state import state
+        if state.settings is not None:
+            if not bool(state.settings.get("auto_recipe_from_barrier", True)):
+                return False
+    except Exception:
+        pass
+    return (os.environ.get("PAPRIKA_AUTO_RECIPE_FROM_BARRIER", "1") or "1").strip().lower() in (
+        "1", "true", "yes", "on",
+    )
+
+
+async def _maybe_register_recipes_from_barriers(
+    *, host: str, new_knowledge: dict, applied: list, job_id: str, url: str,
+) -> None:
+    """For each newly-applied ``per_page.barriers.<kind>`` whose strategy is
+    replayable + confident + present, register a scoped, deduped, AI-tagged
+    fetch_recipe on the host and propagate it cross-hub. Conservative by
+    design (auto recipes are permanent + have no self-heal yet)."""
+    if not _auto_recipe_enabled():
+        return
+    from server.hub._state import state
+    reg = getattr(state, "hosts", None)
+    if reg is None:
+        return
+    from server.hub.hosts import pattern_from_url, strategy_to_recipe_actions
+    from server.hub._invalidate import share_upsert
+
+    barriers = ((new_knowledge.get("per_page") or {}).get("barriers") or {})
+    pattern = pattern_from_url(url) if url else "*"
+    existing = reg.get(host)
+    existing_recipes = list(getattr(existing, "fetch_recipes", []) or []) if existing else []
+
+    for path in applied:
+        if not isinstance(path, str) or not path.startswith("per_page.barriers."):
+            continue
+        kind = path.rsplit(".", 1)[-1]
+        barrier = barriers.get(kind)
+        if not isinstance(barrier, dict) or barrier.get("present") is False:
+            continue
+        try:
+            conf = float(barrier.get("confidence") or 0.0)
+        except (TypeError, ValueError):
+            conf = 0.0
+        if conf < 0.7:
+            continue
+        actions = strategy_to_recipe_actions(barrier.get("strategy"))
+        if not actions:
+            continue
+        description = f"auto: {kind} barrier"
+        first_sel = next(
+            (a.get("selector") for a in actions
+             if a.get("kind") == "click" and a.get("selector")),
+            None,
+        )
+        # Dedup (content-based so cross-hub re-learns converge): same pattern
+        # AND (same auto-description OR same first-click selector).
+        dup = False
+        for r in existing_recipes:
+            if (getattr(r, "pattern", "") or "").strip() != pattern:
+                continue
+            if (getattr(r, "description", "") or "") == description:
+                dup = True
+                break
+            r_acts = getattr(r, "actions", None) or []
+            r_first_sel = next(
+                (a.get("selector") for a in r_acts
+                 if isinstance(a, dict) and a.get("kind") == "click" and a.get("selector")),
+                None,
+            )
+            if first_sel and r_first_sel == first_sel:
+                dup = True
+                break
+        if dup:
+            _log.info("[distiller-r1] recipe dedup: %s already has %s for %s", host, kind, pattern)
+            continue
+        recipe = {
+            "pattern": pattern,
+            "description": description,
+            "actions": actions,
+            "created_by": "ai",
+            "created_from_job": job_id,
+        }
+        try:
+            rec = reg.append_recipe(host, recipe)
+            await share_upsert("hosts", reg, rec)
+            existing_recipes = list(getattr(rec, "fetch_recipes", []) or [])
+            _log.info(
+                "[distiller-r1] auto-registered fetch_recipe host=%s kind=%s pattern=%s actions=%d (job=%s)",
+                host, kind, pattern, len(actions), job_id,
+            )
+        except Exception as e:
+            _log.info("[distiller-r1] recipe register failed host=%s kind=%s: %s", host, kind, e)

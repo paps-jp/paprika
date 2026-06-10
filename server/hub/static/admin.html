@@ -2143,13 +2143,35 @@ curl 'http://paprika.lan/extensions/ublock-lite/download' --output ublock-lite.t
       </div>
     </div>
     <div class="ai-subtabs" role="tablist">
-      <button type="button" class="ai-subtab active" data-ai-subtab="knowledge" role="tab" aria-selected="true"><iconify-icon icon="lucide:brain"></iconify-icon> <span data-i18n="ai.subtab.knowledge">ホスト知識</span> <span class="count" id="cntKnowledge">0</span></button>
+      <button type="button" class="ai-subtab active" data-ai-subtab="live" role="tab" aria-selected="true"><iconify-icon icon="lucide:activity"></iconify-icon> <span data-i18n="ai.subtab.live">稼働中</span></button>
+      <button type="button" class="ai-subtab" data-ai-subtab="knowledge" role="tab" aria-selected="false"><iconify-icon icon="lucide:brain"></iconify-icon> <span data-i18n="ai.subtab.knowledge">ホスト知識</span> <span class="count" id="cntKnowledge">0</span></button>
       <button type="button" class="ai-subtab" data-ai-subtab="skills" role="tab" aria-selected="false"><iconify-icon icon="lucide:wand-sparkles"></iconify-icon> <span data-i18n="ai.subtab.skills">スキル</span> <span class="count" id="cntSkills">0</span></button>
       <button type="button" class="ai-subtab" data-ai-subtab="conventions" role="tab" aria-selected="false"><iconify-icon icon="lucide:scroll-text"></iconify-icon> <span data-i18n="ai.subtab.conventions">作法</span> <span class="count" id="cntConventions">0</span></button>
       <button type="button" class="ai-subtab" data-ai-subtab="grooming" role="tab" aria-selected="false"><iconify-icon icon="lucide:brush-cleaning"></iconify-icon> <span data-i18n="ai.subtab.grooming">整理</span> <span class="count" id="cntGroom">0</span></button>
       <button type="button" class="ai-subtab" data-ai-subtab="oracle" role="tab" aria-selected="false"><iconify-icon icon="lucide:scan-eye"></iconify-icon> <span data-i18n="ai.subtab.oracle">オラクル</span> <span class="count" id="cntOracle">0</span></button>
     </div>
-    <div class="ai-subpane" data-ai-subpane="knowledge">
+    <div class="ai-subpane" data-ai-subpane="live">
+  <section>
+    <h2><iconify-icon icon="lucide:activity"></iconify-icon> <span data-i18n="ai.subtab.live">稼働中</span>
+      <span style="font-size:0.7em; color:#888; font-weight:normal; margin-left:8px;">AI エンジンが今この瞬間に処理している内容（5秒ごと自動更新・表示中のみポーリング）</span>
+    </h2>
+    <div style="font-size:.8em;color:#888;margin:2px 0 6px;">推論の稼働数（active / peak / total）</div>
+    <div id="aiLiveInflight" style="display:flex;gap:10px;flex-wrap:wrap;margin-bottom:18px;"></div>
+    <h3 style="margin:6px 0;font-size:1em;"><iconify-icon icon="lucide:code-2"></iconify-icon> 稼働中の codegen-loop ジョブ</h3>
+    <div id="aiLiveCodegen" style="margin-bottom:18px;"></div>
+    <h3 style="margin:6px 0;font-size:1em;"><iconify-icon icon="lucide:cpu"></iconify-icon> エンジン状態 <span style="font-size:.72em;color:#999;font-weight:normal;">(15秒ごと更新)</span></h3>
+    <table style="width:100%;border-collapse:collapse;margin-bottom:18px;font-size:.9em;">
+      <thead><tr style="border-bottom:2px solid #e2e6ea;text-align:left;color:#666;">
+        <th style="padding:4px 6px;">engine</th><th style="padding:4px 6px;">状態</th><th style="padding:4px 6px;">model</th><th style="padding:4px 6px;">種別</th>
+        <th style="padding:4px 6px;">GPU温度</th><th style="padding:4px 6px;text-align:right;">本日トークン</th><th style="padding:4px 6px;text-align:center;">操作</th>
+      </tr></thead>
+      <tbody id="aiLiveEngines"><tr><td colspan="7" class="empty">読み込み中…</td></tr></tbody>
+    </table>
+    <h3 style="margin:6px 0;font-size:1em;"><iconify-icon icon="lucide:history"></iconify-icon> 直近のAIイベント <span style="font-size:.72em;color:#999;font-weight:normal;">(蒸留 / 視覚 / エスカレ / recipe)</span></h3>
+    <div id="aiLiveRecent"></div>
+  </section>
+    </div>
+    <div class="ai-subpane" data-ai-subpane="knowledge" style="display:none;">
   <section>
     <h2><iconify-icon icon="lucide:brain"></iconify-icon> <span data-i18n="tab.knowledge">Knowledge</span>
       <span style="font-size:0.7em; color:#888; font-weight:normal; margin-left:8px;" data-i18n="knowledge.subtitle">

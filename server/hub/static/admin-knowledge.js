@@ -192,7 +192,13 @@
     document.querySelectorAll('.ai-subpane').forEach(p => {
       p.style.display = (p.dataset.aiSubpane === name) ? '' : 'none';
     });
-    // Lazy-load the activated sub-tab's data.
+    // Lazy-load the activated sub-tab's data. The 稼働中 tab starts a light
+    // poller; every OTHER sub-tab stops it, so it only polls while visible.
+    if (name === 'live') {
+      _aiLiveStart();
+      return;
+    }
+    _aiLiveStop();
     if (name === 'knowledge') {
       if (typeof loadKnowledge === 'function') loadKnowledge();
     } else if (name === 'grooming') {
@@ -202,6 +208,174 @@
     } else {
       loadSkillsConventions();
     }
+  }
+
+  // ===== 稼働中 (live activity): what the AI engines are doing right now =====
+  // Polls the cheap in-memory /ai/activity (5s) + /engines (15s) ONLY while
+  // the pane is visible (offsetParent !== null) and the browser tab is
+  // foregrounded -- so it adds no load when you're elsewhere.
+  let _aiLiveTimer = null, _aiEngTimer = null, _aiServerSkew = 0;
+  let _aiEnginesData = [], _aiActiveSet = new Set(), _aiDisabledSet = new Set(), _aiEngWired = false;
+
+  function _aiLiveStop() {
+    if (_aiLiveTimer) { clearInterval(_aiLiveTimer); _aiLiveTimer = null; }
+    if (_aiEngTimer) { clearInterval(_aiEngTimer); _aiEngTimer = null; }
+  }
+  function _aiLiveVisible() {
+    if (document.hidden) return false;
+    const pane = document.querySelector('.ai-subpane[data-ai-subpane="live"]');
+    return !!(pane && pane.offsetParent !== null);
+  }
+  function _aiLiveStart() {
+    _aiLiveStop();
+    _aiEngWire();
+    loadAiActivity();
+    loadAiEngines();
+    _aiLiveTimer = setInterval(() => { if (_aiLiveVisible()) loadAiActivity(); }, 5000);
+    _aiEngTimer = setInterval(() => { if (_aiLiveVisible()) loadAiEngines(); }, 15000);
+  }
+
+  function _aiAgo(ts) {
+    if (!ts) return '—';
+    const sec = Math.max(0, (Date.now() / 1000 + _aiServerSkew) - ts);
+    if (sec < 60) return Math.round(sec) + 's';
+    if (sec < 3600) return Math.round(sec / 60) + 'm';
+    if (sec < 86400) return Math.round(sec / 3600) + 'h';
+    return Math.round(sec / 86400) + 'd';
+  }
+
+  function _aiCard(icon, label, active, sub, color) {
+    const hot = (active || 0) > 0;
+    return '<div style="flex:1 1 150px;border:1px solid #e2e6ea;border-radius:10px;padding:9px 12px;background:' +
+      (hot ? '#eef7f0' : '#fafbfc') + ';">' +
+      '<div style="font-size:.78em;color:#666;white-space:nowrap;"><iconify-icon icon="' + icon + '"></iconify-icon> ' + label + '</div>' +
+      '<div style="font-size:1.7em;font-weight:700;line-height:1.15;color:' + (hot ? color : '#aaa') + ';">' + (active || 0) + '</div>' +
+      '<div style="font-size:.7em;color:#999;">' + (sub || '') + '</div></div>';
+  }
+
+  async function loadAiActivity() {
+    try {
+      const r = await fetch('/ai/activity');
+      if (!r.ok) return;
+      const d = await r.json();
+      if (d.server_now) _aiServerSkew = d.server_now - Date.now() / 1000;
+      const f = d.inflight || {}, rr = d.reasoning || {};
+      const v = f.vision || {}, j = f.judge || {}, di = f.distiller || {}, c = f.codegen || {};
+      const dOn = rr.distiller_mode && rr.distiller_mode !== 'off';
+      const jOn = rr.judge_mode && rr.judge_mode !== 'off';
+      const inf = document.getElementById('aiLiveInflight');
+      if (inf) inf.innerHTML =
+        _aiCard('lucide:eye', '視覚 perception', v.active, 'peak ' + (v.peak || 0) + ' · total ' + (v.total || 0), '#2e7d32') +
+        _aiCard('lucide:code-2', 'コード生成 codegen', c.active, 'total ' + (c.total || 0), '#1a6a8b') +
+        _aiCard('lucide:brain', '推論 蒸留 distiller', di.active, dOn ? _esc(rr.distiller_engine || '') : 'OFF', '#66558c') +
+        _aiCard('lucide:scale', '審査 judge', j.active, jOn ? _esc(rr.judge_mode) : 'OFF', '#7a6a2a');
+      _renderAiCodegen(d.codegen_loop);
+      _renderAiRecent(d.recent || []);
+      // Fast path for per-engine 稼働中/停止中 badges (the slower /engines
+      // poll carries model/temp/tokens; re-render the table with fresh sets).
+      _aiActiveSet = new Set(d.active_engines || []);
+      _aiDisabledSet = new Set(d.disabled_engines || []);
+      _renderAiEngines();
+    } catch (e) { /* transient */ }
+  }
+
+  function _renderAiCodegen(cg) {
+    const el = document.getElementById('aiLiveCodegen'); if (!el) return;
+    const jobs = (cg && cg.codegen_loop_jobs) || [];
+    const limit = (cg && cg.codegen_loop_limit) || 0;
+    const running = (cg && cg.codegen_loop_running) || 0;
+    const head = '<div style="font-size:.8em;color:#666;margin-bottom:5px;">稼働 ' + running +
+      (limit ? ' / 上限 ' + limit : ' / 上限なし') + '</div>';
+    if (!jobs.length) { el.innerHTML = head + '<div class="empty" style="color:#aaa;">いま生成中のジョブはありません</div>'; return; }
+    el.innerHTML = head + jobs.map(j =>
+      '<div style="border-left:3px solid #1a6a8b;padding:5px 10px;margin-bottom:5px;background:#f7fafb;border-radius:0 6px 6px 0;">' +
+      '<a href="#live/' + encodeURIComponent(j.job_id) + '" style="font-family:monospace;font-size:.82em;">' + _esc(j.job_id) + '</a>' +
+      (j.host ? ' <span class="aibadge tier-auto">' + _esc(j.host) + '</span>' : '') +
+      (j.phase ? ' <span style="font-size:.75em;color:#888;">' + _esc(j.phase) + '</span>' : '') +
+      (j.goal ? '<div style="font-size:.82em;color:#444;margin-top:2px;">' + _esc(j.goal) + '</div>' : '') +
+      '</div>'
+    ).join('');
+  }
+
+  function _renderAiRecent(events) {
+    const el = document.getElementById('aiLiveRecent'); if (!el) return;
+    if (!events.length) { el.innerHTML = '<div class="empty" style="color:#aaa;">まだイベントがありません（再起動後に蓄積）</div>'; return; }
+    const kindColor = { distill: '#66558c', perceive: '#2e7d32', escalate: '#bf722a', recipe: '#1f7a63' };
+    const kindLabel = { distill: '蒸留', perceive: '視覚', escalate: 'エスカレ', recipe: 'recipe' };
+    el.innerHTML = '<div style="max-height:300px;overflow:auto;border:1px solid #eef0f2;border-radius:6px;">' + events.map(e =>
+      '<div style="display:flex;gap:8px;align-items:baseline;padding:4px 8px;border-bottom:1px solid #f3f5f7;font-size:.84em;">' +
+      '<span style="color:#999;width:32px;flex:none;text-align:right;">' + _aiAgo(e.at) + '</span>' +
+      '<span class="aibadge" style="background:' + (kindColor[e.kind] || '#777') + ';color:#fff;flex:none;">' + (kindLabel[e.kind] || _esc(e.kind)) + '</span>' +
+      (e.host ? '<span style="color:#555;flex:none;font-family:monospace;font-size:.92em;">' + _esc(e.host) + '</span>' : '') +
+      '<span style="color:#444;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;">' + _esc(e.summary || '') + '</span>' +
+      '</div>'
+    ).join('') + '</div>';
+  }
+
+  async function loadAiEngines() {
+    try {
+      const r = await fetch('/engines');
+      if (!r.ok) return;
+      const d = await r.json();
+      _aiEnginesData = d.engines || d.items || (Array.isArray(d) ? d : []);
+      _renderAiEngines();
+    } catch (e) { /* transient */ }
+  }
+
+  // 状態: 停止中(operator) / サーマル停止(GPU過熱) / 稼働中(in-flight) / 接続中(ready).
+  function _engineStatus(e) {
+    const th = e.thermal || {};
+    if (_aiDisabledSet.has(e.slug) || e.enabled === false) return { label: '停止中', color: '#9aa3ab', stopped: true };
+    if (th.temp_c != null && th.accepting === false) return { label: 'サーマル停止', color: '#d6791b', stopped: false };
+    if (_aiActiveSet.has(e.slug) || e.active === true) return { label: '稼働中', color: '#2e7d32', stopped: false };
+    return { label: '接続中', color: '#2c6e8e', stopped: false };
+  }
+
+  function _renderAiEngines() {
+    const tb = document.getElementById('aiLiveEngines'); if (!tb) return;
+    const items = _aiEnginesData || [];
+    if (!items.length) { tb.innerHTML = '<tr><td colspan="7" class="empty">エンジンなし</td></tr>'; return; }
+    tb.innerHTML = items.map(e => {
+      const u = e.usage_today || {}, th = e.thermal || {};
+      const tc = th.temp_c;
+      const temp = (tc == null) ? '—' : (Math.round(tc) + '°C');
+      const tcol = (tc == null) ? '#bbb' : (tc >= (th.stop_c || 999) ? '#d65a5a' : (tc >= (th.resume_c || 0) ? '#d6a13a' : '#4a9d6a'));
+      const st = _engineStatus(e);
+      const dot = (st.label === '稼働中')
+        ? '<span style="display:inline-block;width:7px;height:7px;border-radius:50%;background:' + st.color + ';margin-right:5px;"></span>' : '';
+      const badge = '<span style="color:' + st.color + ';font-weight:600;font-size:.92em;white-space:nowrap;">' + dot + st.label + '</span>';
+      const tok = (u.prompt || 0) + (u.completion || 0);
+      const btn = st.stopped
+        ? '<button class="aibtn ai-eng-toggle" data-slug="' + _esc(e.slug) + '" data-stop="0" style="color:#2e7d32;">▶ 再開</button>'
+        : '<button class="aibtn ai-eng-toggle" data-slug="' + _esc(e.slug) + '" data-stop="1" style="color:#c0392b;">■ 停止</button>';
+      return '<tr style="border-bottom:1px solid #f0f2f4;">' +
+        '<td style="padding:4px 6px;"><code>' + _esc(e.slug) + '</code></td>' +
+        '<td style="padding:4px 6px;">' + badge + '</td>' +
+        '<td style="padding:4px 6px;font-size:.85em;">' + _esc(e.model || '') + '</td>' +
+        '<td style="padding:4px 6px;font-size:.82em;color:#777;">' + _esc(e.kind || '') + '</td>' +
+        '<td style="padding:4px 6px;color:' + tcol + ';font-weight:600;">' + temp + '</td>' +
+        '<td style="padding:4px 6px;text-align:right;">' + tok.toLocaleString() + '</td>' +
+        '<td style="padding:4px 6px;text-align:center;">' + btn + '</td></tr>';
+    }).join('');
+  }
+
+  async function _aiEngToggle(slug, stop) {
+    try {
+      await fetch('/engines/' + encodeURIComponent(slug) + '/' + (stop ? 'stop' : 'resume'), { method: 'POST' });
+    } catch (e) { /* transient */ }
+    loadAiActivity();
+    loadAiEngines();  // immediate refresh; don't wait for the poll
+  }
+
+  function _aiEngWire() {
+    if (_aiEngWired) return;
+    const tb = document.getElementById('aiLiveEngines'); if (!tb) return;
+    tb.addEventListener('click', (ev) => {
+      const b = ev.target.closest('button.ai-eng-toggle');
+      if (!b) return;
+      _aiEngToggle(b.dataset.slug, b.dataset.stop === '1');
+    });
+    _aiEngWired = true;
   }
 
   function _esc(s) { return (s == null ? '' : ('' + s)).replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/"/g, '&quot;'); }
@@ -256,6 +430,9 @@
     $('skillCodeProv').textContent = '';
     _skillCodeCurrent = '';
     modal.style.display = 'flex';
+    // Reflect the open skill in the address bar so #ai/skill/<slug> is
+    // shareable / survives reload (no-op when opened via that deep-link).
+    try { if (typeof _entityHashSync === 'function') _entityHashSync('ai', 'skill/' + slug); } catch (_e) {}
     try {
       const r = await fetch('/skills/' + encodeURIComponent(slug));
       if (!r.ok) { $('skillCodeBody').textContent = '取得失敗 (HTTP ' + r.status + ')'; return; }
@@ -278,6 +455,40 @@
       $('skillCodeBody').textContent = '取得失敗: ' + (e && e.message ? e.message : e);
     }
   }
+
+  // ---- Deep-link entry point: #ai/<kind>/<slug> -> open that entity ----
+  // Registered with the core router via window.aiOpenEntity (admin-core.js
+  // _entityDeepLinkOpeners), so a pasted / shared / reloaded
+  //   #ai/skill/<slug>        -> Skills sub-tab + code modal
+  //   #ai/host/<host>         -> Knowledge sub-tab + host-knowledge modal
+  //   #ai/convention/<slug>   -> Conventions sub-tab
+  // lands directly on the entity. ``entityId`` is everything after "#ai/".
+  function aiOpenEntity(entityId) {
+    const s = String(entityId == null ? '' : entityId);
+    const i = s.indexOf('/');
+    const kind = (i >= 0 ? s.slice(0, i) : 'skill').toLowerCase();
+    const id = i >= 0 ? s.slice(i + 1) : s;
+    if (!id) return;
+    if (kind === 'host' || kind === 'hosts' || kind === 'knowledge') {
+      setAiSubtab('knowledge');
+      // _hkData is empty on a cold deep-link; setAiSubtab() kicked off
+      // loadKnowledge() which fills it async, so retry briefly.
+      let tries = 12;
+      const open = () => {
+        if (_hkData.find(e => e.host === id)) { openHkModal(id); return; }
+        if (--tries > 0) setTimeout(open, 400);
+      };
+      open();
+    } else if (kind === 'convention' || kind === 'conventions') {
+      setAiSubtab('conventions');
+    } else {
+      // skill (default): openSkillCode fetches /skills/{slug} directly, so
+      // this works cold without the list having rendered first.
+      setAiSubtab('skills');
+      openSkillCode(id);
+    }
+  }
+  try { window.aiOpenEntity = aiOpenEntity; } catch (_e) {}
 
   // ---- Grooming sub-tab: retire + dedup candidates + auto toggles ----
   function _groomRetireRow(x) {
@@ -551,6 +762,7 @@
     document.getElementById('hkModalRaw').href = '/hosts/' + encodeURIComponent(host) + '/knowledge';
     document.getElementById('hkModalBody').innerHTML = renderHkBody(k);
     document.getElementById('hkModal').style.display = 'flex';
+    try { if (typeof _entityHashSync === 'function') _entityHashSync('ai', 'host/' + host); } catch (_e) {}
   }
 
   function renderHkBody(k) {
@@ -664,8 +876,12 @@
     const _scm = document.getElementById('skillCodeModal');
     const _scClose = document.getElementById('skillCodeClose');
     const _scCopy = document.getElementById('skillCodeCopy');
-    if (_scClose && _scm) _scClose.addEventListener('click', () => { _scm.style.display = 'none'; });
-    if (_scm) _scm.addEventListener('click', (e) => { if (e.target === _scm) _scm.style.display = 'none'; });
+    const _scHide = () => {
+      _scm.style.display = 'none';
+      try { if (typeof _entityHashClear === 'function') _entityHashClear('ai'); } catch (_e) {}
+    };
+    if (_scClose && _scm) _scClose.addEventListener('click', _scHide);
+    if (_scm) _scm.addEventListener('click', (e) => { if (e.target === _scm) _scHide(); });
     if (_scCopy) _scCopy.addEventListener('click', async () => {
       try {
         await navigator.clipboard.writeText(_skillCodeCurrent || '');
@@ -720,11 +936,13 @@
     if (td) td.addEventListener('change', () => _setAutoToggle('auto_dedup_enabled', td.checked));
     const oref = document.getElementById('oracleRefreshBtn');
     if (oref) oref.addEventListener('click', loadOracle);
-    document.getElementById('hkModalClose').addEventListener('click', () => {
+    const _hkHide = () => {
       document.getElementById('hkModal').style.display = 'none';
-    });
+      try { if (typeof _entityHashClear === 'function') _entityHashClear('ai'); } catch (_e) {}
+    };
+    document.getElementById('hkModalClose').addEventListener('click', _hkHide);
     document.getElementById('hkModal').addEventListener('click', (ev) => {
-      if (ev.target.id === 'hkModal') document.getElementById('hkModal').style.display = 'none';
+      if (ev.target.id === 'hkModal') _hkHide();
     });
     // Lazy load when the tab is first shown (the existing tab switcher
     // toggles .active on the panel; observe via clicks).
