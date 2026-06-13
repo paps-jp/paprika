@@ -1884,6 +1884,9 @@ async def _reconcile_worker_sessions(worker, snapshots: list) -> None:
     )
 
 
+_WORKER_SEEN_SAVE: dict = {}  # worker_id -> monotonic ts of last ledger last_seen save (throttle)
+
+
 async def _handle_worker_message(worker, msg) -> None:
     """Dispatch a worker->hub message."""
     assert state.store is not None and state.registry is not None
@@ -1898,6 +1901,21 @@ async def _handle_worker_message(worker, msg) -> None:
             disk_free_gb=msg.disk_free_gb,
             load1=msg.load1,
         )
+        # Keep the MariaDB ledger's last_seen_at fresh on heartbeat (NOT just on
+        # register) so salvage's age-window can tell a just-ghosted worker from a
+        # long-dead VM. Without this, every row's last_seen stayed at register
+        # time -> all workers aged out of [min,max] and salvage detected zero
+        # ghosts. Throttled ~60s/worker to bound DB writes (fleet*hb is a lot).
+        try:
+            import time as _t
+            _mono = _t.monotonic()
+            if _mono - _WORKER_SEEN_SAVE.get(worker.worker_id, 0.0) > 60.0:
+                _WORKER_SEEN_SAVE[worker.worker_id] = _mono
+                if hasattr(state.store, "save_worker"):
+                    await state.store.save_worker(
+                        worker.worker_id, ip=worker.client_address, status="connected")
+        except Exception:
+            pass
         # Mirror the cache snapshot onto the ConnectedWorker so
         # GET /workers can render it without an extra round-trip
         # to the worker. The list is short (typical operator has
