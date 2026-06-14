@@ -38,7 +38,7 @@ import logging
 import os
 import time
 
-from server.hub._state import state
+from server.hub._state import state, config
 
 log = logging.getLogger("paprika.salvage")
 
@@ -77,6 +77,12 @@ def _materialize_key(pem: str) -> str:
     """Write an uploaded SSH key PEM (settings worker_ssh_key_pem, shared to
     every hub) to a local 0600 file so ssh can use it. Idempotent: only
     rewrites when the content changed. Returns the path, or '' on failure."""
+    # OpenSSH private keys REQUIRE a trailing newline. settings._coerce runs
+    # str(v).strip() on every value, which eats that newline -> ssh fails with
+    # "error in libcrypto" and salvage can never authenticate (ghosts pile up).
+    # Re-add it before writing so the materialised key is valid.
+    if pem and not pem.endswith("\n"):
+        pem = pem + "\n"
     try:
         try:
             with open(_KEY_MATERIAL_PATH, "r", encoding="utf-8") as f:
@@ -210,7 +216,7 @@ async def _salvage_one(wid: str, ip: str) -> str:
                 return "skip"
         except Exception:
             pass
-    secret = state.worker_secret or ""
+    secret = config.worker_secret or ""
     port = _int("PAPRIKA_WORKER_SELFRESTART_PORT", 9099)
     if await _http_self_restart(ip, secret, port):
         try:
@@ -253,11 +259,13 @@ async def _salvage_pass() -> int:
             if w.get("alive")
         }
     except Exception:
+        log.warning("salvage: stats_async failed -- pass aborted", exc_info=True)
         return 0
     # MariaDB ledger -- recently-seen workers (cross-hub, durable).
     try:
         meta = await state.store.get_workers_meta()
     except Exception:
+        log.warning("salvage: get_workers_meta failed -- pass aborted", exc_info=True)
         return 0
     now = time.time()
     min_age = _int("PAPRIKA_SALVAGE_GHOST_MIN_AGE_S", 300)
@@ -285,6 +293,11 @@ async def _salvage_pass() -> int:
         if rec is not None and (now - rec) < cooldown:
             continue  # cooldown: avoid restart storms
         ghosts.append((wid, ip))
+    if ghosts:
+        log.info(
+            "salvage: detected %d ghost(s) (alive=%d ledger=%d): %s",
+            len(ghosts), len(alive), len(meta), [g[0] for g in ghosts[:8]],
+        )
     n = 0
     for wid, ip in ghosts[: _int("PAPRIKA_SALVAGE_MAX_PER_PASS", 3)]:
         res = await _salvage_one(wid, ip)
@@ -293,6 +306,8 @@ async def _salvage_pass() -> int:
             n += 1
         elif res == "failed":
             log.info("salvage: %s (%s) unreachable (HTTP+SSH) -- left alone", wid, ip)
+        elif res == "skip":
+            log.info("salvage: %s held by another hub this pass -- skip", wid)
     return n
 
 
