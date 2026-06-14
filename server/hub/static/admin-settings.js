@@ -178,8 +178,8 @@ async function loadSettingsPanel() {
       _setVal('setWorkerSshKeyPath', hub.worker_ssh_key_path);
       const _wsKeyState = document.getElementById('setWorkerSshKeyState');
       if (_wsKeyState) _wsKeyState.textContent = _secretsSet.worker_ssh_key_pem
-        ? '✓ 鍵アップロード済み（変更時のみ再アップロード）'
-        : '（未アップロード）';
+        ? _slvT('salvage.key.uploaded', '✓ 鍵アップロード済み（変更時のみ再アップロード）')
+        : _slvT('salvage.key.none', '（未アップロード）');
 
       const sys = d.system || {};
       const tbody = document.getElementById('setSystemInfoBody');
@@ -227,6 +227,15 @@ function resetSettingsUi() {
   flashSavedHint();
 }
 
+// i18n helper for dynamic salvage status text — translate via i18next when
+// loaded, else fall back to the inline Japanese (CDN down / pre-init).
+function _slvT(key, fallback) {
+  try {
+    return (window.i18next && window.i18next.t)
+      ? window.i18next.t(key, { defaultValue: fallback }) : fallback;
+  } catch (_) { return fallback; }
+}
+
 // Worker salvage SSH (server/hub/_salvage.py). Plain PUT /settings of the
 // three worker_ssh_* keys; no secret redaction (the key is a *path*, not
 // the key material). The actual private key lives in the hub container at
@@ -248,13 +257,13 @@ async function saveSettingsWorkerSsh() {
     });
     if (!r.ok) {
       const t = await r.text();
-      if (stEl) { stEl.textContent = '保存失敗: ' + t.slice(0, 120); stEl.style.color = '#c0392b'; }
+      if (stEl) { stEl.textContent = _slvT('salvage.save.failed', '保存失敗: ') + t.slice(0, 120); stEl.style.color = '#c0392b'; }
       return;
     }
-    if (stEl) { stEl.textContent = '✓ 保存しました (全ハブへ伝播)'; stEl.style.color = '#196b2c'; }
+    if (stEl) { stEl.textContent = _slvT('salvage.save.ok', '✓ 保存しました (全ハブへ伝播)'); stEl.style.color = '#196b2c'; }
     flashSavedHint();
   } catch (e) {
-    if (stEl) { stEl.textContent = '保存失敗: ' + (e.message || e); stEl.style.color = '#c0392b'; }
+    if (stEl) { stEl.textContent = _slvT('salvage.save.failed', '保存失敗: ') + (e.message || e); stEl.style.color = '#c0392b'; }
   }
 }
 
@@ -270,11 +279,11 @@ async function uploadWorkerSshKey(file) {
   try {
     pem = await file.text();
   } catch (e) {
-    if (stEl) { stEl.textContent = '鍵読込失敗: ' + (e.message || e); stEl.style.color = '#c0392b'; }
+    if (stEl) { stEl.textContent = _slvT('salvage.key.readfail', '鍵読込失敗: ') + (e.message || e); stEl.style.color = '#c0392b'; }
     return;
   }
   if (!pem || pem.indexOf('PRIVATE KEY') === -1) {
-    if (stEl) { stEl.textContent = '鍵が PEM 形式ではないようです（PRIVATE KEY が見つからない）'; stEl.style.color = '#c0392b'; }
+    if (stEl) { stEl.textContent = _slvT('salvage.key.notpem', '鍵が PEM 形式ではないようです（PRIVATE KEY が見つからない）'); stEl.style.color = '#c0392b'; }
     return;
   }
   try {
@@ -285,14 +294,14 @@ async function uploadWorkerSshKey(file) {
     });
     if (!r.ok) {
       const t = await r.text();
-      if (stEl) { stEl.textContent = '鍵アップロード失敗: ' + t.slice(0, 120); stEl.style.color = '#c0392b'; }
+      if (stEl) { stEl.textContent = _slvT('salvage.key.uploadfail', '鍵アップロード失敗: ') + t.slice(0, 120); stEl.style.color = '#c0392b'; }
       return;
     }
-    if (stEl) { stEl.textContent = '✓ 鍵をアップロード（全ハブへ伝播）'; stEl.style.color = '#196b2c'; }
-    if (keyStateEl) keyStateEl.textContent = '✓ 鍵アップロード済み（変更時のみ再アップロード）';
+    if (stEl) { stEl.textContent = _slvT('salvage.key.uploadok', '✓ 鍵をアップロード（全ハブへ伝播）'); stEl.style.color = '#196b2c'; }
+    if (keyStateEl) keyStateEl.textContent = _slvT('salvage.key.uploaded', '✓ 鍵アップロード済み（変更時のみ再アップロード）');
     flashSavedHint();
   } catch (e) {
-    if (stEl) { stEl.textContent = '鍵アップロード失敗: ' + (e.message || e); stEl.style.color = '#c0392b'; }
+    if (stEl) { stEl.textContent = _slvT('salvage.key.uploadfail', '鍵アップロード失敗: ') + (e.message || e); stEl.style.color = '#c0392b'; }
   }
 }
 

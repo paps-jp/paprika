@@ -1142,8 +1142,8 @@ asyncio.run(main())"
 
       <!-- 永続: サルベージ復旧履歴 (MariaDB recovery_events・全ハブ共通・段階4) -->
       <h3 style="margin:6px 0 6px; font-size:1em; display:flex; align-items:center; gap:6px; flex-wrap:wrap;">
-        <iconify-icon icon="lucide:wrench"></iconify-icon> サルベージ復旧履歴
-        <span style="font-size:.72em; color:#888; font-weight:normal;">自動復旧の永続ログ（MariaDB・全ハブ共通・ハブ再起動でも残る）</span>
+        <iconify-icon icon="lucide:wrench"></iconify-icon> <span data-i18n="recovery.salvage.title">サルベージ復旧履歴</span>
+        <span style="font-size:.72em; color:#888; font-weight:normal;" data-i18n="recovery.salvage.desc">自動復旧の永続ログ（MariaDB・全ハブ共通・ハブ再起動でも残る）</span>
         <span id="salvageHistoryCount" class="count" style="margin-left:6px;">0</span>
         <span id="salvageHistoryStatus" style="font-size:.72em; color:#aaa; font-weight:normal;"></span>
       </h3>
@@ -1151,12 +1151,12 @@ asyncio.run(main())"
         <table id="salvageHistoryTable" style="width:100%; border-collapse:collapse; font-size:.86em;">
           <thead style="position:sticky; top:0; background:#f5f5f5; z-index:1;">
             <tr>
-              <th style="text-align:left; padding:6px 8px; border-bottom:1px solid #d0d0d0; white-space:nowrap;">時刻</th>
-              <th style="text-align:left; padding:6px 8px; border-bottom:1px solid #d0d0d0; white-space:nowrap;">ワーカー</th>
-              <th style="text-align:left; padding:6px 8px; border-bottom:1px solid #d0d0d0; white-space:nowrap;">方法</th>
-              <th style="text-align:left; padding:6px 8px; border-bottom:1px solid #d0d0d0; white-space:nowrap;">結果</th>
-              <th style="text-align:left; padding:6px 8px; border-bottom:1px solid #d0d0d0; white-space:nowrap;">ハブ</th>
-              <th style="text-align:left; padding:6px 8px; border-bottom:1px solid #d0d0d0;">詳細</th>
+              <th style="text-align:left; padding:6px 8px; border-bottom:1px solid #d0d0d0; white-space:nowrap;" data-i18n="recovery.salvage.th.time">時刻</th>
+              <th style="text-align:left; padding:6px 8px; border-bottom:1px solid #d0d0d0; white-space:nowrap;" data-i18n="recovery.salvage.th.worker">ワーカー</th>
+              <th style="text-align:left; padding:6px 8px; border-bottom:1px solid #d0d0d0; white-space:nowrap;" data-i18n="recovery.salvage.th.method">方法</th>
+              <th style="text-align:left; padding:6px 8px; border-bottom:1px solid #d0d0d0; white-space:nowrap;" data-i18n="recovery.salvage.th.result">結果</th>
+              <th style="text-align:left; padding:6px 8px; border-bottom:1px solid #d0d0d0; white-space:nowrap;" data-i18n="recovery.salvage.th.hub">ハブ</th>
+              <th style="text-align:left; padding:6px 8px; border-bottom:1px solid #d0d0d0;" data-i18n="recovery.salvage.th.detail">詳細</th>
             </tr>
           </thead>
           <tbody><tr><td colspan="6" class="empty" style="padding:14px; text-align:center; color:#888;">—</td></tr></tbody>
@@ -1165,12 +1165,12 @@ asyncio.run(main())"
 
       <!-- ライブ: per-hub ring-buffer events -->
       <h3 style="margin:0 0 6px; font-size:1em; display:flex; align-items:center; gap:6px; flex-wrap:wrap;">
-        <iconify-icon icon="lucide:activity"></iconify-icon> 最近のイベント（ライブ）
-        <span style="font-size:.72em; color:#888; font-weight:normal;">lifecycle / warn / error を横断表示（このハブが知る範囲・10秒ごと自動更新）</span>
+        <iconify-icon icon="lucide:activity"></iconify-icon> <span data-i18n="recovery.events.title">最近のイベント（ライブ）</span>
+        <span style="font-size:.72em; color:#888; font-weight:normal;" data-i18n="recovery.events.desc">lifecycle / warn / error を横断表示（このハブが知る範囲・10秒ごと自動更新）</span>
       </h3>
       <div style="display:flex; align-items:center; gap:10px; margin:6px 0 10px; flex-wrap:wrap; font-size:.88em;">
         <label style="display:flex; align-items:center; gap:4px;">
-          種別:
+          <span data-i18n="recovery.filter.kind">種別:</span>
           <select id="recoveryKindFilter" style="padding:3px 6px;">
             <option value="lifecycle,warn,error">lifecycle + warn + error</option>
             <option value="lifecycle">lifecycle のみ</option>
@@ -1179,7 +1179,7 @@ asyncio.run(main())"
           </select>
         </label>
         <label style="display:flex; align-items:center; gap:4px;">
-          時間範囲:
+          <span data-i18n="recovery.filter.range">時間範囲:</span>
           <select id="recoverySinceFilter" style="padding:3px 6px;">
             <option value="600">過去 10分</option>
             <option value="3600" selected>過去 1時間</option>
@@ -1188,20 +1188,20 @@ asyncio.run(main())"
           </select>
         </label>
         <label style="display:flex; align-items:center; gap:4px;">
-          ワーカー:
-          <input type="text" id="recoveryWorkerFilter" placeholder="worker_id を絞り込み (空 = 全部)" style="padding:3px 6px; width:200px;">
+          <span data-i18n="recovery.filter.worker">ワーカー:</span>
+          <input type="text" id="recoveryWorkerFilter" data-i18n-placeholder="recovery.filter.worker.ph" placeholder="worker_id を絞り込み (空 = 全部)" style="padding:3px 6px; width:200px;">
         </label>
-        <button id="recoveryRefreshBtn" class="pill" style="--la-bg:#f5f5fa; --la-bd:#bbc; --la-fg:#444; font-size:.82em;"><iconify-icon icon="lucide:refresh-cw"></iconify-icon> 再取得</button>
+        <button id="recoveryRefreshBtn" class="pill" style="--la-bg:#f5f5fa; --la-bd:#bbc; --la-fg:#444; font-size:.82em;"><iconify-icon icon="lucide:refresh-cw"></iconify-icon> <span data-i18n="recovery.refresh">再取得</span></button>
         <span id="recoveryStatus" style="color:#888;"></span>
       </div>
       <div style="overflow:auto; max-height:calc(100vh - 360px);">
         <table id="recoveryTable" style="width:100%; border-collapse:collapse; font-size:.88em;">
           <thead style="position:sticky; top:0; background:#f5f5f5; z-index:1;">
             <tr>
-              <th style="text-align:left; padding:6px 8px; border-bottom:1px solid #d0d0d0; white-space:nowrap;">時刻</th>
-              <th style="text-align:left; padding:6px 8px; border-bottom:1px solid #d0d0d0; white-space:nowrap;">種別</th>
-              <th style="text-align:left; padding:6px 8px; border-bottom:1px solid #d0d0d0; white-space:nowrap;">ワーカー</th>
-              <th style="text-align:left; padding:6px 8px; border-bottom:1px solid #d0d0d0;">内容</th>
+              <th style="text-align:left; padding:6px 8px; border-bottom:1px solid #d0d0d0; white-space:nowrap;" data-i18n="recovery.events.th.time">時刻</th>
+              <th style="text-align:left; padding:6px 8px; border-bottom:1px solid #d0d0d0; white-space:nowrap;" data-i18n="recovery.events.th.kind">種別</th>
+              <th style="text-align:left; padding:6px 8px; border-bottom:1px solid #d0d0d0; white-space:nowrap;" data-i18n="recovery.events.th.worker">ワーカー</th>
+              <th style="text-align:left; padding:6px 8px; border-bottom:1px solid #d0d0d0;" data-i18n="recovery.events.th.content">内容</th>
             </tr>
           </thead>
           <tbody><tr><td colspan="4" class="empty" style="padding:20px; text-align:center; color:#888;">loading…</td></tr></tbody>
@@ -3147,8 +3147,8 @@ table.aitbl code { font-size:0.95em; }
 
     <!-- B9. Worker salvage: SSH fallback (server/hub/_salvage.py) -->
     <div class="settings-card">
-    <h3><iconify-icon icon="lucide:life-buoy"></iconify-icon> ワーカー自動復旧 SSH (サルベージ用)
-      <small>ゴーストワーカーを SSH で再起動するための接続情報</small>
+    <h3><iconify-icon icon="lucide:life-buoy"></iconify-icon> <span data-i18n="salvage.ssh.title">ワーカー自動復旧 SSH (サルベージ用)</span>
+      <small data-i18n="salvage.ssh.subtitle">ゴーストワーカーを SSH で再起動するための接続情報</small>
     </h3>
     <p style="margin:4px 0 8px; color:#666; font-size:.88em;">
       各ハブが応答しないワーカー (ゴースト) を検出したとき、まず HTTP self-restart を試み、
@@ -3159,19 +3159,19 @@ table.aitbl code { font-size:0.95em; }
     </p>
 
     <div style="display:grid; grid-template-columns: 200px 1fr; gap:8px 12px; align-items:center; padding:8px 4px;">
-      <label for="setSalvageEnabled" title="自動復旧ループの ON/OFF（全ハブ共通・即反映）">自動復旧:</label>
+      <label for="setSalvageEnabled" title="自動復旧ループの ON/OFF（全ハブ共通・即反映）" data-i18n="salvage.enabled.label">自動復旧:</label>
       <div><label style="font-weight:normal;"><input type="checkbox" id="setSalvageEnabled"> 有効化（ゴーストを定期検出して自動 restart）</label></div>
 
-      <label for="setWorkerSshUser" title="SSH ログインユーザー">SSH ユーザー:</label>
+      <label for="setWorkerSshUser" title="SSH ログインユーザー" data-i18n="salvage.ssh.user">SSH ユーザー:</label>
       <div><input type="text" id="setWorkerSshUser" placeholder="root" style="width:240px; padding:4px 8px;" autocomplete="off"></div>
 
-      <label for="setWorkerSshPort" title="SSH ポート (既定 22)">SSH ポート:</label>
+      <label for="setWorkerSshPort" title="SSH ポート (既定 22)" data-i18n="salvage.ssh.port">SSH ポート:</label>
       <div><input type="number" id="setWorkerSshPort" placeholder="22" min="1" max="65535" style="width:120px; padding:4px 8px;"></div>
 
-      <label for="setWorkerSshKeyPath" title="ハブコンテナ内の秘密鍵パス。空なら下のアップロード鍵を自動使用">秘密鍵パス:</label>
+      <label for="setWorkerSshKeyPath" title="ハブコンテナ内の秘密鍵パス。空なら下のアップロード鍵を自動使用" data-i18n="salvage.ssh.keypath">秘密鍵パス:</label>
       <div><input type="text" id="setWorkerSshKeyPath" placeholder="(空でOK — 下で鍵をアップロードすれば自動)" style="width:320px; padding:4px 8px;" autocomplete="off"></div>
 
-      <label for="setWorkerSshKeyFile" title="秘密鍵ファイル(PEM)をアップロード。全ハブへ配布されます">秘密鍵アップロード:</label>
+      <label for="setWorkerSshKeyFile" title="秘密鍵ファイル(PEM)をアップロード。全ハブへ配布されます" data-i18n="salvage.ssh.keyfile">秘密鍵アップロード:</label>
       <div>
         <input type="file" id="setWorkerSshKeyFile" accept=".pem,.key" style="font-size:.85em;">
         <span id="setWorkerSshKeyState" style="font-size:.82em; color:#888; margin-left:6px;"></span>
@@ -3180,7 +3180,7 @@ table.aitbl code { font-size:0.95em; }
 
       <div></div>
       <div style="display:flex; gap:8px; align-items:center; flex-wrap:wrap; margin-top:4px;">
-        <button id="setSaveWorkerSshBtn" class="pill" style="background:#eef8ee; border-color:#7ab68a; color:#196b2c;"><iconify-icon icon="lucide:save"></iconify-icon> 設定を保存</button>
+        <button id="setSaveWorkerSshBtn" class="pill" style="background:#eef8ee; border-color:#7ab68a; color:#196b2c;"><iconify-icon icon="lucide:save"></iconify-icon> <span data-i18n="salvage.save">設定を保存</span></button>
         <span id="setWorkerSshStatus" style="font-size:.9em; margin-left:4px;"></span>
       </div>
     </div>
