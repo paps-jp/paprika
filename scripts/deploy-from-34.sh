@@ -85,7 +85,18 @@ if [ "$worker_needed" = 0 ] && [ "$hub_needed" = 0 ]; then say "==> nothing chan
 hubs_restarted=0
 if [ "$hub_needed" = 1 ] && [ -z "${SKIP_HUBS:-}" ]; then
   say "==> [3] hub code changed -> rolling hub restart (gated on /health)"
+  # 案B: drain each hub from nginx (consistent-hash ring) BEFORE restarting it,
+  # so its pinned workers re-home to a LIVE hub during the restart instead of
+  # ghosting on the restarting hub -- the root cause of the recurring fleet-
+  # count drop (60->37, worker-ghost-proxied-ws). undrain once it's healthy.
+  # Best-effort: a drain/undrain hiccup must NOT block the deploy (the drain
+  # key carries a 600s TTL that auto-clears a stuck drain).
+  RECON="${RECONCILER_CONTAINER:-reconciler-reconciler-1}"
   for H in "${HUBS[@]}"; do
+    docker exec "$RECON" python /reconciler.py drain "$H" >/dev/null 2>&1 \
+      && say "    drained $H from nginx (workers re-homing off it)" \
+      || say "    (drain $H failed -- continuing; 600s TTL auto-clears)"
+    sleep 4  # let consistent-hash re-home this hub's workers before the kill
     say "    restarting hub $H ..."
     ssh "${SSHO[@]}" "root@$H" "docker restart -t 8 $HUB_CONTAINER >/dev/null 2>&1" \
       || say "    (docker restart returned non-zero on $H; checking /health anyway)"
@@ -95,6 +106,11 @@ if [ "$hub_needed" = 1 ] && [ -z "${SKIP_HUBS:-}" ]; then
       [ "$h" = "200" ] && { healthy=1; break; }
       sleep 2
     done
+    # undrain regardless of the gate result -- a half-up hub must not be left
+    # permanently drained (and the TTL would clear it anyway).
+    docker exec "$RECON" python /reconciler.py undrain "$H" >/dev/null 2>&1 \
+      && say "    undrained $H back into nginx" \
+      || say "    (undrain $H failed -- 600s TTL auto-clears)"
     if [ "$healthy" = 1 ]; then say "    hub $H healthy"; else
       say "    !! hub $H NOT /health 200 after restart -- ABORTING. Fix $H ('ssh root@$H docker restart hub-hub-a-1') then re-run. Other hubs untouched."
       exit 1

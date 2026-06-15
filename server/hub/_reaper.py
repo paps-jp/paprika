@@ -230,10 +230,16 @@ async def _session_reaper_loop():
 # come straight from registry.connections).
 # How long a worker's last heartbeat may be stale before its (dead,
 # disconnected) registration is auto-pruned, and how often we scan.
-# Lowered from the old 7-day / 6-hour values so restart churn / ghost
-# entries vanish within minutes instead of lingering for days. Live,
-# currently-connected workers are never pruned (the loop skips alive=true).
-_DEAD_WORKER_MAX_AGE_S = float(os.environ.get("WORKER_STALE_REAP_S", "300"))
+# Raised 300 -> 3600: a "ghost" worker (VM alive but its control WS pinned
+# by nginx consistent-hash to a hub that doesn't consume it -- see
+# worker-ghost-proxied-ws) stops heartbeating, so the OLD 300s reap deleted a
+# STILL-ALIVE VM from the Redis index within ~5 min, collapsing the fleet
+# count (e.g. 60 -> 37) faster than re-home / salvage could recover it. 3600s
+# gives the deploy-time hub-drain (案B) + hub-side force-disconnect salvage
+# (案D) time to re-home the worker before we ever prune a live VM; a genuinely
+# dead VM still ages out within the hour. Live (connected) workers are never
+# pruned (the loop skips alive=true).
+_DEAD_WORKER_MAX_AGE_S = float(os.environ.get("WORKER_STALE_REAP_S", "3600"))
 _DEAD_WORKER_REAPER_INTERVAL_S = float(os.environ.get("WORKER_REAP_INTERVAL_S", "60"))
 
 

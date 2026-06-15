@@ -97,10 +97,36 @@ def live_backends(r) -> list[str] | None:
     return sorted(f"{ip}:{HUB_PORT}" for ip in ips)
 
 
-def render(conf: str, backends: list[str]) -> str:
-    servers = "\n".join(
-        f"        server {b} max_fails=3 fail_timeout=10s;" for b in backends
-    )
+_DRAIN_KEY = "paprika:hubs:draining"
+
+
+def _drained_ips(r) -> "set[str]":
+    """IPs being drained right now. deploy-from-34.sh marks a hub draining
+    just BEFORE it restarts it (案B), so nginx pulls that hub OUT of the
+    consistent-hash ring and its pinned workers re-home to a LIVE hub instead
+    of ghosting on the restarting hub (root cause of the 60->37 fleet drop,
+    see worker-ghost-proxied-ws). Redis SET; deploy sets a short TTL on the key
+    so a crashed/aborted deploy can't leave a hub down forever."""
+    try:
+        return {
+            (x.decode() if isinstance(x, bytes) else str(x))
+            for x in r.smembers(_DRAIN_KEY)
+        }
+    except Exception:
+        return set()
+
+
+def render(conf: str, backends: list[str], drained: "set[str] | None" = None) -> str:
+    drained = drained or set()
+
+    def _srv(b: str) -> str:
+        # ``down`` removes a hub from the upstream (and from the consistent-hash
+        # ring) without deleting the line, so a drained hub's workers re-home to
+        # a live hub during its restart and don't ghost.
+        suffix = " down" if b.split(":")[0] in drained else ""
+        return f"        server {b} max_fails=3 fail_timeout=10s{suffix};"
+
+    servers = "\n".join(_srv(b) for b in backends)
     hubs = "upstream hubs {\n" + servers + "\n        keepalive 64;\n    }"
     sticky = (
         "upstream hubs_sticky {\n        hash $worker_id consistent;\n"
@@ -147,7 +173,7 @@ def reconcile_once(r) -> None:
         _log(f"read {NGINX_CONF} failed: {exc}")
         return
     try:
-        new = render(cur, backends)
+        new = render(cur, backends, _drained_ips(r))
     except Exception as exc:
         _log(f"render failed: {exc}")
         return
@@ -180,5 +206,24 @@ def main() -> int:
         time.sleep(INTERVAL_S)
 
 
+def _drain_cli(action: str, ip: str) -> int:
+    """``nginx_reconciler.py drain|undrain <ip>`` -- toggle a hub's drain flag
+    and reconcile IMMEDIATELY (don't wait for the ~20s loop). deploy-from-34.sh
+    calls this around each hub restart (案B) so the restarting hub's workers
+    re-home to a live hub instead of ghosting."""
+    r = redis.from_url(REDIS_URL, socket_timeout=5, socket_connect_timeout=5)
+    if action == "drain":
+        r.sadd(_DRAIN_KEY, ip)
+        r.expire(_DRAIN_KEY, 600)  # safety: auto-clear if a deploy aborts mid-roll
+        _log(f"drain {ip}: marked draining + reconciling now")
+    else:
+        r.srem(_DRAIN_KEY, ip)
+        _log(f"undrain {ip}: cleared draining + reconciling now")
+    reconcile_once(r)
+    return 0
+
+
 if __name__ == "__main__":
+    if len(sys.argv) >= 3 and sys.argv[1] in ("drain", "undrain"):
+        raise SystemExit(_drain_cli(sys.argv[1], sys.argv[2]))
     raise SystemExit(main())

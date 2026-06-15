@@ -205,7 +205,16 @@ async def _ssh_restart(ip: str, user: str, port: str, key: str) -> bool:
 
 
 async def _salvage_one(wid: str, ip: str) -> str:
-    """Salvage one ghost. Returns 'http' | 'ssh' | 'failed' | 'skip'."""
+    """Issue a restart for one ghost. Returns 'http' | 'ssh' | 'failed' | 'skip'.
+
+    A restart being ISSUED is NOT recovery (案D). The worker only counts as
+    recovered once it RE-REGISTERS (shows up alive again) -- _salvage_pass
+    confirms that next pass via the pending key. The OLD code recorded
+    result="ok" the moment the worker accepted the restart (HTTP 202 / ssh rc0),
+    which was a FALSE signal: a worker that re-ghosts (same nginx consistent-hash
+    -> same hub) was counted as "recovered" so recovery_events filled with the
+    same wid forever (the observed infinite loop). Now ok is only recorded on
+    confirmed re-register; here we just stage the pending check."""
     r = getattr(state.registry, "_r", None)
     hub_id = getattr(state.registry, "_hub_id", "") or ""
     # Cross-hub mutex: only one hub salvages a given worker at a time.
@@ -218,26 +227,28 @@ async def _salvage_one(wid: str, ip: str) -> str:
             pass
     secret = config.worker_secret or ""
     port = _int("PAPRIKA_WORKER_SELFRESTART_PORT", 9099)
+    method = None
     if await _http_self_restart(ip, secret, port):
-        try:
-            await state.store.bump_worker_recovery(wid, "http self-restart")
-            await state.store.record_recovery_event(
-                wid, hub_id=hub_id, ip=ip, method="http",
-                result="ok", detail="http self-restart")
-        except Exception:
-            pass
-        return "http"
-    user, sshport, key = _ssh_conf()
-    if await _ssh_restart(ip, user, sshport, key):
-        try:
-            await state.store.bump_worker_recovery(wid, "ssh restart")
-            await state.store.record_recovery_event(
-                wid, hub_id=hub_id, ip=ip, method="ssh",
-                result="ok", detail="ssh docker restart")
-        except Exception:
-            pass
-        return "ssh"
-    # Both methods failed -> record the failed attempt too (durable history).
+        method = "http"
+    else:
+        user, sshport, key = _ssh_conf()
+        if await _ssh_restart(ip, user, sshport, key):
+            method = "ssh"
+    if method:
+        # Stage a pending re-register check (resolved next pass). Carry the
+        # restart timestamp so _resolve_pending can declare failure if the
+        # worker never comes back within the window (= re-ghosted).
+        if r is not None:
+            try:
+                await r.set(
+                    f"paprika:salvage:pending:{wid}",
+                    f"{hub_id}|{ip}|{method}|{int(time.time())}",
+                    ex=900,
+                )
+            except Exception:
+                pass
+        return method
+    # Both methods failed -> VM likely truly dead; record + leave alone.
     try:
         await state.store.record_recovery_event(
             wid, hub_id=hub_id, ip=ip, method="http+ssh",
@@ -247,9 +258,78 @@ async def _salvage_one(wid: str, ip: str) -> str:
     return "failed"
 
 
+# 案D: give up restarting a worker after this many confirmed re-ghosts, so we
+# don't restart-loop a worker that keeps landing back on a stale-upstream hub.
+_SALVAGE_FAIL_GIVEUP = _int("PAPRIKA_SALVAGE_FAIL_GIVEUP", 3)
+
+
+async def _resolve_pending(r, alive: set) -> None:
+    """案D: confirm or fail previously-issued restarts. A restarted worker is
+    only RECOVERED once it re-registers (back in the alive set) -- only THEN do
+    we record result=ok. If a restart's re-register window elapses and the
+    worker is still not alive, it re-ghosted: bump a fail counter and, past the
+    give-up threshold, stop restarting it + record give_up, so the operator sees
+    an unrecoverable worker instead of an infinite silent restart loop (the
+    observed recovery_events 'ok' spam)."""
+    hub_id = getattr(state.registry, "_hub_id", "") or ""
+    try:
+        keys = [k async for k in r.scan_iter(match="paprika:salvage:pending:*", count=200)]
+    except Exception:
+        return
+    now = time.time()
+    for k in keys:
+        ks = k.decode() if isinstance(k, bytes) else str(k)
+        wid = ks.rsplit(":", 1)[-1]
+        try:
+            raw = await r.get(ks)
+            raw = raw.decode() if isinstance(raw, bytes) else (raw or "")
+        except Exception:
+            raw = ""
+        parts = raw.split("|")
+        ipv = parts[1] if len(parts) > 1 else ""
+        method = parts[2] if len(parts) > 2 else "restart"
+        try:
+            ts = float(parts[3]) if len(parts) > 3 else 0.0
+        except ValueError:
+            ts = 0.0
+        if wid in alive:
+            # genuine recovery: the worker re-registered after the restart.
+            try:
+                await r.delete(ks)
+                await r.delete(f"paprika:salvage:fails:{wid}")
+                await state.store.bump_worker_recovery(wid, f"{method} re-register")
+                await state.store.record_recovery_event(
+                    wid, hub_id=hub_id, ip=ipv, method=method,
+                    result="ok", detail="re-registered after restart")
+            except Exception:
+                pass
+            continue
+        if now - ts < 150:
+            continue  # still within the re-register grace window; recheck later
+        # window elapsed, still not alive -> re-ghosted. Count a failure.
+        try:
+            await r.delete(ks)
+            fkey = f"paprika:salvage:fails:{wid}"
+            fails = await r.incr(fkey)
+            await r.expire(fkey, 21600)  # 6h: forget the streak if it settles
+            if fails >= _SALVAGE_FAIL_GIVEUP:
+                await state.store.record_recovery_event(
+                    wid, hub_id=hub_id, ip=ipv, method="restart",
+                    result="give_up",
+                    detail=f"re-ghosted {fails}x after restart -- operator intervention")
+                log.warning(
+                    "salvage: GIVE UP on %s after %d re-ghosts -- restart keeps "
+                    "landing on a stale-upstream hub; needs deploy-time hub drain "
+                    "(案B) or manual nginx reload.", wid, fails,
+                )
+        except Exception:
+            pass
+
+
 async def _salvage_pass() -> int:
     if state.store is None or state.registry is None:
         return 0
+    r = getattr(state.registry, "_r", None)
     # Live fleet (cross-hub) -- authoritative "alive" set.
     try:
         payload = await state.registry.stats_async()
@@ -261,6 +341,13 @@ async def _salvage_pass() -> int:
     except Exception:
         log.warning("salvage: stats_async failed -- pass aborted", exc_info=True)
         return 0
+    # 案D: resolve restarts issued in earlier passes (confirm re-register = ok,
+    # or count a re-ghost failure -> eventually give up) BEFORE issuing new ones.
+    if r is not None:
+        try:
+            await _resolve_pending(r, alive)
+        except Exception:
+            log.warning("salvage: resolve_pending failed", exc_info=True)
     # MariaDB ledger -- recently-seen workers (cross-hub, durable).
     try:
         meta = await state.store.get_workers_meta()
@@ -277,13 +364,35 @@ async def _salvage_pass() -> int:
     # so a wide cap is safe; it only widens "which ghosts we TRY".
     max_age = _int("PAPRIKA_SALVAGE_GHOST_MAX_AGE_S", 86400)
     cooldown = _int("PAPRIKA_SALVAGE_COOLDOWN_S", 600)
+    # 案D: workers with a restart already issued + awaiting re-register -- don't
+    # double-issue (one scan, not a get per wid).
+    pending: set = set()
+    if r is not None:
+        try:
+            pending = {
+                (k.decode() if isinstance(k, bytes) else str(k)).rsplit(":", 1)[-1]
+                async for k in r.scan_iter(match="paprika:salvage:pending:*", count=200)
+            }
+        except Exception:
+            pending = set()
     ghosts: list[tuple[str, str]] = []
     for wid, m in meta.items():
         if wid in alive:
             continue
+        if wid in pending:
+            continue  # restart already issued, awaiting re-register (案D)
         ip = m.get("ledger_ip")
         if not ip:
             continue
+        # 案D: skip persistent re-ghosters we've given up on -- another restart
+        # won't help (only a deploy hub-drain / nginx reload fixes those).
+        if r is not None:
+            try:
+                f = await r.get(f"paprika:salvage:fails:{wid}")
+                if f and int(f) >= _SALVAGE_FAIL_GIVEUP:
+                    continue
+            except Exception:
+                pass
         seen = m.get("last_seen_epoch")
         if seen is not None:  # only [min,max]-age gone (skip long-dead VMs)
             gone = now - seen
@@ -302,7 +411,9 @@ async def _salvage_pass() -> int:
     for wid, ip in ghosts[: _int("PAPRIKA_SALVAGE_MAX_PER_PASS", 3)]:
         res = await _salvage_one(wid, ip)
         if res in ("http", "ssh"):
-            log.info("salvage: recovered ghost %s (%s) via %s", wid, ip, res)
+            log.info(
+                "salvage: restart issued for %s (%s) via %s -- awaiting "
+                "re-register (案D)", wid, ip, res)
             n += 1
         elif res == "failed":
             log.info("salvage: %s (%s) unreachable (HTTP+SSH) -- left alone", wid, ip)
