@@ -221,7 +221,18 @@ async def _run_codegen_loop_job(request: Request, info: JobInfo) -> None:
     #     low-fi 480/5 used by the admin-UI live tiles makes
     #     paragraph text illegible.
     #   * Writes JPEG to data_dir/job_id/attempts/{n}/final_screenshot.jpg.
-    async def _capture_attempt_screenshot(jid: str, attempt_n: int) -> Path | None:
+    #
+    # ``full_page=True`` switches to the session-action path (CDP-based,
+    # captureBeyondViewport + clip capped at 3000 px). Used for the
+    # final end-of-attempt capture so the saved final_screenshot.jpg is
+    # the whole page, not just the viewport. Falls back to the legacy
+    # x11grab path on any failure -- the polling-loop screenshot stays.
+    async def _capture_attempt_screenshot(
+        jid: str,
+        attempt_n: int,
+        *,
+        full_page: bool = False,
+    ) -> Path | None:
         if state.sessions is None or state.registry is None:
             return None
         sessions_for_job = [
@@ -236,6 +247,51 @@ async def _run_codegen_loop_job(request: Request, info: JobInfo) -> None:
             key=lambda s: s.created_at or 0,
             reverse=True,
         )
+        import base64
+
+        out = (
+            get_storage_dir() / jid / "attempts" / str(attempt_n) / "final_screenshot.jpg"
+        )
+
+        if full_page:
+            # Try each live session (latest first) via the session-action
+            # path so CDP captureBeyondViewport gives us the whole page.
+            from server.hub.routes.sessions._base import _send_session_action
+            for sess in sessions_for_job:
+                if state.registry.connections.get(sess.worker_id) is None:
+                    continue
+                try:
+                    reply = await _send_session_action(
+                        sess.id,
+                        {
+                            "kind": "screenshot",
+                            "full_page": True,
+                            "max_height": 3000,
+                            "format": "jpeg",
+                            "quality": 50,
+                        },
+                        timeout=20.0,
+                    )
+                except Exception:
+                    log.warning(
+                        "codegen attempt screenshot (full_page): session %s on %s failed",
+                        sess.id,
+                        sess.worker_id,
+                        exc_info=True,
+                    )
+                    continue
+                data = (reply or {}).get("result") if isinstance(reply, dict) else None
+                if not isinstance(data, str) or not data:
+                    continue
+                try:
+                    raw = base64.b64decode(data)
+                except Exception:
+                    continue
+                out.parent.mkdir(parents=True, exist_ok=True)
+                out.write_bytes(raw)
+                return out
+            return None
+
         for sess in sessions_for_job:
             worker = state.registry.connections.get(sess.worker_id)
             if worker is None:
@@ -260,13 +316,10 @@ async def _run_codegen_loop_job(request: Request, info: JobInfo) -> None:
             data = getattr(reply, "jpeg_b64", None)
             if not data:
                 continue
-            import base64
-
             try:
                 raw = base64.b64decode(data)
             except Exception:
                 continue
-            out = get_storage_dir() / jid / "attempts" / str(attempt_n) / "final_screenshot.jpg"
             out.parent.mkdir(parents=True, exist_ok=True)
             out.write_bytes(raw)
             return out

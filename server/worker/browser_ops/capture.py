@@ -236,7 +236,11 @@ async def install_session_asset_capture(
     # URL blacklist (V + Y): operator-managed deny list with substring /
     # glob (*, ?, ^, $) / regex (/.../) syntaxes. Compiled once outside
     # the hot per-response path. See core/url_blacklist.py for syntax.
-    from core.url_blacklist import compile_blacklist as _compile_blacklist
+    from core.url_blacklist import (
+        compile_blacklist as _compile_blacklist,
+        is_manifest_url as _is_manifest_url,
+        pattern_targets_manifests as _pattern_targets_manifests,
+    )
     _bl_matcher = _compile_blacklist(url_blacklist or ())
 
     def _is_blacklisted(url: str) -> str | None:
@@ -285,9 +289,25 @@ async def install_session_asset_capture(
             # decisions, log once, and short-circuit so yt-dlp doesn't
             # fire either. Mark as seen so we don't re-log if the same
             # URL re-appears across navigations.
+            #
+            # Manifest passthrough (2026-06-14): a general host/path rule
+            # like ``*.saawsedge.com*`` (intended for .ts segment noise)
+            # would otherwise silently drop the main video's .m3u8
+            # manifest -- on_stream_detected never fires + yt-dlp never
+            # downloads (job 63f9bf436c2f post-mortem). Manifest URLs
+            # bypass general patterns; manifest-specific patterns (with
+            # literal ``.m3u8``/``.mpd``) still win.
             _bl_pat = _is_blacklisted(url)
             if _bl_pat is not None:
                 seen_urls.add(url)
+                if (_is_manifest_url(url)
+                        and not _pattern_targets_manifests(_bl_pat)):
+                    if on_stream_detected:
+                        try:
+                            on_stream_detected(url, "")
+                        except Exception:
+                            pass
+                    return
                 if log:
                     log(f"  [session-assets] BLOCK (blacklist={_bl_pat!r}) {url[:120]}")
                 return
@@ -560,8 +580,26 @@ async def install_session_asset_capture(
                 # observed playlist and the iframe-captured one. Pre-
                 # blacklist log was leaking via this exact path
                 # (job 9dc8d38174e4 / edge-hls.saawsedge.com).
+                #
+                # Manifest passthrough (2026-06-14): same rationale as
+                # the on_response gate above. A general host pattern
+                # caught a manifest -> let it fire on_stream_detected so
+                # yt-dlp gets the real video source.
                 _bl_hit = _is_blacklisted(url)
                 if _bl_hit is not None:
+                    if (_is_manifest_url(url)
+                            and not _pattern_targets_manifests(_bl_hit)):
+                        _stream_captured[0] = True
+                        if on_stream_detected:
+                            try:
+                                on_stream_detected(url, "")
+                            except Exception as e:
+                                if log:
+                                    log(
+                                        f"  [url-capture] on_stream_detected "
+                                        f"failed: {e}"
+                                    )
+                        continue
                     if log:
                         log(f"  [url-capture] BLOCK (blacklist={_bl_hit!r}) {url[:120]}")
                     continue

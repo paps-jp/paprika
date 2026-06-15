@@ -165,10 +165,55 @@ async def _act_ext(agent, ctx: "_ActionCtx") -> None:
 async def _act_screenshot(agent, ctx: "_ActionCtx") -> None:
     from nodriver import cdp
 
-    png_b64 = await ctx.tab.send(
-        cdp.page.capture_screenshot(format_="png"),
-    )
-    ctx.reply.result = png_b64
+    # ``full_page`` (optional): when truthy, capture the full scrollable
+    # area via CDP captureBeyondViewport + a clip rect capped at
+    # ``max_height`` (default 3000 px). Chrome renders the off-screen
+    # area internally -- the page is NOT actually scrolled, so any
+    # focused element / hover / open menu stays put. ``format`` ("png"
+    # or "jpeg", default "png") + ``quality`` (jpeg only, 0..100) let
+    # the caller pick a lighter encoding when payload size matters
+    # (e.g. the codegen final-capture path).
+    full_page = bool(ctx.action.get("full_page"))
+    try:
+        max_h = int(ctx.action.get("max_height") or 3000)
+    except Exception:
+        max_h = 3000
+    fmt = (str(ctx.action.get("format") or "png")).lower()
+    if fmt not in ("png", "jpeg"):
+        fmt = "png"
+    quality = ctx.action.get("quality")
+    try:
+        quality_int = int(quality) if quality is not None else None
+    except Exception:
+        quality_int = None
+
+    cap_kwargs: dict = {"format_": fmt}
+    if fmt == "jpeg" and quality_int is not None:
+        cap_kwargs["quality"] = quality_int
+    if full_page:
+        try:
+            metrics = await ctx.tab.send(cdp.page.get_layout_metrics())
+            # 6-tuple: (..., ..., ..., cssLayoutVP, cssVisualVP, cssContentSize)
+            css_layout = metrics[3]
+            css_content = metrics[5]
+            w = float(getattr(css_content, "width", 0) or 0)
+            if w <= 0:
+                w = float(getattr(css_layout, "client_width", 0) or 0)
+            h_full = float(getattr(css_content, "height", 0) or 0)
+            if h_full <= 0:
+                h_full = float(getattr(css_layout, "client_height", 0) or 0)
+            h = min(h_full, float(max_h))
+            if w > 0 and h > 0:
+                cap_kwargs["clip"] = cdp.page.Viewport(
+                    x=0.0, y=0.0, width=w, height=h, scale=1.0,
+                )
+                cap_kwargs["capture_beyond_viewport"] = True
+        except Exception:
+            # Fall back to a plain viewport capture if metrics fail.
+            pass
+
+    img_b64 = await ctx.tab.send(cdp.page.capture_screenshot(**cap_kwargs))
+    ctx.reply.result = img_b64
     # Optional: publish to the parent job's gallery when a ``label``
     # is given AND the session is job-bound. Keeps the plain
     # byte-return path untouched for callers that don't want it.
@@ -181,15 +226,17 @@ async def _act_screenshot(agent, ctx: "_ActionCtx") -> None:
             # ms suffix so a sub-second burst doesn't collide.
             ms = int((time.time() % 1) * 1000)
             safe = browser_ops.safe_label(str(label)) or "shot"
-            name = f"screenshot-{ts}-{ms:03d}-{safe}.png"
+            ext = "jpg" if fmt == "jpeg" else "png"
+            mime = "image/jpeg" if fmt == "jpeg" else "image/png"
+            name = f"screenshot-{ts}-{ms:03d}-{safe}.{ext}"
             shots_dir = ctx.state.assets_dir / "screenshots"
             shots_dir.mkdir(parents=True, exist_ok=True)
-            png_path = shots_dir / name
-            png_path.write_bytes(_b64.b64decode(png_b64))
+            img_path = shots_dir / name
+            img_path.write_bytes(_b64.b64decode(img_b64))
             await agent._upload_one_session_asset(
                 ctx.state,
-                png_path,
-                mime="image/png",
+                img_path,
+                mime=mime,
                 asset_name=name,
             )
         except Exception as e:

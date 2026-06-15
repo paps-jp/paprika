@@ -430,6 +430,12 @@ async def close_session(session_id: str, request: Request = None) -> dict:
     pre = state.sessions.get(session_id)
     if pre is None:
         raise HTTPException(404, f"session '{session_id}' not found")
+    # Snapshot the entry state before we flip it to "closing": Fetch
+    # sessions (worker-managed lifecycle) already capture their own
+    # end-of-fetch screenshot, so we skip the final capture below for
+    # them to avoid a duplicate (rare path: admin force-close on a
+    # running fetch).
+    pre_was_fetch = (pre.state or "") == "fetch_running"
     pre.state = "closing"
 
     # Auto-save BEFORE we remove the SessionInfo from the registry --
@@ -442,6 +448,71 @@ async def close_session(session_id: str, request: Request = None) -> dict:
         log.warning(
             "session %s auto-save crashed", session_id, exc_info=True
         )
+
+    # End-of-session FULL-PAGE screenshot. Capped at 3000 px so an
+    # infinite-scroll page can't blow up the JPEG. Goes through the
+    # session_action path so CDP's captureBeyondViewport handles the
+    # off-screen render without actually scrolling the page (script
+    # state stays put). Publishes:
+    #   * to the parent job's gallery as ``screenshot-final-<ts>.jpg``
+    #     (visible in admin UI's Live > Screenshot tab) when the
+    #     session is job-bound;
+    #   * mirrored to ``attempts/<latest-N>/final_screenshot.jpg`` when
+    #     a codegen-loop attempts dir exists, so the Judge LLM sees
+    #     the FULL-PAGE final state instead of the last 5 s viewport
+    #     poll on clean exits.
+    # Skip when this was a fetch session (already captured by the
+    # worker), the worker WS is gone, or the lane isn't bound.
+    if (
+        not pre_was_fetch
+        and pre.lane_idx is not None
+        and state.registry is not None
+        and state.registry.connections.get(pre.worker_id) is not None
+        and (os.environ.get("PAPRIKA_SESSION_FINAL_SCREENSHOT", "1") or "1").strip().lower()
+            not in ("0", "false", "no", "off")
+    ):
+        try:
+            import base64 as _b64fs
+            import time as _time_fs
+            _ts = _time_fs.strftime("%Y%m%d-%H%M%S")
+            _act: dict = {
+                "kind": "screenshot",
+                "full_page": True,
+                "max_height": 3000,
+                "format": "jpeg",
+                "quality": 50,
+            }
+            if pre.job_id:
+                _act["label"] = f"final-{_ts}"
+            _reply = await _send_session_action(session_id, _act, timeout=20.0)
+            _b64_str = (_reply or {}).get("result") if isinstance(_reply, dict) else None
+            if isinstance(_b64_str, str) and _b64_str and pre.job_id:
+                _attempts_dir = get_storage_dir() / pre.job_id / "attempts"
+                if _attempts_dir.is_dir():
+                    _ns = sorted(
+                        (
+                            int(d.name) for d in _attempts_dir.iterdir()
+                            if d.is_dir() and d.name.isdigit()
+                        ),
+                        reverse=True,
+                    )
+                    if _ns:
+                        try:
+                            _out = _attempts_dir / str(_ns[0]) / "final_screenshot.jpg"
+                            _out.parent.mkdir(parents=True, exist_ok=True)
+                            _out.write_bytes(_b64fs.b64decode(_b64_str))
+                        except Exception:
+                            log.info(
+                                "session %s final-screenshot attempt-dir mirror failed",
+                                session_id,
+                                exc_info=True,
+                            )
+        except Exception:
+            log.info(
+                "session %s final-screenshot capture failed",
+                session_id,
+                exc_info=True,
+            )
 
     info = state.sessions.remove(session_id)
     # NOTE on noVNC disconnect ordering: we used to force-disconnect

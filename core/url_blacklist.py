@@ -155,3 +155,46 @@ def compile_blacklist(patterns: Iterable[str] | None) -> BlacklistMatcher:
     """Build a :class:`BlacklistMatcher`. Wrapper exists so callers can
     type-hint against the function rather than the class."""
     return BlacklistMatcher(patterns)
+
+
+# Manifest-URL passthrough — used by the asset-capture gates in
+# core/fetcher.py + server/worker/browser_ops/capture.py to let an HLS/DASH
+# manifest URL flow through to yt-dlp candidate collection EVEN WHEN the
+# operator's blacklist matched it via a general host/path pattern.
+#
+# Why: a rule like ``https://*.saawsedge.com*`` (added to suppress noisy
+# .ts / .mp4 segments + preview thumbs from polluting the gallery) also
+# matched the main video's ``.m3u8`` manifest -- which silently dropped it
+# from ``video_urls_seen`` / ``on_stream_detected``, so yt-dlp never saw the
+# real video and fell back to iframe-generic ad URLs (job 63f9bf436c2f
+# post-mortem 2026-06-14). Solution: a 2-tier semantics --
+#
+#   * MANIFEST-SPECIFIC pattern (literal ``.m3u8`` / ``.mpd`` in the rule,
+#     e.g. ``*/trailer*.m3u8``) -> still blocks manifests. Operator was
+#     explicitly asking to skip a manifest, honour it.
+#   * GENERAL pattern (host / path glob without ``.m3u8`` / ``.mpd``) ->
+#     manifests bypass the block. The save/log suppression still applies
+#     (silent passthrough); only the yt-dlp candidate tracking is allowed.
+#
+# Direct video URLs (.mp4 / .webm / .ts segments) are NOT in the bypass --
+# they're the noise the operator is trying to suppress.
+_MANIFEST_URL_RE = re.compile(r"\.(m3u8|mpd)($|\?)", re.I)
+_MANIFEST_PATTERN_RE = re.compile(r"\.(m3u8|mpd)", re.I)
+
+
+def is_manifest_url(url: str) -> bool:
+    """True if ``url`` looks like an HLS (.m3u8) or DASH (.mpd) manifest."""
+    return bool(_MANIFEST_URL_RE.search(url or ""))
+
+
+def pattern_targets_manifests(pattern: str) -> bool:
+    """True if a blacklist source pattern literally mentions ``.m3u8`` /
+    ``.mpd`` -- i.e. the operator was explicitly blocking a manifest, not
+    just incidentally matching one with a host/path rule.
+
+    The check is intentionally textual on the pattern source (NOT a match
+    against compiled regex) so a glob like ``*/trailer*.m3u8`` is detected
+    independently of how the matcher decomposes it. A host-only pattern
+    like ``*.saawsedge.com*`` returns False even though it would match
+    manifest URLs at runtime."""
+    return bool(_MANIFEST_PATTERN_RE.search(pattern or ""))

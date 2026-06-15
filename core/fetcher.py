@@ -1496,6 +1496,64 @@ JSON.stringify((() => {
 """
 
 
+async def capture_scrolling_screenshot(
+    tab,
+    *,
+    max_height_px: int = 3000,
+    quality: int = 50,
+) -> bytes:
+    """Capture a 'full-page-scroll' screenshot of the live tab, capped at
+    ``max_height_px``.
+
+    Uses CDP ``Page.captureScreenshot`` with ``captureBeyondViewport=True``
+    + a ``clip`` rectangle so Chrome renders the area beyond the current
+    viewport INTERNALLY -- the page is NOT actually scrolled, so the
+    script's DOM state (focused element, hover, current scroll position,
+    open menus) survives untouched. This matters for the codegen polling
+    path where capture happens mid-script.
+
+    Width  = the page's CSS layout width (css_content_size.width).
+    Height = ``min(document_full_height, max_height_px)``. Infinite-scroll
+             pages (where documentHeight grows on every scroll) are bounded
+             by the cap so the JPEG never explodes.
+
+    Returns raw JPEG bytes. On ANY CDP failure (rare; e.g. tab navigated
+    mid-capture) we fall back to a plain viewport JPEG so callers always
+    get something to save.
+    """
+    try:
+        metrics = await tab.send(cdp.page.get_layout_metrics())
+        # 6-tuple: (layoutVP, visualVP, contentSize, cssLayoutVP, cssVisualVP, cssContentSize)
+        css_layout = metrics[3]
+        css_content = metrics[5]
+        # cssContentSize is a dom.Rect with width/height in CSS px.
+        w = float(getattr(css_content, "width", 0) or 0)
+        if w <= 0:
+            w = float(getattr(css_layout, "client_width", 0) or 0)
+        h_full = float(getattr(css_content, "height", 0) or 0)
+        if h_full <= 0:
+            h_full = float(getattr(css_layout, "client_height", 0) or 0)
+        h = min(h_full, float(max_height_px))
+        if w > 0 and h > 0:
+            clip = cdp.page.Viewport(
+                x=0.0, y=0.0, width=w, height=h, scale=1.0,
+            )
+            b64 = await tab.send(cdp.page.capture_screenshot(
+                format_="jpeg",
+                quality=int(quality),
+                clip=clip,
+                capture_beyond_viewport=True,
+            ))
+            return base64.b64decode(b64)
+    except Exception:
+        pass
+    # Fallback: plain viewport JPEG (legacy behavior).
+    b64 = await tab.send(cdp.page.capture_screenshot(
+        format_="jpeg", quality=int(quality),
+    ))
+    return base64.b64decode(b64)
+
+
 async def probe_occlusion(tab) -> dict:
     """Probe the live DOM for a full-screen blocking overlay (login / age /
     consent / paywall modal). Returns a small structural report:
@@ -2106,7 +2164,11 @@ async def fetch(opts: FetchOptions) -> FetchResult:
         # URL blacklist (V + Y): operator-managed deny list. Supports
         # substring / glob / regex (see core/url_blacklist.py for syntax).
         # Compiled once before the on_response hot path.
-        from core.url_blacklist import compile_blacklist as _compile_blacklist
+        from core.url_blacklist import (
+            compile_blacklist as _compile_blacklist,
+            is_manifest_url as _is_manifest_url,
+            pattern_targets_manifests as _pattern_targets_manifests,
+        )
         _fetch_bl_matcher = _compile_blacklist(opts.asset_url_blacklist or ())
 
         def _fetch_blacklisted(u: str) -> str | None:
@@ -2125,8 +2187,23 @@ async def fetch(opts: FetchOptions) -> FetchResult:
             # Blacklist gate: drop matching URLs before any save/yt-dlp
             # decision. Logged once via the network log entry below would
             # leak the URL into operator view, so silent skip is correct.
+            #
+            # Manifest passthrough (2026-06-14): a GENERAL pattern like
+            # ``*.saawsedge.com*`` (intended for .ts/.mp4 segment noise)
+            # would otherwise silently drop the main video's .m3u8
+            # manifest -- yt-dlp then fell back to iframe-generic ad URLs
+            # and produced no video (job 63f9bf436c2f post-mortem).
+            # Manifest URLs (.m3u8/.mpd) are tracked into
+            # video_urls_seen even when blacklisted by a general pattern;
+            # a manifest-specific pattern (literal ``.m3u8``/``.mpd``)
+            # still wins so ``*/trailer*.m3u8`` keeps blocking.
             _bl_pat = _fetch_blacklisted(evt_url)
             if _bl_pat is not None:
+                if (_is_manifest_url(evt_url)
+                        and not _pattern_targets_manifests(_bl_pat)):
+                    if evt_url not in result.video_urls_seen:
+                        result.video_urls_seen.append(evt_url)
+                    return
                 log(f"  BLOCK (blacklist={_bl_pat!r}) {evt_url[:120]}")
                 return
             # _effective_mime falls back to URL extension when the
@@ -2441,8 +2518,15 @@ async def fetch(opts: FetchOptions) -> FetchResult:
                         # this check, `https://*.saawsedge.com*` etc.
                         # are still leaked into network_log + video_urls_seen
                         # via this poller (job 9dc8d38174e4 post-mortem).
+                        # Manifest passthrough (2026-06-14): see the
+                        # on_response gate above; identical rationale.
                         _bl_hit = _fetch_blacklisted(u)
                         if _bl_hit is not None:
+                            if (_is_manifest_url(u)
+                                    and not _pattern_targets_manifests(_bl_hit)):
+                                if u not in result.video_urls_seen:
+                                    result.video_urls_seen.append(u)
+                                continue
                             log(f"  [url-capture] BLOCK (blacklist={_bl_hit!r}) {u[:120]}")
                             continue
                         # Record to network_log so the Live panel
@@ -2793,16 +2877,22 @@ async def fetch(opts: FetchOptions) -> FetchResult:
         except Exception as e:
             log(f"  (occlusion probe failed: {type(e).__name__}: {e})")
 
-        # ② v2 eye: capture one small viewport JPEG now, while tab is live and
-        # the DOM is final (settled / scrolled / recipe-applied -- same point
-        # as the occlusion probe). Stored on FetchResult.screenshot; the worker
-        # persists it as {job}/final.jpg for the hub's perception. Small by
-        # policy (jpeg q50, viewport-only) given fetch volume + the prior
-        # disk-full incident. Best-effort + env kill-switch.
+        # ② v2 eye: capture a FULL-PAGE-SCROLL JPEG now, while tab is live
+        # and the DOM is final (settled / scrolled / recipe-applied -- same
+        # point as the occlusion probe). Stored on FetchResult.screenshot;
+        # the worker persists it as {job}/final.jpg for the hub's perception
+        # AND for the operator's "what did this page look like" view.
+        # Capped at PAPRIKA_FETCH_SCREENSHOT_MAX_HEIGHT (default 3000 px) to
+        # bound infinite-scroll pages. Best-effort + env kill-switch.
         if (os.environ.get("PAPRIKA_FETCH_SCREENSHOT", "1") or "1").strip().lower() not in ("0", "false", "no", "off"):
             try:
-                _shot = await tab.send(cdp.page.capture_screenshot(format_="jpeg", quality=50))
-                result.screenshot = base64.b64decode(_shot)
+                _max_h = int(os.environ.get("PAPRIKA_FETCH_SCREENSHOT_MAX_HEIGHT", "3000") or 3000)
+            except Exception:
+                _max_h = 3000
+            try:
+                result.screenshot = await capture_scrolling_screenshot(
+                    tab, max_height_px=_max_h, quality=50,
+                )
             except Exception as e:
                 log(f"  (screenshot capture failed: {type(e).__name__}: {e})")
 
