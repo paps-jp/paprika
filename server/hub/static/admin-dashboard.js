@@ -212,6 +212,9 @@ async function refresh() {
     // operator already navigated away from (stale) -- gates the table render
     // so a late response can't clobber the current sub-tab's rows.
     let _jobsPageStale = false;
+    // Hoisted so the render block below can fall back on the per-status badge
+    // count when `jobs.total` is racing (e.g. just after a sub-tab change).
+    let _summaryRes = null;
     if (jobsTabActive) {
       // "最近のジョブ" = Recent Jobs. Server-side filter + pagination so
       // each status sub-tab can show ALL matching jobs (not just the
@@ -244,6 +247,7 @@ async function refresh() {
         _refreshJson('/jobs/summary', null),
       ]);
       jobs = pageRes;
+      _summaryRes = summaryRes;
       // Mark the list as having loaded at least once so the table can tell
       // "still loading" (→ spinner) apart from "loaded, 0 rows" (→ empty
       // state). A failed/timed-out page carries __fetchFailed and is NOT
@@ -552,7 +556,13 @@ async function refresh() {
     // shows -- that's the "成功タブに failed が出る" bug. Skip the whole
     // jobs-table + pager render this tick; the in-flight request for the
     // CURRENT view paints it. (Non-jobs tabs never set _jobsPageStale.)
-    if (jobsTabActive && _jobsPageStale) {
+    //
+    // Also skip when the Jobs tab isn't even active. Without this guard the
+    // tick rebuilt the (hidden) #jobsTable + pager using `jobs = ov.jobs`
+    // (which carries the UNFILTERED total of 87k+), so the next time the
+    // operator opened the エラー sub-tab they saw "1-0 / 87637" before the
+    // first real fetch landed -- the stale paint outlived the page change.
+    if (!jobsTabActive || _jobsPageStale) {
       // leave the jobs table + pager exactly as they are this tick
     } else {
 
@@ -580,7 +590,23 @@ async function refresh() {
     // completed when on the 完成 sub-tab). Use this for max-page
     // calculation so the pager spans the full filtered set, not just
     // the page that's currently in memory.
-    const total = jobs.total ?? sorted.length;
+    // `jobs.total` is the page response's filtered total — correct under
+    // normal flow. But during a race (filter just changed, stale response
+    // still landing) it can momentarily hold the previous view's total.
+    // Prefer the per-status badge count from /jobs/summary which the
+    // current tick just refreshed; it's keyed on the FILTER WE'RE
+    // RENDERING NOW, not on whatever the in-flight /jobs response was for.
+    const _badgeTotalForFilter = (() => {
+      const _bs = (_summaryRes && _summaryRes.by_status) || null;
+      if (!_bs) return null;
+      if (_filter === 'all')       return _summaryRes.total ?? null;
+      if (_filter === 'running')   return (_bs.running ?? 0) + (_bs.queued ?? 0);
+      if (_filter === 'completed') return _bs.completed ?? null;
+      if (_filter === 'failed')    return _bs.failed ?? null;
+      if (_filter === 'review')    return _bs.review ?? null;
+      return null;
+    })();
+    const total = _badgeTotalForFilter ?? jobs.total ?? sorted.length;
     const maxPage = Math.max(0, Math.ceil(total / pageSize) - 1);
     if (_jobsPage > maxPage) _jobsPage = maxPage;     // clamp when total shrinks
     if (_jobsPage < 0)       _jobsPage = 0;
@@ -620,24 +646,34 @@ async function refresh() {
       //   • fetch failed this tick but we HAD rows before (transient hub
       //     hiccup / wedged hub)  → keep the last rows, don't flash empty
       //   • fetch OK, genuinely 0 → "no jobs yet"
+      // Empty/loading sigs MUST include filter+page+size+total so a sub-tab
+      // change while the new page is still empty re-renders the pager with
+      // the new total (previously the sentinel was a constant string, so
+      // switching from 全部 to エラー with no rows yet left the pager showing
+      // the old "1-0 / 87637" — the all-jobs total it last painted).
       const _tr = (k, fb) => (window.i18next && window.i18next.t)
         ? window.i18next.t(k, { defaultValue: fb }) : fb;
       const fetchFailed = !!(jobs && jobs.__fetchFailed);
+      const _emptyKey = (kind) => `${kind}#${_filter}#${_jobsPage}#${pageSize}#${total}`;
       if (fetchFailed && _jobsEverLoaded) {
         // transient miss after a good load: leave existing rows untouched
         // and DON'T restamp _jobsLastSig, so the next good tick redraws.
       } else if (!_jobsEverLoaded) {
-        if (_jobsLastSig !== '__loading__') {
+        const want = _emptyKey('__loading__');
+        if (_jobsLastSig !== want) {
           jtbody.innerHTML = '<tr><td colspan=10 class="empty loading-row" data-i18n="jobs.loading">'
             + _tr('jobs.loading', 'Loading…') + '</td></tr>';
-          _jobsLastSig = '__loading__';
+          _jobsLastSig = want;
           didStructuralUpdate = true;
         }
-      } else if (_jobsLastSig !== '__empty__') {
-        jtbody.innerHTML = '<tr><td colspan=11 class="empty" data-i18n="jobs.empty">'
-          + _tr('jobs.empty', 'no jobs yet') + '</td></tr>';
-        _jobsLastSig = '__empty__';
-        didStructuralUpdate = true;
+      } else {
+        const want = _emptyKey('__empty__');
+        if (_jobsLastSig !== want) {
+          jtbody.innerHTML = '<tr><td colspan=11 class="empty" data-i18n="jobs.empty">'
+            + _tr('jobs.empty', 'no jobs yet') + '</td></tr>';
+          _jobsLastSig = want;
+          didStructuralUpdate = true;
+        }
       }
     } else if (visSig === _jobsLastSig) {
       // Fast path: nothing structurally changed since last render. Only

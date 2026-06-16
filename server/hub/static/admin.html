@@ -1079,6 +1079,11 @@ asyncio.run(main())"
         <span data-i18n="workers.subtab.recovery">リカバリー</span>
         <span class="count" id="workersSubtabCntRecovery">0</span>
       </button>
+      <button type="button" class="ai-subtab" data-workers-subtab="events" role="tab" aria-selected="false">
+        <iconify-icon icon="lucide:activity"></iconify-icon>
+        <span data-i18n="workers.subtab.events">イベント</span>
+        <span class="count" id="workersSubtabCntEvents">0</span>
+      </button>
       <button type="button" class="ai-subtab" data-workers-subtab="features" role="tab" aria-selected="false">
         <iconify-icon icon="lucide:settings-2"></iconify-icon>
         <span data-i18n="workers.subtab.features">機能</span>
@@ -1133,23 +1138,24 @@ asyncio.run(main())"
       </thead><tbody><tr><td colspan=6 class="empty" data-i18n="hubs.empty">no hubs registered</td></tr></tbody></table>
     </div>
 
-    <!-- Recovery sub-pane: fleet-wide recovery/lifecycle events.
-         Aggregates the per-worker ring buffer (server/scheduler.py
-         log_event) into a single recent-first table so the operator
-         can see "what just recovered" without opening individual
-         workers' "..." menus. Backed by GET /workers/events. -->
+    <!-- Recovery sub-pane: durable salvage recovery ledger.
+         MariaDB-backed (recovery_events table) so the history survives
+         hub restarts and is identical across all hubs. Lives under its
+         own sub-tab; the live ring-buffer view is now the separate
+         "events" sub-tab next to it. -->
     <div class="workers-subpane" data-workers-subpane="recovery" style="display:none;">
-      <h2 style="margin-top:0;"><iconify-icon icon="lucide:life-buoy"></iconify-icon> <span data-i18n="recovery.heading">リカバリー</span></h2>
-
-      <!-- 永続: サルベージ復旧履歴 (MariaDB recovery_events・全ハブ共通・段階4) -->
-      <h3 style="margin:6px 0 6px; font-size:1em; display:flex; align-items:center; gap:6px; flex-wrap:wrap;">
+      <h2 style="margin-top:0;">
         <iconify-icon icon="lucide:wrench"></iconify-icon> <span data-i18n="recovery.salvage.title">サルベージ復旧履歴</span>
-        <span style="font-size:.72em; color:#888; font-weight:normal;" data-i18n="recovery.salvage.desc">自動復旧の永続ログ（MariaDB・全ハブ共通・ハブ再起動でも残る）</span>
-        <span id="salvageHistoryCount" class="count" style="margin-left:6px;">0</span>
-        <span id="salvageHistoryStatus" style="font-size:.72em; color:#aaa; font-weight:normal;"></span>
-      </h3>
-      <div style="overflow:auto; max-height:240px; border:1px solid #e0ddd8; border-radius:6px; margin-bottom:18px;">
-        <table id="salvageHistoryTable" style="width:100%; border-collapse:collapse; font-size:.86em;">
+        (<span id="salvageHistoryCount">0</span>)
+        <span class="hctrl flat-actions">
+          <span id="salvageHistoryStatus" style="font-size:.78em; color:#888; font-weight:normal;"></span>
+        </span>
+      </h2>
+      <p class="help" style="margin:4px 0 12px; font-size:.88em; color:#666;" data-i18n="recovery.salvage.desc">
+        自動復旧の永続ログ（MariaDB・全ハブ共通・ハブ再起動でも残る）。
+      </p>
+      <div style="overflow:auto; max-height:calc(100vh - 360px); border:1px solid #e0ddd8; border-radius:6px;">
+        <table id="salvageHistoryTable" style="width:100%; border-collapse:collapse; font-size:.88em;">
           <thead style="position:sticky; top:0; background:#f5f5f5; z-index:1;">
             <tr>
               <th style="text-align:left; padding:6px 8px; border-bottom:1px solid #d0d0d0; white-space:nowrap;" data-i18n="recovery.salvage.th.time">時刻</th>
@@ -1163,39 +1169,52 @@ asyncio.run(main())"
           <tbody><tr><td colspan="6" class="empty" style="padding:14px; text-align:center; color:#888;">—</td></tr></tbody>
         </table>
       </div>
+    </div>
 
-      <!-- ライブ: per-hub ring-buffer events -->
-      <h3 style="margin:0 0 6px; font-size:1em; display:flex; align-items:center; gap:6px; flex-wrap:wrap;">
+    <!-- Events sub-pane: live per-hub ring-buffer of lifecycle / warn /
+         error events. Aggregates each worker's in-memory ring buffer
+         (server/scheduler.py log_event) into a single recent-first
+         table, auto-polled every 10s while this sub-tab is visible.
+         Was previously a second h3 inside the recovery sub-pane; split
+         out to its own sub-tab so the two semantic groups (durable
+         salvage ledger vs. live event stream) read clearly. -->
+    <div class="workers-subpane" data-workers-subpane="events" style="display:none;">
+      <h2 style="margin-top:0;">
         <iconify-icon icon="lucide:activity"></iconify-icon> <span data-i18n="recovery.events.title">最近のイベント（ライブ）</span>
-        <span style="font-size:.72em; color:#888; font-weight:normal;" data-i18n="recovery.events.desc">lifecycle / warn / error を横断表示（このハブが知る範囲・10秒ごと自動更新）</span>
-      </h3>
-      <div style="display:flex; align-items:center; gap:10px; margin:6px 0 10px; flex-wrap:wrap; font-size:.88em;">
-        <label style="display:flex; align-items:center; gap:4px;">
-          <span data-i18n="recovery.filter.kind">種別:</span>
-          <select id="recoveryKindFilter" style="padding:3px 6px;">
+        (<span id="recoveryCount">0</span>)
+        <span class="hctrl flat-actions">
+          <button id="recoveryRefreshBtn" class="pill" style="--la-bg:#eef0ff; --la-bd:#6a8ec7; --la-fg:#3a5ca8;" data-i18n-title="recovery.refresh" title="再取得"><iconify-icon icon="lucide:refresh-cw"></iconify-icon> <span data-i18n="recovery.refresh">再取得</span></button>
+          <span id="recoveryStatus" style="font-size:.82em; color:#888;"></span>
+        </span>
+      </h2>
+      <p class="help" style="margin:4px 0 12px; font-size:.88em; color:#666;" data-i18n="recovery.events.desc">
+        lifecycle / warn / error を横断表示（このハブが知る範囲・10秒ごと自動更新）。
+      </p>
+      <div class="recovery-filter-row" style="display:flex; align-items:center; gap:12px; margin:0 0 12px; flex-wrap:wrap; font-size:.88em;">
+        <label style="display:flex; align-items:center; gap:6px;">
+          <span data-i18n="recovery.filter.kind" style="color:#555;">種別:</span>
+          <select id="recoveryKindFilter" style="padding:4px 8px; border:1px solid #d4cfca; border-radius:6px; background:#fff;">
             <option value="lifecycle,warn,error">lifecycle + warn + error</option>
             <option value="lifecycle">lifecycle のみ</option>
             <option value="warn,error">warn + error のみ</option>
             <option value="info,job,lifecycle,warn,error">すべて</option>
           </select>
         </label>
-        <label style="display:flex; align-items:center; gap:4px;">
-          <span data-i18n="recovery.filter.range">時間範囲:</span>
-          <select id="recoverySinceFilter" style="padding:3px 6px;">
+        <label style="display:flex; align-items:center; gap:6px;">
+          <span data-i18n="recovery.filter.range" style="color:#555;">時間範囲:</span>
+          <select id="recoverySinceFilter" style="padding:4px 8px; border:1px solid #d4cfca; border-radius:6px; background:#fff;">
             <option value="600">過去 10分</option>
             <option value="3600" selected>過去 1時間</option>
             <option value="21600">過去 6時間</option>
             <option value="86400">過去 24時間</option>
           </select>
         </label>
-        <label style="display:flex; align-items:center; gap:4px;">
-          <span data-i18n="recovery.filter.worker">ワーカー:</span>
-          <input type="text" id="recoveryWorkerFilter" data-i18n-placeholder="recovery.filter.worker.ph" placeholder="worker_id を絞り込み (空 = 全部)" style="padding:3px 6px; width:200px;">
+        <label style="display:flex; align-items:center; gap:6px;">
+          <span data-i18n="recovery.filter.worker" style="color:#555;">ワーカー:</span>
+          <input type="text" id="recoveryWorkerFilter" data-i18n-placeholder="recovery.filter.worker.ph" placeholder="worker_id を絞り込み (空 = 全部)" style="padding:4px 8px; width:220px; border:1px solid #d4cfca; border-radius:6px;">
         </label>
-        <button id="recoveryRefreshBtn" class="pill" style="--la-bg:#f5f5fa; --la-bd:#bbc; --la-fg:#444; font-size:.82em;"><iconify-icon icon="lucide:refresh-cw"></iconify-icon> <span data-i18n="recovery.refresh">再取得</span></button>
-        <span id="recoveryStatus" style="color:#888;"></span>
       </div>
-      <div style="overflow:auto; max-height:calc(100vh - 360px);">
+      <div style="overflow:auto; max-height:calc(100vh - 360px); border:1px solid #e0ddd8; border-radius:6px;">
         <table id="recoveryTable" style="width:100%; border-collapse:collapse; font-size:.88em;">
           <thead style="position:sticky; top:0; background:#f5f5f5; z-index:1;">
             <tr>

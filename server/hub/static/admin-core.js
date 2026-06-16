@@ -68,6 +68,7 @@ const I18N_RESOURCES = {
     "workers.subtab.hubs":     "ハブ",
     "workers.subtab.features": "機能",
     "workers.subtab.recovery": "リカバリー",
+    "workers.subtab.events":   "イベント",
     // Recovery sub-pane: salvage history + live events
     "recovery.heading":            "リカバリー",
     "recovery.salvage.title":      "サルベージ復旧履歴",

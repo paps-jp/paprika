@@ -1052,7 +1052,7 @@ if (_orig_renderHosts_for_url_info) {
 //                (only one button so far: self-restart this hub).
 // State (active sub-tab) persisted to localStorage for refresh survival.
 
-const _WORKERS_SUBTABS = ['workers', 'hubs', 'recovery', 'features'];
+const _WORKERS_SUBTABS = ['workers', 'hubs', 'recovery', 'events', 'features'];
 
 function setWorkersSubtab(name) {
   if (!_WORKERS_SUBTABS.includes(name)) name = 'workers';
@@ -1067,10 +1067,17 @@ function setWorkersSubtab(name) {
   });
   // Lazy refresh per sub-tab so we don't hammer endpoints when the
   // operator's on a different sub-tab (or different top-level tab).
+  // Recovery (durable salvage ledger) and Events (live ring buffer)
+  // are split sub-tabs but share the same /workers/{events,recovery-events}
+  // backends -- each sub-tab only refreshes the one table it owns.
   if (name === 'hubs') {
     try { refreshHubsTable(); } catch (_) {}
+    try { _stopRecoveryPoll(); } catch (_) {}
   } else if (name === 'recovery') {
-    try { refreshRecoveryTable(); refreshSalvageHistory(); _startRecoveryPoll(); } catch (_) {}
+    try { refreshSalvageHistory(); } catch (_) {}
+    try { _stopRecoveryPoll(); } catch (_) {}
+  } else if (name === 'events') {
+    try { refreshRecoveryTable(); _startRecoveryPoll(); } catch (_) {}
   } else {
     try { _stopRecoveryPoll(); } catch (_) {}
   }
@@ -1106,10 +1113,12 @@ function _startRecoveryPoll() {
   _recoveryPollTimer = setInterval(() => {
     // Skip if the tab/panel is hidden (don't burn requests).
     if (document.hidden) return;
-    const active = document.querySelector('.workers-subpane[data-workers-subpane="recovery"]');
+    // Live events lives under the Events sub-tab now; stop polling
+    // once the operator moves away (incl. Recovery, which keeps its
+    // own durable salvage table separately).
+    const active = document.querySelector('.workers-subpane[data-workers-subpane="events"]');
     if (!active || active.style.display === 'none') { _stopRecoveryPoll(); return; }
     try { refreshRecoveryTable(); } catch (_) {}
-    try { refreshSalvageHistory(); } catch (_) {}
   }, 10000);
 }
 
@@ -1145,7 +1154,10 @@ async function refreshRecoveryTable() {
   const sinceSel = document.getElementById('recoverySinceFilter');
   const workerFilter = (document.getElementById('recoveryWorkerFilter')?.value || '').trim().toLowerCase();
   const statusEl = document.getElementById('recoveryStatus');
-  const cntBadge = document.getElementById('workersSubtabCntRecovery');
+  // Split: live ring buffer lives under the Events sub-tab; the
+  // h2-inline count + the sub-tab badge both reflect "events shown".
+  const cntBadge = document.getElementById('workersSubtabCntEvents');
+  const cntInline = document.getElementById('recoveryCount');
   const kinds = kindSel?.value || 'lifecycle,warn,error';
   const since_s = parseInt(sinceSel?.value || '3600', 10);
   let payload = null;
@@ -1163,6 +1175,7 @@ async function refreshRecoveryTable() {
     events = events.filter(e => (e.worker_id || '').toLowerCase().includes(workerFilter));
   }
   if (cntBadge) cntBadge.textContent = events.length;
+  if (cntInline) cntInline.textContent = events.length;
   if (statusEl) {
     const total = (payload && payload.count) || 0;
     statusEl.textContent = workerFilter
@@ -1212,6 +1225,7 @@ async function refreshSalvageHistory() {
   const tbody = document.querySelector('#salvageHistoryTable tbody');
   if (!tbody) return;
   const cntEl = document.getElementById('salvageHistoryCount');
+  const subtabCnt = document.getElementById('workersSubtabCntRecovery');
   const stEl = document.getElementById('salvageHistoryStatus');
   let payload = null;
   try {
@@ -1222,13 +1236,15 @@ async function refreshSalvageHistory() {
     return;
   }
   if (payload && payload.durable === false) {
-    tbody.innerHTML = '<tr><td colspan="6" class="empty" style="padding:14px; text-align:center; color:#888;">MariaDB 未設定 — 永続履歴は無効（下のライブイベントのみ）</td></tr>';
+    tbody.innerHTML = '<tr><td colspan="6" class="empty" style="padding:14px; text-align:center; color:#888;">MariaDB 未設定 — 永続履歴は無効（「イベント」サブタブのライブ履歴のみ）</td></tr>';
     if (cntEl) cntEl.textContent = '0';
+    if (subtabCnt) subtabCnt.textContent = '0';
     if (stEl) stEl.textContent = '';
     return;
   }
   const events = (payload && payload.events) || [];
   if (cntEl) cntEl.textContent = events.length;
+  if (subtabCnt) subtabCnt.textContent = events.length;
   if (stEl) stEl.textContent = '';
   if (!events.length) {
     tbody.innerHTML = '<tr><td colspan="6" class="empty" style="padding:14px; text-align:center; color:#888;">まだ復旧記録はありません（salvage は既定 OFF）</td></tr>';
@@ -1254,7 +1270,7 @@ async function refreshSalvageHistory() {
     el.addEventListener(ev, () => { try { refreshRecoveryTable(); } catch (_) {} });
   });
   const btn = document.getElementById('recoveryRefreshBtn');
-  if (btn) btn.addEventListener('click', () => { try { refreshRecoveryTable(); refreshSalvageHistory(); } catch (_) {} });
+  if (btn) btn.addEventListener('click', () => { try { refreshRecoveryTable(); } catch (_) {} });
 })();
 
 // ---- Hubs sub-tab ----------------------------------------------------
