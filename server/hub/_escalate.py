@@ -86,6 +86,13 @@ _HOST_COOLDOWN_S = _num("PAPRIKA_ESCALATE_HOST_COOLDOWN_S", 1800.0)
 _MAX_PER_HOUR = int(_num("PAPRIKA_ESCALATE_MAX_PER_HOUR", 12))
 # How many generate->execute attempts the escalated codegen-loop job gets.
 _RETRY_ATTEMPTS = max(1, min(10, int(_num("PAPRIKA_ESCALATE_ATTEMPTS", 3))))
+# R2 futility dead-letter: after this many CONSECUTIVE escalated codegen-loop
+# failures for a host (codegen never delivers -- e.g. a hard login wall), stop
+# re-escalating it for _BLOCK_S seconds. Fleet-wide + persistent via MariaDB
+# (escalate_blocks); a success resets the streak. Degrades OPEN when MariaDB is
+# unavailable. 0 disables the gate.
+_FAIL_STREAK_MAX = int(_num("PAPRIKA_ESCALATE_FAIL_STREAK_MAX", 3))
+_BLOCK_S = _num("PAPRIKA_ESCALATE_BLOCK_S", 86400.0)  # 24h
 
 # In-memory rate-limit state (per hub; reset on restart -- acceptable, the
 # hourly cap is a courtesy throttle, not a correctness invariant).
@@ -416,6 +423,47 @@ def _record_escalate(host: str | None) -> None:
         _last_host_escalate[host] = now
 
 
+async def _futility_ok(host: str | None) -> bool:
+    """False when ``host`` is in the fleet-wide dead-letter block -- its
+    auto-escalated codegen-loops have failed _FAIL_STREAK_MAX times in a row,
+    so spending more GPU on it is futile until the block expires. Degrades OPEN
+    (returns True) when the gate is disabled or MariaDB is unavailable -- this
+    is an optimization, not a correctness invariant."""
+    if _FAIL_STREAK_MAX <= 0 or not host:
+        return True
+    pool = getattr(state, "mariadb_pool", None)
+    if pool is None:
+        return True
+    try:
+        from server.hub.mariadb import escalate_block_until
+        return time.time() >= await escalate_block_until(pool, host)
+    except Exception:
+        log.debug("escalate: futility check failed -- open", exc_info=True)
+        return True
+
+
+async def note_codegen_outcome(url: str | None, success: bool) -> None:
+    """Record an auto-escalated codegen-loop's terminal outcome so a host whose
+    escalations keep failing gets parked (futility dead-letter), and a host that
+    starts succeeding is un-parked. Called from the codegen-loop runner ONLY for
+    escalated jobs (escalated_from set). Best-effort + fleet-wide via MariaDB."""
+    if _FAIL_STREAK_MAX <= 0:
+        return
+    pool = getattr(state, "mariadb_pool", None)
+    if pool is None:
+        return
+    host = _host_of(url)
+    if not host:
+        return
+    try:
+        from server.hub.mariadb import note_escalate_outcome
+        await note_escalate_outcome(
+            pool, host, bool(success), _FAIL_STREAK_MAX, _BLOCK_S, time.time()
+        )
+    except Exception:
+        log.debug("escalate: note_codegen_outcome failed", exc_info=True)
+
+
 # ---------------------------------------------------------------------------
 # Goal synthesis -- codegen-loop requires a natural-language goal; a fetch
 # job only has a URL + options, so we template one from the category.
@@ -509,6 +557,13 @@ async def _escalate_if_eligible(info: JobInfo, category: str | None) -> str | No
         log.info(
             "escalate: rate/cooldown gate skipped %s (host=%s, cat=%s)",
             info.job_id, host, category,
+        )
+        return None
+    if not await _futility_ok(host):
+        log.info(
+            "escalate: futility gate skipped %s (host=%s, cat=%s) -- "
+            "codegen-loop has failed >=%d times in a row here",
+            info.job_id, host, category, _FAIL_STREAK_MAX,
         )
         return None
     if not await _thermal_ok():
