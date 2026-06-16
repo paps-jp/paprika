@@ -118,6 +118,15 @@ class _SessionsMixin:
             lane = await self.lane_pool.acquire(lane_hint=msg.lane_hint)
             if lane is None:
                 raise RuntimeError(f"no free lane (lane_hint={msg.lane_hint})")
+            # Lane occupancy CHANGED -- kick the heartbeat loop so the hub's
+            # in_flight view catches up within ms instead of waiting up to a
+            # full HEARTBEAT_INTERVAL. Sessions don't bump _in_flight, but
+            # the heartbeat sender takes max(in_flight, lane_pool.busy) so a
+            # held lane is correctly reported once a heartbeat fires.
+            try:
+                self._heartbeat_kick.set()
+            except Exception:
+                pass
 
             # Operator-uploaded Chrome profile, if any. Same shape as
             # the /jobs path: download tarball, extract, re-point the
@@ -530,6 +539,10 @@ class _SessionsMixin:
                         pass
                 if state.lane is not None and self.lane_pool is not None:
                     self.lane_pool.release(state.lane)
+                    try:
+                        self._heartbeat_kick.set()
+                    except Exception:
+                        pass
             elif lane is not None and self.lane_pool is not None:
                 # Lane was acquired but the failure happened before the
                 # SessionState was registered (operator-profile install
@@ -539,6 +552,10 @@ class _SessionsMixin:
                 # "no free lane / fleet at capacity" after a transient
                 # profile-fetch error.
                 self.lane_pool.release(lane)
+                try:
+                    self._heartbeat_kick.set()
+                except Exception:
+                    pass
             _logger.info(
                 f"[worker {self.worker_id}] session {sid} start failed: {ack.error}",
             )
@@ -1367,6 +1384,12 @@ class _SessionsMixin:
                     )
             if state.lane is not None and self.lane_pool is not None:
                 self.lane_pool.release(state.lane)
+                # Free lane -- kick the heartbeat so the hub picks us
+                # up as available immediately.
+                try:
+                    self._heartbeat_kick.set()
+                except Exception:
+                    pass
             # Mirror the lane release into self._in_flight so the
             # next heartbeat reports the worker as free. _in_flight
             # was kept incremented past the original
@@ -1380,6 +1403,10 @@ class _SessionsMixin:
             if hasattr(state, "job_id") and state.job_id:
                 try:
                     self._in_flight = max(0, self._in_flight - 1)
+                except Exception:
+                    pass
+                try:
+                    self._heartbeat_kick.set()
                 except Exception:
                     pass
             # keep_session sessions own a worker-side workdir that
@@ -1589,6 +1616,10 @@ class _SessionsMixin:
             try:
                 if state.lane is not None and self.lane_pool is not None:
                     self.lane_pool.release(state.lane)
+                    try:
+                        self._heartbeat_kick.set()
+                    except Exception:
+                        pass
             except Exception:
                 pass
         return len(sids)

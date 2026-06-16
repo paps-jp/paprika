@@ -1695,11 +1695,64 @@ async def create_job(req: JobRequest, request: Request) -> JobInfo:
                 state.hosts.touch_used(auto_host)
             except Exception:
                 pass
+        # CAS-claim the row from queued -> running BEFORE sending the WS
+        # assign. This makes POST symmetric with redrive (which already uses
+        # claim_queued_job) and closes the race that forced redrive's
+        # _MIN_AGE_S to 90s:
+        #   POST sends WS, then blindly upserts queued+worker_id; if redrive
+        #   had simultaneously CAS'd to running+W2, POST's blind save would
+        #   overwrite running+W2 back to queued+W1 -- both workers then run
+        #   the same job. The CAS here pins ownership at the DB layer, so a
+        #   concurrent redrive sees worker_id NOT NULL (or status running)
+        #   and skips. _MIN_AGE_S can now be lowered safely.
+        _started_at = datetime.utcnow()
+        try:
+            _claim_ok = await state.store.claim_queued_job(
+                job_id, worker.worker_id, _started_at,
+            )
+        except Exception:
+            log.warning(f"!! claim_queued_job({job_id}) raised", exc_info=True)
+            _claim_ok = False
+        if not _claim_ok:
+            # Another path (redrive on this or a peer hub) already moved the
+            # row off queued. Release our reserved slot and fall through to
+            # the 503 / cross-hub path -- nothing to do here, the other path
+            # will run the job. The session we eagerly registered (if any)
+            # also rolls back so it doesn't pin to a worker that never got
+            # the assign.
+            try:
+                state.registry.release_pending_assign(worker.worker_id, job_id)
+            except Exception:
+                pass
+            if fetch_sid:
+                try:
+                    state.sessions.remove(fetch_sid)
+                except Exception:
+                    pass
+                info.session_id = None
+            log.info(
+                f"[hub] job {job_id}: claim_queued_job lost the CAS "
+                f"(redrive / peer hub already claimed); deferring to it"
+            )
+            # Re-read the now-running row so the response reflects who took
+            # it. If even that fails, return the local view; the client only
+            # needs the job_id.
+            try:
+                _now = await state.store.get_job_info(job_id)
+                if _now is not None:
+                    info = _now
+            except Exception:
+                pass
+            return _proxy_info(info, request)
         ok = await state.registry.assign(worker, assign)
         if ok:
             # Record which worker + (if known) the noVNC URL so clients can
-            # watch the job live.
+            # watch the job live. Status was already flipped to running by
+            # the CAS above; mirror that locally so the upsert below doesn't
+            # downgrade it.
+            info.status = JobStatus.running
             info.worker_id = worker.worker_id
+            info.started_at = _started_at
             novnc = worker.capabilities.novnc_url
             if novnc:
                 sep = "&" if "?" in novnc else "?"
@@ -1752,6 +1805,25 @@ async def create_job(req: JobRequest, request: Request) -> JobInfo:
             except Exception:
                 pass
             info.session_id = None
+        # We CAS-claimed the row to running before the assign; the WS send
+        # then failed (worker WS dropped between pick + send). Release the
+        # claim back to queued so the redrive (or cross-hub forward below)
+        # can re-dispatch it. Without this the row would sit running+W
+        # until the post_assign_ack_guard expires (30s).
+        try:
+            await state.store.release_claimed_job(job_id)
+            info.status = JobStatus.queued
+            info.worker_id = None
+            info.started_at = None
+        except Exception:
+            log.warning(
+                f"!! release_claimed_job({job_id}) failed after assign send error",
+                exc_info=True,
+            )
+        try:
+            state.registry.release_pending_assign(worker.worker_id, job_id)
+        except Exception:
+            pass
         log.info(f"!! failed to send job to worker {worker.worker_id}")
 
     # P1 cross-hub dispatch: local dispatch did NOT place the job (no free

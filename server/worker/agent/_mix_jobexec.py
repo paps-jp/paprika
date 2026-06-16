@@ -212,6 +212,16 @@ class _JobExecMixin:
             return
         async with self._sem:
             self._in_flight += 1
+            # Kick the heartbeat loop so the hub's stale in_flight view
+            # catches up within ms (vs. up to a full HEARTBEAT_INTERVAL).
+            # Without this, a concurrent pick on the hub saw the worker
+            # as still having capacity right after the lane was acquired,
+            # over-dispatched, and triggered the "no free lane in pool"
+            # cascade. See _heartbeat_loop docstring (incident 2026-06-16).
+            try:
+                self._heartbeat_kick.set()
+            except Exception:
+                pass
             lane = None
             if self.lane_pool is not None:
                 # If hub specified a lane_hint (attach_to_job), wait for THAT
@@ -229,6 +239,10 @@ class _JobExecMixin:
                         )
                     )
                     self._in_flight -= 1
+                    try:
+                        self._heartbeat_kick.set()
+                    except Exception:
+                        pass
                     return
             # Track whether we swapped the lane's profile in so the
             # finally block can restore it on every code path.
@@ -744,6 +758,63 @@ class _JobExecMixin:
                 # _teardown_session_state() below.
                 if not (keep_session and inspect_sid in self._sessions):
                     self._in_flight = max(0, self._in_flight - 1)
+                    # Lane released + in_flight decremented -- kick the
+                    # heartbeat so the hub sees us as free immediately
+                    # (vs up to a full HEARTBEAT_INTERVAL of staleness).
+                    # The same kick fires for the keep_session branch when
+                    # _teardown_session_state actually releases the lane.
+                    try:
+                        self._heartbeat_kick.set()
+                    except Exception:
+                        pass
+                # fd-budget gate: every job end checks the process's open-fd
+                # count and flips into drain mode if it crossed the configured
+                # threshold. The drain loop in _mix_run exits when in_flight
+                # reaches 0 so docker restarts us fresh; this lets a leak
+                # degrade gracefully instead of crashing mid-job with "Too
+                # many open files" (incident 2026-06-16, w50148: 1024 soft
+                # ulimit + 20+ Chrome subprocesses x ~40fd each = 1k fds
+                # easily blown). Idempotent: setting _draining a second time
+                # is a no-op; the recycle still fires on the first
+                # heartbeat that sees in_flight==0.
+                try:
+                    self._check_fd_budget_and_maybe_drain()
+                except Exception:
+                    # Worst case the recycle doesn't fire; the periodic fleet
+                    # restart is the safety-net. Don't crash the job-finally.
+                    pass
+
+    def _check_fd_budget_and_maybe_drain(self) -> None:
+        """Inspect ``/proc/self/fd`` and flip ``self._draining`` when the
+        worker has crossed ``PAPRIKA_WORKER_FD_RESTART_THRESHOLD`` (default
+        800 -- ~78% of the container's default soft RLIMIT_NOFILE=1024).
+        Cheap (one readdir of /proc/self/fd) so safe to call on every job
+        end. No-op when already draining."""
+        if getattr(self, "_draining", False):
+            return
+        try:
+            threshold = int(
+                os.environ.get("PAPRIKA_WORKER_FD_RESTART_THRESHOLD") or 800
+            )
+        except Exception:
+            threshold = 800
+        if threshold <= 0:
+            return
+        try:
+            fd_count = len(os.listdir("/proc/self/fd"))
+        except Exception:
+            return
+        if fd_count < threshold:
+            return
+        _logger = logging.getLogger("server.worker.agent._mix_jobexec")
+        _logger.warning(
+            "[worker %s] fd budget exceeded (%d >= %d): draining for "
+            "recycle (docker will restart after in-flight jobs drain)",
+            getattr(self, "worker_id", "?"),
+            fd_count,
+            threshold,
+        )
+        self._draining = True
 
     def _build_fetch_options(
         self,

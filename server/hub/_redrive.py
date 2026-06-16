@@ -69,14 +69,18 @@ _INTERVAL_S = _num("PAPRIKA_QUEUE_REDRIVE_INTERVAL_S", 3.0)
 # Safety cap on placements per pass so one hub can't monopolise a shared queue;
 # the next pass (≈3s later) continues. 0 = unbounded (place every free lane).
 _MAX_PER_PASS = int(_num("PAPRIKA_QUEUE_REDRIVE_MAX_PER_PASS", 0))
-# Don't touch a queued job until it's older than this -- it MUST exceed the
-# worst-case time a live POST /jobs handler can hold a job as queued+unassigned
-# (8s dispatch grace + up to 60s cross-hub forward). Younger queued rows may
-# still be mid-dispatch by POST (possibly forwarded to a peer that's about to
-# run it), so claiming one would risk a double send. Past this age the handler
-# has definitively finished -- a still-queued+unassigned row is genuinely
-# stranded. The CAS ``worker_id IS NULL`` guard is the belt; this is the braces.
-_MIN_AGE_S = _num("PAPRIKA_QUEUE_REDRIVE_MIN_AGE_S", 90.0)
+# Don't touch a queued job until it's older than this. Used to be 90s as belt-
+# and-braces against the POST race -- POST blindly upserted the row after WS
+# assign, which could overwrite a redrive's CAS-flipped running+W2 back to
+# queued+W1, causing both workers to run the same job. THAT RACE IS NOW CLOSED
+# (2026-06-16): POST also calls ``claim_queued_job`` (the same CAS) BEFORE the
+# WS send, so a concurrent redrive sees the row as running and skips, and a
+# concurrent POST that loses the CAS aborts BEFORE sending its WS. With both
+# paths CAS-guarded the 90s belt is unnecessary; 5s is enough to absorb in-
+# flight cross-hub HTTP forwards (~60s peak) since those use the same CAS too.
+# Net effect: queued rows now dispatch within seconds of a free lane, not
+# minutes.
+_MIN_AGE_S = _num("PAPRIKA_QUEUE_REDRIVE_MIN_AGE_S", 5.0)
 # Stranded-by-stale-``worker_id`` reclaim threshold (incident 2026-06-15).
 # POST records ``worker_id`` the instant the WS assign send returns -- but if
 # the worker NEVER acks (process hung, deploy churn between assign + accept),
@@ -404,20 +408,54 @@ async def _redrive_pass() -> int:
     return placed
 
 
+# Event-driven kick: any call to ``trigger_redrive_now`` sets this, the loop
+# wakes from its sleep, runs ONE pass, clears the event, sleeps again.
+# Multiple ``set`` calls before the loop wakes coalesce into ONE pass (set is
+# idempotent), so a burst of lane-free events (worker completes 10 jobs in a
+# tick) costs one queued-list SELECT, not ten. Replaces the old fixed-interval
+# polling: a freshly-freed lane now triggers a dispatch within ms instead of
+# up to ``_INTERVAL_S`` seconds.
+_redrive_kick: asyncio.Event | None = None
+
+
+def trigger_redrive_now() -> None:
+    """Wake the redrive loop NOW (synchronous, non-blocking). Called from
+    WorkerJobComplete / WorkerJobFailed / session-end paths -- i.e. whenever a
+    lane just freed -- so the queued-job dispatch latency drops from the
+    full interval (3s) to the wake-up time (ms). Safe to call from anywhere;
+    no-op if the loop hasn't started yet (the periodic sleep tick catches up)."""
+    if _redrive_kick is not None:
+        try:
+            _redrive_kick.set()
+        except Exception:
+            pass
+
+
 async def _queued_redrive_loop() -> None:
     """Periodically drain ``queued`` worker-dispatched jobs onto free lanes.
-    Kill-switch: ``PAPRIKA_QUEUE_REDRIVE_DISABLE=1`` -> never starts (system
-    reverts to inline-only dispatch)."""
+    Now event-driven too: ``trigger_redrive_now`` wakes the loop instantly
+    when a lane frees. Kill-switch: ``PAPRIKA_QUEUE_REDRIVE_DISABLE=1`` ->
+    never starts (system reverts to inline-only dispatch)."""
+    global _redrive_kick
     if _flag("PAPRIKA_QUEUE_REDRIVE_DISABLE", False):
         log.info("redrive: kill-switch PAPRIKA_QUEUE_REDRIVE_DISABLE set -- not started")
         return
-    log.info("redrive: queued-job redrive loop started (interval=%.0fs)", _INTERVAL_S)
+    _redrive_kick = asyncio.Event()
+    log.info(
+        "redrive: queued-job redrive loop started (interval=%.0fs, event-driven kick enabled)",
+        _INTERVAL_S,
+    )
     first = True
     while True:
+        timeout = 2.0 if first else _INTERVAL_S
         try:
-            await asyncio.sleep(2 if first else _INTERVAL_S)
+            await asyncio.wait_for(_redrive_kick.wait(), timeout=timeout)
+        except asyncio.TimeoutError:
+            pass
         except asyncio.CancelledError:
             return
+        finally:
+            _redrive_kick.clear()
         first = False
         try:
             await _redrive_pass()

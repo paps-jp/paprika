@@ -2409,6 +2409,15 @@ async def _handle_worker_message(worker, msg) -> None:
         # cascade fires.
         if not keep_session_active:
             state.registry.release(worker.worker_id, msg.job_id)
+            # A lane just freed -- kick the redrive loop so any queued row
+            # eligible for dispatch lands within ms instead of waiting up to
+            # the periodic interval (3s). Self-coalescing: a burst of N
+            # completions in a tick costs ONE queued-list SELECT.
+            try:
+                from server.hub._redrive import trigger_redrive_now
+                trigger_redrive_now()
+            except Exception:
+                pass
         # Tear down the read-only fetch-inspection session we eagerly
         # registered at dispatch. EXCEPTION: keep_session jobs keep
         # the browser + SessionInfo alive past fetch completion so
@@ -2534,6 +2543,15 @@ async def _handle_worker_message(worker, msg) -> None:
             except Exception:
                 pass
             state.registry.release(worker.worker_id, msg.job_id)
+            # Case C re-queue: a lane is now actively expected to be free
+            # (drain just kicked in, but the job is back in the queue and
+            # other lanes on OTHER workers can still pick it up). Kick the
+            # redrive so peer hubs / local-other-workers pick this up fast.
+            try:
+                from server.hub._redrive import trigger_redrive_now
+                trigger_redrive_now()
+            except Exception:
+                pass
             _drop_fetch_session_if_any(info)
             return
         if info is not None:
@@ -2550,6 +2568,12 @@ async def _handle_worker_message(worker, msg) -> None:
             )
         )
         state.registry.release(worker.worker_id, msg.job_id)
+        # Lane just freed (failed jobs free the lane too). Kick the redrive.
+        try:
+            from server.hub._redrive import trigger_redrive_now
+            trigger_redrive_now()
+        except Exception:
+            pass
         _drop_fetch_session_if_any(info)
         await state.store.publish_log(msg.job_id, DONE_SENTINEL)
         # v2 Phase 5: distiller-light also fires on failures so

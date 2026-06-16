@@ -528,6 +528,7 @@ class _RunMixin:
         reaper_task = asyncio.create_task(self._idle_tab_reaper_loop())
         disk_task = asyncio.create_task(self._disk_cleanup_loop())
         preview_task = asyncio.create_task(self._preview_capture_loop())
+        selfcheck_task = asyncio.create_task(self._self_check_loop())
         try:
             async for raw in self._ws:
                 # Any frame from the hub -- even an undecodable one -- proves a
@@ -546,11 +547,29 @@ class _RunMixin:
             reaper_task.cancel()
             disk_task.cancel()
             preview_task.cancel()
+            selfcheck_task.cancel()
 
     async def _heartbeat_loop(self) -> None:
         try:
             while True:
-                await asyncio.sleep(HEARTBEAT_INTERVAL)
+                # Race a kick event against the standard heartbeat interval.
+                # If anything (session_start / job_exec start or end) sets
+                # ``_heartbeat_kick``, we send NOW instead of waiting up to
+                # 10s -- the over-dispatch fix for the hub's stale in_flight
+                # view (incident 2026-06-16). Falls back to the interval when
+                # nothing kicks.
+                try:
+                    await asyncio.wait_for(
+                        self._heartbeat_kick.wait(),
+                        timeout=HEARTBEAT_INTERVAL,
+                    )
+                except asyncio.TimeoutError:
+                    pass
+                finally:
+                    # Clear regardless: if another change happens after we
+                    # build the heartbeat below, the next loop iteration
+                    # will catch it.
+                    self._heartbeat_kick.clear()
                 try:
                     # Snapshot the profile cache so the hub can show
                     # "ready on X/N workers" in the Profiles tab and
@@ -627,8 +646,117 @@ class _RunMixin:
                             f"(docker will restart)",
                         )
                         os._exit(0)
-                except Exception:
+                except Exception as e:
+                    # Heartbeat send failed -- the WS to nginx is presumed dead.
+                    # Used to `return` silently; that left the recv loop blocked
+                    # on `async for raw in self._ws:` and the worker ghosted
+                    # forever (no python INFO logs, only Chrome dbus errors).
+                    # Force the WS closed so the recv loop unblocks, the outer
+                    # run() loop falls through finally + sleep + reconnect.
+                    _logger.warning(
+                        f"[worker {self.worker_id}] heartbeat send failed "
+                        f"({type(e).__name__}: {e}); closing WS to force reconnect"
+                    )
+                    try:
+                        if self._ws is not None:
+                            await self._ws.close(code=1011, reason="hb-send-failed")
+                    except Exception:
+                        pass
                     return
+        except asyncio.CancelledError:
+            return
+
+    async def _self_check_loop(self) -> None:
+        """Active hub-side liveness probe. Catches the ghost pattern where:
+
+        - heartbeat sends keep "succeeding" into a half-dead nginx<->hub upstream
+          (so _last_link_ok stays fresh -> link arm misses);
+        - some auto-traffic keeps inbound fresh too (so v3 inbound arm misses).
+
+        Periodically (default 60s) GET /workers and check whether our own
+        worker_id appears in the fleet list. If we are missing for >=3
+        consecutive checks (default), the hub is genuinely not serving us
+        -> os._exit so docker restarts us and we re-register fresh.
+
+        Belt-and-suspenders next to the passive watchdog arms; both can stay.
+        Env knobs:
+          PAPRIKA_WORKER_SELFCHECK_DISABLE=1   -> turn off
+          PAPRIKA_WORKER_SELFCHECK_INTERVAL_S  -> default 60
+          PAPRIKA_WORKER_SELFCHECK_MISS_THRESHOLD -> default 3
+        """
+        if os.environ.get("PAPRIKA_WORKER_SELFCHECK_DISABLE") == "1":
+            return
+        try:
+            interval = float(
+                os.environ.get("PAPRIKA_WORKER_SELFCHECK_INTERVAL_S") or 60
+            )
+        except (TypeError, ValueError):
+            interval = 60.0
+        if interval <= 0:
+            return
+        try:
+            miss_threshold = int(
+                os.environ.get("PAPRIKA_WORKER_SELFCHECK_MISS_THRESHOLD") or 3
+            )
+        except (TypeError, ValueError):
+            miss_threshold = 3
+        miss_threshold = max(2, miss_threshold)
+        url = f"{self.hub_http_url}/workers"
+        missing_streak = 0
+        # Grace: skip the first probe so the freshly-connected WS has time to be
+        # picked up across hubs via redis aggregation (~1-2s typically).
+        await asyncio.sleep(interval + random.uniform(0.0, 10.0))
+        try:
+            while True:
+                try:
+                    assert self._http is not None
+                    r = await self._http.get(url, timeout=10.0)
+                    if r.status_code != 200:
+                        # transient nginx/hub blip -> do NOT count as a miss
+                        await asyncio.sleep(interval)
+                        continue
+                    payload = r.json()
+                    ws_list = payload.get("workers") or []
+                    me_present = any(
+                        (w.get("worker_id") == self.worker_id) for w in ws_list
+                    )
+                    if me_present:
+                        if missing_streak:
+                            _logger.info(
+                                f"[worker {self.worker_id}] self-check: back in "
+                                f"hub registry (streak was {missing_streak})"
+                            )
+                        missing_streak = 0
+                    else:
+                        missing_streak += 1
+                        _logger.warning(
+                            f"[worker {self.worker_id}] self-check: NOT in hub "
+                            f"/workers (streak={missing_streak}/{miss_threshold}) "
+                            f"-- WS believed alive but hub does not serve us"
+                        )
+                        if missing_streak >= miss_threshold:
+                            try:
+                                _logger.critical(
+                                    f"[worker {self.worker_id}] self-check: missing "
+                                    f"from hub for {missing_streak} consecutive "
+                                    f"checks (~{missing_streak * interval:.0f}s) -> "
+                                    f"exit({WORKER_EXIT_CODE_VERSION_MISMATCH}) for "
+                                    f"clean re-register"
+                                )
+                            except Exception:
+                                pass
+                            os._exit(WORKER_EXIT_CODE_VERSION_MISMATCH)
+                except asyncio.CancelledError:
+                    raise
+                except Exception as e:
+                    # Transient HTTP errors do not count as a miss; that would
+                    # turn a network blip into a fleet-wide exit storm. Only a
+                    # successful 200 that omits our id counts.
+                    _logger.info(
+                        f"[worker {self.worker_id}] self-check probe transient "
+                        f"error ({type(e).__name__}: {e}); will retry"
+                    )
+                await asyncio.sleep(interval + random.uniform(0.0, 5.0))
         except asyncio.CancelledError:
             return
 

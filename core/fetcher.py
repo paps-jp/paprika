@@ -32,6 +32,44 @@ from urllib.parse import urlparse
 
 
 # ---------------------------------------------------------------------------
+# websockets.connect open_timeout bump (CDP handshake on loaded workers)
+# ---------------------------------------------------------------------------
+# nodriver (0.50.x) connects to Chrome's DevTools (CDP) WebSocket via
+# ``websockets.connect(url, ping_timeout=..., max_size=...)`` -- WITHOUT an
+# ``open_timeout`` arg, so the library default (10s in websockets ≥10) gates
+# whether Chrome's CDP listener has materialised. On heavy workers (observed
+# load1=15+ on a 2-lane host) Chrome spends >10s coming up before it accepts
+# the WS upgrade; the handshake then raised "TimeoutError: timed out during
+# opening handshake" out of uc.start() and the fetch failed without a single
+# captured byte (job bb1e3e673407, 2026-06-16).
+#
+# Raise the default to 30s by subclassing ``websockets.connect``. Explicit
+# callers (worker<->hub WS in server/worker/agent/_mix_run.py, hub<->worker
+# ones) that pass open_timeout=... still win -- only the unspecified case
+# moves. Env override: ``PAPRIKA_WS_OPEN_TIMEOUT`` (seconds, float).
+# Idempotent: re-importing fetcher.py does not stack wrappers.
+try:
+    import websockets as _ws_pkg
+    if not getattr(_ws_pkg.connect, "_paprika_open_timeout_patched", False):
+        _PAPRIKA_WS_OPEN_TIMEOUT_S = float(
+            os.environ.get("PAPRIKA_WS_OPEN_TIMEOUT", "30") or 30
+        )
+        _OrigConnect = _ws_pkg.connect
+
+        class _PaprikaConnect(_OrigConnect):
+            def __init__(self, *args, open_timeout=_PAPRIKA_WS_OPEN_TIMEOUT_S, **kwargs):
+                super().__init__(*args, open_timeout=open_timeout, **kwargs)
+
+        _PaprikaConnect._paprika_open_timeout_patched = True
+        _ws_pkg.connect = _PaprikaConnect
+except Exception:
+    # websockets not installed (extremely unlikely in this codebase) or the
+    # library shape changed in a future version: leave the default alone
+    # rather than crashing fetcher.py at import time.
+    pass
+
+
+# ---------------------------------------------------------------------------
 # Worker egress proxy (target-site plane only)
 # ---------------------------------------------------------------------------
 # A worker can route its TARGET-site fetch traffic out through a remote box

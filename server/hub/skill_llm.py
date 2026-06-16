@@ -59,9 +59,13 @@ You are reviewing a successful browser-automation script. Decide
 whether it teaches a REUSABLE pattern other future tasks could
 benefit from, or whether it is too site-specific to be worth saving.
 
-DEFAULT TO SKIP. Only save a skill when there is a clear, abstract
-technique that generalises across sites or tasks. Examples of
-patterns worth saving:
+DEFAULT TO EXTRACT. Save a skill whenever the script demonstrates ANY
+reusable technique, even a narrow one -- better to over-extract and let
+the REUSE check below + the dedup reaper consolidate near-duplicates
+than to lose techniques to over-skipping. The learning loop is starved
+when extraction is too conservative.
+
+Patterns worth saving (be generous -- pick the most informative one):
   - Specific use of paprika-client's higher-level primitives
     (pap.walk + per-page work, page.agent() for unknown UI)
   - Idioms that avoid a common foot-gun (e.g. always handle
@@ -70,20 +74,42 @@ patterns worth saving:
   - Combinations of features that work well together for a class of
     tasks (e.g. "crawl pages + download videos" or "infinite scroll
     gallery + capture-on-stop")
+  - Sequencing patterns (e.g. consent banner → wait → click play →
+    network-trace + download_video)
+  - Error-handling / retry shapes (try/except around missing elements,
+    multi-selector fallback, wait-then-retry)
+  - Any non-trivial timing / scroll / iframe-handling idiom that an LLM
+    writing a fresh script for a similar task could miss
 
-Skip when:
-  - The script is mostly URLs / selectors / domain-specific tweaks
-    with no general technique
-  - The script is just a near-verbatim call of a single
-    paprika-client function (no compound pattern)
-  - This was a one-attempt success on a trivial page (no learning)
+Skip ONLY when ALL of these are true:
+  - The script has NO code structure to learn from (pure URLs /
+    selectors / hardcoded values, no flow or compound calls), AND
+  - The "code" is a single paprika-client call with no surrounding
+    setup, AND
+  - The page was so trivial that any naive script would have worked.
 
-REUSE OVER CREATE: You will be shown EXISTING SKILLS. If your distilled
-technique is essentially the same as one of them (same barrier / goal class,
-their code would work with a small edit), output {"reuse": "<slug>"} INSTEAD
-of a new skill -- never emit a near-duplicate variant of an existing skill
-(e.g. yet another "get past the age-gate then grab the video"). Prefer reuse
-so the skill set CONVERGES instead of proliferating into one-off variants.
+REUSE ONLY WHEN TRULY INTERCHANGEABLE: You will be shown EXISTING SKILLS.
+Output {"reuse": "<slug>"} ONLY when the existing skill captures the SAME
+TECHNIQUE in essentially the same way -- their code would work for this
+task with just URL/parameter edits, no structural changes.
+
+WHEN IN DOUBT, EXTRACT a new skill. It's far cheaper to let the dedup
+reaper merge near-duplicates later than to lose distinct techniques to
+over-eager reuse. Recent measurements showed 78% of distill calls
+collapsing to reuse and 0 new skills extracted in 24h -- that's
+over-correction, the learning loop starves.
+
+Specifically, do NOT reuse just because:
+  - The goal class overlaps (both are "age-gate + video" or "infinite-
+    scroll gallery") — the underlying MECHANISM matters more.
+  - The output looks similar at a high level (both call download_video) —
+    the SETUP / ordering / selectors / waits are the technique.
+
+DIFFERENT MECHANISMS deserve distinct skills:
+  - "agent-prepped session" vs "explicit consent click"
+  - "network-trace video sniff" vs "DOM-evaluate video sniff"
+  - "pap.walk for crawl" vs "hand-rolled BFS with set-dedup"
+  - "iframe-recursion" vs "tab-killer + main-tab redirect"
 
 Output JSON ONLY (no commentary, no markdown fences). Three shapes:
 

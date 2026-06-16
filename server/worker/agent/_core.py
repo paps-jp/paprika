@@ -177,6 +177,15 @@ class WorkerAgent(
         self._update_gate: asyncio.Event = asyncio.Event()
         self._update_jitter_s: float = 0.0
         self._self_update_task: asyncio.Task | None = None
+        # Heartbeat kick: when set, the heartbeat loop wakes immediately
+        # instead of waiting the full HEARTBEAT_INTERVAL (10s). The
+        # job-exec / session-start / lane-pool paths set this whenever the
+        # worker's effective lane occupancy changes (acquire/release) so
+        # the hub's view of in_flight catches up within ms instead of up
+        # to a full interval -- closing the over-dispatch race where the
+        # hub picks a worker that's actually full but whose last heartbeat
+        # still reported "1 free" (incident 2026-06-16: w50182 mass-drain).
+        self._heartbeat_kick: asyncio.Event = asyncio.Event()
         try:
             self._recycle_after = int(os.environ.get("WORKER_RECYCLE_AFTER_JOBS", "200"))
         except (TypeError, ValueError):

@@ -1448,7 +1448,7 @@ async def generate_script(
     hub_url: str,
     extra_context: Optional[str] = None,
     system_addendum: Optional[str] = None,
-    max_tokens: int = 2000,
+    max_tokens: int = 15000,
     temperature: float = 0.1,
     target: Optional[LLMTarget] = None,
     download_video: bool = False,
