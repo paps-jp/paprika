@@ -1458,9 +1458,28 @@ JSON.stringify((() => {
     let inertMain = false;
     try { inertMain = !!document.querySelector('[inert], [aria-hidden="true"]'); } catch (e) {}
     // (4) login password field -- a standard element, far stronger than the
-    // word "login" appearing somewhere on the page.
+    // word "login" appearing somewhere on the page. ONLY counts if the field is
+    // ACTUALLY VISIBLE (not a hidden header-dropdown login form, which many
+    // Chinese aggregator sites stash in the DOM for a future "登录" click).
+    // Pre-fix that flagged every page with a header login form as 課題 even
+    // when the article body rendered fine (false positive on fld777.com /
+    // 福利岛 articles, post-mortem 2026-06-15). "Visible" =
+    //   * non-zero bounding box (display:none -> 0x0 rect, eliminated),
+    //   * intersects the current viewport (off-screen hidden tabs eliminated),
+    //   * computed style not display:none / visibility:hidden / opacity:0.
     let hasPassword = false;
-    try { hasPassword = !!document.querySelector('input[type="password"]'); } catch (e) {}
+    try {
+      for (const inp of document.querySelectorAll('input[type="password"]')) {
+        const b = inp.getBoundingClientRect();
+        if (b.width <= 0 || b.height <= 0) continue;  // display:none
+        if (b.bottom <= 0 || b.top >= H || b.right <= 0 || b.left >= W) continue;  // off-screen
+        const cs = window.getComputedStyle(inp);
+        if (cs.display === 'none' || cs.visibility === 'hidden') continue;
+        if (parseFloat(cs.opacity || '1') <= 0.01) continue;
+        hasPassword = true;
+        break;
+      }
+    } catch (e) {}
     // (5) visible-image scarcity (the operator's intuition), counted on
     // actually-rendered, in-viewport images only.
     let visibleImages = 0;

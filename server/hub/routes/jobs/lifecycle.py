@@ -759,6 +759,21 @@ async def delete_job(job_id: str, request: Request) -> dict:
     t = state.local_tasks.pop(job_id, None)
     if t and not t.done():
         t.cancel()
+    # Purge the durable MinIO/S3 prefix BEFORE dropping the row. The local
+    # dir + jobs row are caches over the bucket; without this the row vanished
+    # but the bucket kept the bytes (orphan). POST /jobs/cleanup and
+    # POST /jobs/minio-orphan-sweep already did this; per-job DELETE now does
+    # it too so caller intent ("delete this job") actually reclaims storage
+    # everywhere instead of leaking it into the bucket.
+    minio_objects = 0
+    minio_bytes = 0
+    if objstore.enabled():
+        try:
+            r = await objstore.delete_prefix(job_id)
+            minio_objects = int(r.get("objects") or 0)
+            minio_bytes = int(r.get("bytes") or 0)
+        except Exception:
+            pass
     deleted = await state.store.delete_job(job_id)
     job_dir = get_storage_dir() / job_id
     try:
@@ -768,7 +783,11 @@ async def delete_job(job_id: str, request: Request) -> dict:
         pass
     if not deleted:
         raise HTTPException(404, f"job '{job_id}' not found")
-    return {"deleted": job_id}
+    return {
+        "deleted": job_id,
+        "minio_objects": minio_objects,
+        "minio_bytes": minio_bytes,
+    }
 
 
 @router.post("/jobs/cleanup")
@@ -1509,13 +1528,19 @@ async def create_job(req: JobRequest, request: Request) -> JobInfo:
     # assign below queues onto it regardless of its in_flight count.
     worker = pinned_worker
     if worker is None:
-        worker = state.registry.pick_worker()
+        # Reserve a pending_assigns slot at pick time so a concurrent picker
+        # (POST inline OR redrive OR post_assign_ack_guard) running on an
+        # await boundary below sees the worker as full. EVERY non-assign exit
+        # path (including the 503 fall-through after this block) must
+        # release_pending_assign. assign() itself idempotently re-adds the
+        # same job_id (set semantics).
+        worker = state.registry.pick_worker(reserve_for_job=job_id)
         if worker is None and JOB_DISPATCH_GRACE_S > 0:
             _grace_deadline = time.monotonic() + JOB_DISPATCH_GRACE_S
             _waited = False
             while worker is None and time.monotonic() < _grace_deadline:
                 await asyncio.sleep(_JOB_DISPATCH_POLL_S)
-                worker = state.registry.pick_worker()
+                worker = state.registry.pick_worker(reserve_for_job=job_id)
                 _waited = True
             if _waited and worker is not None:
                 log.info(

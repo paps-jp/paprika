@@ -239,6 +239,7 @@ async def plan_goal(
     temperature: float = 0.1,
     target: LLMTarget | None = None,
     preflight_block: str = "",
+    job_id: str | None = None,
 ) -> Plan | None:
     """Decompose ``goal`` into a Plan via one LLM call.
 
@@ -319,6 +320,18 @@ async def plan_goal(
             record_engine_usage(tgt, payload.get("usage") or {})
     except Exception as e:
         log.info(f"[planner] LLM call failed: {type(e).__name__}: {e}")
+        try:
+            from server.hub._ai_io_log import record_ai_io
+            _user_str = ""
+            try:
+                _user_str = next((m.get("content","") for m in body.get("messages") or [] if m.get("role")=="user"), "")
+            except Exception: pass
+            record_ai_io(purpose="planner",
+                         engine_slug=getattr(tgt, "engine_slug", "") or tgt.model,
+                         job_id=job_id, prompt=_user_str, response=None,
+                         latency_ms=int((time.time()-t0)*1000),
+                         error=f"{type(e).__name__}: {e}")
+        except Exception: pass
         return None
     elapsed_ms_call = int((time.time() - t0) * 1000)
 
@@ -327,6 +340,20 @@ async def plan_goal(
     if choices:
         msg = choices[0].get("message") or {}
         raw = msg.get("content") or ""
+    try:
+        from server.hub._ai_io_log import record_ai_io
+        _user_str = ""
+        try:
+            _user_str = next((m.get("content","") for m in body.get("messages") or [] if m.get("role")=="user"), "")
+        except Exception: pass
+        _u = payload.get("usage") or {}
+        record_ai_io(purpose="planner",
+                     engine_slug=getattr(tgt, "engine_slug", "") or tgt.model,
+                     job_id=job_id, prompt=_user_str, response=raw,
+                     latency_ms=elapsed_ms_call,
+                     tokens_in=_u.get("prompt_tokens"),
+                     tokens_out=_u.get("completion_tokens"))
+    except Exception: pass
 
     plan = _parse_plan(raw)
     if plan is None:

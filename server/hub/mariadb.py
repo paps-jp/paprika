@@ -173,6 +173,38 @@ _TABLES: list[tuple[str, str]] = [
         ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci
         """,
     ),
+    # Every LLM call's (purpose, engine, prompt, response, latency, ...)
+    # so the operator can reconstruct "for THIS job, what did each LLM see
+    # and answer?" -- the AI loop end-to-end. Long prompts/responses are
+    # offloaded to MinIO (ai_io/<sha1>.bin) and the row keeps only the sha1
+    # ref + first 32KB preview. See server/hub/_ai_io_log.py.
+    (
+        "ai_io_log",
+        """
+        CREATE TABLE IF NOT EXISTS ai_io_log (
+            id            BIGINT       AUTO_INCREMENT PRIMARY KEY,
+            ts            DATETIME(3)  DEFAULT CURRENT_TIMESTAMP(3),
+            job_id        VARCHAR(64),
+            purpose       VARCHAR(32),
+            engine_slug   VARCHAR(64),
+            parent_call   BIGINT,
+            prompt_len    INT,
+            response_len  INT,
+            tokens_in     INT,
+            tokens_out    INT,
+            latency_ms    INT,
+            prompt_text   MEDIUMTEXT,
+            response_text MEDIUMTEXT,
+            prompt_ref    VARCHAR(64),
+            response_ref  VARCHAR(64),
+            error         TEXT,
+            INDEX idx_job_ts (job_id, ts),
+            INDEX idx_purpose_ts (purpose, ts),
+            INDEX idx_engine_ts (engine_slug, ts),
+            INDEX idx_ts (ts)
+        ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci
+        """,
+    ),
     # Per-job page-role overrides. Distinct from the host-template overrides
     # above: this lets the operator pin a single job's role without
     # affecting other jobs on the same template. Persisted so the

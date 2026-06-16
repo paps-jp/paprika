@@ -339,6 +339,73 @@ async def ai_grooming_status() -> dict:
     return st
 
 
+@router.get("/ai/io")
+async def ai_io_log_query(
+    limit: int = 100,
+    purpose: str | None = None,
+    engine_slug: str | None = None,
+    job_id: str | None = None,
+    since_s: float = 3600.0,
+    errors_only: bool = False,
+) -> dict:
+    """Query the ai_io_log table -- per-LLM-call (purpose, engine, prompt,
+    response, latency) capture for observing the whole loop end-to-end.
+
+    Filters:
+      * ``purpose``     -- planner / skill_retrieval / codegen / judge /
+                           skill_distill / convention_distill /
+                           reasoning_distill / perception
+      * ``engine_slug`` -- e.g. deepseek-r1 / qwen3.5 / qwen3-vl-4b
+      * ``job_id``      -- pin to one job's call tree
+      * ``since_s``     -- only rows from the last N seconds
+      * ``errors_only`` -- skip successful calls
+
+    Long prompts/responses are truncated to the inline 32KB preview; the
+    full body lives in MinIO under ``ai_io/<sha1>.bin`` when ``prompt_ref``
+    / ``response_ref`` is set.
+    """
+    from server.hub._state import state
+    pool = getattr(state, "mariadb_pool", None)
+    if pool is None:
+        return {"count": 0, "events": []}
+    import time as _time
+    conds: list[str] = []
+    params: list = []
+    if since_s and since_s > 0:
+        conds.append("ts >= FROM_UNIXTIME(%s)")
+        params.append(_time.time() - float(since_s))
+    if purpose:
+        conds.append("purpose = %s"); params.append(purpose[:32])
+    if engine_slug:
+        conds.append("engine_slug = %s"); params.append(engine_slug[:64])
+    if job_id:
+        conds.append("job_id = %s"); params.append(job_id[:64])
+    if errors_only:
+        conds.append("error IS NOT NULL")
+    where = (" WHERE " + " AND ".join(conds)) if conds else ""
+    sql = (
+        "SELECT id, UNIX_TIMESTAMP(ts) AS ts, job_id, purpose, engine_slug, "
+        "       parent_call, prompt_len, response_len, tokens_in, tokens_out, "
+        "       latency_ms, prompt_text, response_text, prompt_ref, "
+        "       response_ref, error "
+        "FROM ai_io_log" + where + " ORDER BY ts DESC LIMIT %s"
+    )
+    params.append(max(1, min(int(limit), 1000)))
+    rows = []
+    try:
+        async with pool.acquire() as conn:
+            async with conn.cursor() as cur:
+                await cur.execute(sql, tuple(params))
+                rows = list(await cur.fetchall())
+    except Exception as e:
+        raise HTTPException(500, f"ai_io query failed: {type(e).__name__}: {e}")
+    cols = ("id","ts","job_id","purpose","engine_slug","parent_call",
+            "prompt_len","response_len","tokens_in","tokens_out","latency_ms",
+            "prompt_text","response_text","prompt_ref","response_ref","error")
+    events = [dict(zip(cols, r)) for r in rows]
+    return {"count": len(events), "events": events}
+
+
 @router.get("/ai/groom-candidates")
 async def ai_groom_candidates() -> dict:
     """Retire (dud/zombie) + dedup (near-duplicate) candidates for the

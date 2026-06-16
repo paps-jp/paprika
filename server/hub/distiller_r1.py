@@ -549,6 +549,18 @@ async def distill_for_job(
             record_engine_usage(target, payload.get("usage") or {})
     except Exception as e:
         _log.info("[distiller-r1] LLM call failed: %s: %s", type(e).__name__, e)
+        try:
+            from server.hub._ai_io_log import record_ai_io
+            _user_str = ""
+            try:
+                _user_str = next((m.get("content","") for m in body.get("messages") or [] if m.get("role")=="user"), "")
+            except Exception: pass
+            record_ai_io(purpose="reasoning_distill",
+                         engine_slug=engine_slug, job_id=job_id,
+                         prompt=_user_str, response=None,
+                         latency_ms=int((time.time()-t0)*1000),
+                         error=f"{type(e).__name__}: {e}")
+        except Exception: pass
         return None
     elapsed_ms = int((time.time() - t0) * 1000)
 
@@ -557,6 +569,20 @@ async def distill_for_job(
     if choices:
         msg = choices[0].get("message") or {}
         raw = msg.get("content") or ""
+    try:
+        from server.hub._ai_io_log import record_ai_io
+        _user_str = ""
+        try:
+            _user_str = next((m.get("content","") for m in body.get("messages") or [] if m.get("role")=="user"), "")
+        except Exception: pass
+        _u = payload.get("usage") or {}
+        record_ai_io(purpose="reasoning_distill",
+                     engine_slug=engine_slug, job_id=job_id,
+                     prompt=_user_str, response=raw,
+                     latency_ms=elapsed_ms,
+                     tokens_in=_u.get("prompt_tokens"),
+                     tokens_out=_u.get("completion_tokens"))
+    except Exception: pass
     updates = _parse_updates(raw)
     if not updates:
         _log.info(

@@ -224,10 +224,152 @@
       loadGrooming();
     } else if (name === 'oracle') {
       loadOracle();
+    } else if (name === 'aiio') {
+      _aiIoStart();
     } else {
       loadSkillsConventions();
     }
+    if (name !== 'aiio') _aiIoStop();
   }
+
+  // ===== AI I/O log sub-tab =================================================
+  // Lists every LLM call (planner / skill_retrieval / codegen / judge /
+  // skill_distill / convention_distill / reasoning_distill / perception)
+  // with its prompt/response/latency, so the operator can see the whole
+  // loop end-to-end. Backed by GET /ai/io (server/hub/routes/skills.py)
+  // reading from MariaDB ai_io_log. Auto-polls while the tab is visible.
+  let _aiIoPollTimer = null;
+  function _aiIoStop() { if (_aiIoPollTimer) { clearInterval(_aiIoPollTimer); _aiIoPollTimer = null; } }
+  function _aiIoStart() {
+    _aiIoStop();
+    try { refreshAiIoTable(); } catch (_) {}
+    _aiIoPollTimer = setInterval(() => {
+      if (document.hidden) return;
+      const active = document.querySelector('.ai-subpane[data-ai-subpane="aiio"]');
+      if (!active || active.style.display === 'none') { _aiIoStop(); return; }
+      try { refreshAiIoTable(); } catch (_) {}
+    }, 10000);
+  }
+  function _fmtAiIoTs(ts) {
+    if (!ts) return '—';
+    const d = new Date(ts * 1000);
+    const HH = String(d.getHours()).padStart(2, '0');
+    const MM = String(d.getMinutes()).padStart(2, '0');
+    const SS = String(d.getSeconds()).padStart(2, '0');
+    const ago = Math.floor((Date.now() / 1000) - ts);
+    const agoStr = ago < 60 ? ago + 's' : ago < 3600 ? Math.floor(ago / 60) + 'm' : Math.floor(ago / 3600) + 'h';
+    return `<span title="${d.toLocaleString()}">${HH}:${MM}:${SS}</span> <small style="color:#888;">(${agoStr})</small>`;
+  }
+  function _purposeBadge(p) {
+    const colors = {
+      planner:            { bg:'#e6f4ff', fg:'#16608f', bd:'#9bf' },
+      skill_retrieval:    { bg:'#ecf7e9', fg:'#196b2c', bd:'#7ab68a' },
+      codegen:            { bg:'#f3ecfb', fg:'#3a2a7a', bd:'#a09bd0' },
+      judge:              { bg:'#fff3e6', fg:'#7a4500', bd:'#e0a060' },
+      skill_distill:      { bg:'#ecf7e9', fg:'#196b2c', bd:'#7ab68a' },
+      convention_distill: { bg:'#f3ecfb', fg:'#3a2a7a', bd:'#a09bd0' },
+      reasoning_distill:  { bg:'#fff3e6', fg:'#7a4500', bd:'#e0a060' },
+      perception:         { bg:'#e6f4ff', fg:'#16608f', bd:'#9bf' },
+    };
+    const c = colors[p] || { bg:'#f5f5fa', fg:'#555', bd:'#bbc' };
+    return `<span style="display:inline-block; padding:1px 8px; border-radius:10px; font-size:.78em; font-weight:600; background:${c.bg}; color:${c.fg}; border:1px solid ${c.bd};">${_esc(p || 'other')}</span>`;
+  }
+  let _aiIoRows = [];
+  let _aiIoCopyText = '';
+  async function refreshAiIoTable() {
+    const tbody = document.querySelector('#aiIoTable tbody');
+    if (!tbody) return;
+    const purpose = (document.getElementById('aiIoPurpose')?.value || '').trim();
+    const engine  = (document.getElementById('aiIoEngine')?.value || '').trim();
+    const job_id  = (document.getElementById('aiIoJob')?.value || '').trim();
+    const since   = parseInt(document.getElementById('aiIoSince')?.value || '3600', 10);
+    const errs    = !!document.getElementById('aiIoErrorsOnly')?.checked;
+    const statusEl = document.getElementById('aiIoStatus');
+    const cntBadge = document.getElementById('cntAiIo');
+    if (statusEl) statusEl.textContent = '取得中…';
+    const params = new URLSearchParams({ limit:'200', since_s:String(since), errors_only:errs?'1':'0' });
+    if (purpose) params.set('purpose', purpose);
+    if (engine)  params.set('engine_slug', engine);
+    if (job_id)  params.set('job_id', job_id);
+    let payload = null;
+    try {
+      const r = await fetch('/ai/io?' + params.toString());
+      if (r.ok) payload = await r.json();
+    } catch (e) {
+      tbody.innerHTML = `<tr><td colspan="7" class="empty" style="padding:20px; text-align:center; color:#a00;">取得失敗: ${_esc(e.message || e)}</td></tr>`;
+      if (statusEl) statusEl.textContent = '';
+      return;
+    }
+    _aiIoRows = (payload && payload.events) || [];
+    if (cntBadge) cntBadge.textContent = _aiIoRows.length;
+    if (statusEl) statusEl.textContent = `${_aiIoRows.length} 件`;
+    if (!_aiIoRows.length) {
+      tbody.innerHTML = '<tr><td colspan="7" class="empty" style="padding:20px; text-align:center; color:#888;">該当する LLM 呼び出しはありません</td></tr>';
+      return;
+    }
+    const rows = _aiIoRows.map((e, i) => {
+      const preview = (e.prompt_text || '').slice(0, 80).replace(/\n/g, ' ');
+      const tio = (e.tokens_in != null || e.tokens_out != null)
+        ? `${e.tokens_in||'—'}/${e.tokens_out||'—'}` : '—';
+      const errMark = e.error ? ' <span style="color:#a00; font-weight:700;" title="' + _esc(e.error) + '">⚠</span>' : '';
+      return `
+        <tr data-aiio-row="${i}" style="cursor:pointer;" onmouseover="this.style.background='#fafafa'" onmouseout="this.style.background=''">
+          <td style="padding:4px 8px; border-bottom:1px solid #eee; white-space:nowrap;">${_fmtAiIoTs(e.ts)}</td>
+          <td style="padding:4px 8px; border-bottom:1px solid #eee;">${_purposeBadge(e.purpose)}${errMark}</td>
+          <td style="padding:4px 8px; border-bottom:1px solid #eee; white-space:nowrap;"><code style="font-size:.85em;">${_esc(e.engine_slug || '—')}</code></td>
+          <td style="padding:4px 8px; border-bottom:1px solid #eee; white-space:nowrap;"><code style="font-size:.83em;">${_esc((e.job_id || '—').slice(0, 12))}</code></td>
+          <td style="padding:4px 8px; border-bottom:1px solid #eee; text-align:right; white-space:nowrap; font-variant-numeric:tabular-nums;">${e.latency_ms || 0}ms</td>
+          <td style="padding:4px 8px; border-bottom:1px solid #eee; text-align:right; white-space:nowrap; font-variant-numeric:tabular-nums;">${tio}</td>
+          <td style="padding:4px 8px; border-bottom:1px solid #eee; font-family:ui-monospace,Consolas,monospace; font-size:.83em; max-width:380px; overflow:hidden; text-overflow:ellipsis; white-space:nowrap;">${_esc(preview)}</td>
+        </tr>`;
+    }).join('');
+    tbody.innerHTML = rows;
+  }
+  function _openAiIoDetail(idx) {
+    const e = _aiIoRows[idx];
+    if (!e) return;
+    const modal = document.getElementById('aiIoModal');
+    if (!modal) return;
+    document.getElementById('aiIoModalTitle').textContent = (e.purpose || 'other') + ' · ' + (e.engine_slug || '');
+    document.getElementById('aiIoModalMeta').textContent =
+      `job: ${e.job_id || '—'} · ${e.latency_ms || 0}ms · in/out ${e.tokens_in||'—'}/${e.tokens_out||'—'}`;
+    document.getElementById('aiIoModalPLen').textContent = `(${e.prompt_len || 0} bytes${e.prompt_ref?' · MinIO ai_io/'+e.prompt_ref+'.bin で全文':''})`;
+    document.getElementById('aiIoModalRLen').textContent = `(${e.response_len || 0} bytes${e.response_ref?' · MinIO ai_io/'+e.response_ref+'.bin で全文':''})`;
+    document.getElementById('aiIoModalPrompt').textContent = e.prompt_text || '(プロンプト無し)';
+    document.getElementById('aiIoModalResponse').textContent = e.response_text || '(レスポンス無し)';
+    const errEl = document.getElementById('aiIoModalError');
+    if (e.error) { errEl.style.display = ''; errEl.textContent = 'エラー: ' + e.error; }
+    else { errEl.style.display = 'none'; errEl.textContent = ''; }
+    _aiIoCopyText = (e.response_text || '');
+    modal.style.display = 'flex';
+  }
+  (function wireAiIo() {
+    document.addEventListener('DOMContentLoaded', () => {
+      const filterIds = ['aiIoPurpose', 'aiIoEngine', 'aiIoJob', 'aiIoSince', 'aiIoErrorsOnly'];
+      filterIds.forEach(id => {
+        const el = document.getElementById(id);
+        if (!el) return;
+        const ev = (el.tagName === 'INPUT' && el.type !== 'checkbox') ? 'input' : 'change';
+        el.addEventListener(ev, () => { try { refreshAiIoTable(); } catch (_) {} });
+      });
+      const r = document.getElementById('aiIoRefresh');
+      if (r) r.addEventListener('click', () => { try { refreshAiIoTable(); } catch (_) {} });
+      const t = document.getElementById('aiIoTable');
+      if (t) t.addEventListener('click', (ev) => {
+        const tr = ev.target.closest('tr[data-aiio-row]');
+        if (!tr) return;
+        _openAiIoDetail(parseInt(tr.dataset.aiioRow, 10));
+      });
+      const m = document.getElementById('aiIoModal');
+      const close = document.getElementById('aiIoModalClose');
+      const copy = document.getElementById('aiIoModalCopy');
+      if (close && m) close.addEventListener('click', () => { m.style.display = 'none'; });
+      if (m) m.addEventListener('click', (e) => { if (e.target === m) m.style.display = 'none'; });
+      if (copy) copy.addEventListener('click', async () => {
+        try { await navigator.clipboard.writeText(_aiIoCopyText || ''); const old = copy.innerHTML; copy.textContent = '✓ copied'; setTimeout(() => { copy.innerHTML = old; }, 1200); } catch (_) {}
+      });
+    });
+  })();
 
   // ===== 稼働中 (live activity): what the AI engines are doing right now =====
   // Polls the cheap in-memory /ai/activity (5s) + /engines (15s) ONLY while

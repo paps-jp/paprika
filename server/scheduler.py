@@ -243,6 +243,52 @@ class ConnectedWorker:
     # WorkerScreenshotReply messages from the worker resolve the matching
     # future so the requesting HTTP handler can return the JPEG.
     pending_screenshots: dict[str, asyncio.Future] = field(default_factory=dict)
+    # Hub-side scheduling counters, independent of the worker-reported
+    # ``in_flight`` (which heartbeat overwrites every HEARTBEAT_INTERVAL
+    # seconds and is therefore racy as a scheduling input).
+    #
+    # ``pending_assigns`` = jobs THIS hub has dispatched (or reserved at
+    # pick_worker time) that the worker has NOT YET ACKED via
+    # WorkerJobAccepted. Bookkept by pick_worker(reserve_for_job=...) and
+    # assign(). Moved into ``committed_jobs`` on WorkerJobAccepted (a single
+    # atomic transition keeps the effective load stable across the accept).
+    #
+    # ``committed_jobs`` = jobs the worker has accepted and is running --
+    # the hub's ground truth, independent of heartbeat resets. Populated by
+    # WorkerJobAccepted, drained by WorkerJobComplete / WorkerJobFailed
+    # (via :meth:`release`), and seeded from session snapshots at worker
+    # reconnect (so a hub restart doesn't undercount the fleet's load).
+    #
+    # pick_worker uses ``len(pending_assigns) + len(committed_jobs)`` as the
+    # effective load -- never ``in_flight``. This closes the over-dispatch
+    # race that survived earlier fixes (incident 2026-06-15): with the
+    # heartbeat-driven in_flight in the mix, the gap between assign-send
+    # and WorkerJobAccepted always allowed a second picker to underestimate
+    # the load, drive WorkerJobFailed "no free lane in pool" and burn 60%+
+    # of failures. With both counters tracked here, no heartbeat reset can
+    # undo a reservation.
+    pending_assigns: set[str] = field(default_factory=set)
+    committed_jobs: set[str] = field(default_factory=set)
+    # Monotonic deadline (``time.monotonic()`` epoch) for an auto-clearing
+    # ``status="drain"``. The "no free lane in pool" recovery (Case C,
+    # 2026-06-15) sets status="drain" + drain_until = now + 900s when a
+    # worker rejects an assign for that reason -- a stuck lane needs time
+    # to recover (or for operator intervention) but draining FOREVER would
+    # leak fleet capacity. ``pick_worker`` checks the deadline and flips
+    # status back to "active" the moment it passes (lazy clear, no reaper
+    # task needed). 0.0 = no auto-clear (operator-set drain stays).
+    drain_until: float = 0.0
+    # True between WS handshake and the worker's first WorkerSessionAnnounce.
+    # The announce is what populates ``committed_jobs`` from the worker's
+    # actually-running sessions; until it arrives, ``committed_jobs`` is
+    # empty even for a worker that's been busy for hours (it just reconnected
+    # to a different hub after a deploy / consistent-hash re-route). Picking
+    # such a worker would over-dispatch onto its already-busy lanes -- the
+    # surviving "no free lane in pool" cascade after the pending_assigns +
+    # committed_jobs fix went live. pick_worker skips workers with this
+    # flag set; the flag is flipped to False at the end of the
+    # WorkerSessionAnnounce reconcile.
+    awaiting_announce: bool = True
     # Session RPCs:
     #   pending_session_starts[session_id] -> Future[WorkerSessionStartAck]
     #   pending_session_actions[request_id] -> Future[WorkerSessionActionResult]
@@ -843,8 +889,19 @@ class WorkerRegistry:
         cutoff = time.time() - WORKER_TTL
         return [w for w in self.connections.values() if w.last_heartbeat >= cutoff]
 
-    def pick_worker(self) -> ConnectedWorker | None:
+    def pick_worker(
+        self, reserve_for_job: str | None = None,
+    ) -> ConnectedWorker | None:
         """Pick an alive worker with spare capacity, load-balanced.
+
+        When ``reserve_for_job`` is given the returned worker's
+        ``pending_assigns`` set is atomically (sync, no await) updated to
+        include that job_id, so a concurrent ``pick_worker`` call running on
+        an await suspension boundary (e.g. inside the caller's
+        ``await store.claim_queued_job``) sees the worker as full. Callers
+        that pick but then bail BEFORE ``assign()`` MUST call
+        ``release_pending_assign(worker_id, job_id)`` -- the redrive's
+        CAS-claim-then-assign flow is the canonical pattern.
 
         Only considers workers whose operator-controlled status is
         "active"; drained / standby workers are skipped silently.
@@ -879,11 +936,52 @@ class WorkerRegistry:
         # The old check (``lane_novnc_urls > 0`` only) rejected
         # Windows workers as "misconfigured / lane-less" and caused
         # "fleet at capacity" on a single-machine install.
+        #
+        # Effective load = ``len(pending_assigns) + max(in_flight,
+        #                                              len(committed_jobs))``.
+        # pending_assigns are FRESH reservations that haven't been absorbed
+        # into either the worker's ``in_flight`` count or the hub's
+        # ``committed_jobs`` set yet -- they ADD to the steady-state load,
+        # not max with it. After WorkerJobAccepted lands the reservation
+        # moves into ``committed_jobs`` (a single atomic transition), and
+        # heartbeat eventually catches in_flight up; from then on the MAX
+        # of the two steady-state counters is what represents the work
+        # actually running on the worker. The MAX absorbs the
+        # heartbeat lag (in_flight stale after accept) AND a drifted
+        # committed_jobs (post-restart, sessions reconciled from snapshots
+        # may be incomplete). The earlier formulations -- pure SUM
+        # (over-counted after the accept-discard) and pure MAX (under-
+        # counted during the pick reservation window) -- each fell
+        # through one of these races; the
+        # ``pending + max(in_flight, committed)`` shape is the smallest
+        # one that closes both.
+        def _load(w: ConnectedWorker) -> int:
+            return len(w.pending_assigns) + max(w.in_flight, len(w.committed_jobs))
+
+        # Lazy auto-clear of the "no-free-lane" auto-drain: any worker whose
+        # ``drain_until`` deadline has passed flips back to "active" the
+        # instant pick_worker scans it. Operator-set drains keep
+        # drain_until=0.0 so they're never auto-cleared.
+        _now_mono = time.monotonic()
+        for _w in self.connections.values():
+            if (
+                _w.status == "drain"
+                and _w.drain_until
+                and _now_mono >= _w.drain_until
+            ):
+                _w.status = "active"
+                _w.drain_until = 0.0
         candidates = [
             w
             for w in self.alive_workers()
             if w.status == "active"
-            and w.in_flight < w.capabilities.max_concurrent
+            # Skip workers we haven't reconciled yet: their committed_jobs
+            # set is empty even when they're actually busy, so picking them
+            # would over-dispatch onto their already-occupied lanes. Cleared
+            # the moment WorkerSessionAnnounce lands (typically <1s after
+            # WS handshake).
+            and not w.awaiting_announce
+            and _load(w) < w.capabilities.max_concurrent
             and (
                 len(w.capabilities.lane_novnc_urls or []) > 0
                 or bool(w.capabilities.novnc_url)
@@ -899,14 +997,38 @@ class WorkerRegistry:
         if not candidates:
             return None
 
-        # Rank key: smaller in_flight first, then larger capacity.
+        # Rank key: smaller effective load first, then larger capacity.
         def _key(w: ConnectedWorker) -> tuple:
-            return (w.in_flight, -w.capabilities.max_concurrent)
+            return (_load(w), -w.capabilities.max_concurrent)
 
         best = min(_key(w) for w in candidates)
         tied = [w for w in candidates if _key(w) == best]
         # Random pick among equally-good workers -> even spread.
-        return random.choice(tied)
+        winner = random.choice(tied)
+        # Reserve the slot atomically WITH the pick. Otherwise the caller's
+        # subsequent ``await`` (e.g. store.claim_queued_job's DB round-trip,
+        # or building the assign msg) would let a second picker pick the same
+        # worker before its slot is booked -- the over-dispatch race that
+        # drove "no free lane in pool" failures even after pending_assigns
+        # was added inside assign() (incident 2026-06-15, pre-pick-reserve).
+        # Idempotent: assign() adds the same job_id to pending_assigns again,
+        # set semantics make that a no-op. The caller MUST call
+        # ``release_pending_assign`` on EVERY non-assign exit path (failed
+        # CAS claim, build error) or the reservation persists and the worker
+        # capacity drifts down by one until the next reconcile.
+        if reserve_for_job is not None:
+            winner.pending_assigns.add(reserve_for_job)
+        return winner
+
+    def release_pending_assign(self, worker_id: str, job_id: str) -> None:
+        """Roll back a ``pick_worker(reserve_for_job=...)`` reservation when
+        the caller decided NOT to call ``assign`` -- e.g. the CAS claim
+        failed, or the assign-message build threw. Safe to call multiple
+        times (set.discard is no-op on missing); safe to call after a
+        successful WorkerJobAccepted handler discarded the same entry."""
+        worker = self.connections.get(worker_id)
+        if worker is not None:
+            worker.pending_assigns.discard(job_id)
 
     def stats(self) -> dict:
         # Pass 1: every currently-connected worker (rich data: in_flight
@@ -1264,29 +1386,45 @@ class WorkerRegistry:
         """Reserve a lane on this worker AND push the ``HubAssignJob``. Returns
         True on success, False if the send raises (reservation is rolled back).
 
-        ``in_flight`` is bumped BEFORE the awaited ``worker.send`` so a second
-        ``pick_worker`` that races us during the send doesn't see the worker
-        as still-having-capacity and over-dispatch onto the same lanes. That
-        race is the source of the worker-side "no free lane in pool" failures
-        (incident 2026-06-15): with POST inline + redrive + post-assign-guard
-        all calling pick_worker concurrently, two pickers could both see
-        ``in_flight=1, max=2`` and both send -- the worker's lane_pool would
-        accept the first, run out of lanes on the second, and the WorkerJobFailed
-        cascade burned ~60% of recent failures."""
+        Race-safety: the slot is reserved by **adding to ``pending_assigns``**
+        the instant assign() begins -- BEFORE the awaited ``worker.send`` --
+        so a concurrent ``pick_worker`` that runs during the send (or during
+        a parent caller's ``await store.claim_queued_job``) sees the
+        reservation and skips the worker. Bumping ``in_flight`` was NOT
+        enough on its own (incident 2026-06-15 fix #1) because the next
+        WorkerHeartbeat overwrites ``in_flight`` with the worker's own count
+        -- so the increment survived only until the worker's next heartbeat,
+        and the race fired again the moment heartbeat reset us. Concretely:
+        redrive_A pick (in_flight=1) -> claim_queued_job await -> redrive_B
+        pick (in_flight=1 *or* heartbeat reset to 1) -> both assign ->
+        worker capacity 2, lane #1 already busy -> WorkerJobFailed
+        "no free lane in pool". The ``pending_assigns`` set persists until
+        WorkerJobAccepted / WorkerJobComplete / WorkerJobFailed lands,
+        independent of heartbeat resets."""
+        worker.pending_assigns.add(msg.job_id)
         worker.in_flight += 1
         self.assignments.setdefault(worker.worker_id, set()).add(msg.job_id)
         try:
             await worker.send(msg)
         except Exception:
             # Roll back the reservation -- the worker never got the assign.
+            worker.pending_assigns.discard(msg.job_id)
             worker.in_flight = max(0, worker.in_flight - 1)
             self.assignments.get(worker.worker_id, set()).discard(msg.job_id)
             return False
         return True
 
     def release(self, worker_id: str, job_id: str) -> None:
-        """Decrement in_flight when a job finishes."""
+        """A job is no longer running on the worker (WorkerJobComplete /
+        WorkerJobFailed / post-assign guard reclaiming a stranded assign).
+        Discards from BOTH ``pending_assigns`` (the never-acked case) and
+        ``committed_jobs`` (the normal acked-and-ran case) so the scheduler
+        sees the slot free. Also legacy-decrements the heartbeat-driven
+        ``in_flight`` for display continuity; the next heartbeat reconciles."""
         worker = self.connections.get(worker_id)
-        if worker and worker.in_flight > 0:
-            worker.in_flight -= 1
+        if worker:
+            if worker.in_flight > 0:
+                worker.in_flight -= 1
+            worker.pending_assigns.discard(job_id)
+            worker.committed_jobs.discard(job_id)
         self.assignments.get(worker_id, set()).discard(job_id)

@@ -195,6 +195,7 @@ function ljpRenderRunConfig(info) {
         <input type="text" value="${_esc(info.url || '')}" disabled>
       </div>
       <div style="margin-top:8px; display:flex; align-items:center; gap:8px; flex-wrap:wrap;">
+        <button type="button" class="pill" id="jtOpenHost" data-url="${_esc(info.url || '')}" style="--la-bg:#eef4ff; --la-bd:#a9bee0; --la-fg:#1a4480;" title="このジョブの URL の host を #hosts タブで開く（cookie / レシピ / 知識を確認・編集）"><iconify-icon icon="lucide:globe"></iconify-icon> ホスト情報を見る</button>
         <button type="button" class="pill" id="jtExcludeHost" data-url="${_esc(info.url || '')}" style="--la-bg:#fff3f0; --la-bd:#e0a99a; --la-fg:#a23c2a;" title="このサイト(host)を「対象外」に登録。今後このサイトは課題判定もAIエスカレーションもされません（cookie 等は保持）。"><iconify-icon icon="lucide:ban"></iconify-icon> このサイトを対象外に</button>
         <span id="jtExcludeHostMsg" style="font-size:.82em; color:#888;"></span>
       </div>
@@ -301,6 +302,25 @@ function ljpRenderRunConfig(info) {
   host.innerHTML = `<div class="fetch-options" style="margin:0;">${blocks.join('')}</div>`;
   const _exBtn = host.querySelector('#jtExcludeHost');
   if (_exBtn) _exBtn.addEventListener('click', () => _excludeHostFromJob(_exBtn.dataset.url, _exBtn));
+  const _hostBtn = host.querySelector('#jtOpenHost');
+  if (_hostBtn) _hostBtn.addEventListener('click', () => _openHostFromJob(_hostBtn.dataset.url));
+}
+
+// Jump from the live panel to the host's record in the #hosts tab.
+// Strips a leading "www." to match the registry's canonical form (the
+// /hosts list and the deep-link map agree on this). Falling back to the
+// raw hostname when the strip would leave nothing keeps single-label
+// hosts (e.g. "localhost") working. If the URL doesn't parse, we just
+// no-op rather than navigate to a broken hash.
+function _openHostFromJob(url) {
+  let host = '';
+  try {
+    const h = new URL(url).hostname || '';
+    const stripped = h.replace(/^www\./, '');
+    host = stripped || h;
+  } catch (_) {}
+  if (!host) return;
+  location.hash = '#hosts/' + encodeURIComponent(host);
 }
 
 // One-click from a job: register its host as 対象外 (excluded = "do nothing").

@@ -77,82 +77,103 @@ be useful" -- give direct guidance.
 """
 
 
-async def _gather_host_signal(pool: Any, host: str, *, since_ts: float) -> dict:
-    """Gather yesterday's signal for one host. Returns a compact dict
-    the LLM can render."""
-    sig: dict[str, Any] = {
-        "host": host,
-        "failed_jobs": 0,
-        "review_jobs": 0,
-        "completed_jobs": 0,
-        "escalated_jobs": 0,
-        "common_errors": [],
-        "url_templates": [],
-    }
-    async with pool.acquire() as conn:
-        async with conn.cursor() as cur:
-            # Job counts by status (last 24h, this host).
-            await cur.execute(
-                """SELECT status, COUNT(*) FROM jobs
-                   WHERE host=%s AND created_at >= FROM_UNIXTIME(%s)
-                   GROUP BY status""",
-                (host, since_ts),
-            )
-            for status, n in (await cur.fetchall()):
-                if status == "failed":
-                    sig["failed_jobs"] = int(n)
-                elif status == "review":
-                    sig["review_jobs"] = int(n)
-                elif status == "completed":
-                    sig["completed_jobs"] = int(n)
-            # Top error reasons (failed jobs).
-            await cur.execute(
-                """SELECT error FROM jobs
-                   WHERE host=%s AND status='failed'
-                     AND created_at >= FROM_UNIXTIME(%s)
-                     AND error IS NOT NULL AND error <> ''
-                   ORDER BY created_at DESC LIMIT 20""",
-                (host, since_ts),
-            )
-            errs = [str(r[0])[:160] for r in await cur.fetchall() if r and r[0]]
-            # Crude grouping: first 60 chars as the bucket.
-            buckets: dict[str, int] = {}
-            for e in errs:
-                k = e[:60].strip()
-                buckets[k] = buckets.get(k, 0) + 1
-            sig["common_errors"] = sorted(
-                buckets.items(), key=lambda x: -x[1]
-            )[:5]
-            # Most-seen URL templates on this host (last 24h URLs only).
-            await cur.execute(
-                """SELECT template, COUNT(*) FROM host_url_history
-                   WHERE host=%s AND last_seen_at >= FROM_UNIXTIME(%s)
-                     AND template IS NOT NULL
-                   GROUP BY template ORDER BY COUNT(*) DESC LIMIT 8""",
-                (host, since_ts),
-            )
-            sig["url_templates"] = [
-                {"template": str(r[0]), "hits": int(r[1])}
-                for r in await cur.fetchall() if r
-            ]
-    return sig
+def _host_of(url: str) -> str:
+    """Normalised hostname from a URL ('' on parse error).
+    The jobs table holds URLs not hosts, so we derive the host here and
+    group in Python instead of SQL."""
+    if not url:
+        return ""
+    try:
+        from urllib.parse import urlparse
+        h = (urlparse(url).hostname or "").strip().lower()
+    except Exception:
+        return ""
+    if h.startswith("www."):
+        h = h[4:]
+    return h
 
 
-async def _hosts_with_signal(pool: Any, *, since_ts: float, limit: int) -> list[str]:
-    """Pick the top ``limit`` hosts by failed+review job count in the
-    last 24h, with at least ``_MIN_SIGNAL`` total flagged jobs."""
+async def _scan_24h_signals(pool: Any, *, since_ts: float) -> dict[str, dict]:
+    """ONE query: pull every job created in the last 24h + its url/status/error.
+    Group by host in Python (the jobs table has no host column).
+
+    Returns ``{host: {failed_jobs, review_jobs, completed_jobs, common_errors}}``
+    with errors already bucketed (top 5 per host). URL-template stats are
+    pulled separately per-host since host_url_history HAS a host column.
+    """
+    sigs: dict[str, dict] = {}
+    raw_errs: dict[str, dict[str, int]] = {}
     async with pool.acquire() as conn:
         async with conn.cursor() as cur:
             await cur.execute(
-                """SELECT host, COUNT(*) AS n FROM jobs
-                   WHERE created_at >= FROM_UNIXTIME(%s)
-                     AND status IN ('failed','review')
-                     AND host IS NOT NULL AND host <> ''
-                   GROUP BY host HAVING n >= %s
-                   ORDER BY n DESC LIMIT %s""",
-                (since_ts, _MIN_SIGNAL, int(limit)),
+                """SELECT url, status, error FROM jobs
+                   WHERE created_at >= FROM_UNIXTIME(%s)""",
+                (since_ts,),
             )
-            return [str(r[0]) for r in await cur.fetchall() if r and r[0]]
+            rows = await cur.fetchall()
+    for row in rows:
+        if not row:
+            continue
+        url, status, error = row[0], row[1], row[2] if len(row) > 2 else None
+        host = _host_of(str(url or ""))
+        if not host:
+            continue
+        sig = sigs.setdefault(host, {
+            "host": host,
+            "failed_jobs": 0, "review_jobs": 0, "completed_jobs": 0,
+            "escalated_jobs": 0,
+            "common_errors": [], "url_templates": [],
+        })
+        if status == "failed":
+            sig["failed_jobs"] += 1
+            if error:
+                bkt = raw_errs.setdefault(host, {})
+                k = str(error)[:60].strip()
+                bkt[k] = bkt.get(k, 0) + 1
+        elif status == "review":
+            sig["review_jobs"] += 1
+        elif status == "completed":
+            sig["completed_jobs"] += 1
+    # Fold the error buckets into each host's sig (top 5 by frequency).
+    for host, bkt in raw_errs.items():
+        sigs[host]["common_errors"] = sorted(
+            bkt.items(), key=lambda x: -x[1]
+        )[:5]
+    return sigs
+
+
+async def _attach_url_templates(pool: Any, sigs: dict, *, since_ts: float) -> None:
+    """For each host already in ``sigs``, pull its top URL templates from
+    host_url_history (which DOES have a host column). Mutates sigs in place.
+    Best-effort: a per-host failure leaves an empty list and continues."""
+    for host, sig in sigs.items():
+        try:
+            async with pool.acquire() as conn:
+                async with conn.cursor() as cur:
+                    await cur.execute(
+                        """SELECT template, COUNT(*) FROM host_url_history
+                           WHERE host=%s AND last_seen_at >= FROM_UNIXTIME(%s)
+                             AND template IS NOT NULL
+                           GROUP BY template ORDER BY COUNT(*) DESC LIMIT 8""",
+                        (host, since_ts),
+                    )
+                    sig["url_templates"] = [
+                        {"template": str(r[0]), "hits": int(r[1])}
+                        for r in await cur.fetchall() if r
+                    ]
+        except Exception:
+            sig["url_templates"] = []
+
+
+def _pick_flagged_hosts(sigs: dict, *, limit: int, min_signal: int) -> list[str]:
+    """Top hosts by (failed_jobs + review_jobs), filtered by min_signal."""
+    flagged = []
+    for host, sig in sigs.items():
+        n = int(sig.get("failed_jobs", 0) or 0) + int(sig.get("review_jobs", 0) or 0)
+        if n >= min_signal:
+            flagged.append((host, n))
+    flagged.sort(key=lambda x: -x[1])
+    return [h for h, _ in flagged[:limit]]
 
 
 def _format_signal(sig: dict, existing_strategy: str) -> str:
@@ -326,9 +347,19 @@ async def run_once() -> dict:
         return stats
 
     since_ts = time.time() - 24 * 3600
-    hosts = await _hosts_with_signal(pool, since_ts=since_ts, limit=max_hosts)
+    # Single pass over the 24h jobs window -> per-host signal dict. Then
+    # attach url-template stats from host_url_history (which DOES have
+    # a host column). Avoids the N+1 per-host queries the old code did,
+    # AND fixes a bug where the old SQL assumed a non-existent jobs.host
+    # column (jobs only carries url; host is derived in Python).
+    sigs = await _scan_24h_signals(pool, since_ts=since_ts)
+    hosts = _pick_flagged_hosts(sigs, limit=max_hosts, min_signal=_MIN_SIGNAL)
     stats["hosts_considered"] = len(hosts)
     _log.info("[nightly-review] %d host(s) flagged for digest update", len(hosts))
+    # Trim sigs to just the flagged hosts before attaching templates so
+    # we don't run an O(all-hosts) query.
+    sigs = {h: sigs[h] for h in hosts if h in sigs}
+    await _attach_url_templates(pool, sigs, since_ts=since_ts)
 
     from server.hub.mariadb import host_strategy_get, host_strategy_upsert
     for host in hosts:
@@ -341,7 +372,7 @@ async def run_once() -> dict:
             if existing_rec and existing_rec.get("updated_by") == "operator":
                 stats["hosts_skipped"] += 1
                 continue
-            sig = await _gather_host_signal(pool, host, since_ts=since_ts)
+            sig = sigs.get(host) or {"host": host}
             digest = await _ask_llm_for_digest(sig, existing, target)
             if not digest:
                 stats["hosts_skipped"] += 1

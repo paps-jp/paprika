@@ -315,9 +315,21 @@ async def distill_skill_from_job(
     except Exception as e:
         meta["elapsed_ms"] = int((time.time() - t0) * 1000)
         meta["reason"] = f"llm error: {type(e).__name__}: {e}"
+        try:
+            from server.hub._ai_io_log import record_ai_io
+            record_ai_io(purpose="skill_distill", engine_slug=SKILL_DISTILL_MODEL_NAME,
+                         job_id=job_id, prompt=user, response=None,
+                         latency_ms=meta["elapsed_ms"], error=meta["reason"])
+        except Exception: pass
         return None, meta
     meta["elapsed_ms"] = int((time.time() - t0) * 1000)
     meta["raw"] = raw
+    try:
+        from server.hub._ai_io_log import record_ai_io
+        record_ai_io(purpose="skill_distill", engine_slug=SKILL_DISTILL_MODEL_NAME,
+                     job_id=job_id, prompt=user, response=raw,
+                     latency_ms=meta["elapsed_ms"])
+    except Exception: pass
     parsed = _extract_json(raw)
     meta["parsed"] = parsed
     if parsed is None:
@@ -421,9 +433,21 @@ async def pick_relevant_skills(
     except Exception as e:
         meta["elapsed_ms"] = int((time.time() - t0) * 1000)
         meta["reason"] = f"llm error: {type(e).__name__}: {e}"
+        try:
+            from server.hub._ai_io_log import record_ai_io
+            record_ai_io(purpose="skill_retrieval", engine_slug=SKILL_RETRIEVAL_MODEL_NAME,
+                         job_id=None, prompt=user, response=None,
+                         latency_ms=meta["elapsed_ms"], error=meta["reason"])
+        except Exception: pass
         return [], meta
     meta["elapsed_ms"] = int((time.time() - t0) * 1000)
     meta["raw"] = raw
+    try:
+        from server.hub._ai_io_log import record_ai_io
+        record_ai_io(purpose="skill_retrieval", engine_slug=SKILL_RETRIEVAL_MODEL_NAME,
+                     job_id=None, prompt=user, response=raw,
+                     latency_ms=meta["elapsed_ms"])
+    except Exception: pass
     parsed = _extract_json(raw)
     meta["parsed"] = parsed
     if parsed is None:

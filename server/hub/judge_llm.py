@@ -285,6 +285,7 @@ async def judge_attempt(
     temperature: float = 0.0,
     target: LLMTarget | None = None,
     blind: bool = False,
+    job_id: str | None = None,
 ) -> Verdict | None:
     """Ask the LLM whether the attempt satisfied the goal.
 
@@ -410,6 +411,20 @@ async def judge_attempt(
             record_engine_usage(tgt, payload.get("usage") or {})
     except Exception as e:
         log.info(f"[judge] LLM call failed: {type(e).__name__}: {e}")
+        try:
+            from server.hub._ai_io_log import record_ai_io
+            _user_str = ""
+            try:
+                _user_str = next((m.get("content","") for m in body.get("messages") or [] if m.get("role")=="user"), "") if isinstance(body, dict) else ""
+            except Exception: pass
+            if isinstance(_user_str, list):
+                _user_str = " ".join(p.get("text","") for p in _user_str if isinstance(p, dict))
+            record_ai_io(purpose="judge",
+                         engine_slug=getattr(tgt, "engine_slug", "") or tgt.model,
+                         job_id=job_id, prompt=str(_user_str), response=None,
+                         latency_ms=int((time.time()-t0)*1000),
+                         error=f"{type(e).__name__}: {e}")
+        except Exception: pass
         return None
     elapsed_ms_call = int((time.time() - t0) * 1000)
 
@@ -418,6 +433,22 @@ async def judge_attempt(
     if choices:
         msg = choices[0].get("message") or {}
         raw = msg.get("content") or ""
+    try:
+        from server.hub._ai_io_log import record_ai_io
+        _user_str = ""
+        try:
+            _user_str = next((m.get("content","") for m in body.get("messages") or [] if m.get("role")=="user"), "") if isinstance(body, dict) else ""
+        except Exception: pass
+        if isinstance(_user_str, list):
+            _user_str = " ".join(p.get("text","") for p in _user_str if isinstance(p, dict))
+        _u = payload.get("usage") or {}
+        record_ai_io(purpose="judge",
+                     engine_slug=getattr(tgt, "engine_slug", "") or tgt.model,
+                     job_id=job_id, prompt=str(_user_str), response=raw,
+                     latency_ms=elapsed_ms_call,
+                     tokens_in=_u.get("prompt_tokens"),
+                     tokens_out=_u.get("completion_tokens"))
+    except Exception: pass
 
     verdict = _parse_verdict(raw)
     if verdict is None:
@@ -600,6 +631,7 @@ async def judge_via_reasoning(
     script: str = "",
     target: LLMTarget,
     blind: bool = False,
+    job_id: str | None = None,
 ) -> Verdict | None:
     """Reasoning-model-based goal verification.
 
@@ -712,6 +744,15 @@ async def judge_via_reasoning(
             record_engine_usage(target, payload.get("usage") or {})
     except Exception as e:
         log.info(f"[judge:reasoning] LLM call failed: {type(e).__name__}: {e}")
+        try:
+            from server.hub._ai_io_log import record_ai_io
+            record_ai_io(purpose="judge",
+                         engine_slug=getattr(target, "engine_slug", "") or target.model,
+                         job_id=job_id, prompt=user_msg, response=None,
+                         latency_ms=int((time.time()-t0)*1000),
+                         error=f"{type(e).__name__}: {e}",
+                         extra={"reasoning_judge": True})
+        except Exception: pass
         return None
     elapsed_ms_call = int((time.time() - t0) * 1000)
 
@@ -720,6 +761,17 @@ async def judge_via_reasoning(
     if choices:
         msg = choices[0].get("message") or {}
         raw = msg.get("content") or ""
+    try:
+        from server.hub._ai_io_log import record_ai_io
+        _u = payload.get("usage") or {}
+        record_ai_io(purpose="judge",
+                     engine_slug=getattr(target, "engine_slug", "") or target.model,
+                     job_id=job_id, prompt=user_msg, response=raw,
+                     latency_ms=elapsed_ms_call,
+                     tokens_in=_u.get("prompt_tokens"),
+                     tokens_out=_u.get("completion_tokens"),
+                     extra={"reasoning_judge": True})
+    except Exception: pass
 
     # DeepSeek can place reasoning in a separate reasoning_content field
     # (when configured that way). We ignore it -- only the answer matters.

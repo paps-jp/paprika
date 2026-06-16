@@ -1452,6 +1452,7 @@ async def generate_script(
     temperature: float = 0.1,
     target: Optional[LLMTarget] = None,
     download_video: bool = False,
+    job_id: Optional[str] = None,
 ) -> dict:
     """Call the configured LLM, return ``{code, model, elapsed_ms, raw}``.
 
@@ -1639,6 +1640,17 @@ async def generate_script(
     elapsed_ms = int((time.time() - t0) * 1000)
 
     code = _strip_fences(raw)
+    try:
+        from server.hub._ai_io_log import record_ai_io
+        record_ai_io(purpose="codegen",
+                     engine_slug=getattr(tgt, "engine_slug", "") or tgt.model,
+                     job_id=job_id, prompt=user_msg, response=raw,
+                     latency_ms=elapsed_ms,
+                     tokens_in=total_usage.get("prompt_tokens"),
+                     tokens_out=total_usage.get("completion_tokens"),
+                     extra={"finish_reason": finish_reason,
+                            "tool_calls": len(tool_calls_log)})
+    except Exception: pass
     return {
         "code": code,
         "raw": raw,

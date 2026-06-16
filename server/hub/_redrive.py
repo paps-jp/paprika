@@ -284,13 +284,17 @@ async def _redrive_dispatch_one(info) -> bool:
     mode = (info.options.mode if info.options else None) or "fetch"
     if mode in ("codegen-loop", "rerun"):
         return False  # hub-orchestrated -> redispatch_orphan_job's domain
-    worker = state.registry.pick_worker()
+    # Reserve a pending_assigns slot at pick time so a concurrent picker
+    # during the await store.claim_queued_job DB round-trip below sees the
+    # worker as full. EVERY non-assign exit path must release_pending_assign.
+    worker = state.registry.pick_worker(reserve_for_job=info.job_id)
     if worker is None:
         return False
     base = getattr(worker, "public_base_url", None)
     if not base:
         # No dial-in URL recorded -> can't build the asset-upload base. Rare;
         # leave queued (the POST path uses the request host as a fallback).
+        state.registry.release_pending_assign(worker.worker_id, info.job_id)
         return False
 
     started = datetime.now(timezone.utc).replace(tzinfo=None)
@@ -301,8 +305,10 @@ async def _redrive_dispatch_one(info) -> bool:
         won = await store.claim_queued_job(info.job_id, worker.worker_id, started)
     except Exception:
         log.debug("redrive: claim(%s) failed", info.job_id, exc_info=True)
+        state.registry.release_pending_assign(worker.worker_id, info.job_id)
         return False
     if not won:
+        state.registry.release_pending_assign(worker.worker_id, info.job_id)
         return False
 
     ok = False
