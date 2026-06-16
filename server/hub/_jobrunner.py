@@ -702,6 +702,21 @@ async def _run_codegen_loop_job(request: Request, info: JobInfo) -> None:
     except Exception as e:
         _log(f"  !! distiller-light crashed (non-fatal): {type(e).__name__}: {e}")
 
+    # R2 futility dead-letter: feed this escalated codegen-loop's outcome back
+    # to the auto-escalation gate so a host whose escalations keep failing
+    # (e.g. a hard login wall the AI can't pass) stops being re-escalated
+    # fleet-wide, and one that starts succeeding is un-parked. Only for
+    # auto-escalated jobs -- a manual codegen-loop run is the operator's call.
+    try:
+        _o = info.options
+        if _o is not None and getattr(_o, "escalated_from", None):
+            from server.hub._escalate import note_codegen_outcome
+            await note_codegen_outcome(
+                info.url, info.status == JobStatus.completed
+            )
+    except Exception as e:
+        _log(f"  !! escalate-outcome record crashed (non-fatal): {type(e).__name__}: {e}")
+
     # v2 Phase 6: R1 Distiller (deep updates).
     # Gated by PAPRIKA_R1_DISTILLER_MODE=off|on|new. When enabled, R1
     # reads the job brief + current HostKnowledge and proposes narrow,

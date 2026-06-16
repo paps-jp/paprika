@@ -129,6 +129,24 @@ _TABLES: list[tuple[str, str]] = [
         ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci
         """,
     ),
+    # ---- Auto-escalation futility dead-letter (R2) ----
+    # Fleet-wide + persistent block for the codegen-loop escalation gate
+    # (server/hub/_escalate.py). A host whose auto-escalated codegen-loops
+    # fail N times in a row gets parked here so EVERY hub stops re-escalating
+    # it until ``blocked_until`` (epoch seconds) passes; a success resets the
+    # streak. New table -> auto-created on startup, no migration needed.
+    (
+        "escalate_blocks",
+        """
+        CREATE TABLE IF NOT EXISTS escalate_blocks (
+            host          VARCHAR(255) PRIMARY KEY,
+            fail_streak   INT          NOT NULL DEFAULT 0,
+            blocked_until DOUBLE       NOT NULL DEFAULT 0,
+            last_outcome  VARCHAR(16),
+            updated_at    DATETIME(3)  DEFAULT CURRENT_TIMESTAMP(3)
+        ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci
+        """,
+    ),
     # ---- Per-host URL history (durable learning store) ----
     # Fetched/escalated URLs accumulate here so the per-host page-role
     # predictor (server/hub/_page_role.py) can learn each site's structure
@@ -2255,6 +2273,70 @@ async def delete_preset_row(pool: Any, name: str) -> None:
     async with pool.acquire() as conn:
         async with conn.cursor() as cur:
             await cur.execute("DELETE FROM presets WHERE name=%s", (name,))
+
+
+async def escalate_block_until(pool: Any, host: str) -> float:
+    """Epoch seconds until which auto-escalation is suppressed for ``host``
+    (0.0 = not blocked). Fleet-wide dead-letter behind the codegen-loop
+    futility gate (server/hub/_escalate.py)."""
+    if pool is None or not host:
+        return 0.0
+    async with pool.acquire() as conn:
+        async with conn.cursor() as cur:
+            await cur.execute(
+                "SELECT blocked_until FROM escalate_blocks WHERE host=%s",
+                (host,),
+            )
+            row = await cur.fetchone()
+    if not row or row[0] is None:
+        return 0.0
+    try:
+        return float(row[0])
+    except (TypeError, ValueError):
+        return 0.0
+
+
+async def note_escalate_outcome(
+    pool: Any,
+    host: str,
+    success: bool,
+    streak_max: int,
+    block_s: float,
+    now: float,
+) -> None:
+    """Record one auto-escalated codegen-loop outcome for ``host`` and maintain
+    the fleet-wide dead-letter block. A success resets the streak (and
+    unblocks); a failure increments it and, once it reaches ``streak_max``
+    consecutive failures, parks the host for ``block_s`` seconds. Best-effort:
+    a rare cross-hub read-modify-write race only mis-counts the streak by one,
+    harmless for an optimization."""
+    if pool is None or not host:
+        return
+    async with pool.acquire() as conn:
+        async with conn.cursor() as cur:
+            await cur.execute(
+                "SELECT fail_streak FROM escalate_blocks WHERE host=%s",
+                (host,),
+            )
+            row = await cur.fetchone()
+            cur_streak = int(row[0]) if row and row[0] is not None else 0
+            if success:
+                streak, blocked_until, outcome = 0, 0.0, "success"
+            else:
+                streak = cur_streak + 1
+                blocked_until = (now + block_s) if streak >= streak_max else 0.0
+                outcome = "fail"
+            await cur.execute(
+                """INSERT INTO escalate_blocks
+                       (host, fail_streak, blocked_until, last_outcome)
+                   VALUES (%s,%s,%s,%s)
+                   ON DUPLICATE KEY UPDATE
+                       fail_streak=VALUES(fail_streak),
+                       blocked_until=VALUES(blocked_until),
+                       last_outcome=VALUES(last_outcome),
+                       updated_at=CURRENT_TIMESTAMP(3)""",
+                (host, int(streak), float(blocked_until), outcome),
+            )
 
 
 async def upsert_host_row(pool: Any, rec: Any) -> None:
