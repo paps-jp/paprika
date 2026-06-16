@@ -1967,12 +1967,22 @@ async def _reconcile_worker_sessions(worker, snapshots: list) -> None:
             except Exception:
                 pass
 
-    # Pass 3: in_flight reconcile. Count = lanes the worker is
-    # holding (snapshot length, since each snapshot has a lane_idx).
-    # Scheduler picks workers by in_flight < capacity, so this stops
-    # the over-dispatch failure mode after hub restarts.
+    # Pass 3: in_flight + committed_jobs reconcile. Count = lanes the worker
+    # is holding (snapshot length, since each snapshot has a lane_idx).
+    # Seeds the hub-side ``committed_jobs`` set from each snapshot's
+    # ``job_id`` (where present) so the scheduler picks correctly after a
+    # hub restart -- pre-fix, an empty ``committed_jobs`` would let
+    # pick_worker treat a still-running worker as idle and over-dispatch.
+    # Flipping ``awaiting_announce`` here is the only place pick_worker is
+    # allowed to consider this worker; until reconcile fills committed_jobs
+    # the worker is invisible to the scheduler (small <1s window between
+    # WS handshake and announce).
     try:
         worker.in_flight = len(snapshots)
+        worker.committed_jobs = {
+            s.job_id for s in snapshots if getattr(s, "job_id", None)
+        }
+        worker.awaiting_announce = False
     except Exception:
         pass
 
@@ -2060,6 +2070,16 @@ async def _handle_worker_message(worker, msg) -> None:
         return
 
     if isinstance(msg, WorkerJobAccepted):
+        # Move pending -> committed: the worker is now running this job, so it
+        # stops being a "pending dispatch" and becomes a "live commitment".
+        # Both contribute to pick_worker's effective load, so this transition
+        # is invisible to the scheduler -- it just stabilises the load against
+        # heartbeat resets that would otherwise let a second picker slip in.
+        try:
+            worker.pending_assigns.discard(msg.job_id)
+            worker.committed_jobs.add(msg.job_id)
+        except Exception:
+            pass
         try:
             jid_short = (msg.job_id or "")[:8]
             lane = msg.lane_idx if msg.lane_idx is not None else "?"
@@ -2459,7 +2479,63 @@ async def _handle_worker_message(worker, msg) -> None:
             unregister_codegen_loop(msg.job_id)
         except Exception:
             pass
+        # NO-FREE-LANE recovery (Case C, 2026-06-15 incident): when the worker
+        # rejects an assign because its lane_pool was full, that's NOT a real
+        # job failure -- the URL never ran. Marking the job failed throws away
+        # work that any other worker (or the same one after a stuck lane is
+        # released) would handle fine. Instead: drop the row back to
+        # ``queued`` so redrive re-dispatches it onto a different worker, and
+        # drain THIS worker for a few minutes so it stops attracting more
+        # assigns until either a real lane releases or operator intervenes.
+        # The drain auto-clears after PAPRIKA_NO_FREE_LANE_DRAIN_S (default
+        # 900 s = 15 min); recurring failures on the same worker re-arm it.
+        # All other WorkerJobFailed errors keep their original "mark failed"
+        # semantics so a real bad URL doesn't bounce around the fleet.
+        _err_lc = (msg.error or "").lower()
+        _is_no_free_lane = (
+            "no free lane in pool" in _err_lc
+            or "no free lane (lane_hint=" in _err_lc
+        )
         info = await state.store.get_job_info(msg.job_id)
+        if _is_no_free_lane and info is not None and info.status in (
+            JobStatus.queued, JobStatus.running,
+        ):
+            try:
+                _drain_s = float(os.environ.get(
+                    "PAPRIKA_NO_FREE_LANE_DRAIN_S",
+                ) or 900.0)
+            except Exception:
+                _drain_s = 900.0
+            try:
+                worker.status = "drain"
+                worker.drain_until = time.monotonic() + max(60.0, _drain_s)
+            except Exception:
+                pass
+            log.info(
+                "no-free-lane recovery: worker %s drained for %.0fs; "
+                "re-queueing job %s (status was %s)",
+                worker.worker_id, _drain_s, msg.job_id, info.status,
+            )
+            try:
+                state.registry.log_event(
+                    worker.worker_id,
+                    f"[{jid_short}] no-free-lane: drained for {int(_drain_s)}s, job re-queued",
+                    kind="warn",
+                )
+            except Exception:
+                pass
+            info.status = JobStatus.queued
+            info.worker_id = None
+            info.started_at = None
+            if info.progress is not None:
+                info.progress.phase = "queued"
+            try:
+                await state.store.save_job_info(info)
+            except Exception:
+                pass
+            state.registry.release(worker.worker_id, msg.job_id)
+            _drop_fetch_session_if_any(info)
+            return
         if info is not None:
             info.status = JobStatus.failed
             info.progress.phase = "failed"

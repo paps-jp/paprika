@@ -435,6 +435,15 @@ async def generate_perception(
             type(e).__name__,
             e,
         )
+        try:
+            from server.hub._ai_io_log import record_ai_io
+            record_ai_io(purpose="perception",
+                         engine_slug=getattr(tgt, "engine_slug", "") or tgt.model,
+                         job_id=job_id, prompt="(perception brief)",
+                         response=None,
+                         latency_ms=int((time.time()-t0)*1000),
+                         error=f"{type(e).__name__}: {e}")
+        except Exception: pass
         return None
     elapsed_ms = int((time.time() - t0) * 1000)
 
@@ -445,6 +454,16 @@ async def generate_perception(
         return None
     msg = choices[0].get("message") or {}
     raw = msg.get("content") or ""
+    try:
+        from server.hub._ai_io_log import record_ai_io
+        _u = payload.get("usage") or {}
+        record_ai_io(purpose="perception",
+                     engine_slug=getattr(tgt, "engine_slug", "") or tgt.model,
+                     job_id=job_id, prompt="(perception brief)",
+                     response=raw, latency_ms=elapsed_ms,
+                     tokens_in=_u.get("prompt_tokens"),
+                     tokens_out=_u.get("completion_tokens"))
+    except Exception: pass
     if not raw.strip():
         _log.info("[perception] LLM returned empty content")
         return None

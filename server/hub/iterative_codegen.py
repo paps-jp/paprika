@@ -854,6 +854,7 @@ async def run_iterative_codegen(
             start_url=start_url,
             target=llm_target,
             preflight_block=preflight_block,
+            job_id=job_id,
         )
     except Exception as e:
         _log(f"planner: call raised {type(e).__name__}: {e} -- skipping")
@@ -981,6 +982,7 @@ async def run_iterative_codegen(
                 system_addendum=convention_addendum,
                 target=llm_target,
                 download_video=download_video,
+                job_id=job_id,
             )
             code = cg.get("code") or ""
             raw = cg.get("raw") or ""
@@ -1458,6 +1460,7 @@ async def run_iterative_codegen(
                     target_pages=target,
                     target=llm_target,
                     blind=_blind_judge,
+                    job_id=job_id,
                 )
 
             # Reasoning judge (shadow / primary mode).
@@ -1581,6 +1584,7 @@ async def run_iterative_codegen(
                             script=code or "",
                             target=reasoning_target,
                             blind=_blind_judge,
+                            job_id=job_id,
                         )
 
                     # Persist reasoning verdict for offline comparison.

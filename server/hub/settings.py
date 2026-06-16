@@ -221,6 +221,12 @@ _SCHEMA: dict[str, tuple[Any, str]] = {
     # recover). See server/hub/_page_role.py. Default OFF so operators can opt
     # in after the role tables warm up. Detected-video fetches always bypass.
     "escalate_page_role_gate": (False, "bool"),
+    # AI I/O log: per-LLM-call (purpose, engine, prompt, response, latency)
+    # capture for observing the whole loop end-to-end. Persisted to MariaDB
+    # ai_io_log + per-day JSONL + MinIO offload for long content. Default ON
+    # so the operator can see the loop without flipping a switch first; flip
+    # OFF if cost / privacy becomes a concern. See server/hub/_ai_io_log.py.
+    "ai_io_log_enabled": (True, "bool"),
     # Nightly review subagent: runs once per day at the configured UTC hour,
     # picks hosts with notable failure/review activity in the last 24h, and
     # writes a fresh per-host strategy digest into host_strategy via the
@@ -347,6 +353,7 @@ def _env_default(key: str, fallback: Any) -> Any:
         "reasoning_distiller_mode": ("PAPRIKA_REASONING_DISTILLER_MODE", "str"),
         "reasoning_distiller_engine": ("PAPRIKA_REASONING_DISTILLER_ENGINE", "str"),
         "escalate_page_role_gate": ("PAPRIKA_ESCALATE_PAGE_ROLE_GATE", "bool"),
+        "ai_io_log_enabled": ("PAPRIKA_AI_IO_LOG_ENABLED", "bool"),
         # MariaDB: settings.json -> env vars -> static default.
         "mariadb_host": ("PAPRIKA_MARIADB_HOST", "str"),
         "mariadb_port": ("PAPRIKA_MARIADB_PORT", "int"),

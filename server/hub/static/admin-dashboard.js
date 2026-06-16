@@ -208,6 +208,10 @@ async function refresh() {
     const workers = ov.workers || { count: 0, workers: [] };
     const sessions = ov.sessions || { count: 0, sessions: [] };
     let jobs = ov.jobs || { total: 0 };
+    // Set true below when the /jobs page that just resolved is for a view the
+    // operator already navigated away from (stale) -- gates the table render
+    // so a late response can't clobber the current sub-tab's rows.
+    let _jobsPageStale = false;
     if (jobsTabActive) {
       // "最近のジョブ" = Recent Jobs. Server-side filter + pagination so
       // each status sub-tab can show ALL matching jobs (not just the
@@ -218,7 +222,9 @@ async function refresh() {
       // when the store had thousands of completed / failed jobs.
       const _f = _jobsStatusFilter || 'all';
       const _ps = _jobsPageSize();
-      const _off = (_jobsPage || 0) * _ps;
+      const _reqPage = _jobsPage || 0;
+      const _off = _reqPage * _ps;
+      const _mySeq = ++_jobsReqSeq;
       let _q = `?limit=${_ps}&offset=${_off}`;
       if (_f === 'running') {
         // "実行中" tab folds queued + running so the operator sees both
@@ -244,6 +250,16 @@ async function refresh() {
       // counted as a load, so a slow/wedged hub keeps showing "Loading…"
       // instead of flashing "no jobs yet".
       if (jobs && !jobs.__fetchFailed) _jobsEverLoaded = true;
+      // Race guard: drop this page if the operator switched sub-tab / page /
+      // page-size while it was in flight, or a newer page already rendered.
+      // No await runs between here and the synchronous table render below, so
+      // claiming _jobsAppliedSeq now is atomic w.r.t. other refresh() ticks.
+      _jobsPageStale =
+           ((_jobsStatusFilter || 'all') !== _f)
+        || ((_jobsPage || 0) !== _reqPage)
+        || (_jobsPageSize() !== _ps)
+        || (_mySeq < _jobsAppliedSeq);
+      if (!_jobsPageStale) _jobsAppliedSeq = _mySeq;
       if (summaryRes && summaryRes.by_status) {
         const _bs = summaryRes.by_status;
         const _setCnt = (id, n) => {
@@ -531,6 +547,15 @@ async function refresh() {
     syncScreenshotBusyState(jobList, sessions.sessions || []);
     sortScreenshotGrid();
 
+    // Out-of-order guard (race fix): a /jobs page that resolved for a view the
+    // operator already left must NOT repaint the table the current sub-tab
+    // shows -- that's the "成功タブに failed が出る" bug. Skip the whole
+    // jobs-table + pager render this tick; the in-flight request for the
+    // CURRENT view paints it. (Non-jobs tabs never set _jobsPageStale.)
+    if (jobsTabActive && _jobsPageStale) {
+      // leave the jobs table + pager exactly as they are this tick
+    } else {
+
     // jobs table -- skip rebuild while a row's actions menu is open,
     // otherwise the 2-second refresh would tear it down underneath the
     // user. Counts in the tab header still tick.
@@ -725,6 +750,7 @@ async function refresh() {
       const _jt = document.getElementById('jobsTable');
       if (_jt) _jt.classList.remove('jobs-refreshing');
     }
+    } // end out-of-order guard else
   } catch (e) {
     document.getElementById('status').textContent = 'error: ' + e.message;
   }
@@ -762,6 +788,16 @@ let _jobsEverLoaded = false;
 // like the tab wasn't loading).
 const JOBS_STATUS_FILTER_KEY = 'paprika.jobs.statusFilter';
 let _jobsStatusFilter = 'all';
+// Out-of-order response guard for the /jobs page fetch. refresh() runs both
+// on the 2s poll AND synchronously on every sub-tab click, so several
+// /jobs?status=… requests can be in flight at once. Under load they resolve
+// OUT OF ORDER -- a slow status=failed page (エラー tab) can land AFTER the
+// status=completed page (成功 tab), repainting the 成功 table with failed
+// rows. Each request stamps a monotonic seq; only the newest-applied wins,
+// and a response whose (filter/page/size) no longer matches the live view is
+// dropped. (Bug: "成功タブに failed が出る".)
+let _jobsReqSeq = 0;       // ++ per /jobs page request issued
+let _jobsAppliedSeq = -1;  // seq of the most recently applied (rendered) page
 // Status badge labels. Most statuses show their raw value; ``review`` shows
 // the friendlier 課題 (its CSS class stays `review`, see .badge.review).
 const _JOB_STATUS_LABEL = { review: '課題' };

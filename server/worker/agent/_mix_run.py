@@ -566,12 +566,32 @@ class _RunMixin:
                             )
                             for n, e in self._profile_cache.items()
                         ]
-                    # While draining (recycle), report the worker as full
-                    # so the hub stops assigning; real in-flight still drives
-                    # the exit check below.
-                    eff_in_flight = (
-                        self.max_concurrent if self._draining else self._in_flight
-                    )
+                    # While draining (recycle), report the worker as full so the
+                    # hub stops assigning; real in-flight still drives the exit
+                    # check below. Otherwise report the TRUE lane occupancy --
+                    # max(job-semaphore counter, busy lanes) -- NOT just
+                    # self._in_flight. Lanes are also held by operator-started
+                    # sessions (HubSessionStart = noVNC / recorder), which
+                    # acquire a lane WITHOUT bumping self._in_flight (and by any
+                    # leaked busy lane). Reporting only _in_flight let the hub's
+                    # pick_worker see those lanes as free and over-dispatch -- the
+                    # worker then couldn't acquire a lane -> "no free lane in
+                    # pool" (job 663a3251f4af). max() keeps the brief pre-acquire
+                    # window safe: _in_flight is ++'d at the top of job exec,
+                    # before lane.acquire(), so during that sliver the job counter
+                    # is the higher (safe) number.
+                    if self._draining:
+                        eff_in_flight = self.max_concurrent
+                    else:
+                        eff_in_flight = self._in_flight
+                        if self.lane_pool is not None:
+                            try:
+                                eff_in_flight = max(
+                                    eff_in_flight,
+                                    int(self.lane_pool.stats().get("busy", 0)),
+                                )
+                            except Exception:
+                                pass
                     # Snapshot CT/host resources for the admin Workers list
                     # + the hub-side disk-pressure dispatch gate (pick_worker
                     # skips workers with disk_pct > 90). Stamp onto the

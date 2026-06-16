@@ -2346,6 +2346,7 @@ curl 'http://paprika.lan/extensions/ublock-lite/download' --output ublock-lite.t
       <button type="button" class="ai-subtab" data-ai-subtab="conventions" role="tab" aria-selected="false"><iconify-icon icon="lucide:scroll-text"></iconify-icon> <span data-i18n="ai.subtab.conventions">作法</span> <span class="count" id="cntConventions">0</span></button>
       <button type="button" class="ai-subtab" data-ai-subtab="grooming" role="tab" aria-selected="false"><iconify-icon icon="lucide:brush-cleaning"></iconify-icon> <span data-i18n="ai.subtab.grooming">整理</span> <span class="count" id="cntGroom">0</span></button>
       <button type="button" class="ai-subtab" data-ai-subtab="oracle" role="tab" aria-selected="false"><iconify-icon icon="lucide:scan-eye"></iconify-icon> <span data-i18n="ai.subtab.oracle">オラクル</span> <span class="count" id="cntOracle">0</span></button>
+      <button type="button" class="ai-subtab" data-ai-subtab="aiio" role="tab" aria-selected="false" title="各 LLM 呼び出しの入出力ログ (planner/codegen/judge/skill 蒸留/conv 蒸留/r1 distiller/perception)"><iconify-icon icon="lucide:logs"></iconify-icon> <span data-i18n="ai.subtab.aiio">入出力</span> <span class="count" id="cntAiIo">0</span></button>
     </div>
     <div class="ai-subpane" data-ai-subpane="live">
   <section>
@@ -2559,6 +2560,96 @@ curl 'http://paprika.lan/extensions/ublock-lite/download' --output ublock-lite.t
       </table>
       <div class="ai-pager" id="pager-oracle"></div>
     </div>
+
+    <!-- AI I/O log sub-pane: per-LLM-call (purpose, engine, prompt, response,
+         latency) capture for end-to-end loop observation. Backed by
+         GET /ai/io (server/hub/routes/skills.py) reading from the MariaDB
+         ai_io_log table. Long prompts/responses inline-truncate at 32KB
+         (full body in MinIO ai_io/<sha1>.bin). Click a row to expand. -->
+    <div class="ai-subpane" data-ai-subpane="aiio" style="display:none;">
+      <section>
+        <h2 style="margin-top:0;"><iconify-icon icon="lucide:logs"></iconify-icon>
+          <span data-i18n="ai.subtab.aiio">AI 入出力ログ</span>
+          <span style="font-size:0.68em; color:#888; font-weight:normal; margin-left:8px;">
+            各 LLM 呼び出しの (用途 / engine / prompt / response / latency) — ループ全体の観察用 (10秒ごと更新)
+          </span>
+        </h2>
+        <div style="display:flex; align-items:center; gap:10px; margin:6px 0 10px; flex-wrap:wrap; font-size:.88em;">
+          <label style="display:flex; align-items:center; gap:4px;">
+            用途:
+            <select id="aiIoPurpose" style="padding:3px 6px;">
+              <option value="">すべて</option>
+              <option value="planner">planner</option>
+              <option value="skill_retrieval">skill_retrieval</option>
+              <option value="codegen">codegen</option>
+              <option value="judge">judge</option>
+              <option value="skill_distill">skill_distill</option>
+              <option value="convention_distill">convention_distill</option>
+              <option value="reasoning_distill">reasoning_distill</option>
+              <option value="perception">perception</option>
+            </select>
+          </label>
+          <label style="display:flex; align-items:center; gap:4px;">
+            engine:
+            <input type="text" id="aiIoEngine" placeholder="例 deepseek-r1" style="padding:3px 6px; width:140px;">
+          </label>
+          <label style="display:flex; align-items:center; gap:4px;">
+            job_id:
+            <input type="text" id="aiIoJob" placeholder="job_id (空=全件)" style="padding:3px 6px; width:140px;">
+          </label>
+          <label style="display:flex; align-items:center; gap:4px;">
+            時間範囲:
+            <select id="aiIoSince" style="padding:3px 6px;">
+              <option value="600">過去 10分</option>
+              <option value="3600" selected>過去 1時間</option>
+              <option value="21600">過去 6時間</option>
+              <option value="86400">過去 24時間</option>
+            </select>
+          </label>
+          <label style="display:flex; align-items:center; gap:4px;">
+            <input type="checkbox" id="aiIoErrorsOnly"> エラーのみ
+          </label>
+          <button id="aiIoRefresh" class="pill" style="--la-bg:#f5f5fa; --la-bd:#bbc; --la-fg:#444; font-size:.82em;"><iconify-icon icon="lucide:refresh-cw"></iconify-icon> 再取得</button>
+          <span id="aiIoStatus" style="color:#888;"></span>
+        </div>
+        <div style="overflow:auto; max-height:calc(100vh - 380px);">
+          <table id="aiIoTable" style="width:100%; border-collapse:collapse; font-size:.86em;">
+            <thead style="position:sticky; top:0; background:#f5f5f5; z-index:1;">
+              <tr>
+                <th style="text-align:left; padding:6px 8px; border-bottom:1px solid #d0d0d0; white-space:nowrap;">時刻</th>
+                <th style="text-align:left; padding:6px 8px; border-bottom:1px solid #d0d0d0; white-space:nowrap;">用途</th>
+                <th style="text-align:left; padding:6px 8px; border-bottom:1px solid #d0d0d0; white-space:nowrap;">engine</th>
+                <th style="text-align:left; padding:6px 8px; border-bottom:1px solid #d0d0d0; white-space:nowrap;">job_id</th>
+                <th style="text-align:right; padding:6px 8px; border-bottom:1px solid #d0d0d0; white-space:nowrap;">latency</th>
+                <th style="text-align:right; padding:6px 8px; border-bottom:1px solid #d0d0d0; white-space:nowrap;">in/out</th>
+                <th style="text-align:left; padding:6px 8px; border-bottom:1px solid #d0d0d0;">プロンプト先頭</th>
+              </tr>
+            </thead>
+            <tbody><tr><td colspan="7" class="empty" style="padding:20px; text-align:center; color:#888;">loading…</td></tr></tbody>
+          </table>
+        </div>
+      </section>
+    </div>
+</div>
+
+<!-- AI I/O detail modal: full prompt + response of one ai_io_log row -->
+<div id="aiIoModal" style="display:none; position:fixed; inset:0; background:rgba(0,0,0,0.6); z-index:1102; align-items:center; justify-content:center; padding:20px;">
+  <div style="background:#fff; max-width:1100px; width:100%; max-height:92vh; border-radius:9px; overflow:hidden; display:flex; flex-direction:column;">
+    <div style="display:flex; align-items:center; gap:10px; padding:11px 15px; border-bottom:1px solid #eee; background:#fafafa;">
+      <iconify-icon icon="lucide:logs" style="color:#6a3ea6;"></iconify-icon>
+      <strong id="aiIoModalTitle" style="flex:1; min-width:0; overflow:hidden; text-overflow:ellipsis; white-space:nowrap;">AI I/O</strong>
+      <span id="aiIoModalMeta" style="font-size:.82em; color:#777; white-space:nowrap;"></span>
+      <button id="aiIoModalCopy" class="pill" style="--la-bg:#eef8ff; --la-bd:#9bf; --la-fg:#16608f; font-size:.82em;"><iconify-icon icon="lucide:copy"></iconify-icon> copy</button>
+      <button id="aiIoModalClose" style="background:transparent; border:none; cursor:pointer; font-size:1.3em; color:#666; padding:0 4px;" title="close">&#10005;</button>
+    </div>
+    <div style="overflow:auto; padding:14px 16px;">
+      <div style="font-weight:600; font-size:.86em; color:#444; margin:4px 0 4px;">プロンプト <span id="aiIoModalPLen" style="font-weight:normal; color:#999;"></span></div>
+      <pre id="aiIoModalPrompt" style="background:#f6f8fa; border:1px solid #eaecef; padding:10px 12px; border-radius:6px; white-space:pre-wrap; word-break:break-word; font-size:12.5px; line-height:1.5; max-height:38vh; overflow:auto; margin:0;"></pre>
+      <div style="font-weight:600; font-size:.86em; color:#444; margin:12px 0 4px;">レスポンス <span id="aiIoModalRLen" style="font-weight:normal; color:#999;"></span></div>
+      <pre id="aiIoModalResponse" style="background:#0d1117; color:#e6edf3; padding:12px 14px; border-radius:6px; overflow:auto; font-family:ui-monospace,Consolas,monospace; font-size:12.5px; line-height:1.55; white-space:pre-wrap; word-break:break-word; max-height:38vh; margin:0;"></pre>
+      <div id="aiIoModalError" style="font-size:.85em; color:#a23c2a; margin-top:10px; display:none;"></div>
+    </div>
+  </div>
 </div>
 
 <!-- HostKnowledge detail modal -->
