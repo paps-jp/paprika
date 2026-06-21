@@ -152,7 +152,8 @@
   details { margin-top: .5rem; font-size: .9rem; }
   details summary { cursor: pointer; color: #c0392b; }
   details > * { margin-right: 1rem; }
-  .url { font-family: ui-monospace, Consolas, monospace; font-size: .82rem; color: #555; max-width: 360px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; display: inline-block; vertical-align: middle; }
+  .url { font-family: ui-monospace, Consolas, monospace; font-size: .82rem; color: #555; vertical-align: middle; }
+  .url > a { display: inline-block; max-width: 360px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; vertical-align: middle; }
 
   /* --- pill button + dropdown menu --- */
   .pill {

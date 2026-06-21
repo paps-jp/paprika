@@ -320,6 +320,13 @@ class JobProgress(BaseModel):
     assets_saved: int = 0
     assets_failed: int = 0
     last_log: str | None = None
+    # Video-DL progress (persisted, throttled ~once per 5s by the worker).
+    # Lets the #jobs list show a slim progress bar AND the Live panel
+    # restore the bar on reopen mid-download (the ephemeral
+    # [[paprika:progress]] marker is broadcast-only and never replays).
+    download_pct: float | None = None
+    download_eta: str | None = None
+    download_speed: str | None = None
 
 
 class JobInfo(BaseModel):
@@ -571,6 +578,12 @@ class WorkerJobProgress(BaseModel):
     phase: str | None = None
     assets_saved: int = 0
     assets_failed: int = 0
+    # Video-DL persistent progress (mirrors JobProgress fields). Optional --
+    # only set on yt-dlp / parallel-hls ticks; phase-only updates leave them
+    # None (so the hub keeps the last known value).
+    download_pct: float | None = None
+    download_eta: str | None = None
+    download_speed: str | None = None
 
 
 class WorkerJobLog(BaseModel):

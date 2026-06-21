@@ -114,6 +114,19 @@ async def _host_lan_ip_via_redis(redis_client) -> str | None:
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
+    # Bypass docker's flaky embedded DNS (127.0.0.11) BEFORE the SSRF guard,
+    # boto3, or anything else attempts a hostname resolution. Sibling of the
+    # worker fix (server/worker/dns_fix.py). docker's embedded resolver
+    # intermittently HANGS on cold lookups for ~4-16s, tripping
+    # core/ssrf_guard.py:resolve_all -> "host X does not resolve to any
+    # address" 400 — surfaced as PaprikaError in codegen-loop sandbox stderr
+    # (job f8a9aa803021, 2026-06-17). No-op unless the container is on
+    # 127.0.0.11; disable with PAPRIKA_HUB_DNS=off, customise with =ip1,ip2.
+    try:
+        from server.hub import dns_fix
+        dns_fix.apply()
+    except Exception as e:
+        log.warning("dns_fix: init failed (continuing): %s", e)
     # Memoise ssl.create_default_context BEFORE anything creates an httpx
     # client: the hub's ~25 per-call AI/LLM clients each loaded the system CA
     # bundle on the event loop (a slow, GIL-releasing C call), stalling the
@@ -463,6 +476,15 @@ async def lifespan(app: FastAPI):
         from server.hub._reaper import _stale_job_reconciler_loop
 
         stale_reconcile_task = asyncio.create_task(_stale_job_reconciler_loop())
+
+        # Success Audit: periodically sample completed video-download jobs +
+        # ask a VisionAI whether the saved video is actually the page's main
+        # content. Settings-gated (default OFF). See _success_audit.py.
+        try:
+            from server.hub._success_audit import start_loop as _audit_start
+            _audit_start()
+        except Exception:
+            log.debug("success audit loop start failed", exc_info=True)
 
         # Queued-job redrive: place queued worker-dispatched jobs (fetch /
         # vision-agent) onto free lanes as they open up, instead of letting them

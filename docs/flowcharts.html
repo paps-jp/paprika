@@ -1,0 +1,198 @@
+---
+title: アーキテクチャ・フロー
+description: "Paprika の主要動線(ジョブ・セッション・ワーカー・Codegen ループ・アセット・マルチハブ・AI エスカレーション)を Mermaid で系統別にまとめたフローチャート集の入口。"
+active: architecture
+---
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+<meta charset="utf-8">
+<title>アーキテクチャ・フロー — Paprika の主要動線まとめ — Paprika</title>
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<link rel="stylesheet" href="style.css">
+{% include favicon.html %}
+<meta name="description" content="Paprika の主要動線(ジョブ・セッション・ワーカー・Codegen ループ・アセット・マルチハブ・AI エスカレーション)を Mermaid で系統別にまとめたフローチャート集の入口。">
+<link rel="canonical" href="https://paps-jp.github.io/paprika/flowcharts.html">
+<meta property="og:type" content="website">
+<meta property="og:site_name" content="Paprika">
+<meta property="og:title" content="アーキテクチャ・フロー — Paprika の主要動線まとめ">
+<meta property="og:description" content="Paprika の主要動線(ジョブ・セッション・ワーカー・Codegen ループ・アセット・マルチハブ・AI エスカレーション)を Mermaid で系統別にまとめたフローチャート集の入口。">
+<meta property="og:url" content="https://paps-jp.github.io/paprika/flowcharts.html">
+<meta property="og:image" content="https://paps-jp.github.io/paprika/icon.svg">
+<meta property="og:locale" content="ja_JP">
+<meta name="twitter:card" content="summary">
+<style>
+.mermaid{background:var(--bg-soft);border:1px solid var(--border-soft);border-radius:10px;padding:20px;margin:16px 0;overflow-x:auto;text-align:center}
+.mermaid svg{max-width:100%;height:auto}
+.flow-ref{font-family:ui-monospace,"SF Mono",Menlo,Consolas,monospace;color:var(--fg-muted,#6b7280);font-size:.82rem;display:block;margin:6px 0 14px}
+.flow-ref::before{content:"↪ ";opacity:.5}
+.flow-tag{display:inline-block;padding:2px 8px;border-radius:10px;font-size:.75rem;font-weight:500;vertical-align:middle;margin-right:4px}
+.flow-tag.fetch{background:#e7f1ff;color:#0969da}
+.flow-tag.codegen{background:#fff3d7;color:#9a6700}
+.flow-tag.session{background:#dafbe1;color:#1a7f37}
+.flow-tag.review{background:#ffebe9;color:#cf222e}
+[data-theme="dark"] .flow-tag.fetch{background:rgba(56,139,253,.15);color:#79c0ff}
+[data-theme="dark"] .flow-tag.codegen{background:rgba(187,128,9,.2);color:#e3b341}
+[data-theme="dark"] .flow-tag.session{background:rgba(63,185,80,.15);color:#7ee2a8}
+[data-theme="dark"] .flow-tag.review{background:rgba(248,81,73,.15);color:#ff7b72}
+</style>
+<script src="https://cdn.jsdelivr.net/npm/mermaid@10/dist/mermaid.min.js"></script>
+</head>
+<body>
+
+{% include header.html active="architecture" %}
+
+{% include breadcrumbs.html %}
+<div class="layout">
+  <aside class="sidebar">
+    <h4>フローチャート</h4>
+    <ul>
+      <li><a href="flowcharts.html" class="current">概要・トポロジー</a></li>
+      <li><a href="flow-job.html">01 Job Lifecycle</a></li>
+      <li><a href="flow-session.html">02 Session Lifecycle</a></li>
+      <li><a href="flow-worker.html">03 Worker Fleet</a></li>
+      <li><a href="flow-codegen.html">04 Codegen Loop</a></li>
+      <li><a href="flow-asset.html">05 Asset / Storage</a></li>
+      <li><a href="flow-multihub.html">06 Multi-Hub</a></li>
+      <li><a href="flow-ai-review.html">07 AI / 課題判定</a></li>
+    </ul>
+    <h4>このページ</h4>
+    <ul>
+      <li><a href="#topology">全体トポロジー</a></li>
+      <li><a href="#cards">各章への入口</a></li>
+      <li><a href="#legend">凡例</a></li>
+    </ul>
+  </aside>
+  <main id="main-content" class="content">
+
+<h1>アーキテクチャ・フロー</h1>
+<p class="lead">分散ブラウザフリート Paprika の主要動線(Hub / Worker / Session / Codegen ループ / アセット / マルチハブ / AI 連携)を、系統別の Mermaid 図でまとめた索引ページ。</p>
+
+<div class="tldr">
+  <span class="tldr-label">概要</span>
+  <ul>
+    <li><strong>3 つの永続層 + コーディネーション層</strong>: ジョブと設定は MariaDB、アセットは MinIO、ワーカー登録・セッション所有・設定 invalidate は Redis 経由。Hub のローカルディスクは bounded cache(=SoT ではない)。</li>
+    <li><strong>クライアントは round-robin / ワーカー WS は sticky</strong>: nginx が複数 Hub を均す一方、worker_id ハッシュで WS だけは一定 Hub に貼り付け、ハブ間の状態差をシンプルに保つ。</li>
+    <li><strong>動線は 7 系統に分割</strong>。各章は独立してジャンプ可能。コードファイルへの参照(<code>file_path:line</code>)を埋めてあるので、図と実装を対応付けて読める。</li>
+  </ul>
+</div>
+
+<h2 id="topology">全体トポロジー</h2>
+<div class="mermaid">
+flowchart LR
+  subgraph C["Clients"]
+    SDK["paprika-client SDK / CLI"]
+    UI["admin UI"]
+    EXT["外部 consumer<br/>(通知連携など)"]
+  end
+  subgraph E["Edge"]
+    NGX["nginx<br/>:8000 client / :8100 worker"]
+  end
+  subgraph H["Hub フリート"]
+    H1["hub-A"]
+    H2["hub-B"]
+    H3["hub-C"]
+  end
+  subgraph S["Coordination &amp; Storage"]
+    R["Redis<br/>registry / sessions / pub-sub"]
+    M["MariaDB<br/>jobs / configs / users"]
+    O["MinIO<br/>asset SoT"]
+  end
+  subgraph F["Worker fleet<br/>~60 LXC<br/>w50141..w50200"]
+    W1["w50141<br/>lane 0/1"]
+    W2["w50150"]
+    Wn["..."]
+  end
+  subgraph G["GPU 推論"]
+    G1["GPU host A<br/>(汎用 LLM)"]
+    G2["GPU host B<br/>(VL モデル a/b)"]
+  end
+  SDK & UI & EXT --> NGX
+  NGX --rr--> H1 & H2 & H3
+  H1 & H2 & H3 <--> R
+  H1 & H2 & H3 <--> M
+  H1 & H2 & H3 <--> O
+  H1 & H2 & H3 <-->|HubAssignJob / WorkerHeartbeat<br/>HubExpectedVersion| W1 & W2 & Wn
+  H1 & H2 & H3 -->|LLM 呼び出し| G1 & G2
+  W1 & W2 & Wn -.->|noVNC proxy| NGX
+</div>
+<div class="callout info"><strong>3 ストア分散</strong>: ジョブと設定行は <code>MariaDB</code>、アセット(HTML / PNG / MP4 / HAR)は <code>MinIO</code>、ワーカー登録・セッション所有・設定 invalidate は <code>Redis</code>。Hub のローカル <code>/data/jobs</code> は 180 秒で evict される <strong>bounded cache</strong>=どのハブから読んでも同じものが見える。</div>
+
+<h2 id="cards">各章への入口</h2>
+<div class="cards">
+  <a href="flow-job.html" class="card">
+    <span class="card-num">01</span>
+    <h3>Job Lifecycle</h3>
+    <p><code>POST /jobs</code> → 直接配信 / queue→再投入 → worker 実行 → <code>WorkerJobComplete</code> → 課題分類 → 永続化。<span class="flow-tag fetch">fetch</span><span class="flow-tag codegen">codegen</span></p>
+  </a>
+  <a href="flow-session.html" class="card">
+    <span class="card-num">02</span>
+    <h3>Session Lifecycle</h3>
+    <p>OPEN / noVNC RFB keepalive / cross-hub 転送 / 4 経路 CLOSE。<span class="flow-tag session">session</span></p>
+  </a>
+  <a href="flow-worker.html" class="card">
+    <span class="card-num">03</span>
+    <h3>Worker Fleet</h3>
+    <p>WS 接続 → IP 派生 worker_id → 登録 / version gate + 順次セルフアップデート / heartbeat / ghost 検知。</p>
+  </a>
+  <a href="flow-codegen.html" class="card">
+    <span class="card-num">04</span>
+    <h3>Codegen Loop</h3>
+    <p>plan → for n: generate → execute → 判定スタック(objective / LLM judge / reasoning) → retry / 終端。<span class="flow-tag codegen">codegen</span></p>
+  </a>
+  <a href="flow-asset.html" class="card">
+    <span class="card-num">05</span>
+    <h3>Asset / Storage</h3>
+    <p>worker upload → hub mirror + sidecar → MinIO SoT / 180s evict / DELETE 連動削除。</p>
+  </a>
+  <a href="flow-multihub.html" class="card">
+    <span class="card-num">06</span>
+    <h3>Multi-Hub</h3>
+    <p>nginx 振り分け / hub_id IP 派生 / 設定 invalidate / session 転送ミドルウェア / P2 再起動復元 / SoT デプロイ。</p>
+  </a>
+  <a href="flow-ai-review.html" class="card">
+    <span class="card-num">07</span>
+    <h3>AI / 課題判定</h3>
+    <p>fetch 完了 → 課題分類(占有率ベース) → escalation 決定 → perception → distiller → barrier→recipe。<span class="flow-tag review">review</span><span class="flow-tag codegen">codegen</span></p>
+  </a>
+</div>
+
+<h2 id="legend">凡例</h2>
+<table>
+<thead><tr><th>マーク</th><th>意味</th></tr></thead>
+<tbody>
+<tr><td><span class="flow-tag fetch">fetch</span></td><td>1 ショット fetch(<code>mode=fetch</code>)。worker が <code>FetchResult</code> を返したら完了する単純経路。</td></tr>
+<tr><td><span class="flow-tag codegen">codegen</span></td><td>plan → write → exec → judge → retry の AI ループ(<code>mode=codegen-loop</code> / <code>rerun</code>)。</td></tr>
+<tr><td><span class="flow-tag session">session</span></td><td>持続的なブラウザタブ。lane を保持し続け、noVNC で human view 可能。</td></tr>
+<tr><td><span class="flow-tag review">review</span></td><td>課題(全画面オーバーレイなどで結果が信用できない) — 第 3 の終端ステータス <code>JobStatus.review</code>。</td></tr>
+<tr><td><code>path/to/file.py:42</code></td><td>ソース参照。クリック先は無いので、リポジトリで開いて参照。</td></tr>
+</tbody>
+</table>
+
+<div class="callout"><strong>図の使い分け</strong> — <em>sequenceDiagram</em> は時系列メッセージ、<em>flowchart</em> は分岐(状態を持たない)、<em>stateDiagram</em> はステートマシン。系統に応じて選択。</div>
+
+<div class="footer">
+  Paprika &copy; 2026 <a href="https://www.paps.jp">paps-jp</a>
+</div>
+  </main>
+</div>
+{% include footer.html %}
+
+<script>
+(function(){
+  document.querySelectorAll('.mermaid').forEach(function(el){ el.dataset.source = el.textContent.trim(); });
+  function getTheme(){ return document.documentElement.dataset.theme === 'dark' ? 'dark' : 'neutral'; }
+  function initAndRun(){
+    mermaid.initialize({startOnLoad:false, theme:getTheme(), securityLevel:'loose'});
+    document.querySelectorAll('.mermaid').forEach(function(el){
+      if (el.dataset.source) { el.removeAttribute('data-processed'); el.innerHTML = el.dataset.source; }
+    });
+    mermaid.run();
+  }
+  if (document.readyState === 'loading') document.addEventListener('DOMContentLoaded', initAndRun);
+  else initAndRun();
+  new MutationObserver(initAndRun).observe(document.documentElement, {attributes:true, attributeFilter:['data-theme']});
+})();
+</script>
+</body>
+</html>

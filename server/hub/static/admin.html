@@ -1300,6 +1300,12 @@ asyncio.run(main())"
         <span data-i18n="jobs.tab.review">課題</span>
         <span class="count" id="jobsCntReview">0</span>
       </button>
+      <button type="button" class="ai-subtab" data-jobs-status="downloading" role="tab" aria-selected="false"
+        title="ワーカー上で yt-dlp が動画ダウンロード中のジョブのみを表示します (進捗バー付き)">
+        <iconify-icon icon="lucide:download" style="color:#4ea3ff;"></iconify-icon>
+        <span data-i18n="jobs.tab.downloading">動画DL中</span>
+        <span class="count" id="jobsCntDownloading">0</span>
+      </button>
     </div>
     <div class="jobs-subpane">
     <h2 style="margin-top:0;"><span data-i18n="tab.jobs">Recent jobs</span>
@@ -1314,7 +1320,7 @@ asyncio.run(main())"
     </h2>
     <table id="jobsTable"><thead>
       <tr><th data-col="id" data-i18n="jobs.th.id">id</th><th data-col="mode" data-i18n="jobs.th.mode">mode</th><th data-col="status" data-i18n="jobs.th.status">status</th><th data-col="url">URL</th><th data-col="role" title="URL 構造とホスト統計から推定したページ種別 (詳細 / 一覧 / カテゴリ / タグ / トップ / エラー / 不明)">種類</th><th data-col="worker" data-i18n="jobs.th.worker">worker/lane</th><th data-col="started" data-i18n="jobs.th.started">started</th><th data-col="ended" data-i18n="jobs.th.ended">ended</th><th data-col="duration" data-i18n="jobs.th.duration">duration</th><th data-col="actions" data-i18n="jobs.th.actions">actions</th></tr>
-    </thead><tbody><tr><td colspan=9 class="empty loading-row" data-i18n="jobs.loading">Loading…</td></tr></tbody></table>
+    </thead><tbody><tr><td colspan=10 class="empty loading-row" data-i18n="jobs.loading">Loading…</td></tr></tbody></table>
     <!-- Recent-jobs client-side pager. Rebuilt by admin.js after each
          refresh() tick so total / range / button-enabled state track
          the live data. Page size is operator-set via the select on
@@ -2366,6 +2372,7 @@ curl 'http://paprika.lan/extensions/ublock-lite/download' --output ublock-lite.t
       <button type="button" class="ai-subtab" data-ai-subtab="grooming" role="tab" aria-selected="false"><iconify-icon icon="lucide:brush-cleaning"></iconify-icon> <span data-i18n="ai.subtab.grooming">整理</span> <span class="count" id="cntGroom">0</span></button>
       <button type="button" class="ai-subtab" data-ai-subtab="oracle" role="tab" aria-selected="false"><iconify-icon icon="lucide:scan-eye"></iconify-icon> <span data-i18n="ai.subtab.oracle">オラクル</span> <span class="count" id="cntOracle">0</span></button>
       <button type="button" class="ai-subtab" data-ai-subtab="aiio" role="tab" aria-selected="false" title="各 LLM 呼び出しの入出力ログ (planner/codegen/judge/skill 蒸留/conv 蒸留/r1 distiller/perception)"><iconify-icon icon="lucide:logs"></iconify-icon> <span data-i18n="ai.subtab.aiio">入出力</span> <span class="count" id="cntAiIo">0</span></button>
+      <button type="button" class="ai-subtab" data-ai-subtab="audit" role="tab" aria-selected="false" title="VisionAI で完了ジョブをサンプリング監査 (本当に正しい動画を取れたか)"><iconify-icon icon="lucide:eye"></iconify-icon> <span data-i18n="ai.subtab.audit">成功監査</span> <span class="count" id="cntAudit">0</span></button>
     </div>
     <div class="ai-subpane" data-ai-subpane="live">
   <section>
@@ -2645,6 +2652,106 @@ curl 'http://paprika.lan/extensions/ublock-lite/download' --output ublock-lite.t
               </tr>
             </thead>
             <tbody><tr><td colspan="7" class="empty" style="padding:20px; text-align:center; color:#888;">loading…</td></tr></tbody>
+          </table>
+        </div>
+      </section>
+    </div>
+
+    <!-- Success Audit sub-pane: periodic VisionAI sampling of completed
+         video-download jobs to detect "objective-OK but actually wrong
+         video" (preview/ad/mismatched). Backed by GET /ai/audit-stats +
+         GET /ai/audit-recent (server/hub/routes/skills.py) reading from
+         the MariaDB audit_results table. Click a row to expand. -->
+    <div class="ai-subpane" data-ai-subpane="audit" style="display:none;">
+      <section>
+        <h2 style="margin-top:0;"><iconify-icon icon="lucide:eye"></iconify-icon>
+          <span data-i18n="ai.subtab.audit">成功監査</span>
+          <span style="font-size:0.68em; color:#888; font-weight:normal; margin-left:8px;">
+            完了ジョブを定期サンプリング → VisionAI で「本当に正しい動画?」を判定 (60s 更新)
+          </span>
+        </h2>
+        <!-- 4-quadrant KPI tiles: report vs reality -->
+        <div id="auditKpi" style="display:flex; gap:12px; margin:8px 0 14px; flex-wrap:wrap;">
+          <div style="flex:0 0 auto; padding:10px 16px; background:#fff; border:1px solid #d4cfca; border-radius:8px; min-width:130px;">
+            <div style="font-size:.78em; color:#888;">監査済み</div>
+            <div id="auditCntAudited" style="font-size:1.6em; font-weight:700; color:#16608f;">—</div>
+          </div>
+          <div style="flex:0 0 auto; padding:10px 16px; background:#fff; border:1px solid #7ab68a; border-radius:8px; min-width:130px;" title="報告も実態も成功">
+            <div style="font-size:.78em; color:#196b2c;">✓ 真の成功</div>
+            <div id="auditCntTrueOk" style="font-size:1.6em; font-weight:700; color:#196b2c;">—</div>
+          </div>
+          <div style="flex:0 0 auto; padding:10px 16px; background:#fff; border:1px solid #e0a99a; border-radius:8px; min-width:130px;" title="報告では成功だが実態は失敗 (誤った動画など)">
+            <div style="font-size:.78em; color:#a23c2a;">✗ 偽陽性</div>
+            <div id="auditCntFalsePos" style="font-size:1.6em; font-weight:700; color:#a23c2a;">—</div>
+          </div>
+          <div style="flex:0 0 auto; padding:10px 16px; background:#fff; border:1px solid #b07ac6; border-radius:8px; min-width:130px;" title="報告では失敗だが実態は成功 (隠れた成功)">
+            <div style="font-size:.78em; color:#6a3ea6;">🎯 偽陰性</div>
+            <div id="auditCntFalseNeg" style="font-size:1.6em; font-weight:700; color:#6a3ea6;">—</div>
+          </div>
+          <div style="flex:0 0 auto; padding:10px 16px; background:#fff; border:1px solid #888; border-radius:8px; min-width:130px;" title="報告も実態も失敗">
+            <div style="font-size:.78em; color:#444;">— 真の失敗</div>
+            <div id="auditCntTrueFail" style="font-size:1.6em; font-weight:700; color:#444;">—</div>
+          </div>
+          <div style="flex:0 0 auto; padding:10px 16px; background:#fff; border:1px solid #d4cfca; border-radius:8px; min-width:140px;" title="(真の成功 + 真の失敗) / 全判定 = 報告と実態が一致した率">
+            <div style="font-size:.78em; color:#888;">報告一致率</div>
+            <div id="auditAgreeRate" style="font-size:1.6em; font-weight:700; color:#3a5ca8;">—</div>
+          </div>
+          <div style="flex:0 0 auto; padding:10px 16px; background:#fff; border:1px solid #d4cfca; border-radius:8px; min-width:140px;" title="(真の成功 + 偽陰性) / 全判定 = 実態としての本当の成功率">
+            <div style="font-size:.78em; color:#888;">真の成功率</div>
+            <div id="auditTrueRate" style="font-size:1.6em; font-weight:700; color:#3a5ca8;">—</div>
+          </div>
+          <div style="flex:1 1 auto; padding:10px 16px; background:#fff; border:1px solid #d4cfca; border-radius:8px; min-width:240px;">
+            <div style="font-size:.78em; color:#888;">偽陽性 top ホスト (download_video 見直し候補)</div>
+            <div id="auditTopFpHosts" style="font-size:.85em; color:#a23c2a; max-height:54px; overflow:auto;">—</div>
+          </div>
+          <div style="flex:1 1 auto; padding:10px 16px; background:#fff; border:1px solid #d4cfca; border-radius:8px; min-width:240px;">
+            <div style="font-size:.78em; color:#888;">偽陰性 top ホスト (judge/escalation 見直し候補)</div>
+            <div id="auditTopFnHosts" style="font-size:.85em; color:#6a3ea6; max-height:54px; overflow:auto;">—</div>
+          </div>
+        </div>
+        <div style="display:flex; align-items:center; gap:10px; margin:8px 0; flex-wrap:wrap; font-size:.88em;">
+          <label style="display:flex; align-items:center; gap:4px;">
+            時間範囲:
+            <select id="auditSince" style="padding:3px 6px;">
+              <option value="3600">過去 1時間</option>
+              <option value="14400">過去 4時間</option>
+              <option value="86400" selected>過去 24時間</option>
+              <option value="604800">過去 7日</option>
+            </select>
+          </label>
+          <label style="display:flex; align-items:center; gap:4px;">
+            判定:
+            <select id="auditVerdictKind" style="padding:3px 6px;">
+              <option value="">すべて</option>
+              <option value="false_positive">偽陽性のみ</option>
+              <option value="false_negative">偽陰性のみ</option>
+              <option value="true_ok">真の成功のみ</option>
+              <option value="true_failure">真の失敗のみ</option>
+              <option value="unparsed">未判定のみ</option>
+            </select>
+          </label>
+          <label style="display:flex; align-items:center; gap:4px;" title="偽陽性 OR 偽陰性 (報告と実態の不一致)">
+            <input type="checkbox" id="auditFailsOnly"> 報告不一致のみ
+          </label>
+          <button id="auditRefresh" class="pill" style="--la-bg:#f5f5fa; --la-bd:#bbc; --la-fg:#444; font-size:.82em;"><iconify-icon icon="lucide:refresh-cw"></iconify-icon> 再取得</button>
+          <button id="auditRunNow" class="pill" style="--la-bg:#eef8ee; --la-bd:#7ab68a; --la-fg:#196b2c; font-size:.82em;" title="次の定期サンプリングを待たずに即時 1 パス実行"><iconify-icon icon="lucide:play"></iconify-icon> 即時実行</button>
+          <span id="auditStatus" style="color:#888;"></span>
+        </div>
+        <div style="overflow:auto; max-height:calc(100vh - 430px);">
+          <table id="auditTable" style="width:100%; border-collapse:collapse; font-size:.86em;">
+            <thead style="position:sticky; top:0; background:#f5f5f5; z-index:1;">
+              <tr>
+                <th style="text-align:left; padding:6px 8px; border-bottom:1px solid #d0d0d0; white-space:nowrap;">時刻</th>
+                <th style="text-align:left; padding:6px 8px; border-bottom:1px solid #d0d0d0; white-space:nowrap;">報告</th>
+                <th style="text-align:left; padding:6px 8px; border-bottom:1px solid #d0d0d0; white-space:nowrap;">実態</th>
+                <th style="text-align:right; padding:6px 8px; border-bottom:1px solid #d0d0d0; white-space:nowrap;">conf</th>
+                <th style="text-align:left; padding:6px 8px; border-bottom:1px solid #d0d0d0; white-space:nowrap;">job_id</th>
+                <th style="text-align:left; padding:6px 8px; border-bottom:1px solid #d0d0d0;">URL</th>
+                <th style="text-align:left; padding:6px 8px; border-bottom:1px solid #d0d0d0;">video</th>
+                <th style="text-align:left; padding:6px 8px; border-bottom:1px solid #d0d0d0;">理由</th>
+              </tr>
+            </thead>
+            <tbody><tr><td colspan="8" class="empty" style="padding:20px; text-align:center; color:#888;">loading…</td></tr></tbody>
           </table>
         </div>
       </section>

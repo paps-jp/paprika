@@ -1061,6 +1061,12 @@ def pick_stream_urls(urls: list[str]) -> list[str]:
     fMP4 segments whose signed URLs expire within seconds; by the time
     yt-dlp tries them they 404, and the .m3u8 yt-dlp call already covers
     the full stream.
+
+    NB: this is the SYNC entry point kept for backward-compatibility. The
+    async variant :func:`pick_stream_urls_async` additionally fetches each
+    m3u8 to detect master-playlist relationships and skip variant children
+    (= different bitrates / resolutions of the same content), avoiding the
+    "yt-dlp ran twice for the same video at 720p and 1080p" duplication.
     """
     hls = [u for u in urls if re.search(r"\.m3u8($|\?)", u, re.I)]
     dash = [u for u in urls if re.search(r"\.mpd($|\?)", u, re.I)]
@@ -1085,6 +1091,133 @@ def pick_stream_urls(urls: list[str]) -> list[str]:
             if (urlparse(u).hostname or "") not in hls_hosts
         ]
     return list(dict.fromkeys(hls + dash + direct))
+
+
+# Regex over an m3u8's first few KB. A master playlist (Multivariant Playlist
+# per RFC 8216) declares its variants with ``#EXT-X-STREAM-INF:`` lines, each
+# immediately followed by the variant's URI on the next non-comment line. A
+# media playlist (the actual segment list a single variant points at) instead
+# contains ``#EXTINF:`` segment-duration tags. We classify by the FIRST
+# tag we see.
+_HLS_STREAM_INF_RE = re.compile(
+    r"^#EXT-X-STREAM-INF:[^\n]*\n([^\s#][^\n]*)", re.M
+)
+_HLS_EXTINF_RE = re.compile(r"^#EXTINF:", re.M)
+
+
+async def _peek_m3u8(url: str, client) -> str:
+    """Fetch the first ~4KB of an m3u8 URL. Used by
+    :func:`_detect_hls_variant_children` to classify master vs media playlist.
+    Returns the text body (best-effort -- any error => empty string).
+
+    4KB easily covers up to ~30 variants in a typical master playlist; we
+    cap with ``Range`` to keep the probe cheap even when the actual playlist
+    is much larger (a long-form HLS media playlist can be 50KB+).
+    """
+    try:
+        # Don't follow redirects manually; httpx follow_redirects=True is the
+        # caller's responsibility.
+        resp = await client.get(
+            url,
+            headers={"Range": "bytes=0-4095"},
+            timeout=10.0,
+        )
+        # Range may be honoured (206) or ignored (200); both fine.
+        return resp.text or ""
+    except Exception:
+        return ""
+
+
+async def _detect_hls_variant_children(
+    hls_urls: list[str], client,
+) -> set[str]:
+    """Return the subset of ``hls_urls`` that are variant CHILDREN of another
+    URL in the same list (= a master playlist).
+
+    A master playlist whose variants are also captured by the network sniffer
+    triggers redundant downloads in the current code path: paprika feeds
+    EACH captured ``.m3u8`` to yt-dlp separately, even when they're the same
+    video at different bitrates. By peeking each m3u8 and reading its
+    ``#EXT-X-STREAM-INF`` lines, we can mark the variant URIs as "yt-dlp
+    will already get these via the master" and drop them from the dispatch
+    list. yt-dlp's native variant selection picks the best quality from the
+    master, so the operator still gets the highest-resolution download.
+
+    Best-effort: any HTTP / parse failure for a given URL is silently
+    treated as "not a master", so the caller falls back to the existing
+    no-dedup behavior (= still works, just emits the dup downloads).
+    """
+    from urllib.parse import urljoin
+
+    # Parallel peek with a per-fetch 10s timeout. ``return_exceptions=True``
+    # so one stuck CDN can't drop the whole detection.
+    peeks = await asyncio.gather(
+        *(_peek_m3u8(u, client) for u in hls_urls),
+        return_exceptions=True,
+    )
+    bodies: dict[str, str] = {}
+    for u, body in zip(hls_urls, peeks):
+        if isinstance(body, str):
+            bodies[u] = body
+        else:
+            bodies[u] = ""
+
+    # Canonical form for matching: strip query string so a master's variant
+    # URI matches a captured URL that picked up a cache-bust ``?t=NNN``.
+    def _canon(u: str) -> str:
+        return u.split("?", 1)[0]
+
+    captured_canon = {_canon(u): u for u in hls_urls}
+    children: set[str] = set()
+    for master_url, body in bodies.items():
+        if not body:
+            continue
+        # Classify: must have at least one #EXT-X-STREAM-INF (master marker).
+        # We deliberately tolerate also seeing #EXTINF later (some playlist
+        # tools generate hybrids), but a body with ONLY #EXTINF is a media
+        # playlist and we leave it alone.
+        m_iter = list(_HLS_STREAM_INF_RE.finditer(body))
+        if not m_iter:
+            continue
+        # For each variant URI under #EXT-X-STREAM-INF, resolve relative to
+        # the master URL and check whether it's in our captured set.
+        for m in m_iter:
+            variant_uri = m.group(1).strip()
+            if not variant_uri:
+                continue
+            absolute = urljoin(master_url, variant_uri)
+            target = captured_canon.get(_canon(absolute))
+            if target and target != master_url:
+                children.add(target)
+    return children
+
+
+async def pick_stream_urls_async(urls: list[str], client=None) -> list[str]:
+    """Async variant of :func:`pick_stream_urls` that ALSO dedups HLS
+    variants. Drops captured m3u8 URLs that are children of a captured
+    master playlist (same video at lower bitrate) so yt-dlp is invoked
+    ONCE per logical video instead of once per quality.
+
+    Passes ``client`` (an httpx.AsyncClient) for the master-detection
+    fetches. If ``client`` is None, behaves identically to the sync version
+    (no dedup, safe fallback). The first-stage host-level segment filter
+    from the sync version is preserved.
+    """
+    base = pick_stream_urls(urls)
+    if client is None:
+        return base
+    # Only m3u8 URLs are relevant for master detection. Anything else
+    # (DASH, direct mp4) passes through unchanged.
+    hls = [u for u in base if re.search(r"\.m3u8($|\?)", u, re.I)]
+    if len(hls) < 2:
+        return base
+    try:
+        children = await _detect_hls_variant_children(hls, client)
+    except Exception:
+        return base
+    if not children:
+        return base
+    return [u for u in base if u not in children]
 
 
 # ----------------------------------------------------------------------------
@@ -1192,10 +1325,51 @@ def _unique_path(directory: Path, name: str) -> Path:
         i += 1
 
 
+# File extensions we trust as the actual content type so the gallery /
+# desktop file managers can render them. Anything NOT in this set is
+# treated as a non-extension suffix (e.g. xhamster's CDN serves URLs
+# like ``…/1280x720.c.jpg.v1699771613`` where ``.v1699771613`` is a
+# version tag, not an extension — without intervention the asset would
+# land on disk as ``…v1699771613`` and the gallery would skip it).
+_KNOWN_MEDIA_EXTS = frozenset({
+    # images
+    "jpg", "jpeg", "png", "gif", "webp", "avif", "bmp", "svg", "ico",
+    "tiff", "tif", "heic", "jfif",
+    # video
+    "mp4", "webm", "mov", "m4v", "mkv", "avi", "ts", "m3u8", "mpd", "flv", "ogv",
+    # audio
+    "mp3", "m4a", "ogg", "wav", "flac", "aac", "opus",
+    # docs / data
+    "pdf", "html", "htm", "json", "txt", "md", "xml", "csv",
+    # web assets
+    "css", "js", "mjs", "wasm", "woff", "woff2", "ttf", "eot", "otf",
+    # archives
+    "zip", "gz", "tar", "7z",
+})
+
+
 def _filename_from(url: str, mime: str, fallback: str) -> str:
     parsed = urlparse(url)
     name = Path(parsed.path).name or fallback
-    if "." not in name:
+    parts = name.split(".")
+    # 1. Already ends with a recognised media ext -> leave alone.
+    if len(parts) >= 2 and parts[-1].lower() in _KNOWN_MEDIA_EXTS:
+        pass
+    # 2. A recognised ext sits SOMEWHERE in the middle of the basename
+    #    (e.g. "1280x720.c.jpg.v1699771613" has ".jpg" buried before the
+    #    ".v1699771613" version tag). Move the LAST such ext to the end
+    #    so file managers / the gallery treat the asset as that media
+    #    type. Preserves original casing of the moved segment.
+    elif len(parts) >= 3 and any(p.lower() in _KNOWN_MEDIA_EXTS for p in parts[:-1]):
+        for i in range(len(parts) - 2, -1, -1):
+            if parts[i].lower() in _KNOWN_MEDIA_EXTS:
+                ext = parts.pop(i)
+                parts.append(ext)
+                break
+        name = ".".join(parts)
+    # 3. No recognised ext anywhere -> derive one from MIME (legacy
+    #    behaviour, unchanged for the unnamed-blob case).
+    elif "." not in name:
         ext = mime.split(";")[0].split("/")[-1] or "bin"
         name = f"{name}.{ext}"
     name = re.sub(r'[<>:"/\\|?*]', "_", name)
@@ -3037,7 +3211,31 @@ async def fetch(opts: FetchOptions) -> FetchResult:
                     ):
                         add_target(src, url, "iframe-generic")
 
-            for s in pick_stream_urls(result.video_urls_seen):
+            # HLS master/variant dedup: when two captured m3u8 URLs are
+            # actually the same video at different bitrates (a master and one
+            # of its variants both surfaced through the network sniffer), feed
+            # ONLY the master to yt-dlp. yt-dlp picks the best variant itself.
+            # ``make_async_client`` honours the same proxy / TLS / DNS knobs
+            # the rest of the worker uses; the peek is HEAD-like (Range 0-4095)
+            # and best-effort, so a stuck CDN can't block fetch completion.
+            _dedup_targets: list[str]
+            try:
+                from core.httpclient import make_async_client as _mac
+                # 10s overall (connect + read) per peek; the inner gather()
+                # parallelises so total wall time stays bounded by the slowest
+                # single response, not the sum.
+                async with _mac(
+                    timeout=10.0,
+                    follow_redirects=True,
+                ) as _peek_client:
+                    _dedup_targets = await pick_stream_urls_async(
+                        result.video_urls_seen, _peek_client,
+                    )
+            except Exception:
+                # Fallback to sync path on any setup error -- no dedup but no
+                # functional regression either.
+                _dedup_targets = pick_stream_urls(result.video_urls_seen)
+            for s in _dedup_targets:
                 add_target(s, url, "network-stream")
 
             if ytdlp_targets and opts.defer_video_download:

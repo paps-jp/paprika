@@ -234,6 +234,12 @@ async function refresh() {
         // pre-dispatch and in-flight jobs together. Server accepts a
         // comma-separated status list.
         _q += '&status=running,queued';
+      } else if (_f === 'downloading') {
+        // "動画DL中" tab: server filters running jobs to those with an
+        // active video download (JobInfo.progress.download_pct set + <100).
+        // No status= param needed -- the server forces status=running when
+        // downloading=1 is set.
+        _q += '&downloading=1';
       } else if (_f !== 'all') {
         _q += '&status=' + encodeURIComponent(_f);
       }
@@ -278,6 +284,10 @@ async function refresh() {
         // 課題(review): completed-but-content-blocked (full-screen auth/modal
         // wall). A distinct terminal status, so it's NOT folded into 成功.
         _setCnt('jobsCntReview',  _bs.review ?? 0);
+        // 動画DL中: virtual sub-status synthesised by /jobs/summary from the
+        // running set's JobInfo.progress.download_pct field. NOT a real
+        // JobStatus -- pure UI badge for the matching sub-tab.
+        _setCnt('jobsCntDownloading', _bs.downloading ?? 0);
       }
     }
     const wcount = workers.count || 0;
@@ -572,7 +582,17 @@ async function refresh() {
     // ``jobList`` is now a single server-paginated page (e.g. 20 rows)
     // for the current filter, not the unfiltered ~300 the old path
     // fetched. Sort defensively in case the store returns out of order.
-    const sortedAll = [...jobList].sort((a,b) => (b.created_at || '').localeCompare(a.created_at || ''));
+    // Tiebreak on job_id (DESC) so DATETIME(3) ms ties don't shuffle on
+    // each reload — matches the MariaDB-side ``ORDER BY created_at DESC,
+    // job_id DESC`` in list_job_infos. Without this, ms-bursts (e.g. .23
+    // import storms) or multi-hub cache mismatch (each hub caches its own
+    // 1.5s snapshot) make the same job hop between adjacent rows every
+    // poll tick — the "リストがずれる" complaint.
+    const sortedAll = [...jobList].sort((a,b) => {
+      const ca = (b.created_at || '').localeCompare(a.created_at || '');
+      if (ca) return ca;
+      return (b.job_id || '').localeCompare(a.job_id || '');
+    });
     // Sub-tab counters are now populated by the /jobs/counts call
     // above (all 4 in one round-trip). Just resolve _filter so the
     // visSig downstream can include it; no per-tab update needed here.
@@ -669,7 +689,7 @@ async function refresh() {
       } else {
         const want = _emptyKey('__empty__');
         if (_jobsLastSig !== want) {
-          jtbody.innerHTML = '<tr><td colspan=11 class="empty" data-i18n="jobs.empty">'
+          jtbody.innerHTML = '<tr><td colspan=10 class="empty" data-i18n="jobs.empty">'
             + _tr('jobs.empty', 'no jobs yet') + '</td></tr>';
           _jobsLastSig = want;
           didStructuralUpdate = true;
@@ -738,7 +758,14 @@ async function refresh() {
         <tr data-job-id="${jid}">
           <td data-col="id"><code>${esc(j.job_id.substring(0,10))}</code></td>
           <td data-col="mode"><span class="badge">${modeLabel}</span></td>
-          <td data-col="status"><span class="badge ${esc(j.status)}"${j.status === 'review' ? ` title="${esc((j.progress && j.progress.last_log) || '課題: ログイン/年齢確認/同意などの全面オーバーレイでコンテンツが取得できていない可能性')}"` : ''}>${esc(_JOB_STATUS_LABEL[j.status] || j.status)}</span>${j.status === 'review' ? `<button class="pill" style="margin-left:6px; padding:1px 8px; font-size:.78em; --la-bg:#fff3f0; --la-bd:#e0a99a; --la-fg:#a23c2a;" onclick="excludeHostAndResolve('${jid}','${encodeURIComponent(j.url||'')}',this)" title="このサイト(host)を対象外に登録し、このジョブを課題から外して completed にします（cookie 保持）"><iconify-icon icon="lucide:ban"></iconify-icon> 対象外</button>` : ''}</td>
+          <td data-col="status"><span class="badge ${esc(j.status)}"${j.status === 'review' ? ` title="${esc((j.progress && j.progress.last_log) || '課題: ログイン/年齢確認/同意などの全面オーバーレイでコンテンツが取得できていない可能性')}"` : ''}>${esc(_JOB_STATUS_LABEL[j.status] || j.status)}</span>${j.status === 'review' ? `<button class="pill" style="margin-left:6px; padding:1px 8px; font-size:.78em; --la-bg:#fff3f0; --la-bd:#e0a99a; --la-fg:#a23c2a;" onclick="excludeHostAndResolve('${jid}','${encodeURIComponent(j.url||'')}',this)" title="このサイト(host)を対象外に登録し、このジョブを課題から外して completed にします（cookie 保持）"><iconify-icon icon="lucide:ban"></iconify-icon> 対象外</button>` : ''}${(() => {
+            const dp = j.progress && j.progress.download_pct;
+            if (typeof dp !== 'number' || j.status === 'completed' || j.status === 'failed' || j.status === 'cancelled' || j.status === 'review') return '';
+            const pct = Math.max(0, Math.min(100, dp));
+            const eta = (j.progress && j.progress.download_eta) ? ' · ETA ' + esc(j.progress.download_eta) : '';
+            const sp = (j.progress && j.progress.download_speed) ? ' · ' + esc(j.progress.download_speed) : '';
+            return `<div style="margin-top:3px; font-size:10px; color:#446; font-family:monospace;" title="動画ダウンロード進捗">${pct.toFixed(1)}%${sp}${eta}<div style="height:3px; background:#dde; border-radius:2px; margin-top:1px; overflow:hidden;"><div style="height:100%; width:${pct}%; background:#4ea3ff; transition:width .3s ease;"></div></div></div>`;
+          })()}</td>
           <td data-col="url" class="url" title="${esc(j.url)}"><a href="${esc(j.url)}" target="_blank">${esc(j.url)}</a></td>
           <td data-col="role">${_jobRoleBadge(j.page_role)}</td>
           <td data-col="worker">${j.worker_id ? `<code>${esc(j.worker_id)}</code>${canAttach ? ` <small>#${laneIdx}</small>` : ''}` : '<span class="empty">—</span>'}</td>
@@ -958,6 +985,7 @@ const JOB_COLS = [
   { key: 'mode',     i18n: 'jobs.th.mode',     fallback: 'mode' },
   { key: 'status',   i18n: 'jobs.th.status',   fallback: 'status' },
   { key: 'url',      i18n: null,               fallback: 'URL' },
+  { key: 'role',     i18n: null,               fallback: '種類' },
   { key: 'worker',   i18n: 'jobs.th.worker',   fallback: 'worker/lane' },
   { key: 'started',  i18n: 'jobs.th.started',  fallback: 'started' },
   { key: 'ended',    i18n: 'jobs.th.ended',    fallback: 'ended' },

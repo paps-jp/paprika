@@ -129,6 +129,21 @@ def _session_effective_mime(server_mime: str, url: str) -> str:
     return _SESSION_EXT_TO_MIME.get(ext, "")
 
 
+# Kept in sync with core.fetcher._KNOWN_MEDIA_EXTS — extensions we trust
+# as the asset's real content type. Anything else (e.g. a ".v1699771613"
+# version tag tail) gets rerouted by _session_filename so the gallery
+# can still render the file.
+_SESSION_KNOWN_MEDIA_EXTS = frozenset({
+    "jpg", "jpeg", "png", "gif", "webp", "avif", "bmp", "svg", "ico",
+    "tiff", "tif", "heic", "jfif",
+    "mp4", "webm", "mov", "m4v", "mkv", "avi", "ts", "m3u8", "mpd", "flv", "ogv",
+    "mp3", "m4a", "ogg", "wav", "flac", "aac", "opus",
+    "pdf", "html", "htm", "json", "txt", "md", "xml", "csv",
+    "css", "js", "mjs", "wasm", "woff", "woff2", "ttf", "eot", "otf",
+    "zip", "gz", "tar", "7z",
+})
+
+
 def _session_filename(url: str, mime: str, fallback: str) -> str:
     """Mirror of core.fetcher._filename_from -- mint a usable filename
     from the response URL + mime. Kept inline to avoid pulling fetch's
@@ -137,7 +152,22 @@ def _session_filename(url: str, mime: str, fallback: str) -> str:
 
     parsed = urlparse(url)
     name = Path(parsed.path).name or fallback
-    if "." not in name:
+    parts = name.split(".")
+    # 1. Already ends with a recognised media ext -> leave alone.
+    if len(parts) >= 2 and parts[-1].lower() in _SESSION_KNOWN_MEDIA_EXTS:
+        pass
+    # 2. A recognised ext sits SOMEWHERE in the middle -> move the last
+    #    such ext to the end so e.g. "1280x720.c.jpg.v1699771613"
+    #    becomes "1280x720.c.v1699771613.jpg".
+    elif len(parts) >= 3 and any(p.lower() in _SESSION_KNOWN_MEDIA_EXTS for p in parts[:-1]):
+        for i in range(len(parts) - 2, -1, -1):
+            if parts[i].lower() in _SESSION_KNOWN_MEDIA_EXTS:
+                ext = parts.pop(i)
+                parts.append(ext)
+                break
+        name = ".".join(parts)
+    # 3. No recognised ext anywhere -> derive from MIME (legacy fallback).
+    elif "." not in name:
         ext = (mime or "").split(";")[0].split("/")[-1] or "bin"
         name = f"{name}.{ext}"
     name = re.sub(r'[<>:"/\\|?*]', "_", name)

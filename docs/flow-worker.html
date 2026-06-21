@@ -1,0 +1,208 @@
+---
+title: Worker Fleet
+description: "Paprika のワーカーが Hub と接続する WebSocket ライフサイクル。IP 派生 worker_id、version gate、順次セルフアップデート、heartbeat、ghost 両側検知を Mermaid で。"
+active: architecture
+---
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+<meta charset="utf-8">
+<title>Worker Fleet — WS 接続・version gate・heartbeat・ghost 検知 — Paprika</title>
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<link rel="stylesheet" href="style.css">
+{% include favicon.html %}
+<meta name="description" content="Paprika のワーカーが Hub と接続する WebSocket ライフサイクル。IP 派生 worker_id、version gate、順次セルフアップデート、heartbeat、ghost 両側検知を Mermaid で。">
+<link rel="canonical" href="https://paps-jp.github.io/paprika/flow-worker.html">
+<meta property="og:type" content="website">
+<meta property="og:site_name" content="Paprika">
+<meta property="og:title" content="Worker Fleet — Paprika">
+<meta property="og:description" content="Paprika のワーカーが Hub と接続する WebSocket ライフサイクル。IP 派生 worker_id、version gate、順次セルフアップデート、heartbeat、ghost 両側検知を Mermaid で。">
+<meta property="og:url" content="https://paps-jp.github.io/paprika/flow-worker.html">
+<meta property="og:image" content="https://paps-jp.github.io/paprika/icon.svg">
+<meta property="og:locale" content="ja_JP">
+<meta name="twitter:card" content="summary">
+<style>
+.mermaid{background:var(--bg-soft);border:1px solid var(--border-soft);border-radius:10px;padding:20px;margin:16px 0;overflow-x:auto;text-align:center}
+.mermaid svg{max-width:100%;height:auto}
+.flow-ref{font-family:ui-monospace,"SF Mono",Menlo,Consolas,monospace;color:var(--fg-muted,#6b7280);font-size:.82rem;display:block;margin:6px 0 14px}
+.flow-ref::before{content:"↪ ";opacity:.5}
+</style>
+<script src="https://cdn.jsdelivr.net/npm/mermaid@10/dist/mermaid.min.js"></script>
+</head>
+<body>
+
+{% include header.html active="architecture" %}
+
+{% include breadcrumbs.html %}
+<div class="layout">
+  <aside class="sidebar">
+    <h4>フローチャート</h4>
+    <ul>
+      <li><a href="flowcharts.html">概要・トポロジー</a></li>
+      <li><a href="flow-job.html">01 Job Lifecycle</a></li>
+      <li><a href="flow-session.html">02 Session Lifecycle</a></li>
+      <li><a href="flow-worker.html" class="current">03 Worker Fleet</a></li>
+      <li><a href="flow-codegen.html">04 Codegen Loop</a></li>
+      <li><a href="flow-asset.html">05 Asset / Storage</a></li>
+      <li><a href="flow-multihub.html">06 Multi-Hub</a></li>
+      <li><a href="flow-ai-review.html">07 AI / 課題判定</a></li>
+    </ul>
+    <h4>このページ</h4>
+    <ul>
+      <li><a href="#connect">CONNECT + REGISTER</a></li>
+      <li><a href="#version">VERSION + self-update</a></li>
+      <li><a href="#heartbeat">HEARTBEAT</a></li>
+      <li><a href="#ghost">GHOST 検知</a></li>
+      <li><a href="#state">ライフサイクル全体図</a></li>
+    </ul>
+  </aside>
+  <main id="main-content" class="content">
+
+<h1>Worker Fleet</h1>
+<p class="lead">数十台のワーカーが WebSocket で Hub に接続。worker_id は LAN IP から決定論的に派生(<code>w50150</code>)。 version mismatch は Hub PUSH の <code>HubExpectedVersion</code> をきっかけに 順次セルフアップデート。 ghost(プロキシ WS 経由のゾンビ)は両側から検知。</p>
+
+<div class="tldr">
+  <span class="tldr-label">概要</span>
+  <ul>
+    <li><strong>worker_id は LAN IP から派生</strong>: <code>10.10.50.150</code> → <code>w50150</code>。self-update / 再起動 / id-file 喪失を跨いで安定。</li>
+    <li><strong>version gate は heartbeat 経由でゼロダウンタイム</strong>: Hub が <code>HubExpectedVersion</code> を毎 heartbeat で push。worker は 順次ドレイン → exit(42) で自己更新。Hub の再起動は不要。</li>
+    <li><strong>ghost 検知は両側に必要</strong>: 送信側からは ESTABLISHED に見える failure mode を、Hub 側回収プロセス + worker 側 inbound 沈黙 watchdog の両方で潰す。</li>
+  </ul>
+</div>
+
+<h2 id="connect">1. CONNECT + REGISTER</h2>
+<div class="mermaid">
+sequenceDiagram
+  participant W as Worker
+  participant N as nginx
+  participant H as Hub (routes/workers.py)
+  participant R as scheduler/registry
+  participant RD as Redis
+  W->>W: worker_id = w&lt;3rd&gt;&lt;4th&gt;<br/>(LAN IP の 3・4 オクテット)
+  W->>N: WS /workers/{worker_id}/link
+  N->>H: 転送<br/>(hash $worker_id consistent / sticky)
+  W->>H: WorkerRegister(worker_id, secret, caps, version)
+  H->>H: _ip_derived_worker_id(client_ip)
+  alt IP-derived != incoming
+    H->>W: 再割当 + close
+    Note over W: 新 ID で再接続
+  else 一致
+    H->>R: registry.register(worker)
+    R->>RD: zadd / hset / online flag<br/>(TTL 120s)
+    H->>W: HubRegistered(expected_worker_version)
+  end
+</div>
+<p class="flow-ref">server/hub/routes/workers.py:1485–1591 / server/scheduler.py:549–573</p>
+<div class="callout tip"><strong>stable worker_id</strong>: 例えば <code>10.10.50.150</code> なら常に <code>w50150</code>。LAN /16 衝突時はフル IP フォールバック。self-update や再起動を跨いで安定し、一貫ハッシュの再帰属がきれいに収束する。</div>
+
+<h2 id="version">2. VERSION GATE + 順次セルフアップデート</h2>
+<div class="mermaid">
+sequenceDiagram
+  participant W as Worker
+  participant H as Hub
+  W->>H: WorkerRegister(version=X)
+  H->>H: _hub_version() == X?
+  alt match
+    H->>W: HubRegistered(expected=X)
+  else mismatch
+    H->>W: HubRegistered(expected=Y)
+    W->>W: _maybe_begin_self_update(Y)<br/>_draining = true
+    loop heartbeat
+      W->>H: WorkerHeartbeat<br/>(draining=true で capacity full 報告)
+      H->>W: HubExpectedVersion(Y)<br/>(毎 heartbeat = liveness ACK 兼用)
+    end
+    W->>W: lanes 完了待ち
+    W->>W: exit(42)
+    Note over W: supervisor が再起動<br/>新ソース tarball を Hub が serve
+  end
+</div>
+<p class="flow-ref">routes/workers.py:2042–2069 / worker/agent/_mix_run.py:388–394 / 924–928</p>
+<div class="callout tip"><strong>zero-downtime</strong>: 以前は worker コード変更で Hub 再起動が必要だった。今は Hub が heartbeat の度に <code>HubExpectedVersion</code> を push し、worker 自身が 順次ドレイン → self-update。Hub は無停止。</div>
+
+<h2 id="heartbeat">3. HEARTBEAT(定常状態)</h2>
+<div class="mermaid">
+sequenceDiagram
+  participant W as Worker (_heartbeat_loop, 10s)
+  participant H as Hub
+  participant R as Redis
+  participant WD as Watchdog thread
+  loop 10 秒
+    W->>H: WorkerHeartbeat<br/>(in_flight / capacity / cpu / mem / disk / load1 / profiles_cached)
+    H->>R: registry.heartbeat()<br/>zadd + hset + online TTL refresh
+    H->>W: HubExpectedVersion
+    W->>W: stamp _last_inbound_ok
+  end
+  WD->>WD: now - _last_inbound_ok &gt; 300s + jitter ?
+  alt threshold 超過
+    WD->>W: ghost と判断
+    W->>W: POST /self-restart (loopback)
+    W->>W: exit(42)
+  end
+</div>
+<p class="flow-ref">worker/agent/_mix_run.py:552–730 / scheduler.py:754–868</p>
+
+<h2 id="ghost">4. GHOST 検知 — 両側ガード</h2>
+<div class="mermaid">
+flowchart TD
+  subgraph HubSide[Hub 側]
+    hr["_dead_worker_reaper_loop (60s)"]
+    hr --> stats["registry.stats_async"]
+    stats --> chk{"worker.alive?<br/>(now - last_hb &lt; 120s = WORKER_TTL)"}
+    chk -->|alive| s1[skip]
+    chk -->|dead &lt; 3600s| pend["保留(復活待ち)"]
+    chk -->|dead &gt; 3600s| reap["registry.forget<br/>Redis 行削除"]
+  end
+  subgraph WorkerSide[Worker 側 inbound watchdog]
+    wd["watchdog thread"]
+    wd --> wchk{"now - _last_inbound_ok &gt; 300s + jitter"}
+    wchk -->|no| ok["OK"]
+    wchk -->|yes| ghost["ghost と判断<br/>(WS は ESTABLISHED だが応答無し)"]
+    ghost --> sr["POST /self-restart (loopback)"]
+    sr --> e42["exit(42) → 再起動"]
+  end
+</div>
+<div class="callout warn"><strong>なぜ両側に必要か</strong>: worker → nginx の WS は <code>ESTABLISHED</code> のままだが nginx → Hub 上流が死んでいる ghost パターンが起こりうる。送信側の <code>_send</code> は成功し続けるので worker からはまっとうに見える。INBOUND フレーム到着の沈黙を見るのが正解。</div>
+
+<h2 id="state">5. workers ライフサイクル全体図</h2>
+<div class="mermaid">
+stateDiagram-v2
+  [*] --> Connecting: boot
+  Connecting --> Registering: WS open
+  Registering --> Reassigning: IP-derived ID 不一致
+  Reassigning --> Connecting
+  Registering --> Running: HubRegistered
+  Running --> Draining: version mismatch
+  Draining --> Restarting: lanes 完了
+  Restarting --> [*]: exit(42)
+  Running --> Ghost: inbound 沈黙 &gt; 300s
+  Ghost --> Restarting: self-restart
+  Running --> Dead: hub last_hb &gt; 120s
+  Dead --> Forgotten: &gt; 3600s
+  Forgotten --> [*]
+</div>
+
+<div class="footer">
+  Paprika &copy; 2026 <a href="https://www.paps.jp">paps-jp</a>
+</div>
+  </main>
+</div>
+{% include footer.html %}
+
+<script>
+(function(){
+  document.querySelectorAll('.mermaid').forEach(function(el){ el.dataset.source = el.textContent.trim(); });
+  function getTheme(){ return document.documentElement.dataset.theme === 'dark' ? 'dark' : 'neutral'; }
+  function initAndRun(){
+    mermaid.initialize({startOnLoad:false, theme:getTheme(), securityLevel:'loose'});
+    document.querySelectorAll('.mermaid').forEach(function(el){
+      if (el.dataset.source) { el.removeAttribute('data-processed'); el.innerHTML = el.dataset.source; }
+    });
+    mermaid.run();
+  }
+  if (document.readyState === 'loading') document.addEventListener('DOMContentLoaded', initAndRun);
+  else initAndRun();
+  new MutationObserver(initAndRun).observe(document.documentElement, {attributes:true, attributeFilter:['data-theme']});
+})();
+</script>
+</body>
+</html>

@@ -1,0 +1,236 @@
+---
+title: Job Lifecycle
+description: "Paprika のジョブが POST /jobs 到着から完了/課題/失敗まで辿る経路。直接配信 / queue→再投入 / WorkerJobComplete + 課題分類 / WorkerJobFailed を Mermaid シーケンス図と状態遷移図で。"
+active: architecture
+---
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+<meta charset="utf-8">
+<title>Job Lifecycle — ジョブが POST から完了まで辿る経路 — Paprika</title>
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<link rel="stylesheet" href="style.css">
+{% include favicon.html %}
+<meta name="description" content="Paprika のジョブが POST /jobs 到着から完了/課題/失敗まで辿る経路。直接配信 / queue→再投入 / WorkerJobComplete + 課題分類 / WorkerJobFailed を Mermaid シーケンス図と状態遷移図で。">
+<link rel="canonical" href="https://paps-jp.github.io/paprika/flow-job.html">
+<meta property="og:type" content="website">
+<meta property="og:site_name" content="Paprika">
+<meta property="og:title" content="Job Lifecycle — Paprika のジョブが辿る経路">
+<meta property="og:description" content="Paprika のジョブが POST /jobs 到着から完了/課題/失敗まで辿る経路。直接配信 / queue→再投入 / 課題分類を Mermaid で。">
+<meta property="og:url" content="https://paps-jp.github.io/paprika/flow-job.html">
+<meta property="og:image" content="https://paps-jp.github.io/paprika/icon.svg">
+<meta property="og:locale" content="ja_JP">
+<meta name="twitter:card" content="summary">
+<style>
+.mermaid{background:var(--bg-soft);border:1px solid var(--border-soft);border-radius:10px;padding:20px;margin:16px 0;overflow-x:auto;text-align:center}
+.mermaid svg{max-width:100%;height:auto}
+.flow-ref{font-family:ui-monospace,"SF Mono",Menlo,Consolas,monospace;color:var(--fg-muted,#6b7280);font-size:.82rem;display:block;margin:6px 0 14px}
+.flow-ref::before{content:"↪ ";opacity:.5}
+</style>
+<script src="https://cdn.jsdelivr.net/npm/mermaid@10/dist/mermaid.min.js"></script>
+</head>
+<body>
+
+{% include header.html active="architecture" %}
+
+{% include breadcrumbs.html %}
+<div class="layout">
+  <aside class="sidebar">
+    <h4>フローチャート</h4>
+    <ul>
+      <li><a href="flowcharts.html">概要・トポロジー</a></li>
+      <li><a href="flow-job.html" class="current">01 Job Lifecycle</a></li>
+      <li><a href="flow-session.html">02 Session Lifecycle</a></li>
+      <li><a href="flow-worker.html">03 Worker Fleet</a></li>
+      <li><a href="flow-codegen.html">04 Codegen Loop</a></li>
+      <li><a href="flow-asset.html">05 Asset / Storage</a></li>
+      <li><a href="flow-multihub.html">06 Multi-Hub</a></li>
+      <li><a href="flow-ai-review.html">07 AI / 課題判定</a></li>
+    </ul>
+    <h4>このページ</h4>
+    <ul>
+      <li><a href="#mode">mode 分岐</a></li>
+      <li><a href="#path-a">PATH A — 直接配信</a></li>
+      <li><a href="#path-b">PATH B — queue→再投入</a></li>
+      <li><a href="#complete">結果回収(成功 + 課題)</a></li>
+      <li><a href="#failed">失敗回収</a></li>
+      <li><a href="#state">状態遷移</a></li>
+      <li><a href="#guards">配信ガード</a></li>
+    </ul>
+  </aside>
+  <main id="main-content" class="content">
+
+<h1>Job Lifecycle</h1>
+<p class="lead"><code>POST /jobs</code> 到着 → 直接配信 or キュー → 再投入 → worker 実行 → 結果永続化と課題分類。mode は <em>fetch</em> / <em>codegen-loop</em> / <em>rerun</em> の 3 系統。</p>
+
+<div class="tldr">
+  <span class="tldr-label">概要</span>
+  <ul>
+    <li>POST 時に空き lane があれば<strong>直接配信(PATH A)</strong>。無ければ row は <code>queued</code> のままになり、各 Hub の <strong>再投入ループが 3 秒ごとに拾う(PATH B)</strong>。</li>
+    <li>WorkerJobComplete を受けたら、<strong>占有率ベースの課題分類</strong>(全画面オーバーレイで content が壁に塞がれていないか)を経て <code>completed</code> / <code>review</code> に振り分け。</li>
+    <li>二重配信は <strong>3 重ガード</strong>(原子 CAS / <code>worker_id IS NULL</code> 確認 / age-grace)で防止。ACK が来ない場合は 15 秒で <code>queued</code> に戻して再投入に委ねる。</li>
+  </ul>
+</div>
+
+<h2 id="mode">1. mode 分岐(POST 直後)</h2>
+<div class="mermaid">
+flowchart TD
+  POST["POST /jobs"]
+  POST --> mode{"options.mode?"}
+  mode -->|fetch (既定)| fetch["fleet capacity チェック<br/>+ pick_worker(grace)"]
+  mode -->|codegen-loop| cg["spawn _run_codegen_loop_job task<br/>(GPU gate あり)"]
+  mode -->|rerun| rr["spawn _run_rerun_loop_job task<br/>(既存 script を再生)"]
+  fetch --> AB["PATH A or PATH B"]
+  cg --> CGloop["Codegen ループへ"]
+  rr --> RRloop["sandbox 1 回実行"]
+</div>
+<p class="flow-ref">server/hub/routes/jobs/lifecycle.py:1041</p>
+<div class="callout"><code>codegen-loop</code> / <code>rerun</code> は<strong>フリート capacity チェックを経由しない</strong>(GPU gate と別経路)。<code>fetch</code> だけが満杯時に 503(<em>fleet at capacity</em>)を返す。</div>
+
+<h2 id="path-a">2. PATH A — 直接 WS 配信(空き lane あり)</h2>
+<div class="mermaid">
+sequenceDiagram
+  participant C as Client
+  participant N as nginx
+  participant H as Hub
+  participant S as Store(MariaDB)
+  participant W as Worker
+  C->>N: POST /jobs (goal, mode, options)
+  N->>H: round-robin 転送
+  H->>H: validate options, gen job_id
+  H->>S: save JobInfo(queued)
+  H->>H: pick_worker() with grace
+  Note over H: 空き lane あり
+  H->>S: claim_queued_job CAS<br/>(queued → running)
+  H->>W: HubAssignJob<br/>(cookies, asset_upload_base, ...)
+  W-->>H: WorkerJobAccepted
+  H->>C: 200 {job_id}
+  W->>W: 実行
+  Note over H: post_assign_ack_guard 15s 待機<br/>ACK 無ければ queued に戻す
+</div>
+<p class="flow-ref">routes/jobs/lifecycle.py:1041–1798 / server/scheduler.py:301 ConnectedWorker.send</p>
+
+<h2 id="path-b">3. PATH B — queue → 再投入(空き lane 無し)</h2>
+<div class="mermaid">
+sequenceDiagram
+  participant L as _redrive_loop<br/>(各 Hub, 3 秒間隔)
+  participant S as Store
+  participant H as Hub
+  participant W as Worker
+  Note over L: POST 時に空き無し → row は queued のまま
+  loop 3 秒ごと
+    L->>S: list queued (age &gt;= 2s で claim 競合回避)
+    L->>L: oldest-first sort (FIFO)
+    L->>H: pick_worker()
+    alt 空きあり
+      L->>S: claim_queued_job CAS
+      L->>W: HubAssignJob (POST と同じ mirror)
+      W-->>H: WorkerJobAccepted
+    else 空きなし
+      L->>L: skip → 次ループ
+    end
+  end
+</div>
+<p class="flow-ref">server/hub/_redrive.py:282–463</p>
+<div class="callout warn"><strong>なぜ再投入が必要か</strong>: POST が <code>fetch</code> を inline で配信する間にクライアント切断や cross-hub 並列分散で中断された queued ジョブが死蔵される事故が頻発(失敗の大半が「180 秒以上 queued のまま割り当てなし」)。再投入は 3 重ガード(CAS / <code>worker_id IS NULL</code> / 90s age-grace)で二重配信を防ぐ。</div>
+
+<h2 id="complete">4. 結果回収 — <code>WorkerJobComplete</code> + 課題分類</h2>
+<div class="mermaid">
+sequenceDiagram
+  participant W as Worker
+  participant H as Hub (routes/workers.py)
+  participant R as classify_review
+  participant S as Store
+  participant M as MinIO (asset mirror)
+  participant P as save_perception_for_job (bg)
+  W->>H: WorkerJobComplete(result)
+  H->>H: GPU gate unregister
+  H->>S: read JobInfo
+  alt keep_session=true
+    H->>S: status=running, phase=keepalive
+  else 通常
+    H->>R: classify_review(info, result)
+    alt 課題判定 HIT<br/>(coverage&gt;=.85 + dominance&gt;=.6<br/>+ content scarce + modal/login/scrollLock)
+      R-->>H: reason
+      H->>S: status=review
+    else 普通
+      R-->>H: None
+      H->>S: status=completed
+    end
+  end
+  H->>S: save_job_info / save_job_result
+  par 非同期
+    H->>P: perception observation (LLM)
+    H->>M: assets mirror + .meta sidecar
+  end
+</div>
+<p class="flow-ref">routes/workers.py:2202–2320 / server/hub/_review.py:85 classify_review</p>
+
+<h2 id="failed">5. 失敗回収 — <code>WorkerJobFailed</code></h2>
+<div class="mermaid">
+flowchart TD
+  W["WorkerJobFailed(job_id, error)"]
+  W --> gpu["GPU gate unregister"]
+  gpu --> chk{"error に<br/>'no free lane in pool'?"}
+  chk -->|yes| req["release job → queued<br/>worker drain"]
+  chk -->|no| std["status=failed<br/>+ error + completed_at"]
+  req --> back["再投入ループが拾う"]
+  std --> done["save_job_info"]
+</div>
+<p class="flow-ref">routes/workers.py:2472–2510</p>
+
+<h2 id="state"><code>JobStatus</code> 状態遷移</h2>
+<div class="mermaid">
+stateDiagram-v2
+  [*] --> queued: POST /jobs
+  queued --> running: claim CAS (PATH A or B)
+  queued --> failed: queued_timeout 180s
+  queued --> failed: explicit DELETE
+  running --> completed: WorkerJobComplete + 課題なし
+  running --> review: WorkerJobComplete + classify_review HIT
+  running --> failed: WorkerJobFailed
+  running --> queued: WorkerJobFailed (no-free-lane)
+  running --> running: keep_session=true (phase→keepalive)
+  completed --> [*]
+  failed --> [*]
+  review --> [*]
+  review --> running: AI escalation
+</div>
+<div class="callout tip"><strong>review</strong> は失敗ではなく「結果は残っているが信用できない」第 3 の終端ステータス。<code>protocol.py:280</code> で定義、<code>_review.py</code> が <code>mode=fetch</code> 完了時に占有率ベースで判定。AI escalation の入口でもある(<a href="flow-ai-review.html">→ AI / 課題判定</a>)。</div>
+
+<h2 id="guards">7. 配信ガードの全体図</h2>
+<div class="mermaid">
+flowchart LR
+  cas["claim_queued_job CAS<br/>(queued→running 原子的)"]
+  nul["worker_id IS NULL 確認"]
+  age["age &gt;= 2s (PATH B)<br/>or age &lt;= 90s (POST 内)"]
+  ack["post_assign_ack_guard 15s"]
+  cas --- nul --- age --- ack
+  ack -->|ACK 無し| recl["queued に戻す → 再投入で再試行"]
+</div>
+
+<div class="footer">
+  Paprika &copy; 2026 <a href="https://www.paps.jp">paps-jp</a>
+</div>
+  </main>
+</div>
+{% include footer.html %}
+
+<script>
+(function(){
+  document.querySelectorAll('.mermaid').forEach(function(el){ el.dataset.source = el.textContent.trim(); });
+  function getTheme(){ return document.documentElement.dataset.theme === 'dark' ? 'dark' : 'neutral'; }
+  function initAndRun(){
+    mermaid.initialize({startOnLoad:false, theme:getTheme(), securityLevel:'loose'});
+    document.querySelectorAll('.mermaid').forEach(function(el){
+      if (el.dataset.source) { el.removeAttribute('data-processed'); el.innerHTML = el.dataset.source; }
+    });
+    mermaid.run();
+  }
+  if (document.readyState === 'loading') document.addEventListener('DOMContentLoaded', initAndRun);
+  else initAndRun();
+  new MutationObserver(initAndRun).observe(document.documentElement, {attributes:true, attributeFilter:['data-theme']});
+})();
+</script>
+</body>
+</html>

@@ -223,6 +223,43 @@ _TABLES: list[tuple[str, str]] = [
         ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci
         """,
     ),
+    # Success Audit results -- a vision LLM's second-opinion on whether a
+    # job's REPORTED status (completed / failed / review) matches REALITY
+    # (the page's content + saved assets). Catches both false positives
+    # (reported OK but wrong video / no real content) and false negatives
+    # (reported failed but assets actually meet the goal). Populated by the
+    # periodic sampler in server/hub/_success_audit.py.
+    #
+    # verdict_kind: 'true_ok' | 'false_positive' | 'false_negative' |
+    #               'true_failure' | 'unparsed'
+    # truly_succeeded: NULL=unparseable, 1=actually OK, 0=actually NG.
+    #                  (kept for back-compat / quick filters.)
+    (
+        "audit_results",
+        """
+        CREATE TABLE IF NOT EXISTS audit_results (
+            id              BIGINT       AUTO_INCREMENT PRIMARY KEY,
+            ts              DATETIME(3)  DEFAULT CURRENT_TIMESTAMP(3),
+            job_id          VARCHAR(64),
+            url             TEXT,
+            goal_short      TEXT,
+            reported_status VARCHAR(32),
+            verdict_kind    VARCHAR(32),
+            video_file      VARCHAR(255),
+            midframe_ref    VARCHAR(64),
+            truly_succeeded TINYINT(1),
+            confidence      FLOAT,
+            reason          TEXT,
+            engine_slug     VARCHAR(64),
+            latency_ms      INT,
+            error           TEXT,
+            INDEX idx_job (job_id),
+            INDEX idx_ts (ts),
+            INDEX idx_truly_ts (truly_succeeded, ts),
+            INDEX idx_verdict_ts (verdict_kind, ts)
+        ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci
+        """,
+    ),
     # Per-job page-role overrides. Distinct from the host-template overrides
     # above: this lets the operator pin a single job's role without
     # affecting other jobs on the same template. Persisted so the
@@ -704,6 +741,10 @@ _REQUIRED_COLUMNS: list[tuple[str, str, str]] = [
     # Persisted page-role (compute role_for_url once, read back on the /jobs
     # list instead of recomputing for every job on every request).
     ("jobs", "page_role", "JSON"),
+    # Success Audit 4-quadrant verdict columns (added Phase 1; safe to add
+    # to legacy audit_results tables that only had truly_succeeded).
+    ("audit_results", "reported_status", "VARCHAR(32)"),
+    ("audit_results", "verdict_kind", "VARCHAR(32)"),
 ]
 
 
