@@ -67,6 +67,9 @@ active: home
       <li><a href="#background">背景 — paps / ProtectionAI</a></li>
       <li><a href="#why-evidence">なぜ証拠保全が必要か</a></li>
       <li><a href="#usage">利用について</a></li>
+      <li><a href="#absolute-ban">　· 絶対禁止 (CSAM / NCII)</a></li>
+      <li><a href="#access-control">　· アクセス制御</a></li>
+      <li><a href="#operator-duty">　· 運用者の責務</a></li>
     </ul>
     <h4 style="margin-top:18px;">クイックリンク</h4>
     <ul>
@@ -339,17 +342,82 @@ asyncio.run(main())</code></pre>
 
 
     <h2 id="usage">利用について</h2>
-    <p><strong>想定用途：証拠保全</strong> — 意に反して拡散された画像・動画の <strong>《削除要請に使う記録》</strong>
-    — スクリーンショット・HTML・収集物・取得時刻 — をタイムスタンプ付きで保存する用途を前提に運用されています。
-    想定する利用者は <strong>デジタル性暴力被害支援団体・報道・弁護士</strong> など、
-    被害支援・著作権侵害対応・コンプライアンスなど <strong>正当な目的での利用を前提</strong> としています。</p>
-    <p><strong>禁止する用途</strong> — 取得した画像・動画・テキストには <strong>第三者の著作物</strong> が含まれ得ます。
-    <strong>証拠保全・私的利用・引用の範囲を超えた再配布・公開・商用利用</strong> は著作権侵害となるため <strong>使用してはいけません</strong>。
-    対象サイトの利用規約（ToS）と各国法令（日本では著作権法・不正アクセス禁止法など）の遵守が求められています。
-    判断に迷う場合は実行しないでください。</p>
-    <p><strong>DRM 回避は厳禁</strong> — Paprika は <strong>Widevine / FairPlay / PlayReady などの DRM の解読・回避を一切行いません</strong>。
-    DRM 回避は <strong>著作権法（技術的保護手段の回避禁止：第30条第1項第2号、第120条の2）</strong>に違反し、配信プラットフォームに対する <strong>不正アクセス禁止法</strong>違反となる場合もあります。
-    国内外（米国 DMCA 1201 条、EU 著作権指令 第6条等）で禁止されています。</p>
+    <p><strong>Paprika は誰でも自由に使えるツールではありません。</strong>
+    被害者支援・証拠保全・正当な業務の文脈で運用されることを前提としており、運用者・利用者の双方に明確な責任を求めます。</p>
+
+    <h3 id="absolute-ban">絶対禁止 — 児童性的虐待コンテンツ (CSAM)</h3>
+    <div class="callout warn" style="border-left: 5px solid var(--accent);">
+      <strong>これは最優先で、いかなる例外もありません。</strong>
+      <p>Paprika を <strong>児童ポルノ・児童性的虐待コンテンツ (CSAM) の収集・保存・拡散</strong>に用いることは、<strong>児童買春・児童ポルノ禁止法</strong>に基づく刑事犯罪であり、子どもへの加害そのものです。<strong>paps-jp はこの種の利用を一切許容しません。</strong></p>
+      <p>万一そうしたコンテンツを発見した場合、運用者は <strong>即時に該当ジョブ・セッションを停止</strong> し、<strong>警察および <a href="https://www.internethotline.jp/" target="_blank" rel="noopener">インターネット・ホットラインセンター (IHC)</a></strong> に通報してください。</p>
+      <p>運用者は <strong>ポリシー宣言だけでは不十分</strong> です。検知のための <strong>既知 CSAM ハッシュ照合・URL フィルタ・ブラックリストといった技術的措置</strong> を導入することが強く求められます (<a href="#operator-duty">運用者の責務</a>)。</p>
+    </div>
+
+    <h3 id="ncii-ban">絶対禁止 — 非合意の親密画像 (NCII / リベンジポルノ)</h3>
+    <div class="callout warn">
+      <p>本人の同意なく撮影・公開された性的画像・動画を <strong>第三者が収集・転送・再公開</strong> する目的での利用は、<strong>私事性的画像記録の提供等による被害の防止に関する法律 (いわゆるリベンジポルノ防止法)</strong> に抵触する場合があり、許容されません。</p>
+      <p>ただし <strong>被害当事者本人またはその支援者が、自分・支援対象への加害コンテンツの所在を記録し、削除要請に用いる「証拠保全」</strong>は paps-jp の本来の用途です。これらは別物として明確に区別してください。判断に迷う場合は <a href="https://www.paps.jp" target="_blank" rel="noopener">paps-jp</a> に相談してください。</p>
+    </div>
+
+    <h3 id="intended-use">想定用途 — 証拠保全</h3>
+    <p>Paprika は、意に反して拡散された画像・動画の <strong>《削除要請に使う記録》</strong> — スクリーンショット・HTML・収集物・取得時刻 — をタイムスタンプ付きで保存する用途を前提に運用されています。
+    想定する利用者は <strong>デジタル性暴力被害支援団体・報道・弁護士</strong> など、被害支援・著作権侵害対応・コンプライアンスなどの <strong>正当な目的での利用</strong> です。</p>
+
+    <h3 id="forbidden-uses">禁止される用途のまとめ</h3>
+    <ul>
+      <li><strong>児童性的虐待コンテンツ (CSAM) の収集・保存・拡散</strong> — 児童ポルノ禁止法違反、刑事犯罪 (上記)</li>
+      <li><strong>非合意の親密画像 (NCII / リベンジポルノ) の第三者による収集・拡散</strong> — リベンジポルノ防止法 (上記)</li>
+      <li><strong>DRM の回避・解読</strong> — Widevine / FairPlay / PlayReady 等。著作権法 第30条第1項第2号 / 第120条の2、米 DMCA §1201、EU 著作権指令 第6条 で世界的に禁止</li>
+      <li><strong>サイトのアクセス制御を破る形での利用</strong> — ログイン要件・年齢制限・地理ブロック等を技術的に迂回する利用 (不正アクセス禁止法)</li>
+      <li><strong>取得した第三者著作物の再配布・公開・商用利用</strong> — 証拠保全・私的利用・引用の範囲を超えるもの (著作権侵害)</li>
+    </ul>
+    <p>取得した画像・動画・テキストには <strong>第三者の著作物</strong> が含まれ得ます。対象サイトの利用規約と各国法令の遵守が求められます。<strong>判断に迷う場合は実行しないでください。</strong></p>
+
+    <h3 id="access-control">アクセス制御 — 公開時は必ず認証を入れる</h3>
+    <div class="callout warn" style="border-left: 5px solid var(--accent);">
+      <p><strong>公開 Hub を認証なしで運用してはいけません。</strong></p>
+      <p>Paprika の Hub は <strong>既定で認証がありません</strong> (private LAN 想定)。<strong>インターネットに公開する場合は、必ず手前にリバースプロキシと認証 (Basic 認証 / SSO / OAuth など) を入れてください</strong>。</p>
+      <p><strong>認証なしの公開 Hub = 誰でも自由に画像・動画を取得できる状態</strong> であり、上記すべての禁止用途 (CSAM・NCII・著作権侵害・不正アクセス) の温床になります。<strong>これは Paprika 側の技術では阻止できず、運用者が負うべき責任</strong>です。公開する以上は、自分で守ってください。</p>
+    </div>
+
+    <h3 id="violation-response">違反時の対応</h3>
+    <p>違反を検知した運用者は次を行ってください:</p>
+    <ul>
+      <li><strong>即時のアクセス停止</strong> — 違反ジョブの停止、違反利用者の権限剥奪</li>
+      <li><strong>関連機関への通報</strong> — CSAM は <strong>警察 + <a href="https://www.internethotline.jp/" target="_blank" rel="noopener">IHC</a></strong>、NCII は <strong><a href="https://www.paps.jp" target="_blank" rel="noopener">paps-jp</a> 等の被害者支援団体 + 警察</strong>、著作権侵害は権利者・所管</li>
+      <li><strong>ログの保全</strong> — 投入 URL・利用者・取得物のメタ情報を消さずに残す (事後の調査・捜査のため)</li>
+    </ul>
+
+    <h3 id="operator-duty">運用者の責務 — 願うだけでは悪用は防げない</h3>
+    <p><strong>「正当な目的の利用者だけが使う」を願うだけでは悪用は防げません。</strong>
+    利用ポリシーに書かれた理念を現実のものにするには、運用者による <strong>具体的な統制</strong> が不可欠です。Paprika を公開・運用する組織は、最低限以下の 4 つを整備してください。</p>
+    <div class="cards">
+      <div class="card">
+        <h3>1. ユーザーの審査 (vetting)</h3>
+        <p>不特定多数に開かない。利用者の身元・所属・利用目的を確認した上で、個別にアカウントを発行する。</p>
+      </div>
+      <div class="card">
+        <h3>2. ログの取得・保全</h3>
+        <p>誰が・いつ・どの URL に・何を投げ・何が取れたか。事後の通報・調査の証跡として、消えない形で残す。</p>
+      </div>
+      <div class="card">
+        <h3>3. 悪用への毅然とした対応</h3>
+        <p>警告 → 永久停止 → 関係機関への通報。<strong>グレーゾーンを許容しない</strong>姿勢を運用者が明示する。</p>
+      </div>
+      <div class="card">
+        <h3>4. CSAM の技術的検知</h3>
+        <p>運用組織で利用可能な <strong>既知 CSAM ハッシュデータベース</strong> との照合、URL ブラックリスト、明白な違法サイトの遮断などを導入する。</p>
+      </div>
+    </div>
+
+    <h3 id="cooperation">支援団体・関連機関との連携 (運用基準の策定)</h3>
+    <p>運用基準の策定は <strong>paps-jp や同等の被害者支援団体・関連機関と連携して行うことを強く推奨</strong> します。
+    <strong>運用者一人で抱え込まないこと</strong>が、結果として被害者保護と運用継続の両立につながります。</p>
+    <ul>
+      <li><a href="https://www.paps.jp" target="_blank" rel="noopener">paps-jp (特定非営利活動法人ぱっぷす)</a> — デジタル性暴力被害・性的搾取被害の相談窓口。運用基準策定や違反対応の相談を受け付け</li>
+      <li><a href="https://www.internethotline.jp/" target="_blank" rel="noopener">インターネット・ホットラインセンター (IHC)</a> — 違法・有害情報の通報窓口</li>
+      <li><a href="https://www.npa.go.jp/cyber/" target="_blank" rel="noopener">警察庁サイバー警察局</a> — 重大な違反の刑事通報</li>
+    </ul>
 
     <div class="footer">
       Paprika &copy; 2026 <a href="https://www.paps.jp">paps-jp</a>
