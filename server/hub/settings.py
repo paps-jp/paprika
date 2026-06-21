@@ -152,6 +152,28 @@ _SCHEMA: dict[str, tuple[Any, str]] = {
     "fetch_scroll_max": (3000, "int"),
     "fetch_scroll_early_after": (5.0, "float"),
     "fetch_post_click_seconds": (5.0, "float"),
+    # ---- Fleet capacity recommendation (GET /workers/capacity) ----------
+    # Three knobs feeding the per-worker-health formula in
+    # server/hub/routes/workers.py:_compute_capacity. Cross-hub via the
+    # settings registry so the operator can tune live without a deploy
+    # (consumers like .23 poll /workers/capacity for recommended_concurrency
+    # and adjust their parallel POST /jobs rate).
+    #
+    # Each falls through to its env var equivalent if the settings value
+    # is left at default 0 — see _env_default below for the mapping.
+    #
+    # fetch_load_factor: global headroom multiplier on healthy_lanes.
+    #   0.7 = recommend 70% of healthy capacity (was a fixed 0.8 in the
+    #   old single-input formula).
+    # fetch_load_ref: load1 above which a worker contributes less than its
+    #   full capacity. LXC host load1 propagates into the container per
+    #   [[paprika-fleet-lxc-on-proxmox]]; ~24 is a typical 2-lane-on-busy-host
+    #   threshold. health = clamp(1 - (load1 - REF)/REF, 0.3, 1.0).
+    # fetch_mem_ref: mem_pct above which a worker contributes less. 75 keeps
+    #   safe margin before Chrome/yt-dlp OOM territory (~85+).
+    "fetch_load_factor": (0.7, "float"),
+    "fetch_load_ref":    (24.0, "float"),
+    "fetch_mem_ref":     (75.0, "float"),
     # ---- Codegen web_search tool (SearXNG-backed) ------------------------
     # When ``searxng_url`` is non-empty AND the Coder's engine has
     # supports_tools=True, the hub attaches a ``web_search`` OpenAI tool
@@ -227,6 +249,14 @@ _SCHEMA: dict[str, tuple[Any, str]] = {
     # so the operator can see the loop without flipping a switch first; flip
     # OFF if cost / privacy becomes a concern. See server/hub/_ai_io_log.py.
     "ai_io_log_enabled": (True, "bool"),
+    # Success Audit: periodically sample completed video-download jobs and
+    # ask a VisionAI whether the saved video is plausibly the page's main
+    # content (not a preview / ad / mismatched). See _success_audit.py.
+    # Default OFF -- flip ON when the operator wants the audit signal.
+    "success_audit_enabled": (False, "bool"),
+    "success_audit_sample_pct": (0.10, "float"),   # 10% of recent completed
+    "success_audit_max_per_run": (12, "int"),       # cap audits per pass
+    "success_audit_interval_min": (30, "int"),      # minutes between passes
     # Nightly review subagent: runs once per day at the configured UTC hour,
     # picks hosts with notable failure/review activity in the last 24h, and
     # writes a fresh per-host strategy digest into host_strategy via the
@@ -347,6 +377,10 @@ def _env_default(key: str, fallback: Any) -> Any:
         "searxng_url": ("SEARXNG_URL", "str"),
         "searxng_timeout_s": ("SEARXNG_TIMEOUT_S", "float"),
         "web_search_max_calls": ("WEB_SEARCH_MAX_CALLS", "int"),
+        # Capacity recommendation knobs: settings.json -> env vars -> default.
+        "fetch_load_factor": ("PAPRIKA_FETCH_LOAD_FACTOR", "float"),
+        "fetch_load_ref":    ("PAPRIKA_FETCH_LOAD_REF",    "float"),
+        "fetch_mem_ref":     ("PAPRIKA_FETCH_MEM_REF",     "float"),
         # Reasoning judge: settings.json -> env vars -> static default.
         "reasoning_judge_mode": ("PAPRIKA_R1_JUDGE_MODE", "str"),
         "reasoning_judge_engine": ("PAPRIKA_R1_DISTILLER_ENGINE", "str"),
@@ -354,6 +388,10 @@ def _env_default(key: str, fallback: Any) -> Any:
         "reasoning_distiller_engine": ("PAPRIKA_REASONING_DISTILLER_ENGINE", "str"),
         "escalate_page_role_gate": ("PAPRIKA_ESCALATE_PAGE_ROLE_GATE", "bool"),
         "ai_io_log_enabled": ("PAPRIKA_AI_IO_LOG_ENABLED", "bool"),
+        "success_audit_enabled": ("PAPRIKA_SUCCESS_AUDIT_ENABLED", "bool"),
+        "success_audit_sample_pct": ("PAPRIKA_SUCCESS_AUDIT_SAMPLE_PCT", "float"),
+        "success_audit_max_per_run": ("PAPRIKA_SUCCESS_AUDIT_MAX_PER_RUN", "int"),
+        "success_audit_interval_min": ("PAPRIKA_SUCCESS_AUDIT_INTERVAL_MIN", "int"),
         # MariaDB: settings.json -> env vars -> static default.
         "mariadb_host": ("PAPRIKA_MARIADB_HOST", "str"),
         "mariadb_port": ("PAPRIKA_MARIADB_PORT", "int"),

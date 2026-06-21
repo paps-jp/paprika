@@ -415,12 +415,13 @@ class MariaDBJobStore:
                 if limit > 0:
                     await cur.execute(
                         "SELECT job_id FROM jobs "
-                        "ORDER BY created_at DESC LIMIT %s OFFSET %s",
+                        "ORDER BY created_at DESC, job_id DESC "
+                        "LIMIT %s OFFSET %s",
                         (limit, offset))
                 else:
                     await cur.execute(
                         "SELECT job_id FROM jobs "
-                        "ORDER BY created_at DESC")
+                        "ORDER BY created_at DESC, job_id DESC")
                 rows = await cur.fetchall()
         return [r[0] for r in rows]
 
@@ -499,10 +500,17 @@ class MariaDBJobStore:
                     "created_at, started_at, completed_at, error, progress, "
                     "owner_id"
                 )
+                # job_id is the DESC tiebreaker so DATETIME(3) ms ties don't
+                # let MariaDB/InnoDB hand back rows in storage-order (which
+                # shuffles per query/connection). Without this the admin
+                # jobs list re-orders on every reload — especially under
+                # multi-hub round-robin where each hub re-queries from its
+                # own 1.5s cache and ms-bursts (e.g. .23 import storms) hit.
                 if limit > 0:
                     page_sql = (
                         f"SELECT {select_cols} FROM jobs {where_sql} "
-                        f"ORDER BY created_at DESC LIMIT %s OFFSET %s"
+                        f"ORDER BY created_at DESC, job_id DESC "
+                        f"LIMIT %s OFFSET %s"
                     )
                     await cur.execute(
                         page_sql, tuple(params) + (limit, offset),
@@ -510,7 +518,7 @@ class MariaDBJobStore:
                 else:
                     page_sql = (
                         f"SELECT {select_cols} FROM jobs {where_sql} "
-                        f"ORDER BY created_at DESC"
+                        f"ORDER BY created_at DESC, job_id DESC"
                     )
                     await cur.execute(page_sql, tuple(params))
                 rows = await cur.fetchall()

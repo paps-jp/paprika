@@ -179,6 +179,7 @@ async def list_jobs(
     status: str | None = None,
     mode: str | None = None,
     q: str | None = None,
+    downloading: int = 0,
 ) -> dict:
     """List jobs with optional server-side pagination and filtering.
 
@@ -230,6 +231,17 @@ async def list_jobs(
             [s.strip().lower() for s in status.split(",") if s.strip()]
             if status else None
         )
+        # ``downloading=1`` is a virtual sub-filter on the running set: only
+        # running jobs can be actively downloading, and we further trim to
+        # those whose JobInfo.progress carries a download_pct (set by the
+        # WorkerJobLog → _persist_dl_progress pipeline). We force-narrow the
+        # status filter to ``running`` so the underlying SQL paging sees the
+        # smallest possible base set, then post-filter the rows in python --
+        # cheap because the active-download count is bounded by the fleet's
+        # lane count (~120) and typically <20.
+        _dl_only = bool(downloading)
+        if _dl_only:
+            status_list = ["running"]
         mode_list = (
             [m.strip().lower() for m in mode.split(",") if m.strip()]
             if mode else None
@@ -240,20 +252,44 @@ async def list_jobs(
         # _proxy_info below still runs per request -- it model_copy's, never
         # mutates the cached JobInfos -- so each response stays request-correct.
         _ck = (off, lim, tuple(status_list or ()), tuple(mode_list or ()),
-               q or "", own or "")
+               q or "", own or "", _dl_only)
         _now = time.time()
         _hit = _JOBS_LIST_CACHE.get(_ck)
         if _hit is not None and (_now - _hit[0]) < _JOBS_LIST_CACHE_TTL_S:
             infos, filtered_total, page_roles = _hit[1]
         else:
-            infos, filtered_total = await fast(
-                offset=off,
-                limit=lim,
-                status=status_list,
-                mode=mode_list,
-                url_substr=q,
-                owner_id=own,
-            )
+            if _dl_only:
+                # Active-DL view: pull the full running set (typically <100),
+                # post-filter on JobInfo.progress.download_pct, then paginate
+                # the filtered list ourselves so ``total`` reflects the
+                # filtered count (not the raw running count). The fleet's lane
+                # cap bounds this set in practice; the 500 hard cap on
+                # list_job_infos is plenty.
+                all_running, _ = await fast(
+                    offset=0,
+                    limit=500,
+                    status=status_list,
+                    mode=mode_list,
+                    url_substr=q,
+                    owner_id=own,
+                )
+                _matched = [
+                    i for i in all_running
+                    if getattr(i, "progress", None) is not None
+                    and getattr(i.progress, "download_pct", None) is not None
+                    and (i.progress.download_pct or 0) < 100.0
+                ]
+                filtered_total = len(_matched)
+                infos = _matched[off:off + lim]
+            else:
+                infos, filtered_total = await fast(
+                    offset=off,
+                    limit=lim,
+                    status=status_list,
+                    mode=mode_list,
+                    url_substr=q,
+                    owner_id=own,
+                )
             # page_roles depends only on each job's id + url (stable across the
             # cache TTL), so memoise it WITH the infos. It was re-running
             # role_for_url for every job on EVERY request -- even cache hits,
@@ -448,8 +484,33 @@ async def get_jobs_summary() -> dict:
     # ----- active section: running preview + queued count
     queued_n = by_status.get("queued", 0)
     running_n = by_status.get("running", 0)
-    running_preview: list[dict] = []
+    # ----- downloading count (running jobs with an active video download).
+    # Subset of running_n where JobInfo.progress.download_pct is set and < 100.
+    # Bounded by the fleet's lane count (~120), so we walk the running set
+    # once -- python loop over ~60-100 hydrated infos is microseconds. Injected
+    # into by_status as a virtual sub-status so the admin sub-tab badge can
+    # read it like the others. NB: status='downloading' is NOT a real job
+    # status, just a synthesised count for the UI.
+    downloading_n = 0
     fast_list = getattr(state.store, "list_job_infos", None)
+    if callable(fast_list) and running_n > 0:
+        try:
+            _all_running, _ = await fast_list(
+                offset=0,
+                limit=500,
+                status=["running"],
+            )
+            for _i in _all_running:
+                _pg = getattr(_i, "progress", None)
+                if _pg is None:
+                    continue
+                _pct = getattr(_pg, "download_pct", None)
+                if _pct is not None and _pct < 100.0:
+                    downloading_n += 1
+        except Exception:
+            log.debug("jobs/summary: downloading count failed", exc_info=True)
+    by_status["downloading"] = downloading_n
+    running_preview: list[dict] = []
     if callable(fast_list) and running_n > 0:
         try:
             infos, _ = await fast_list(

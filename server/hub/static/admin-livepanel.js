@@ -94,10 +94,18 @@ function ljpAppendLine(text, cls) {
     catch (_) { /* malformed marker -- ignore */ }
     return;
   }
-  // Asset uploaded -> mark the gallery dirty; ljpRefreshStatus refreshes it
-  // on the next tick (coalesces a burst of uploads into one fetch).
+  // Asset uploaded -> refresh the gallery RIGHT NOW (not on the next
+  // status tick) so a final video that lands AFTER the job flipped to
+  // 'completed' still reflects without a manual page reload. Also reopen
+  // the polling window if it was closed by a prior terminal status tick
+  // (galleryStopped) — a late-arriving asset must be visible. The dirty
+  // flag is still set so a concurrent refresh-in-progress coalesces this
+  // tick into its successor.
   if (typeof text === 'string' && text.startsWith(LJP_ASSET_MARKER)) {
     LJP._galleryDirty = true;
+    LJP.galleryStopped = false;
+    try { if (typeof ljpRefreshGallery === 'function') ljpRefreshGallery(); }
+    catch (_) {}
     return;
   }
   // Page links captured -> refresh the Links tab once (links are a final
@@ -519,6 +527,25 @@ async function ljpRefreshStatus() {
     } else {
       pill.style.display = 'none';
     }
+    // Persisted video-DL progress: drives a bar that SURVIVES reopen
+    // (the ephemeral [[paprika:progress]] marker only replays via the
+    // log stream, so a fresh page load wouldn't otherwise see history).
+    // Hub persists download_pct/eta/speed on every yt-dlp tick (throttled
+    // 5s). Renders under the same #ljpProgress strip as the live bar.
+    try {
+      const pct = info.progress && info.progress.download_pct;
+      if (typeof pct === 'number') {
+        const persistedKey = '__persisted_dl__';
+        ljpUpdateProgress({
+          key: persistedKey,
+          label: 'video download',
+          state: pct >= 100 ? 'done' : 'downloading',
+          pct: pct,
+          eta: info.progress.download_eta || undefined,
+          speed: info.progress.download_speed || undefined,
+        });
+      }
+    } catch (_) { /* never let a render bug break the status poll */ }
     // Fetch-mode jobs carry their noVNC URL directly on JobInfo.
     // noVNC is LIVE only when the hub rewrote novnc_url to its
     // session-rooted proxy form ("/sessions/{sid}/novnc/..."):

@@ -14,6 +14,7 @@ import asyncio
 import io
 import logging
 import os
+import re as _re
 import tarfile
 import time
 from datetime import datetime, timezone
@@ -143,15 +144,40 @@ async def _compute_capacity() -> dict:
     now_iso = datetime.now(timezone.utc).isoformat(timespec="seconds").replace(
         "+00:00", "Z"
     )
-    try:
-        load_factor = float(os.environ.get("PAPRIKA_FETCH_LOAD_FACTOR") or 0.8)
-    except (TypeError, ValueError):
-        load_factor = 0.8
-    load_factor = max(0.05, min(load_factor, 1.0))
+    # All three knobs settle to Settings (cross-hub, runtime-editable) →
+    # env var → static default in that order. See server/hub/settings.py
+    # for the env_map; the operator changes them live via the admin
+    # Settings tab and every hub picks the new value on its next
+    # /workers/capacity call (no restart).
+    #
+    # fetch_load_factor : global headroom on healthy_lanes (0.7 default)
+    # fetch_load_ref    : load1 threshold a worker is judged "saturated" at
+    # fetch_mem_ref     : mem_pct threshold a worker is judged "tight" at
+    #
+    # load_factor stays clamped [0.05, 1.0] so a bad value in settings can
+    # never accidentally take the fleet to 0% or push it above the hard cap.
+    def _setting_f(key: str, fb: float) -> float:
+        try:
+            if state.settings is not None:
+                v = state.settings.get(key, None)
+                if isinstance(v, (int, float)):
+                    return float(v)
+        except Exception:
+            pass
+        return fb
+
+    load_factor = max(0.05, min(_setting_f("fetch_load_factor", 0.7), 1.0))
+    load_ref = max(1.0, _setting_f("fetch_load_ref", 24.0))
+    mem_ref = max(1.0, min(_setting_f("fetch_mem_ref", 75.0), 99.0))
+    MIN_HEALTH = 0.3  # floor so a sweltering fleet still recommends *something*
+
     if state.registry is None:
         return {
             "max_concurrent": 0, "recommended_concurrency": 0, "available": 0,
-            "running": 0, "utilization_pct": 0, "load_factor": load_factor,
+            "running": 0, "utilization_pct": 0,
+            "load_factor": load_factor,
+            "load_ref": load_ref, "mem_ref": mem_ref,
+            "healthy_lanes": 0, "queue_health": 1.0,
             "lanes": {"total": 0, "busy": 0, "free": 0},
             "workers": {"eligible": 0, "active": 0, "alive": 0},
             "queued": None, "note": "no worker registry", "as_of": now_iso,
@@ -180,6 +206,23 @@ async def _compute_capacity() -> dict:
     eligible = [w for w in active if _dispatchable(w)]
     available = sum(max(0, _cap(w) - int(w.get("in_flight") or 0)) for w in eligible)
 
+    # Per-worker health (load1 + mem_pct). LXC host load1 propagates into
+    # the container per [[paprika-fleet-lxc-on-proxmox]], so a host carrying
+    # too many busy CTs makes ALL its workers contribute less. Worker missing
+    # a metric (None) is treated as healthy for that axis (idle assumption).
+    def _health(w) -> float:
+        load1 = w.get("load1")
+        mem_pct = w.get("mem_pct")
+        load_h = 1.0
+        if isinstance(load1, (int, float)) and load1 > 0:
+            load_h = 1.0 - max(0.0, float(load1) - load_ref) / load_ref
+        mem_h = 1.0
+        if isinstance(mem_pct, (int, float)) and mem_pct > 0:
+            mem_h = 1.0 - max(0.0, float(mem_pct) - mem_ref) / max(1.0, 100.0 - mem_ref)
+        return max(MIN_HEALTH, min(load_h, mem_h, 1.0))
+
+    healthy_lanes = sum(_cap(w) * _health(w) for w in eligible)
+
     # Best-effort queued backlog (one indexed COUNT; never fail the endpoint).
     queued = None
     try:
@@ -189,10 +232,38 @@ async def _compute_capacity() -> dict:
     except Exception:
         queued = None
 
+    # Back off further when queue depth approaches hard cap — adding more
+    # work just stacks behind redrive. Floor 0.7 so a momentary spike
+    # doesn't crater the recommendation; clip at 1.0 for an empty queue.
+    if queued is not None and max_concurrent > 0:
+        queue_health = max(0.7, min(1.0, 1.0 - float(queued) / max_concurrent))
+    else:
+        queue_health = 1.0
+
+    recommended = round(healthy_lanes * load_factor * queue_health)
+
+    # Server-side "is there room?" answer so consumers don't have to do
+    # `recommended_concurrency - running` math themselves and can express
+    # admission as a single boolean check. ``recommended_free`` is the
+    # *advisory* free-slot count keyed on the recommended cap (not the
+    # hard ``available``); ``accept_new`` is its boolean form so client
+    # SDKs can write ``if caps['accept_new']: submit()``. Strict (running
+    # only, ignoring queued) because ``queue_health`` above already
+    # pulls ``recommended`` down as the queue grows -- subtracting
+    # ``queued`` here too would double-count.
+    recommended_free = max(0, recommended - running)
+    accept_new = recommended_free > 0
+
     return {
         "max_concurrent": max_concurrent,
-        "recommended_concurrency": round(max_concurrent * load_factor),
+        "recommended_concurrency": recommended,
+        "recommended_free": recommended_free,
+        "accept_new": accept_new,
         "load_factor": load_factor,
+        "load_ref": load_ref,
+        "mem_ref": mem_ref,
+        "healthy_lanes": round(healthy_lanes, 1),
+        "queue_health": round(queue_health, 2),
         "available": available,
         "running": running,
         "utilization_pct": round(100 * running / max_concurrent) if max_concurrent else 0,
@@ -204,8 +275,10 @@ async def _compute_capacity() -> dict:
         },
         "queued": queued,
         "note": (
-            "1 fetch = 1 lane; any free lane runs a fetch. Cap parallel fetches "
-            "at `available`; beyond it, jobs queue (redrive) or POST /jobs 503s."
+            "1 fetch = 1 lane; any free lane runs a fetch. Check "
+            "`accept_new` (or `recommended_free > 0`) before POSTing; "
+            "beyond `available`, jobs queue (redrive) or POST /jobs 503s. "
+            "Knobs are live-editable in Settings."
         ),
         "as_of": now_iso,
     }
@@ -1808,6 +1881,136 @@ async def worker_link(ws: WebSocket, worker_id: str):
             pass
 
 
+# Per-job throttle for _persist_dl_progress: job_id -> last persist monotonic
+# timestamp. Stops the DB UPDATE from running ~20x/sec under a fast download
+# without losing the FINAL 100% / done state (the cap is bypassed when
+# state == 'done' so the bar resolves promptly).
+_DL_PROGRESS_LAST_PERSIST_AT: dict[str, float] = {}
+_DL_PROGRESS_PERSIST_INTERVAL_S: float = 1.5
+
+# Plain-yt-dlp progress line regex (NO json marker). Matches lines like
+# "[download]   12.6% of  541.13MiB at   40.61MiB/s ETA 00:11" emitted by
+# ``core/fetcher.py``'s yt-dlp subprocess for FETCH-mode video downloads
+# (separate code path from session-based downloads in
+# ``server/worker/agent/video.py``; the latter wraps each line in a
+# ``[[paprika:progress]] {json}`` marker, the former just forwards the raw
+# yt-dlp line via ``log()`` and there's no convenient hook). Catching it
+# here on the hub side keeps the fix worker-churn-free.
+_DLP_PLAIN_RE = _re.compile(
+    r"\[download\]\s+([0-9.]+)%(?:\s+of\s+~?\s*[0-9.]+\s*[KMGT]?i?B)?"
+    r"(?:\s+at\s+([0-9.]+\s*[KMGT]?i?B/s|Unknown\s*B/s))?"
+    r"(?:\s+ETA\s+([0-9:]+|Unknown))?"
+)
+
+
+async def _persist_dl_progress(job_id: str, line: str) -> None:
+    """Parse a ``[[paprika:progress]] {json}`` marker OR a plain ``[download]
+    X.X%...`` yt-dlp line, and persist the download %/eta/speed into
+    ``JobInfo.progress`` so the UI can show a bar even after a page reopen.
+    Best-effort, throttled per-job. Two input formats:
+
+      1. SESSION-based downloads (codegen scripts using ``page.download_video``
+         in ``server/worker/agent/video.py``) emit a structured marker:
+         ``[[paprika:progress]] {pct, eta, speed, state, ...}``.
+      2. FETCH-mode downloads (the auto-discovered HLS/mp4 capture in
+         ``core/fetcher.py``) just forward raw yt-dlp stdout: plain
+         ``[download]  12.6% of 541MiB at 40MiB/s ETA 00:11`` lines.
+
+    Both reach the hub via WorkerJobLog; this dispatches to the right parser."""
+    if line.startswith(JOB_PROGRESS_MARKER):
+        await _persist_dl_progress_marker(job_id, line)
+    elif "[download]" in line and "%" in line:
+        await _persist_dl_progress_plain(job_id, line)
+
+
+async def _persist_dl_progress_plain(job_id: str, line: str) -> None:
+    """Parse a raw ``[download] X.X% of ... at ... ETA ...`` yt-dlp line
+    (FETCH-mode path: emitted by core/fetcher.py without a json wrapper)."""
+    m = _DLP_PLAIN_RE.search(line)
+    if not m:
+        return
+    try:
+        pct = float(m.group(1))
+    except (TypeError, ValueError):
+        return
+    speed_raw = m.group(2) or ""
+    speed = speed_raw.strip() if speed_raw and "Unknown" not in speed_raw else None
+    eta_raw = m.group(3) or ""
+    eta = eta_raw.strip() if eta_raw and "Unknown" not in eta_raw else None
+    # Treat as 'done' when >=100% so the throttle bypass + final-100 logic
+    # mirror the json-marker path.
+    state = "done" if pct >= 100.0 else "downloading"
+    await _persist_dl_progress_payload(job_id, {
+        "pct": pct, "eta": eta, "speed": speed, "state": state,
+    })
+
+
+async def _persist_dl_progress_marker(job_id: str, line: str) -> None:
+    """Parse a ``[[paprika:progress]] {json}`` marker."""
+    try:
+        payload_raw = line[len(JOB_PROGRESS_MARKER):]
+        payload = _json.loads(payload_raw)
+    except Exception:
+        return
+    if not isinstance(payload, dict):
+        return
+    await _persist_dl_progress_payload(job_id, payload)
+
+
+async def _persist_dl_progress_payload(job_id: str, payload: dict) -> None:
+    """Common throttled-persist for both marker and plain-line paths."""
+    if not isinstance(payload, dict):
+        return
+    pct = payload.get("pct")
+    eta = payload.get("eta")
+    speed = payload.get("speed")
+    st = payload.get("state")
+    # Only persist actual download progress; muxing/start/done w/o pct don't
+    # carry numeric info worth a DB hit (start/done already drive the UI bar
+    # via the broadcast-only marker).
+    if pct is None and st not in ("done",):
+        return
+    now = time.monotonic()
+    last = _DL_PROGRESS_LAST_PERSIST_AT.get(job_id, 0.0)
+    # Always persist the terminal 'done' tick so the bar resolves; throttle
+    # the per-segment ticks.
+    if st != "done" and (now - last) < _DL_PROGRESS_PERSIST_INTERVAL_S:
+        return
+    _DL_PROGRESS_LAST_PERSIST_AT[job_id] = now
+    try:
+        info = await state.store.get_job_info(job_id)
+    except Exception:
+        return
+    if info is None or info.progress is None:
+        return
+    changed = False
+    if pct is not None:
+        try:
+            new_pct = float(pct)
+        except (TypeError, ValueError):
+            new_pct = None
+        if new_pct is not None and info.progress.download_pct != new_pct:
+            info.progress.download_pct = new_pct
+            changed = True
+    if eta is not None and info.progress.download_eta != str(eta):
+        info.progress.download_eta = str(eta)
+        changed = True
+    if speed is not None and info.progress.download_speed != str(speed):
+        info.progress.download_speed = str(speed)
+        changed = True
+    if st == "done":
+        # Force-resolve the bar even if pct wasn't on this particular line.
+        if info.progress.download_pct is not None and info.progress.download_pct < 100.0:
+            info.progress.download_pct = 100.0
+            changed = True
+    if not changed:
+        return
+    try:
+        await state.store.save_job_info(info)
+    except Exception:
+        pass
+
+
 def _drop_fetch_session_if_any(info) -> None:
     """Remove the fetch-owned SessionInfo a job registered at dispatch.
 
@@ -2155,6 +2358,18 @@ async def _handle_worker_message(worker, msg) -> None:
                 LINKS_CAPTURE_MARKER,
             )
         ):
+            # Persist a SLIM snapshot of the yt-dlp progress into
+            # JobInfo.progress so it survives a Live-panel reopen mid-
+            # download (the marker itself is broadcast-only via publish_log
+            # and never replays) AND so the #jobs row can render a slim
+            # progress bar without subscribing to the log stream.
+            # Throttled per-job to ~once every 5s so we don't UPDATE the
+            # row 20 times/sec under a fast download.
+            if msg.line.startswith(JOB_PROGRESS_MARKER):
+                try:
+                    await _persist_dl_progress(msg.job_id, msg.line)
+                except Exception:
+                    pass
             try:
                 await state.store.publish_log(msg.job_id, msg.line)
             except Exception:
@@ -2167,6 +2382,18 @@ async def _handle_worker_message(worker, msg) -> None:
         # zero-cost; for the MariaDB store the batcher is also None and the
         # direct path runs a synchronous INSERT right here.
         #
+        # Plain ``[download] X.X% of ... at ... ETA ...`` lines also drive
+        # the progress bar: FETCH-mode video downloads run from
+        # ``core/fetcher.py`` and emit raw yt-dlp stdout (no
+        # ``[[paprika:progress]]`` marker wrapper). Catch them here so the
+        # progress bar populates for those too. Cheap: a quick "[download]"
+        # substring + "%" check before the regex; the inner persist itself
+        # is throttled per-job.
+        if "[download]" in msg.line and "%" in msg.line:
+            try:
+                await _persist_dl_progress(msg.job_id, msg.line)
+            except Exception:
+                pass
         # Persisting a log line is best-effort telemetry and must NEVER
         # tear down the worker control link. A store error -- e.g. a
         # MariaDB FK violation when the parent job was deleted mid-stream

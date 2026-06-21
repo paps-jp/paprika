@@ -226,11 +226,157 @@
       loadOracle();
     } else if (name === 'aiio') {
       _aiIoStart();
+    } else if (name === 'audit') {
+      _auditStart();
     } else {
       loadSkillsConventions();
     }
     if (name !== 'aiio') _aiIoStop();
+    if (name !== 'audit') _auditStop();
   }
+
+  // ===== Success Audit sub-tab ============================================
+  // VisionAI-sampled audit of completed video-download jobs. Backed by
+  // GET /ai/audit-stats (KPIs) + GET /ai/audit-recent (table) +
+  // POST /ai/audit-now (operator-triggered immediate run).
+  let _auditPollTimer = null;
+  function _auditStop() { if (_auditPollTimer) { clearInterval(_auditPollTimer); _auditPollTimer = null; } }
+  function _auditStart() {
+    _auditStop();
+    try { refreshAuditPanel(); } catch (_) {}
+    _auditPollTimer = setInterval(() => {
+      if (document.hidden) return;
+      const a = document.querySelector('.ai-subpane[data-ai-subpane="audit"]');
+      if (!a || a.style.display === 'none') { _auditStop(); return; }
+      try { refreshAuditPanel(); } catch (_) {}
+    }, 60000);
+  }
+  function _fmtAuditTs(ts) {
+    if (!ts) return '—';
+    const d = new Date(ts * 1000);
+    return d.getHours().toString().padStart(2,'0') + ':' +
+           d.getMinutes().toString().padStart(2,'0') + ':' +
+           d.getSeconds().toString().padStart(2,'0');
+  }
+  function _auditVerdictBadge(ts) {
+    // ts here is the actually_succeeded value (1 / 0 / null).
+    if (ts === 1 || ts === true)  return '<span style="display:inline-block; padding:1px 8px; border-radius:10px; font-size:.78em; font-weight:600; background:#ecf7e9; color:#196b2c; border:1px solid #7ab68a;">✓ OK</span>';
+    if (ts === 0 || ts === false) return '<span style="display:inline-block; padding:1px 8px; border-radius:10px; font-size:.78em; font-weight:600; background:#fdecec; color:#a23c2a; border:1px solid #e0a99a;">✗ NG</span>';
+    return '<span style="display:inline-block; padding:1px 8px; border-radius:10px; font-size:.78em; font-weight:600; background:#f5f5fa; color:#555; border:1px solid #bbc;">?? 不明</span>';
+  }
+  function _reportedStatusBadge(rs) {
+    const colors = {
+      completed: { bg: '#ecf7e9', fg: '#196b2c', bd: '#7ab68a' },
+      failed:    { bg: '#fdecec', fg: '#a23c2a', bd: '#e0a99a' },
+      review:    { bg: '#fff3e6', fg: '#b8860b', bd: '#e0b48a' },
+    };
+    const c = colors[rs] || { bg: '#f5f5fa', fg: '#555', bd: '#bbc' };
+    return `<span style="display:inline-block; padding:1px 8px; border-radius:10px; font-size:.78em; font-weight:600; background:${c.bg}; color:${c.fg}; border:1px solid ${c.bd};">${_esc(rs || '?')}</span>`;
+  }
+  function _verdictRowFlag(vk) {
+    // Highlight disagreement rows so the eye catches them.
+    if (vk === 'false_positive') return 'background:#fffaf0;';
+    if (vk === 'false_negative') return 'background:#faf5ff;';
+    return '';
+  }
+  async function refreshAuditPanel() {
+    const since = parseInt(document.getElementById('auditSince')?.value || '86400', 10);
+    const failsOnly = !!document.getElementById('auditFailsOnly')?.checked;
+    const vk = (document.getElementById('auditVerdictKind')?.value || '').trim();
+    const statusEl = document.getElementById('auditStatus');
+    if (statusEl) statusEl.textContent = '取得中…';
+    // 1) KPI tiles (4-quadrant)
+    try {
+      const r = await fetch('/ai/audit-stats?since_s=' + since);
+      if (r.ok) {
+        const d = await r.json();
+        const set = (id, v) => { const el = document.getElementById(id); if (el) el.textContent = v; };
+        set('auditCntAudited', d.audited ?? 0);
+        set('auditCntTrueOk', d.true_ok ?? 0);
+        set('auditCntFalsePos', d.false_positive ?? 0);
+        set('auditCntFalseNeg', d.false_negative ?? 0);
+        set('auditCntTrueFail', d.true_failure ?? 0);
+        const ar = d.report_agreement_rate;
+        set('auditAgreeRate', (ar == null) ? '—' : Math.round(ar * 100) + '%');
+        const tr = d.true_success_rate;
+        set('auditTrueRate', (tr == null) ? '—' : Math.round(tr * 100) + '%');
+        const renderHosts = (id, list) => {
+          const el = document.getElementById(id);
+          if (!el) return;
+          el.innerHTML = (list && list.length)
+            ? list.map(h => `<div><code>${_esc(h[0])}</code> ×${h[1]}</div>`).join('')
+            : '<span style="color:#999;">(なし)</span>';
+        };
+        renderHosts('auditTopFpHosts', d.top_false_positive_hosts || []);
+        renderHosts('auditTopFnHosts', d.top_false_negative_hosts || []);
+        const badge = document.getElementById('cntAudit');
+        if (badge) badge.textContent = (d.false_positive ?? 0) + (d.false_negative ?? 0);
+      }
+    } catch (_) {}
+    // 2) Table
+    const tbody = document.querySelector('#auditTable tbody');
+    if (!tbody) return;
+    try {
+      const params = new URLSearchParams({ limit: '200' });
+      if (failsOnly) params.set('only_failures', '1');
+      if (vk) params.set('verdict_kind', vk);
+      const r = await fetch('/ai/audit-recent?' + params.toString());
+      if (!r.ok) { tbody.innerHTML = `<tr><td colspan="8" class="empty" style="padding:20px; text-align:center; color:#a00;">取得失敗 (HTTP ${r.status})</td></tr>`; return; }
+      const d = await r.json();
+      const rows = d.rows || [];
+      if (statusEl) statusEl.textContent = `${rows.length} 件表示`;
+      if (!rows.length) {
+        tbody.innerHTML = '<tr><td colspan="8" class="empty" style="padding:20px; text-align:center; color:#888;">監査結果なし — 「即時実行」で開始するか、Settings で success_audit_enabled を true に</td></tr>';
+        return;
+      }
+      tbody.innerHTML = rows.map(e => `
+        <tr style="${_verdictRowFlag(e.verdict_kind)}">
+          <td style="padding:4px 8px; border-bottom:1px solid #eee; white-space:nowrap;">${_fmtAuditTs(e.ts)}</td>
+          <td style="padding:4px 8px; border-bottom:1px solid #eee;">${_reportedStatusBadge(e.reported_status)}</td>
+          <td style="padding:4px 8px; border-bottom:1px solid #eee;">${_auditVerdictBadge(e.truly_succeeded)}</td>
+          <td style="padding:4px 8px; border-bottom:1px solid #eee; text-align:right; font-variant-numeric:tabular-nums;">${e.confidence == null ? '—' : (Math.round(e.confidence*100)+'%')}</td>
+          <td style="padding:4px 8px; border-bottom:1px solid #eee; white-space:nowrap;"><code style="font-size:.83em;">${_esc((e.job_id || '').slice(0,12))}</code></td>
+          <td style="padding:4px 8px; border-bottom:1px solid #eee; max-width:240px; overflow:hidden; text-overflow:ellipsis; white-space:nowrap;"><a href="${_esc(e.url || '#')}" target="_blank" rel="noopener" style="font-size:.85em;">${_esc((e.url || '').slice(0, 60))}</a></td>
+          <td style="padding:4px 8px; border-bottom:1px solid #eee; font-family:ui-monospace,Consolas,monospace; font-size:.82em; max-width:140px; overflow:hidden; text-overflow:ellipsis; white-space:nowrap;">${_esc(e.video_file || '—')}</td>
+          <td style="padding:4px 8px; border-bottom:1px solid #eee; font-size:.85em; max-width:380px; word-break:break-word;">${_esc(e.reason || '')}</td>
+        </tr>`).join('');
+    } catch (e) {
+      tbody.innerHTML = `<tr><td colspan="8" class="empty" style="padding:20px; text-align:center; color:#a00;">取得失敗: ${_esc(e.message || e)}</td></tr>`;
+    }
+    if (statusEl && (statusEl.textContent || '').endsWith('取得中…')) statusEl.textContent = '';
+  }
+  (function wireAudit() {
+    document.addEventListener('DOMContentLoaded', () => {
+      ['auditSince','auditFailsOnly','auditVerdictKind'].forEach(id => {
+        const el = document.getElementById(id);
+        if (!el) return;
+        const ev = el.type === 'checkbox' ? 'change' : 'change';
+        el.addEventListener(ev, () => { try { refreshAuditPanel(); } catch (_) {} });
+      });
+      const r = document.getElementById('auditRefresh');
+      if (r) r.addEventListener('click', () => { try { refreshAuditPanel(); } catch (_) {} });
+      const run = document.getElementById('auditRunNow');
+      if (run) run.addEventListener('click', async () => {
+        run.disabled = true;
+        const status = document.getElementById('auditStatus');
+        if (status) status.textContent = '実行中…';
+        try {
+          const resp = await fetch('/ai/audit-now', { method: 'POST' });
+          if (resp.ok) {
+            const d = await resp.json();
+            if (status) status.textContent = `audited=${d.audited||0} ok=${d.ok||0} ng=${d.ng||0}`;
+          } else {
+            if (status) status.textContent = `失敗 (HTTP ${resp.status})`;
+          }
+        } catch (e) {
+          if (status) status.textContent = '失敗: ' + (e.message || e);
+        } finally {
+          run.disabled = false;
+          try { refreshAuditPanel(); } catch (_) {}
+        }
+      });
+    });
+  })();
 
   // ===== AI I/O log sub-tab =================================================
   // Lists every LLM call (planner / skill_retrieval / codegen / judge /

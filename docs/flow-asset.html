@@ -1,0 +1,197 @@
+---
+title: Asset / Storage
+description: "Paprika のアセットが worker → hub local cache → MinIO SoT へ書込まれる経路と、180 秒 evict・DELETE 連動削除・source_url 解決順を Mermaid で。"
+active: architecture
+---
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+<meta charset="utf-8">
+<title>Asset / Storage — worker → hub → MinIO 永続化と evict — Paprika</title>
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<link rel="stylesheet" href="style.css">
+{% include favicon.html %}
+<meta name="description" content="Paprika のアセットが worker → hub local cache → MinIO SoT へ書込まれる経路と、180 秒 evict・DELETE 連動削除・source_url 解決順を Mermaid で。">
+<link rel="canonical" href="https://paps-jp.github.io/paprika/flow-asset.html">
+<meta property="og:type" content="website">
+<meta property="og:site_name" content="Paprika">
+<meta property="og:title" content="Asset / Storage — Paprika">
+<meta property="og:description" content="Paprika のアセットが worker → hub → MinIO SoT に書込まれる経路、180 秒 evict、DELETE 連動削除、source_url 解決順を Mermaid で。">
+<meta property="og:url" content="https://paps-jp.github.io/paprika/flow-asset.html">
+<meta property="og:image" content="https://paps-jp.github.io/paprika/icon.svg">
+<meta property="og:locale" content="ja_JP">
+<meta name="twitter:card" content="summary">
+<style>
+.mermaid{background:var(--bg-soft);border:1px solid var(--border-soft);border-radius:10px;padding:20px;margin:16px 0;overflow-x:auto;text-align:center}
+.mermaid svg{max-width:100%;height:auto}
+.flow-ref{font-family:ui-monospace,"SF Mono",Menlo,Consolas,monospace;color:var(--fg-muted,#6b7280);font-size:.82rem;display:block;margin:6px 0 14px}
+.flow-ref::before{content:"↪ ";opacity:.5}
+</style>
+<script src="https://cdn.jsdelivr.net/npm/mermaid@10/dist/mermaid.min.js"></script>
+</head>
+<body>
+
+{% include header.html active="architecture" %}
+
+{% include breadcrumbs.html %}
+<div class="layout">
+  <aside class="sidebar">
+    <h4>フローチャート</h4>
+    <ul>
+      <li><a href="flowcharts.html">概要・トポロジー</a></li>
+      <li><a href="flow-job.html">01 Job Lifecycle</a></li>
+      <li><a href="flow-session.html">02 Session Lifecycle</a></li>
+      <li><a href="flow-worker.html">03 Worker Fleet</a></li>
+      <li><a href="flow-codegen.html">04 Codegen Loop</a></li>
+      <li><a href="flow-asset.html" class="current">05 Asset / Storage</a></li>
+      <li><a href="flow-multihub.html">06 Multi-Hub</a></li>
+      <li><a href="flow-ai-review.html">07 AI / 課題判定</a></li>
+    </ul>
+    <h4>このページ</h4>
+    <ul>
+      <li><a href="#topology">ストレージトポロジー</a></li>
+      <li><a href="#upload">worker upload</a></li>
+      <li><a href="#evict">cache evict</a></li>
+      <li><a href="#delete">DELETE 連動削除</a></li>
+      <li><a href="#sourceurl">source_url 解決順</a></li>
+      <li><a href="#gallery">Gallery 読み出し</a></li>
+    </ul>
+  </aside>
+  <main id="main-content" class="content">
+
+<h1>Asset / Storage</h1>
+<p class="lead">MinIO がアセット SoT。Hub のローカル <code>/data/jobs</code> は 180 秒で evict される <strong>bounded cache</strong>。DELETE は MinIO 連動削除。MariaDB 行は ephemeral(クライアントが消す)、MinIO は durable。</p>
+
+<div class="tldr">
+  <span class="tldr-label">概要</span>
+  <ul>
+    <li><strong>アセット SoT は MinIO</strong>。Hub のディスクは bounded cache で、180 秒経過 + MinIO 側の存在確認後に evict。 どの Hub からでも同じものが見える。</li>
+    <li><strong>upload 時に <code>.meta</code> sidecar も MinIO にミラー</strong>。これが無いと evict 後に <code>source_url</code> などのメタデータを失う(disk-full 事故からの修正)。</li>
+    <li><strong>DELETE は MinIO 連動削除</strong>: 行を消す前に MinIO の <code>jobs/{id}/</code> prefix を一括削除。 過去 leak していた orphan を根絶。</li>
+  </ul>
+</div>
+
+<h2 id="topology">1. ストレージトポロジー</h2>
+<div class="mermaid">
+flowchart LR
+  subgraph WW["Worker"]
+    W["FetchResult: HTML / PNG / MP4 / HAR"]
+  end
+  subgraph HH["Hub (任意の 1 台)"]
+    HC["/data/jobs/{id}/<br/>(bounded cache, 180s evict)"]
+    SC["sidecar .meta<br/>(content-type, source_url, mtime)"]
+  end
+  subgraph SS["Storage"]
+    M["MinIO<br/>bucket=paprika<br/>key=jobs/{id}/...<br/>(SoT)"]
+    DB["MariaDB<br/>row(ephemeral)<br/>クライアント DELETE で消える"]
+  end
+  W -->|HTTP POST asset_upload_base| HC
+  HC --> SC
+  HC -->|mirror_file| M
+  SC -->|mirror_file (meta)| M
+  HC -.->|reads| Gal["Gallery / SDK"]
+  M -.->|cache miss フォールバック| Gal
+  HC --> DB
+</div>
+<div class="callout"><strong>3 ストア分散</strong>: ジョブと設定は <code>MariaDB</code>、アセットは <code>MinIO</code>、コーディネーション(worker registry / sessions / pub-sub invalidate)は <code>Redis</code>。 Hub local は cache でしかない=どのハブでも同じものが見える。</div>
+
+<h2 id="upload">2. Worker → Hub → MinIO upload</h2>
+<div class="mermaid">
+sequenceDiagram
+  participant W as Worker
+  participant H as Hub (routes/jobs/artifacts.py)
+  participant FS as /data/jobs (cache)
+  participant M as MinIO
+  W->>H: POST /jobs/{id}/assets/{name} (binary + meta hdrs)
+  H->>FS: write asset
+  H->>FS: write .meta sidecar (content-type, source_url, original-name, mtime)
+  par 非同期 mirror
+    H->>M: PUT jobs/{id}/{name}
+    H->>M: PUT jobs/{id}/{name}.meta
+  end
+  H-->>W: 201 Created
+</div>
+<div class="callout warn"><strong>.meta sidecar も mirror が必要</strong>: 過去の disk-full 事故以降、保存時に asset と一緒に <code>.meta</code> も MinIO へ。これが無いと evict で <code>source_url</code> が消える。</div>
+
+<h2 id="evict">3. Hub local cache — 180 秒 evict</h2>
+<div class="mermaid">
+flowchart TD
+  loop["_cache_evict (定期)"]
+  loop --> scan["scan /data/jobs/*"]
+  scan --> age{"dir age &gt; 180s ?"}
+  age -->|no| skip[skip]
+  age -->|yes| exist{"MinIO prefix_exists?"}
+  exist -->|true| rm["rmdir /data/jobs/{id}"]
+  exist -->|false| keep["⚠ keep<br/>(mirror 未完了の可能性 → 次の loop)"]
+</div>
+<div class="callout warn"><strong>事故の系譜</strong>: cache が動画で 22 GB/hub まで育って 3 Hub 全停止。修正=(1) sidecar も同時 mirror、(2) <code>prefix_exists</code> 確認後だけ削除、(3) ホスト cron フォールバック。<code>get_storage_dir()</code> は素の <code>docker exec</code> では相対パスを返す罠あり(<code>config.data_dir=/data/jobs</code> を set してから)。</div>
+
+<h2 id="delete">4. <code>DELETE /jobs/{id}</code> — MinIO 連動削除</h2>
+<div class="mermaid">
+sequenceDiagram
+  participant C as Client
+  participant H as Hub (lifecycle.py:751)
+  participant M as MinIO
+  participant DB as Store
+  C->>H: DELETE /jobs/{id}
+  H->>M: objstore.delete_prefix(jobs/{id}/)
+  M-->>H: deleted N objects (X MiB reclaim)
+  H->>DB: drop row
+  H-->>C: 204
+  Note over M: row drop 前に MinIO 一括削除<br/>= leak していた orphan を根絶
+</div>
+<p class="flow-ref">routes/jobs/lifecycle.py:751</p>
+
+<h2 id="sourceurl">5. <code>assets.json</code> の <code>source_url</code> 解決順</h2>
+<div class="mermaid">
+flowchart TD
+  q["GET /jobs/{id}/assets.json"]
+  q --> a1["1. sidecar (.meta) の source_url"]
+  a1 -->|miss| a2["2. job result.assets[].url"]
+  a2 -->|miss| a3["3. session network.jsonl<br/>(widget / iframe 資源)"]
+  a3 -->|miss| a4["4. fetcher netcap"]
+  a4 -->|miss| nul["null"]
+  a1 -->|hit| done["return https:// 絶対URL"]
+  a2 -->|hit| done
+  a3 -->|hit| done
+  a4 -->|hit| done
+</div>
+<div class="callout tip"><strong>4 段カスケードの意味</strong>: 外部 consumer が画像の元 URL を必要とするケース(削除依頼通知など、アセットを「どこから取った」かを連絡文面に載せる用途)で <code>source_url=null</code> が出ないように、worker が捕捉した URL を多段で漁る。</div>
+
+<h2 id="gallery">6. Gallery 読み出し</h2>
+<div class="mermaid">
+flowchart LR
+  C["Client browser"]
+  C -->|今| H["Hub /jobs/{id}/assets/{name}"]
+  H -->|local hit| local["/data/jobs から serve"]
+  H -->|miss| M["MinIO proxy 経由"]
+  M -.->|計画| pre["署名付き URL モデル<br/>(Hub から URL 発行<br/>クライアントが MinIO 直)"]
+  pre --> M
+</div>
+<div class="callout">署名付き URL モデルは現時点で<strong>設計のみで未実装</strong>。 現状は全て Hub proxy。</div>
+
+<div class="footer">
+  Paprika &copy; 2026 <a href="https://www.paps.jp">paps-jp</a>
+</div>
+  </main>
+</div>
+{% include footer.html %}
+
+<script>
+(function(){
+  document.querySelectorAll('.mermaid').forEach(function(el){ el.dataset.source = el.textContent.trim(); });
+  function getTheme(){ return document.documentElement.dataset.theme === 'dark' ? 'dark' : 'neutral'; }
+  function initAndRun(){
+    mermaid.initialize({startOnLoad:false, theme:getTheme(), securityLevel:'loose'});
+    document.querySelectorAll('.mermaid').forEach(function(el){
+      if (el.dataset.source) { el.removeAttribute('data-processed'); el.innerHTML = el.dataset.source; }
+    });
+    mermaid.run();
+  }
+  if (document.readyState === 'loading') document.addEventListener('DOMContentLoaded', initAndRun);
+  else initAndRun();
+  new MutationObserver(initAndRun).observe(document.documentElement, {attributes:true, attributeFilter:['data-theme']});
+})();
+</script>
+</body>
+</html>

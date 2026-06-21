@@ -1,0 +1,204 @@
+---
+title: AI / 課題判定
+description: "Paprika の AI エスカレーション(failed/review → codegen-loop 再投入)、課題判定(占有率ベース)、perception → reasoning distiller → barrier→recipe の学習ループを Mermaid で。"
+active: architecture
+---
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+<meta charset="utf-8">
+<title>AI Escalation &amp; 課題判定 — perception → distiller → recipe — Paprika</title>
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<link rel="stylesheet" href="style.css">
+{% include favicon.html %}
+<meta name="description" content="Paprika の AI エスカレーション(failed/review → codegen-loop 再投入)、課題判定(占有率ベース)、perception → reasoning distiller → barrier→recipe の学習ループを Mermaid で。">
+<link rel="canonical" href="https://paps-jp.github.io/paprika/flow-ai-review.html">
+<meta property="og:type" content="website">
+<meta property="og:site_name" content="Paprika">
+<meta property="og:title" content="AI Escalation &amp; 課題判定 — Paprika">
+<meta property="og:description" content="Paprika の AI エスカレーション、課題判定(占有率ベース)、perception → reasoning distiller → barrier→recipe の学習ループを Mermaid で。">
+<meta property="og:url" content="https://paps-jp.github.io/paprika/flow-ai-review.html">
+<meta property="og:image" content="https://paps-jp.github.io/paprika/icon.svg">
+<meta property="og:locale" content="ja_JP">
+<meta name="twitter:card" content="summary">
+<style>
+.mermaid{background:var(--bg-soft);border:1px solid var(--border-soft);border-radius:10px;padding:20px;margin:16px 0;overflow-x:auto;text-align:center}
+.mermaid svg{max-width:100%;height:auto}
+.flow-ref{font-family:ui-monospace,"SF Mono",Menlo,Consolas,monospace;color:var(--fg-muted,#6b7280);font-size:.82rem;display:block;margin:6px 0 14px}
+.flow-ref::before{content:"↪ ";opacity:.5}
+</style>
+<script src="https://cdn.jsdelivr.net/npm/mermaid@10/dist/mermaid.min.js"></script>
+</head>
+<body>
+
+{% include header.html active="architecture" %}
+
+{% include breadcrumbs.html %}
+<div class="layout">
+  <aside class="sidebar">
+    <h4>フローチャート</h4>
+    <ul>
+      <li><a href="flowcharts.html">概要・トポロジー</a></li>
+      <li><a href="flow-job.html">01 Job Lifecycle</a></li>
+      <li><a href="flow-session.html">02 Session Lifecycle</a></li>
+      <li><a href="flow-worker.html">03 Worker Fleet</a></li>
+      <li><a href="flow-codegen.html">04 Codegen Loop</a></li>
+      <li><a href="flow-asset.html">05 Asset / Storage</a></li>
+      <li><a href="flow-multihub.html">06 Multi-Hub</a></li>
+      <li><a href="flow-ai-review.html" class="current">07 AI / 課題判定</a></li>
+    </ul>
+    <h4>このページ</h4>
+    <ul>
+      <li><a href="#classify">課題分類(占有率)</a></li>
+      <li><a href="#escalation">AI escalation gate</a></li>
+      <li><a href="#perception">perception → distiller</a></li>
+      <li><a href="#recipe">barrier → fetch_recipe</a></li>
+      <li><a href="#engine">engine routing</a></li>
+      <li><a href="#loop">学習ループ全体</a></li>
+    </ul>
+  </aside>
+  <main id="main-content" class="content">
+
+<h1>AI Escalation &amp; 課題判定</h1>
+<p class="lead">fetch 完了の中でも <strong>「壁に塞がれて結果が信用できない」</strong> を <code>JobStatus.review</code> に分離(課題)。 AI エスカレーションは failed / review を Codegen ループに再投入。 perception → reasoning distiller でホスト知識を蓄積し、barrier → fetch_recipe で自動学習。</p>
+
+<div class="tldr">
+  <span class="tldr-label">概要</span>
+  <ul>
+    <li><strong>「fetch は完了したが信用できない」を分離</strong>: 全画面オーバーレイ(login / age-gate / consent / paywall) で本文が見えていないケースを <code>review</code>(課題)に振り分ける。 結果は破棄せず保持。</li>
+    <li><strong>失敗 / 課題が AI 学習の燃料</strong>: review / failed を Codegen ループへ再投入。 GPU アイドル時のみ・per-host cooldown・件数上限のゲートで暴走を防ぐ。</li>
+    <li><strong>壁の構造化 → recipe 化</strong>: vision LLM が壁を見て、reasoning モデルがホスト知識に蒸留、それを fetch_recipe(<code>on_after_navigate</code> アクション)に変換して登録。 次回 fetch は recipe で壁を超える。</li>
+  </ul>
+</div>
+
+<h2 id="classify">1. 課題分類 — 占有率ベース判定</h2>
+<div class="mermaid">
+flowchart TD
+  done["worker FetchResult 到着"]
+  done --> fch{"mode=fetch ?"}
+  fch -->|no| skip[skip<br/>codegen-loop は自前で判定]
+  fch -->|yes| ex{"host.excluded?<br/>(対象外)"}
+  ex -->|yes| skip
+  ex -->|no| en{"review_flag_enabled<br/>+ PAPRIKA_REVIEW_DISABLE != 1"}
+  en -->|disabled| skip
+  en -->|on| occ{"occlusion data ある?<br/>(probe_occlusion JS)"}
+  occ -->|missing/error| skip
+  occ -->|ok| crit{"coverage &gt;= 0.85<br/>+ dominance &gt;= 0.6<br/>+ vis_img &lt;= 3 &amp; text_len &lt;= 1200<br/>+ (scroll_lock OR aria_modal OR hasPassword)"}
+  crit -->|no| comp["status = completed"]
+  crit -->|yes| rev["status = review<br/>last_log = reason"]
+</div>
+<p class="flow-ref">server/hub/_review.py:85 classify_review / core/fetcher probe_occlusion</p>
+<div class="callout tip"><strong>z-index を解釈しない</strong>: worker 側の <code>probe_occlusion</code> がブラウザの <code>elementFromPoint</code> グリッド hit-test を直接行う。 サイト固有の z-index ルールを焼かない設計。</div>
+
+<h2 id="escalation">2. AI escalation gate</h2>
+<div class="mermaid">
+flowchart TD
+  hook["WorkerJobComplete OR WorkerJobFailed"]
+  hook --> excl{"host.excluded?"}
+  excl -->|yes| stop[stop]
+  excl -->|no| en{"auto_escalate_enabled?"}
+  en -->|off| stop
+  en -->|on| dup{"options.escalated_from set?<br/>(既にエスカ済)"}
+  dup -->|yes| stop[二重防止]
+  dup -->|no| gpu{"GPU アイドル?<br/>(thermal &amp; stop gate 通過)"}
+  gpu -->|busy| stop
+  gpu -->|idle| rate{"per-host 30 分 cooldown<br/>+ 件数/h 上限内?"}
+  rate -->|no| stop
+  rate -->|yes| spawn["POST /jobs mode=codegen-loop<br/>options.escalated_from = {parent}<br/>goal は parent の goal+url から派生"]
+  spawn --> child["child job (Codegen ループへ)"]
+</div>
+<div class="callout"><strong>2 フック必須</strong>: 認証 / 動画 DL 失敗の大半は <code>WorkerJobFailed</code> ではなく <code>completed</code>(fetch は結果さえ返せば常に completed)→ <code>WorkerJobComplete</code> + <code>WorkerJobFailed</code> 両方フック。</div>
+
+<h2 id="perception">3. perception → reasoning distiller</h2>
+<div class="mermaid">
+sequenceDiagram
+  participant J as parent fetch (completed or failed)
+  participant V as perception_llm (vision)
+  participant Sav as save_perception_for_job (bg)
+  participant DB as MariaDB host_records
+  participant R as reasoning_distiller
+  Note over J: 成功時 / 失敗時の両方で走る<br/>(failed-fetch 用に最終 JPEG を強制 capture)
+  J->>V: final.jpg + outline + title + url
+  V-->>J: PerceptionResult (structured facts)
+  J->>Sav: persist perception.json
+  Sav->>DB: HostRecord に蓄積
+  opt distiller_mode = new + 蓄積十分
+    Sav->>R: 累積 perception + barriers → distill
+    R-->>Sav: HostKnowledge<br/>(barriers, distiller 結果)
+    Sav->>DB: persist
+  end
+</div>
+
+<h2 id="recipe">4. barrier → fetch_recipe(自動学習)</h2>
+<div class="mermaid">
+flowchart TD
+  acc["distiller 結果の barriers にホスト固有の壁が蓄積<br/>(age-gate / consent / paywall / cookie banner ...)"]
+  acc --> trig["_maybe_register_recipes_from_barriers (永続化後フック)"]
+  trig --> gate{"settings.auto_recipe_from_barrier?<br/>(既定 ON)"}
+  gate -->|off| keep[蓄積のみ]
+  gate -->|on| map["hosts.strategy_to_recipe_actions<br/>barrier → on_after_navigate action 変換"]
+  map --> reg["POST /hosts/{host}/recipes<br/>(cross-hub 伝播)"]
+  reg --> use["以降 fetch_strategy=recipe で<br/>navigate 直後に自動適用<br/>(core 変更なし)"]
+</div>
+<div class="callout tip"><strong>サイト固有を core に焼かない</strong>方針: 汎用 hover などを <code>core/fetcher</code> に足す案は破棄。 ホスト別 recipe で <code>evaluate</code>(任意 JS) / <code>click</code> / <code>scroll</code> / <code>wait</code> を組合せる。</div>
+
+<h2 id="engine">5. engine routing — thermal + 停止 + フェイルオーバ</h2>
+<div class="mermaid">
+flowchart TD
+  call["page.agent / codegen / perception / judge"]
+  call --> role["役割→engine 順序解決<br/>(_roles.resolve_role_engine_slug)"]
+  role --> chk1{"engine 停止中?<br/>(settings.engines_disabled の csv)"}
+  chk1 -->|disabled| nxt[次候補へ]
+  chk1 -->|ok| chk2{"GPU thermal?<br/>現温度 &gt;= 受付停止温度?"}
+  chk2 -->|throttle| nxt
+  chk2 -->|ok| dispatch["LLM call<br/>+ record_engine_usage<br/>(MariaDB engine_usage 原子 UPSERT)"]
+  nxt --> fo{"次候補ある?"}
+  fo -->|yes| chk1
+  fo -->|no| err["503 / 失敗 → escalate or 終端"]
+</div>
+<div class="callout"><strong>使用量は MariaDB 集約</strong>: per-Hub の JSON ファイルから MariaDB の <code>engine_usage(date, slug)</code> 原子 UPSERT に移行。 フリート合計が見える。</div>
+
+<h2 id="loop">6. 全体ループ — failed-fetch → 学習 → 次回成功</h2>
+<div class="mermaid">
+flowchart LR
+  fetch["mode=fetch ジョブ"]
+  fetch --> outc{"成功?"}
+  outc -->|そのまま成功| C1[completed]
+  outc -->|壁| rev2[review]
+  outc -->|エラー| F1[failed]
+  rev2 --> esc[AI escalation gate]
+  F1 --> esc
+  esc -->|gate 通過| cg["codegen-loop"]
+  cg --> per["perception"]
+  per --> dist["distiller"]
+  dist --> rec["recipe 登録"]
+  rec --> fetch
+  esc -.->|gate ブロック| stop[stop]
+</div>
+<div class="callout tip"><strong>学習ループの設計図</strong>: review / failed を燃料に AI が試行 → perception で「何故壁にぶつかったか」を構造化 → distiller がホスト知識化 → recipe として次回 fetch を自動補強。 成功判定の精度が足りないと学習が偽信号で汚染されるため、Codegen ループの判定改善が要石になる。</div>
+
+<div class="footer">
+  Paprika &copy; 2026 <a href="https://www.paps.jp">paps-jp</a>
+</div>
+  </main>
+</div>
+{% include footer.html %}
+
+<script>
+(function(){
+  document.querySelectorAll('.mermaid').forEach(function(el){ el.dataset.source = el.textContent.trim(); });
+  function getTheme(){ return document.documentElement.dataset.theme === 'dark' ? 'dark' : 'neutral'; }
+  function initAndRun(){
+    mermaid.initialize({startOnLoad:false, theme:getTheme(), securityLevel:'loose'});
+    document.querySelectorAll('.mermaid').forEach(function(el){
+      if (el.dataset.source) { el.removeAttribute('data-processed'); el.innerHTML = el.dataset.source; }
+    });
+    mermaid.run();
+  }
+  if (document.readyState === 'loading') document.addEventListener('DOMContentLoaded', initAndRun);
+  else initAndRun();
+  new MutationObserver(initAndRun).observe(document.documentElement, {attributes:true, attributeFilter:['data-theme']});
+})();
+</script>
+</body>
+</html>

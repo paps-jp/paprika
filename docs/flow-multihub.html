@@ -1,0 +1,244 @@
+---
+title: Multi-Hub
+description: "Paprika のマルチハブ構成(nginx 振り分け / hub_id IP 派生 / 設定 cross-hub invalidate / session 転送ミドルウェア / P2 再起動復元)とデプロイモデルを Mermaid で。"
+active: architecture
+---
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+<meta charset="utf-8">
+<title>Multi-Hub — nginx 振り分け・設定 invalidate・session 転送・SoT デプロイ — Paprika</title>
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<link rel="stylesheet" href="style.css">
+{% include favicon.html %}
+<meta name="description" content="Paprika のマルチハブ構成(nginx 振り分け / hub_id IP 派生 / 設定 cross-hub invalidate / session 転送ミドルウェア / P2 再起動復元)とデプロイモデルを Mermaid で。">
+<link rel="canonical" href="https://paps-jp.github.io/paprika/flow-multihub.html">
+<meta property="og:type" content="website">
+<meta property="og:site_name" content="Paprika">
+<meta property="og:title" content="Multi-Hub — Paprika">
+<meta property="og:description" content="Paprika のマルチハブ構成(nginx 振り分け / hub_id IP 派生 / 設定 cross-hub invalidate / session 転送ミドルウェア / P2 再起動復元)とデプロイモデルを Mermaid で。">
+<meta property="og:url" content="https://paps-jp.github.io/paprika/flow-multihub.html">
+<meta property="og:image" content="https://paps-jp.github.io/paprika/icon.svg">
+<meta property="og:locale" content="ja_JP">
+<meta name="twitter:card" content="summary">
+<style>
+.mermaid{background:var(--bg-soft);border:1px solid var(--border-soft);border-radius:10px;padding:20px;margin:16px 0;overflow-x:auto;text-align:center}
+.mermaid svg{max-width:100%;height:auto}
+.flow-ref{font-family:ui-monospace,"SF Mono",Menlo,Consolas,monospace;color:var(--fg-muted,#6b7280);font-size:.82rem;display:block;margin:6px 0 14px}
+.flow-ref::before{content:"↪ ";opacity:.5}
+</style>
+<script src="https://cdn.jsdelivr.net/npm/mermaid@10/dist/mermaid.min.js"></script>
+</head>
+<body>
+
+{% include header.html active="architecture" %}
+
+{% include breadcrumbs.html %}
+<div class="layout">
+  <aside class="sidebar">
+    <h4>フローチャート</h4>
+    <ul>
+      <li><a href="flowcharts.html">概要・トポロジー</a></li>
+      <li><a href="flow-job.html">01 Job Lifecycle</a></li>
+      <li><a href="flow-session.html">02 Session Lifecycle</a></li>
+      <li><a href="flow-worker.html">03 Worker Fleet</a></li>
+      <li><a href="flow-codegen.html">04 Codegen Loop</a></li>
+      <li><a href="flow-asset.html">05 Asset / Storage</a></li>
+      <li><a href="flow-multihub.html" class="current">06 Multi-Hub</a></li>
+      <li><a href="flow-ai-review.html">07 AI / 課題判定</a></li>
+    </ul>
+    <h4>このページ</h4>
+    <ul>
+      <li><a href="#nginx">nginx 振り分け</a></li>
+      <li><a href="#hubid">hub_id IP 派生</a></li>
+      <li><a href="#invalidate">設定 cross-hub invalidate</a></li>
+      <li><a href="#forward">session 転送ミドルウェア</a></li>
+      <li><a href="#restart">P2 再起動復元</a></li>
+      <li><a href="#deploy">SoT デプロイ</a></li>
+      <li><a href="#full">全体俯瞰</a></li>
+    </ul>
+  </aside>
+  <main id="main-content" class="content">
+
+<h1>Multi-Hub</h1>
+<p class="lead">Edge の nginx が複数 Hub を rr。worker WS だけ sticky。 設定変更は MariaDB write-through + Redis pub-sub で live propagate。 session HTTP はミドルウェアが owner hub へ転送。 デプロイは <strong>SoT 一本化</strong>(本番 Hub を直接編集しない)。</p>
+
+<div class="tldr">
+  <span class="tldr-label">概要</span>
+  <ul>
+    <li><strong>クライアントは rr、worker WS だけ sticky</strong>: client は rr で OK(session はミドルウェアが転送、jobs は store-shared)。 worker は sticky で hub_id を安定させ、heartbeat と version gate の往復をシンプルに保つ。</li>
+    <li><strong>設定変更は live propagate</strong>: skills / conv / presets / hosts / settings / engines が MariaDB write-through + Redis pub-sub で全 Hub に伝播。</li>
+    <li><strong>本番 Hub を直接編集しない</strong>: SoT 1 箇所のみ編集し、watcher が hash 分類 → 並列 rsync → /health gate 付き 順次再起動 → worker self-update まで自動化。</li>
+  </ul>
+</div>
+
+<h2 id="nginx">1. nginx 振り分け</h2>
+<div class="mermaid">
+flowchart TB
+  subgraph edge["Edge nginx"]
+    cl[":8000 client api"]
+    wk[":8100 worker WS"]
+  end
+  subgraph hubs["Hub (+ standby)"]
+    H1["hub-A"]
+    H2["hub-B"]
+    H3["hub-C"]
+    H4["hub-D (standby)"]
+    H5["hub-E"]
+    H6["hub-F"]
+  end
+  cl -->|round-robin| H1 & H2 & H3
+  wk -->|hash $worker_id consistent (sticky)| H1 & H2 & H3
+</div>
+<div class="callout tip"><strong>sticky は worker WS だけ</strong>: client は rr で OK(session はミドルウェアが転送、jobs は store-shared)。 worker は sticky で hub_id を安定させ、heartbeat と version gate の往復をシンプルに保つ。</div>
+
+<h2 id="hubid">2. <code>hub_id</code> IP 派生 + orphan-guard</h2>
+<div class="mermaid">
+flowchart TD
+  boot["hub container boot"]
+  boot --> ip["自身の LAN IP 取得<br/>(redis CLIENT INFO 経由)"]
+  ip --> hid["hub_id = hub-&lt;4th oct&gt;"]
+  hid --> own["lease 取得 (Redis)"]
+  own --> peer{"既存 peer alive?"}
+  peer -->|yes| skip["orphan-guard: nuke しない<br/>peer の状態を温存"]
+  peer -->|no| reco["reconstruct_owned_sessions<br/>(Redis から rebuild)"]
+</div>
+
+<h2 id="invalidate">3. 設定 cross-hub invalidate(live propagate)</h2>
+<div class="mermaid">
+sequenceDiagram
+  participant U as 操作者
+  participant H1 as hub-A (writer)
+  participant Mar as MariaDB
+  participant R as Redis pub-sub
+  participant H2 as hub-B
+  participant H3 as hub-C
+  U->>H1: PUT /settings /engines /hosts<br/>/skills /conv /presets /extensions /profiles
+  H1->>Mar: write-through
+  H1->>R: PUBLISH paprika:registry:invalidate {type, key}
+  par 並列受信
+    R-->>H2: event
+    R-->>H3: event
+  end
+  H2->>H2: _apply_event<br/>(MinIO 等 endpoint 変更時は reset_client も)
+  H3->>H3: _apply_event
+</div>
+<div class="callout warn"><strong>クライアント cache の罠</strong>: MinIO endpoint 変更時に <code>_apply_event</code> が <code>reset_client()</code> を呼ばないと、peer Hub が古い endpoint を握り続けるケースがあった。</div>
+
+<h2 id="forward">4. session 転送ミドルウェア</h2>
+<div class="mermaid">
+sequenceDiagram
+  participant C as Client
+  participant N as nginx (rr)
+  participant Y as Hub-Y (landed)
+  participant R as Redis owner index
+  participant X as Hub-X (owner)
+  C->>N: /sessions/{sid}/*
+  N->>Y: rr 転送
+  Y->>Y: _session_forward_middleware
+  Y->>Y: state.sessions.get(sid)?
+  alt local
+    Y-->>C: handle
+  else remote
+    Y->>R: lookup_owner(sid)
+    R-->>Y: (worker_id, owner_hub)
+    Y->>X: POST /internal/sessions/{sid}/action
+    X-->>Y: result
+    Y-->>C: result
+  end
+</div>
+<div class="callout">ミドルウェアに集約しなかった頃は、各エンドポイントごとに転送を呼び忘れる footgun があった。 詳細は <a href="flow-session.html">Session Lifecycle</a>。</div>
+
+<h2 id="restart">5. P2 — Hub 再起動を跨いだセッション復元</h2>
+<div class="mermaid">
+sequenceDiagram
+  participant Hx as hub-X (before)
+  participant R as Redis
+  participant W as Worker (consistent hash)
+  participant Hx2 as hub-X (after restart)
+  Hx->>R: persist SessionInfo(full state)
+  Hx->>R: owner index (sid → worker_id, hub_id)
+  Note over Hx: container restart
+  W->>W: WS drop → reconnect (sticky hash 戻る)
+  W->>Hx2: WorkerRegister
+  Hx2->>R: reconstruct_owned_sessions<br/>(rebuild from Redis)
+  Hx2->>W: take ownership (re-announce)
+  W-->>Hx2: session 状態送信
+  Note over W,Hx2: HTTP /sessions/{sid} 200 維持
+</div>
+
+<h2 id="deploy">6. デプロイ — SoT 一本化</h2>
+<div class="mermaid">
+flowchart TD
+  edit["edit SoT host: /opt/paprika/{server,core}"]
+  edit --> watch["paprika-deploy-watcher (systemd)<br/>30 秒 debounce"]
+  watch --> hash["content-hash 分類<br/>hub vs worker 変更を判定"]
+  hash --> rsync["並列 rsync to 全 Hub"]
+  rsync --> heal["/health gate + 順次再起動<br/>docker compose -t 8 restart hub"]
+  heal --> wprop["worker self-update<br/>(HubExpectedVersion push, no hub restart)"]
+  wprop --> verify["poll verify (fleet count converge)"]
+</div>
+<div class="callout warn"><strong>絶対ルール</strong>: 本番 Hub やワーカーを直接編集 / scp / 再起動しない。 SoT ホスト 1 箇所のみ編集する。 デプロイ対象は <code>server/</code> + <code>core/</code> のみ。 <code>scripts/</code> や <code>nginx.conf</code> は対象外=手動更新。</div>
+
+<h2 id="full">7. 全体俯瞰</h2>
+<div class="mermaid">
+flowchart LR
+  subgraph clients[Clients]
+    SDK["SDK / CLI"]
+    Web["admin UI"]
+    Ext["外部 consumer"]
+  end
+  subgraph edge[Edge nginx]
+    NG[":8000 / :8100"]
+  end
+  subgraph hubs[hub-A..hub-C]
+    HA["hub-A"]
+    HB["hub-B"]
+    HC["hub-C"]
+  end
+  subgraph store[Shared SoT]
+    R["Redis<br/>registry / sessions / pub-sub"]
+    M["MariaDB<br/>jobs / configs / users"]
+    O["MinIO<br/>assets"]
+  end
+  subgraph fleet[Worker fleet]
+    W1["w50141"]
+    W2["w50150"]
+    Wn["..."]
+  end
+  SDK & Web & Ext --> NG
+  NG --rr--> HA & HB & HC
+  HA & HB & HC <-->|state| R
+  HA & HB & HC <-->|rows| M
+  HA & HB & HC <-->|assets| O
+  NG -->|worker WS sticky| HA & HB & HC
+  HA & HB & HC <-->|HubAssignJob / HubExpectedVersion<br/>WorkerHeartbeat| W1 & W2 & Wn
+  cfg["SoT host<br/>/opt/paprika/{server,core}"]
+  cfg -.->|watcher rsync| HA & HB & HC
+</div>
+
+<div class="footer">
+  Paprika &copy; 2026 <a href="https://www.paps.jp">paps-jp</a>
+</div>
+  </main>
+</div>
+{% include footer.html %}
+
+<script>
+(function(){
+  document.querySelectorAll('.mermaid').forEach(function(el){ el.dataset.source = el.textContent.trim(); });
+  function getTheme(){ return document.documentElement.dataset.theme === 'dark' ? 'dark' : 'neutral'; }
+  function initAndRun(){
+    mermaid.initialize({startOnLoad:false, theme:getTheme(), securityLevel:'loose'});
+    document.querySelectorAll('.mermaid').forEach(function(el){
+      if (el.dataset.source) { el.removeAttribute('data-processed'); el.innerHTML = el.dataset.source; }
+    });
+    mermaid.run();
+  }
+  if (document.readyState === 'loading') document.addEventListener('DOMContentLoaded', initAndRun);
+  else initAndRun();
+  new MutationObserver(initAndRun).observe(document.documentElement, {attributes:true, attributeFilter:['data-theme']});
+})();
+</script>
+</body>
+</html>

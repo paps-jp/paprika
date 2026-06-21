@@ -1,0 +1,225 @@
+---
+title: Session Lifecycle
+description: "Paprika のセッションが OPEN・noVNC・cross-hub 転送・4 経路 CLOSE を辿る経路と、idle TTL / 絶対 TTL / 操作 keepalive の判定を Mermaid で可視化。"
+active: architecture
+---
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+<meta charset="utf-8">
+<title>Session Lifecycle — OPEN・noVNC・cross-hub・CLOSE の動線 — Paprika</title>
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<link rel="stylesheet" href="style.css">
+{% include favicon.html %}
+<meta name="description" content="Paprika のセッションが OPEN・noVNC・cross-hub 転送・4 経路 CLOSE を辿る経路と、idle TTL / 絶対 TTL / 操作 keepalive の判定を Mermaid で可視化。">
+<link rel="canonical" href="https://paps-jp.github.io/paprika/flow-session.html">
+<meta property="og:type" content="website">
+<meta property="og:site_name" content="Paprika">
+<meta property="og:title" content="Session Lifecycle — Paprika">
+<meta property="og:description" content="Paprika のセッションが OPEN・noVNC・cross-hub 転送・4 経路 CLOSE を辿る経路を Mermaid で可視化。">
+<meta property="og:url" content="https://paps-jp.github.io/paprika/flow-session.html">
+<meta property="og:image" content="https://paps-jp.github.io/paprika/icon.svg">
+<meta property="og:locale" content="ja_JP">
+<meta name="twitter:card" content="summary">
+<style>
+.mermaid{background:var(--bg-soft);border:1px solid var(--border-soft);border-radius:10px;padding:20px;margin:16px 0;overflow-x:auto;text-align:center}
+.mermaid svg{max-width:100%;height:auto}
+.flow-ref{font-family:ui-monospace,"SF Mono",Menlo,Consolas,monospace;color:var(--fg-muted,#6b7280);font-size:.82rem;display:block;margin:6px 0 14px}
+.flow-ref::before{content:"↪ ";opacity:.5}
+</style>
+<script src="https://cdn.jsdelivr.net/npm/mermaid@10/dist/mermaid.min.js"></script>
+</head>
+<body>
+
+{% include header.html active="architecture" %}
+
+{% include breadcrumbs.html %}
+<div class="layout">
+  <aside class="sidebar">
+    <h4>フローチャート</h4>
+    <ul>
+      <li><a href="flowcharts.html">概要・トポロジー</a></li>
+      <li><a href="flow-job.html">01 Job Lifecycle</a></li>
+      <li><a href="flow-session.html" class="current">02 Session Lifecycle</a></li>
+      <li><a href="flow-worker.html">03 Worker Fleet</a></li>
+      <li><a href="flow-codegen.html">04 Codegen Loop</a></li>
+      <li><a href="flow-asset.html">05 Asset / Storage</a></li>
+      <li><a href="flow-multihub.html">06 Multi-Hub</a></li>
+      <li><a href="flow-ai-review.html">07 AI / 課題判定</a></li>
+    </ul>
+    <h4>このページ</h4>
+    <ul>
+      <li><a href="#open">OPEN</a></li>
+      <li><a href="#novnc">noVNC + keepalive</a></li>
+      <li><a href="#crosshub">CROSS-HUB 転送</a></li>
+      <li><a href="#close">CLOSE 4 経路</a></li>
+      <li><a href="#state">状態遷移</a></li>
+      <li><a href="#touch">last_active_at を触る経路</a></li>
+    </ul>
+  </aside>
+  <main id="main-content" class="content">
+
+<h1>Session Lifecycle</h1>
+<p class="lead">Session = 持続的なブラウザタブ。OPEN すると lane を専有し、noVNC で human view が可能。idle TTL / 絶対 TTL / DELETE / worker drop の 4 経路で閉じる。Hub 再起動を跨いで生存する(P2)。</p>
+
+<div class="tldr">
+  <span class="tldr-label">概要</span>
+  <ul>
+    <li><strong>noVNC 操作だけが keepalive</strong>: 「眺めているだけ」は <code>last_active_at</code> を更新しない。クリックしないと既定 <strong>300 秒</strong>で reap される。</li>
+    <li><strong>cross-hub 転送はミドルウェアで集約</strong>: nginx が rr で別 Hub に着地しても、ミドルウェアが Redis owner index を引いてオーナー Hub に proxy する。エンドポイントごとに転送を呼び忘れる footgun を根絶。</li>
+    <li><strong>Hub 再起動を跨ぐ</strong>(P2): 完全状態を Redis に永続化、worker は WS drop で破棄せず再 announce 待ち。再起動後の Hub は Redis から rebuild。</li>
+  </ul>
+</div>
+
+<h2 id="open">1. OPEN — <code>POST /sessions</code></h2>
+<div class="mermaid">
+sequenceDiagram
+  participant C as Client
+  participant H as Hub (routes/sessions/lifecycle.py)
+  participant SR as state.sessions
+  participant W as Worker (_mix_sessions.py)
+  C->>H: POST /sessions (options)
+  H->>H: pick_worker (free lane)
+  H->>SR: SessionInfo new (state=opening)
+  H->>W: HubSessionStart (session_id, options)
+  W->>W: lane 確保 (Xvfb / Chrome / x11vnc / noVNC ready)
+  W-->>H: WorkerSessionStartAck (lane_idx, novnc_url)
+  H->>SR: stamp lane_idx + novnc_url + state=ready
+  H->>H: novnc_url → Hub-proxied URL に書換
+  H->>C: 200 {session_id, novnc_url}
+</div>
+<p class="flow-ref">routes/sessions/lifecycle.py:119–396 / server/worker/agent/_mix_sessions.py:101</p>
+
+<h2 id="novnc">2. noVNC + 操作 keepalive</h2>
+<div class="mermaid">
+sequenceDiagram
+  participant B as Browser (operator)
+  participant N as nginx
+  participant H as Hub (routes/novnc.py)
+  participant W as Worker websockify
+  B->>N: GET /sessions/{sid}/novnc/
+  N->>H: 転送
+  H->>H: _resolve_session_novnc_target<br/>→ (worker_id, lane_idx)
+  H->>W: HTTP GET vnc_lite.html (proxy)
+  W-->>H: HTML
+  H-->>B: HTML
+  B->>H: WS /sessions/{sid}/novnc/websockify
+  H->>W: 上流へ WS bridge
+  loop RFB frames
+    B->>H: RFB frame
+    alt type 4/5/6 (Key/Pointer/Cut) = 操作
+      H->>H: state.sessions.touch (10s throttle)
+      H->>W: HubSessionInteraction (keepalive)
+      H-->>W: frame
+    else type 3 (FramebufferUpdateRequest) = 受動視聴
+      Note over H: touch しない<br/>(意図的)
+      H-->>W: frame
+    end
+    W-->>H: frame
+    H-->>B: frame
+  end
+</div>
+<p class="flow-ref">server/hub/routes/novnc.py:451–522</p>
+<div class="callout warn"><strong>keepalive の落とし穴</strong>: 受動視聴は <code>last_active_at</code> を更新しない。クリックしないと <code>idle_ttl_s</code>(既定 300 秒)で reap される。長時間張り付くケースは、定期的に keepalive POST を叩くか operator が触る必要がある。</div>
+
+<h2 id="crosshub">3. CROSS-HUB 転送(マルチハブ)</h2>
+<div class="mermaid">
+sequenceDiagram
+  participant C as Client
+  participant N as nginx (rr)
+  participant Y as Hub-Y (landed)
+  participant R as Redis sessions owner index
+  participant X as Hub-X (real owner)
+  C->>N: /sessions/{sid}/...
+  N->>Y: rr 転送
+  Y->>Y: _session_forward_middleware (app.py)
+  Y->>Y: state.sessions.get(sid)
+  alt local
+    Y-->>C: handle locally
+  else remote
+    Y->>R: lookup_owner(sid)
+    R-->>Y: (worker_id, owner_hub)
+    Y->>X: POST /internal/sessions/{sid}/action (proxy)
+    X->>X: worker_secret 検証 + execute
+    X-->>Y: result
+    Y-->>C: result
+  end
+</div>
+<div class="callout"><strong>ミドルウェアに集約</strong>: 各エンドポイントごとに転送を呼び忘れる footgun を、app.py のミドルウェアが <code>/sessions/{sid}/*</code> を吸収して根絶。</div>
+
+<h2 id="close">4. CLOSE — 4 経路</h2>
+<div class="mermaid">
+flowchart TD
+  trig{"close trigger"}
+  trig --> a["DELETE /sessions/{sid}"]
+  trig --> b["idle TTL 回収プロセス<br/>now - last_active_at &gt; idle_ttl_s (既定 300s)"]
+  trig --> c["absolute TTL 回収プロセス<br/>now - created_at &gt; absolute_ttl_s (既定 3600s)"]
+  trig --> d["worker WS disconnect"]
+  a --> close["close_session(sid)"]
+  b --> close
+  c --> close
+  d --> drop["drop_by_worker<br/>in-memory のみ削除<br/>Redis owner-map は KEEP<br/>(hub 再起動時に reconstruct)"]
+  close --> mark["state=closing"]
+  mark --> save["_auto_save_session_cookies<br/>(host registry へ dump-back)"]
+  save --> shot["final full-page screenshot"]
+  shot --> unreg["state.sessions.remove"]
+  unreg --> hsend["HubSessionEnd → worker"]
+  hsend --> drain["worker m3u8/mp4 drain"]
+  drain --> disc["noVNC bridge disconnect"]
+</div>
+<p class="flow-ref">routes/sessions/lifecycle.py:401–639 / server/hub/_reaper.py:142–217</p>
+
+<h2 id="state">5. 状態遷移</h2>
+<div class="mermaid">
+stateDiagram-v2
+  [*] --> opening: POST /sessions
+  opening --> ready: WorkerSessionStartAck
+  ready --> active: 操作開始(RFB 4/5/6)
+  active --> active: touch (10s throttle)
+  ready --> closing: idle TTL or absolute TTL
+  active --> closing: 同上 or DELETE
+  closing --> closed: HubSessionEnd ack
+  closed --> [*]
+  ready --> RedisOnly: worker disconnect<br/>(in-memory drop / Redis 残)
+  active --> RedisOnly: 同上
+  RedisOnly --> ready: hub 再起動 reconstruct
+</div>
+<div class="callout tip"><strong>P2: Hub 再起動を跨いで生存</strong> — hub-side の Redis 永続化 + worker-side の「transient WS drop でセッションを破棄しない」両方で実現。worker は WS 切断時に <code>_force_end_all_sessions</code> を呼ばず再 announce 待ち。</div>
+
+<h2 id="touch">6. <code>last_active_at</code> を触る経路</h2>
+<table>
+<thead><tr><th>経路</th><th>file:line</th><th>条件</th></tr></thead>
+<tbody>
+<tr><td>POST /sessions/{sid}/keepalive</td><td><code>lifecycle.py:859</code></td><td>SDK <code>session.detach()</code> の明示延長</td></tr>
+<tr><td>session_action START</td><td><code>routes/sessions/_base.py:269</code></td><td>任意のセッション action 送信前</td></tr>
+<tr><td>session_action COMPLETE</td><td><code>routes/sessions/_base.py:283</code></td><td>worker からの応答後</td></tr>
+<tr><td>RFB Key / Pointer / Cut</td><td><code>routes/novnc.py:522</code></td><td>type 4 / 5 / 6、10 秒 throttle</td></tr>
+<tr><td>RFB FramebufferUpdateRequest</td><td>—</td><td><strong>意図的に除外</strong>(受動視聴を操作と見做さない)</td></tr>
+</tbody>
+</table>
+
+<div class="footer">
+  Paprika &copy; 2026 <a href="https://www.paps.jp">paps-jp</a>
+</div>
+  </main>
+</div>
+{% include footer.html %}
+
+<script>
+(function(){
+  document.querySelectorAll('.mermaid').forEach(function(el){ el.dataset.source = el.textContent.trim(); });
+  function getTheme(){ return document.documentElement.dataset.theme === 'dark' ? 'dark' : 'neutral'; }
+  function initAndRun(){
+    mermaid.initialize({startOnLoad:false, theme:getTheme(), securityLevel:'loose'});
+    document.querySelectorAll('.mermaid').forEach(function(el){
+      if (el.dataset.source) { el.removeAttribute('data-processed'); el.innerHTML = el.dataset.source; }
+    });
+    mermaid.run();
+  }
+  if (document.readyState === 'loading') document.addEventListener('DOMContentLoaded', initAndRun);
+  else initAndRun();
+  new MutationObserver(initAndRun).observe(document.documentElement, {attributes:true, attributeFilter:['data-theme']});
+})();
+</script>
+</body>
+</html>

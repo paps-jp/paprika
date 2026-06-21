@@ -1,0 +1,212 @@
+---
+title: Codegen Loop
+description: "Paprika の Codegen ループ(mode=codegen-loop)が plan → for n: generate → execute → 判定スタック → retry を辿る経路。objective gate・LLM judge・reasoning judge の三段判定を Mermaid で。"
+active: architecture
+---
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+<meta charset="utf-8">
+<title>Codegen Loop — plan → generate → execute → judge → retry — Paprika</title>
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<link rel="stylesheet" href="style.css">
+{% include favicon.html %}
+<meta name="description" content="Paprika の Codegen ループ(mode=codegen-loop)が plan → for n: generate → execute → 判定スタック → retry を辿る経路。objective gate・LLM judge・reasoning judge の三段判定を Mermaid で。">
+<link rel="canonical" href="https://paps-jp.github.io/paprika/flow-codegen.html">
+<meta property="og:type" content="website">
+<meta property="og:site_name" content="Paprika">
+<meta property="og:title" content="Codegen Loop — Paprika">
+<meta property="og:description" content="Paprika の Codegen ループ(mode=codegen-loop)が plan → for n: generate → execute → 判定スタック → retry を辿る経路を Mermaid で可視化。">
+<meta property="og:url" content="https://paps-jp.github.io/paprika/flow-codegen.html">
+<meta property="og:image" content="https://paps-jp.github.io/paprika/icon.svg">
+<meta property="og:locale" content="ja_JP">
+<meta name="twitter:card" content="summary">
+<style>
+.mermaid{background:var(--bg-soft);border:1px solid var(--border-soft);border-radius:10px;padding:20px;margin:16px 0;overflow-x:auto;text-align:center}
+.mermaid svg{max-width:100%;height:auto}
+.flow-ref{font-family:ui-monospace,"SF Mono",Menlo,Consolas,monospace;color:var(--fg-muted,#6b7280);font-size:.82rem;display:block;margin:6px 0 14px}
+.flow-ref::before{content:"↪ ";opacity:.5}
+</style>
+<script src="https://cdn.jsdelivr.net/npm/mermaid@10/dist/mermaid.min.js"></script>
+</head>
+<body>
+
+{% include header.html active="architecture" %}
+
+{% include breadcrumbs.html %}
+<div class="layout">
+  <aside class="sidebar">
+    <h4>フローチャート</h4>
+    <ul>
+      <li><a href="flowcharts.html">概要・トポロジー</a></li>
+      <li><a href="flow-job.html">01 Job Lifecycle</a></li>
+      <li><a href="flow-session.html">02 Session Lifecycle</a></li>
+      <li><a href="flow-worker.html">03 Worker Fleet</a></li>
+      <li><a href="flow-codegen.html" class="current">04 Codegen Loop</a></li>
+      <li><a href="flow-asset.html">05 Asset / Storage</a></li>
+      <li><a href="flow-multihub.html">06 Multi-Hub</a></li>
+      <li><a href="flow-ai-review.html">07 AI / 課題判定</a></li>
+    </ul>
+    <h4>このページ</h4>
+    <ul>
+      <li><a href="#highlevel">ハイレベル動線</a></li>
+      <li><a href="#judge">判定スタック</a></li>
+      <li><a href="#retry">retry context 構築</a></li>
+      <li><a href="#state">Outcome 状態遷移</a></li>
+      <li><a href="#persist">試行ごとの永続化</a></li>
+      <li><a href="#escalate">AI escalation との接続</a></li>
+    </ul>
+  </aside>
+  <main id="main-content" class="content">
+
+<h1>Codegen Loop</h1>
+<p class="lead"><code>mode=codegen-loop</code> のジョブが辿る AI ループ。planner → <em>for n=1..max</em>: generate → execute → 判定スタック(<strong>objective pregate → LLM judge → reasoning judge</strong>)→ retry context 構築 → 終端。 判定の本丸は <code>server/hub/iterative_codegen.py</code>。</p>
+
+<div class="tldr">
+  <span class="tldr-label">概要</span>
+  <ul>
+    <li><strong>plan + execute パターン</strong>: 別 LLM が goal を 3–7 step に分解 + テスト可能な success criterion を発行。 以降の試行はその plan に従って 1 スクリプトを書く。</li>
+    <li><strong>判定は三段</strong>: (1) objective pregate(動画ファイル数など物的証拠) → (2) blind LLM judge(screenshot + asset count のみで判定) → (3) reasoning judge(perception → 推論モデル)。 objective が決まれば LLM 判定を skip。</li>
+    <li><strong>retry context は失敗種別ごとに別アドバイス</strong>: timeout / zero-progress / under-target / 通常エラーで異なる構造化テキストを次回 prompt に折込む。</li>
+  </ul>
+</div>
+
+<h2 id="highlevel">1. ハイレベル — plan → 反復 → 終端</h2>
+<div class="mermaid">
+sequenceDiagram
+  participant Op as Operator
+  participant H as Hub
+  participant P as planner_llm
+  participant G as codegen_llm
+  participant SB as sandbox runner
+  participant W as Worker (fleet)
+  participant J as 判定スタック
+  Op->>H: POST /jobs (mode=codegen-loop, goal)
+  H->>P: plan_goal(goal, start_url)
+  P-->>H: Plan(3-7 steps, success_criteria)
+  loop n = 1..max_attempts (既定 3)
+    H->>G: generate_script(goal, plan, retry_context?)
+    G-->>H: code
+    H->>SB: execute_in_sandbox(code, timeout)
+    SB->>W: paprika_client 呼び出し<br/>(page.goto / page.agent / pap.walk / page.download_video / ...)
+    W-->>SB: 結果 + actions
+    SB-->>H: ExecResult(exit, stdout, stderr, success)
+    H->>H: save_attempt(n) + actions.json
+    H->>J: 判定スタック
+    alt OK
+      H->>Op: outcome=success
+    else NG + retry あり
+      H->>H: _build_retry_context (失敗種別ごと)
+      Note over H: 次の試行へ
+    else NG + retry 無し
+      H->>Op: outcome=failed
+    end
+  end
+</div>
+<p class="flow-ref">server/hub/iterative_codegen.py:679 run_iterative_codegen / planner_llm.py / codegen.py / runner.py / judge_llm.py</p>
+
+<h2 id="judge">2. 判定スタック(<code>ExecResult.success=true</code> 後の本丸)</h2>
+<div class="mermaid">
+flowchart TD
+  ok["ExecResult.success = true"]
+  ok --> soft["soft-failure チェック<br/>(crawl intent + zero-progress / under-target)"]
+  soft -->|該当 + retry あり| mark["stderr に [orchestrator] マーカー追加<br/>→ continue で次の試行"]
+  soft -->|該当しない| obj["_objective_pregate<br/>(goal, assets_dir)"]
+  obj -->|video intent + valid .mp4 &gt;= 1| objok["✅ verdict=OK<br/>(客観ゲート判定)"]
+  obj -->|video intent + 0 .mp4| objng["❌ verdict=NG"]
+  obj -->|該当無し| llm["judge_attempt (LLM)"]
+  llm -->|blind_mode=true (既定)| blind["screenshot + asset count のみ<br/>script/stdout/stderr 隠蔽"]
+  llm -->|blind_mode=false| full["script + stdout/stderr 含む"]
+  blind --> v[Verdict]
+  full --> v
+  v --> reason{"reasoning_judge_mode?"}
+  reason -->|off| fin["verdict 確定"]
+  reason -->|shadow| log["二者ログ AGREE / DISAGREE"]
+  reason -->|primary| over["reasoning verdict を採用<br/>(engine 落ちたら default にフォールバック)"]
+  log --> fin
+  over --> fin
+  objok --> fin
+  objng --> fin
+</div>
+<div class="callout"><strong>客観ゲートが出した verdict は reasoning judge で上書きしない</strong>(<code>iterative_codegen.py:1489</code>)。物的証拠を LLM の意見で覆さない設計。</div>
+<div class="callout warn"><strong>「judge が落ちたら成功」の入り口</strong>: LLM judge が到達不能 / 解析不能のとき(<code>verdict=None</code>)、現状はヒューリスティック合格として通している。 assets 0 / crawl 50% 未満などの場合は <code>JobStatus.review</code> に倒すのが妥当(<a href="flow-ai-review.html">→ AI / 課題判定</a>)。</div>
+
+<h2 id="retry">3. retry context 構築 — 失敗種別ごとに別アドバイス</h2>
+<div class="mermaid">
+flowchart TD
+  prev["試行 N が NG / 失敗"]
+  prev --> kind{"何で落ちた?"}
+  kind -->|timed_out| T["TIMEOUT advice<br/>「同じアルゴリズムを retry しても再 timeout<br/>page.agent を減らせ / target を下げろ / capture を削れ」"]
+  kind -->|zero-progress soft-fail| Z["ZERO-PROGRESS advice<br/>「outline href regex が strict すぎる<br/>relative href を urljoin で吸収せよ<br/>age gate を最初に明示 accept」"]
+  kind -->|under-target soft-fail| U["UNDER-TARGET advice<br/>「dead-end (.xml / .rss / .pdf) フィルタ<br/>cross-domain redirect の back ループ防止<br/>links[0] 固執を queue 化」"]
+  kind -->|error / NG judge| E["GENERIC advice<br/>「動いた部分は残し、判明したエラー箇所を修正<br/>+ judge hint があれば折込み」"]
+  T --> next["次の試行の prompt に組込み"]
+  Z --> next
+  U --> next
+  E --> next
+</div>
+<p class="flow-ref">iterative_codegen.py:374–603 _build_retry_context</p>
+
+<h2 id="state">4. Outcome 状態遷移</h2>
+<div class="mermaid">
+stateDiagram-v2
+  [*] --> Planning
+  Planning --> Attempt: plan ok
+  Planning --> Attempt: plan 失敗 → no-plan フォールバック
+  Attempt --> Execute: generate
+  Execute --> SoftCheck
+  SoftCheck --> Attempt: soft-fail + retry (stderr marker 付加)
+  SoftCheck --> Eval: 通過
+  Eval --> Success: OK (any judge)
+  Eval --> Attempt: NG + retry あり (hint 付加)
+  Eval --> Failed: NG + retry 無し
+  Success --> [*]
+  Failed --> [*]
+</div>
+
+<h2 id="persist">5. 試行ごとの永続化</h2>
+<div class="mermaid">
+flowchart LR
+  attempt["試行 n"]
+  attempt --> sc["script.py"]
+  attempt --> ol["stdout.log"]
+  attempt --> el["stderr.log"]
+  attempt --> rj["result.json"]
+  attempt --> aj["actions.json<br/>(__PAPRIKA_ACTION__ パース)"]
+  attempt --> jj["judge.json"]
+  attempt --> rjr["judge_reasoning.json<br/>(shadow/primary 時)"]
+  attempt --> per["perception.json<br/>(失敗時にも走るよう改修済)"]
+  attempt --> shot["final_screenshot.jpg"]
+  win["採用された試行 確定"]
+  win --> top["jobs/{id}/script.py + actions.json + outcome.json"]
+</div>
+<p class="flow-ref">iterative_codegen.py:612 _save_attempt / :645 _save_outcome / data/jobs/{id}/attempts/{n}/</p>
+
+<h2 id="escalate">6. AI escalation との接続</h2>
+<div class="callout tip">fetch ジョブが失敗 / completed-but-empty のときに「同じ goal を Codegen ループで挑戦し直す」連携。<code>JobOptions.escalated_from / escalated_to</code> で系譜を辿れる。 発火条件・cooldown・gating は <a href="flow-ai-review.html">AI / 課題判定</a> 参照。</div>
+
+<div class="footer">
+  Paprika &copy; 2026 <a href="https://www.paps.jp">paps-jp</a>
+</div>
+  </main>
+</div>
+{% include footer.html %}
+
+<script>
+(function(){
+  document.querySelectorAll('.mermaid').forEach(function(el){ el.dataset.source = el.textContent.trim(); });
+  function getTheme(){ return document.documentElement.dataset.theme === 'dark' ? 'dark' : 'neutral'; }
+  function initAndRun(){
+    mermaid.initialize({startOnLoad:false, theme:getTheme(), securityLevel:'loose'});
+    document.querySelectorAll('.mermaid').forEach(function(el){
+      if (el.dataset.source) { el.removeAttribute('data-processed'); el.innerHTML = el.dataset.source; }
+    });
+    mermaid.run();
+  }
+  if (document.readyState === 'loading') document.addEventListener('DOMContentLoaded', initAndRun);
+  else initAndRun();
+  new MutationObserver(initAndRun).observe(document.documentElement, {attributes:true, attributeFilter:['data-theme']});
+})();
+</script>
+</body>
+</html>

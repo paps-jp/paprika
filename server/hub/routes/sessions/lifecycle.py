@@ -156,6 +156,38 @@ async def create_session(body: dict, request: Request = None) -> dict:
     else:
         worker = state.registry.pick_worker()
         if worker is None:
+            # P1 cross-hub forward (mirror of POST /jobs at
+            # server/hub/routes/jobs/lifecycle.py:1890): pick_worker only
+            # consults THIS hub's local connections, so a hub whose local
+            # workers happen to all be busy 503s even when peer hubs sit
+            # with free lanes. Codegen-loop sandboxed scripts hit this
+            # constantly because they cli.session() in a tight loop, and
+            # the parent codegen-loop is pinned to the hub that owns the
+            # parent JobInfo -- a bad scheduling-hash draw kept failing
+            # 3 attempts in a row even with 50+ free fleet-wide lanes.
+            # Try a peer with spare BEFORE returning 503. _FWD_MARK on the
+            # request short-circuits the loop -- one hop max, no bounce.
+            if request is not None and not request.headers.get(_FWD_MARK):
+                from server.hub.routes.jobs._base import (
+                    _peer_hub_with_spare_capacity,
+                )
+                _peer = await _peer_hub_with_spare_capacity()
+                if _peer:
+                    try:
+                        _resp = await _proxy_request_to_hub(_peer, request, 30.0)
+                    except Exception:
+                        _resp = None
+                    if (
+                        _resp is not None
+                        and getattr(_resp, "status_code", 503) != 503
+                    ):
+                        log.info(
+                            "[hub] /sessions: no free local worker -> "
+                            "forwarded to peer hub %s (cross-hub create)",
+                            _peer,
+                        )
+                        return _resp
+                    # peer also full / unreachable -> fall through to the local 503.
             raise HTTPException(503, "no active worker available")
 
     sid = new_session_id()

@@ -406,6 +406,132 @@ async def ai_io_log_query(
     return {"count": len(events), "events": events}
 
 
+@router.get("/ai/audit-stats")
+async def ai_audit_stats(since_s: float = 86400.0) -> dict:
+    """Aggregate Success Audit verdicts (4-quadrant) over the last
+    ``since_s`` seconds.
+
+    Quadrants: ``true_ok`` / ``false_positive`` (reported OK but actually NG)
+    / ``false_negative`` (reported failed but actually OK) / ``true_failure``
+    / ``unparsed``. Also returns the top hosts driving false positives and
+    false negatives separately, since they imply different fixes (download_
+    video tuning for FPs, escalation/judge tuning for FNs).
+    """
+    from server.hub._state import state
+    pool = getattr(state, "mariadb_pool", None)
+    empty = {
+        "audited": 0, "true_ok": 0, "false_positive": 0,
+        "false_negative": 0, "true_failure": 0, "unparsed": 0,
+        "report_agreement_rate": None,
+        "true_success_rate": None,
+        "top_false_positive_hosts": [],
+        "top_false_negative_hosts": [],
+    }
+    if pool is None:
+        return empty
+    import time as _t
+    cutoff_ts = _t.time() - max(0.0, float(since_s))
+    counts = {"true_ok": 0, "false_positive": 0, "false_negative": 0,
+              "true_failure": 0, "unparsed": 0}
+    fp_hosts: dict = {}
+    fn_hosts: dict = {}
+    try:
+        async with pool.acquire() as conn:
+            async with conn.cursor() as cur:
+                await cur.execute(
+                    "SELECT verdict_kind, COUNT(*) FROM audit_results "
+                    "WHERE ts >= FROM_UNIXTIME(%s) GROUP BY verdict_kind",
+                    (cutoff_ts,),
+                )
+                for vk, c in await cur.fetchall():
+                    if vk in counts:
+                        counts[vk] = int(c)
+                # FP and FN host breakdowns.
+                from urllib.parse import urlparse as _up
+                for kind, bucket in (("false_positive", fp_hosts),
+                                     ("false_negative", fn_hosts)):
+                    await cur.execute(
+                        "SELECT url, COUNT(*) FROM audit_results "
+                        "WHERE ts >= FROM_UNIXTIME(%s) AND verdict_kind = %s "
+                        "GROUP BY url ORDER BY COUNT(*) DESC LIMIT 30",
+                        (cutoff_ts, kind),
+                    )
+                    for url, c in await cur.fetchall():
+                        try:
+                            h = (_up(url or "").hostname or "?").lower()
+                            if h.startswith("www."): h = h[4:]
+                            bucket[h] = bucket.get(h, 0) + int(c)
+                        except Exception:
+                            pass
+    except Exception as e:
+        raise HTTPException(500, f"audit_stats query failed: {type(e).__name__}: {e}")
+    audited = sum(counts.values())
+    decisive = counts["true_ok"] + counts["false_positive"] + counts["false_negative"] + counts["true_failure"]
+    agree = counts["true_ok"] + counts["true_failure"]
+    actually_ok = counts["true_ok"] + counts["false_negative"]
+    return {
+        "audited": audited,
+        **counts,
+        "report_agreement_rate": (agree / decisive) if decisive else None,
+        "true_success_rate": (actually_ok / decisive) if decisive else None,
+        "top_false_positive_hosts": sorted(fp_hosts.items(), key=lambda kv: -kv[1])[:8],
+        "top_false_negative_hosts": sorted(fn_hosts.items(), key=lambda kv: -kv[1])[:8],
+    }
+
+
+@router.get("/ai/audit-recent")
+async def ai_audit_recent(
+    limit: int = 100,
+    only_failures: bool = False,
+    verdict_kind: str | None = None,
+) -> dict:
+    """Most-recent rows from ``audit_results`` for the admin UI table.
+    Each row includes ``verdict_kind`` (true_ok / false_positive /
+    false_negative / true_failure / unparsed) and ``reported_status``."""
+    from server.hub._state import state
+    pool = getattr(state, "mariadb_pool", None)
+    if pool is None:
+        return {"count": 0, "rows": []}
+    where_parts: list[str] = []
+    params: list = []
+    if only_failures:
+        # "failures" here means disagreement -- false positive OR false negative.
+        where_parts.append("verdict_kind IN ('false_positive','false_negative')")
+    if verdict_kind:
+        where_parts.append("verdict_kind = %s")
+        params.append(verdict_kind[:32])
+    where = ("WHERE " + " AND ".join(where_parts)) if where_parts else ""
+    sql = (
+        "SELECT id, UNIX_TIMESTAMP(ts) AS ts, job_id, url, goal_short, "
+        "       reported_status, verdict_kind, video_file, truly_succeeded, "
+        "       confidence, reason, engine_slug, latency_ms, error "
+        f"FROM audit_results {where} ORDER BY ts DESC LIMIT %s"
+    )
+    params.append(max(1, min(int(limit), 500)))
+    try:
+        async with pool.acquire() as conn:
+            async with conn.cursor() as cur:
+                await cur.execute(sql, tuple(params))
+                rows = list(await cur.fetchall())
+    except Exception as e:
+        raise HTTPException(500, f"audit_recent query failed: {type(e).__name__}: {e}")
+    cols = ("id","ts","job_id","url","goal_short","reported_status",
+            "verdict_kind","video_file","truly_succeeded","confidence",
+            "reason","engine_slug","latency_ms","error")
+    return {"count": len(rows), "rows": [dict(zip(cols, r)) for r in rows]}
+
+
+@router.post("/ai/audit-now")
+async def ai_audit_now() -> dict:
+    """Operator-triggered one-pass audit (no wait for the scheduled
+    interval). Returns the same summary the periodic loop logs."""
+    from server.hub._success_audit import run_one_pass
+    try:
+        return await run_one_pass()
+    except Exception as e:
+        raise HTTPException(500, f"audit run failed: {type(e).__name__}: {e}")
+
+
 @router.get("/ai/groom-candidates")
 async def ai_groom_candidates() -> dict:
     """Retire (dud/zombie) + dedup (near-duplicate) candidates for the
