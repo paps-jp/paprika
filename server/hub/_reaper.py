@@ -526,6 +526,12 @@ _RETIRE_INTERVAL_S = 3600
 # Need at least this many injections before a low success_rate is trusted
 # as a real "dud" verdict (small samples are noise).
 _RETIRE_MIN_USE = 5
+# Higher water mark: a skill repeatedly injected this many times with
+# success_count == 0 is a "high-use never-won" dud and is retired even
+# under the cold-start guard (otherwise an early-stuck-at-0 system can
+# never escape the dud loop -- exactly what happened with
+# age-gate-media-extraction at use=45 / succ=0).
+_RETIRE_HIGH_USE_DUD = 20
 # success_rate at/below this (with >= _RETIRE_MIN_USE uses) = repeatedly
 # rode along yet rarely correlated with success.
 _RETIRE_MAX_RATE = 0.15
@@ -652,6 +658,12 @@ def _retire_reason(rec, *, allow_dud: bool) -> str | None:
     0.0). The zombie verdict (never injected + old) is always safe."""
     uc = getattr(rec, "use_count", 0) or 0
     sc = getattr(rec, "success_count", 0) or 0
+    # High-water dud: independently of the cold-start guard, a skill that
+    # has been injected this many times with zero successes is wasting AI
+    # cycles -- retire it. This unblocks the "everything is at succ=0 so
+    # the cold-start guard suppresses ALL dud verdicts" deadlock.
+    if uc >= _RETIRE_HIGH_USE_DUD and sc == 0:
+        return f"dud (high-use never-won, use={uc} success=0)"
     if allow_dud and uc >= _RETIRE_MIN_USE and (sc / uc) <= _RETIRE_MAX_RATE:
         return f"dud (use={uc} success={sc} rate={sc / uc:.2f})"
     if uc == 0:

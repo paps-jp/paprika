@@ -24,7 +24,7 @@ import os
 import shutil
 from datetime import datetime
 from server.hub.routes.novnc import _proxy_info
-from server.protocol import AssetInfo, JobResult, JobStatus
+from server.protocol import AssetInfo, IN_FLIGHT_STATUSES, JobResult, JobStatus
 from server.runner import DONE_SENTINEL
 import uuid
 from fastapi import WebSocket, WebSocketDisconnect
@@ -179,7 +179,6 @@ async def list_jobs(
     status: str | None = None,
     mode: str | None = None,
     q: str | None = None,
-    downloading: int = 0,
 ) -> dict:
     """List jobs with optional server-side pagination and filtering.
 
@@ -231,17 +230,8 @@ async def list_jobs(
             [s.strip().lower() for s in status.split(",") if s.strip()]
             if status else None
         )
-        # ``downloading=1`` is a virtual sub-filter on the running set: only
-        # running jobs can be actively downloading, and we further trim to
-        # those whose JobInfo.progress carries a download_pct (set by the
-        # WorkerJobLog → _persist_dl_progress pipeline). We force-narrow the
-        # status filter to ``running`` so the underlying SQL paging sees the
-        # smallest possible base set, then post-filter the rows in python --
-        # cheap because the active-download count is bounded by the fleet's
-        # lane count (~120) and typically <20.
-        _dl_only = bool(downloading)
-        if _dl_only:
-            status_list = ["running"]
+        # ※ 2026-06-23: 旧 ?downloading=1 virtual filter は廃止。
+        # 新方式: ?status=downloading を直接使う (JobStatus.downloading enum)。
         mode_list = (
             [m.strip().lower() for m in mode.split(",") if m.strip()]
             if mode else None
@@ -252,44 +242,23 @@ async def list_jobs(
         # _proxy_info below still runs per request -- it model_copy's, never
         # mutates the cached JobInfos -- so each response stays request-correct.
         _ck = (off, lim, tuple(status_list or ()), tuple(mode_list or ()),
-               q or "", own or "", _dl_only)
+               q or "", own or "")
         _now = time.time()
         _hit = _JOBS_LIST_CACHE.get(_ck)
         if _hit is not None and (_now - _hit[0]) < _JOBS_LIST_CACHE_TTL_S:
             infos, filtered_total, page_roles = _hit[1]
         else:
-            if _dl_only:
-                # Active-DL view: pull the full running set (typically <100),
-                # post-filter on JobInfo.progress.download_pct, then paginate
-                # the filtered list ourselves so ``total`` reflects the
-                # filtered count (not the raw running count). The fleet's lane
-                # cap bounds this set in practice; the 500 hard cap on
-                # list_job_infos is plenty.
-                all_running, _ = await fast(
-                    offset=0,
-                    limit=500,
-                    status=status_list,
-                    mode=mode_list,
-                    url_substr=q,
-                    owner_id=own,
-                )
-                _matched = [
-                    i for i in all_running
-                    if getattr(i, "progress", None) is not None
-                    and getattr(i.progress, "download_pct", None) is not None
-                    and (i.progress.download_pct or 0) < 100.0
-                ]
-                filtered_total = len(_matched)
-                infos = _matched[off:off + lim]
-            else:
-                infos, filtered_total = await fast(
-                    offset=off,
-                    limit=lim,
-                    status=status_list,
-                    mode=mode_list,
-                    url_substr=q,
-                    owner_id=own,
-                )
+            # downloading は SQL レベルで status='downloading' 絞り込みできる
+            # ので、 旧 virtual filter (full-running scan + python post-filter)
+            # は廃止。 通常パスと同じ paging で OK。
+            infos, filtered_total = await fast(
+                offset=off,
+                limit=lim,
+                status=status_list,
+                mode=mode_list,
+                url_substr=q,
+                owner_id=own,
+            )
             # page_roles depends only on each job's id + url (stable across the
             # cache TTL), so memoise it WITH the infos. It was re-running
             # role_for_url for every job on EVERY request -- even cache hits,
@@ -484,32 +453,11 @@ async def get_jobs_summary() -> dict:
     # ----- active section: running preview + queued count
     queued_n = by_status.get("queued", 0)
     running_n = by_status.get("running", 0)
-    # ----- downloading count (running jobs with an active video download).
-    # Subset of running_n where JobInfo.progress.download_pct is set and < 100.
-    # Bounded by the fleet's lane count (~120), so we walk the running set
-    # once -- python loop over ~60-100 hydrated infos is microseconds. Injected
-    # into by_status as a virtual sub-status so the admin sub-tab badge can
-    # read it like the others. NB: status='downloading' is NOT a real job
-    # status, just a synthesised count for the UI.
-    downloading_n = 0
+    # downloading は JobStatus enum 値になったので by_status に自然に含まれる
+    # (= 上の list_status_counts が status='downloading' を SELECT で集計済)。
+    # 万一 by_status["downloading"] が無ければ 0 を埋める (UI badge 互換)。
+    by_status.setdefault("downloading", 0)
     fast_list = getattr(state.store, "list_job_infos", None)
-    if callable(fast_list) and running_n > 0:
-        try:
-            _all_running, _ = await fast_list(
-                offset=0,
-                limit=500,
-                status=["running"],
-            )
-            for _i in _all_running:
-                _pg = getattr(_i, "progress", None)
-                if _pg is None:
-                    continue
-                _pct = getattr(_pg, "download_pct", None)
-                if _pct is not None and _pct < 100.0:
-                    downloading_n += 1
-        except Exception:
-            log.debug("jobs/summary: downloading count failed", exc_info=True)
-    by_status["downloading"] = downloading_n
     running_preview: list[dict] = []
     if callable(fast_list) and running_n > 0:
         try:
@@ -635,7 +583,7 @@ async def cancel_job(job_id: str, request: Request) -> dict:
     Idempotent: cancelling an already-finished job is a no-op
     returning ``{cancelled: false}``."""
     info = await _require_owned_job_info(job_id, request)
-    if info.status not in (JobStatus.queued, JobStatus.running):
+    if info.status not in IN_FLIGHT_STATUSES:
         return {
             "job_id": job_id,
             "cancelled": False,
@@ -1126,7 +1074,7 @@ async def create_job(req: JobRequest, request: Request) -> JobInfo:
     if (req.options.mode or "fetch") == "fetch" and not req.options.attach_to_job:
         try:
             _active, _ = await state.store.list_job_infos(
-                status=["queued", "running"], url_substr=req.url, limit=100
+                status=["queued", "running", "downloading"], url_substr=req.url, limit=100
             )
         except Exception:
             _active = []
