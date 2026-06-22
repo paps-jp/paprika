@@ -3286,36 +3286,165 @@ async def fetch(opts: FetchOptions) -> FetchResult:
                                 print(line, file=_sys.stderr)
                             except Exception:
                                 pass
+                    # File-name → source URL mapping. yt-dlp の各実行前後で
+                    # assets_dir を diff し、新規ファイルを呼び出し URL に紐づける。
+                    # 後段の `assets_saved` 登録時に `url` として書き戻して
+                    # `.meta` sidecar 経由で `assets.json` の source_url まで届く。
+                    # これがないと crawl.py 等の下流が source_url 空のため動画を
+                    # 完全に取りこぼす (= face 抽出 0 件)。
+                    _ytdlp_url_for_file: dict[str, str] = {}
+
+                    # fetch-mode の wall-clock timeout (default run_ytdlp=600s)。
+                    # 600s だと 800 KiB/s で ~470 MB の VOD でギリギリ間に合わない
+                    # ケース (99.3% で kill されて .mp4.part 残し) が発生した。
+                    # env で延長可能にする (default 30 分 = 0.83 MB/s で 1.5 GB)。
+                    # PAPRIKA_YTDLP_FETCH_TIMEOUT_S=0 で旧 600s に戻る。
+                    _fetch_yt_timeout = int(
+                        os.environ.get("PAPRIKA_YTDLP_FETCH_TIMEOUT_S", "1800")
+                    ) or 600
+                    # rate-gate / stall-gate kill 後の自動 retry 回数 (= 0 で無効)。
+                    # yt-dlp は default で `--continue` 相当の挙動なので、 既存 `.part`
+                    # から resume されて 2 回目で完走することが多い (= CDN 一時不調や
+                    # PEER 切断のケース)。
+                    _yt_retry_max = int(
+                        os.environ.get("PAPRIKA_YTDLP_RETRY_ON_STALL", "1")
+                    )
+
                     for u, ref, lbl in ytdlp_targets:
-                        log(f"  [{lbl}]")
-                        # yt-dlp shells out synchronously (subprocess.run);
-                        # offload to a worker thread so the asyncio loop
-                        # keeps pumping the worker's heartbeat + WS ping
-                        # response while the download runs (long HLS
-                        # downloads were tripping uvicorn's 20s ping
-                        # timeout on the hub, leaving the worker thinking
-                        # the job succeeded while the hub had already
-                        # settled it as orphaned).
-                        ok, msg = await asyncio.to_thread(
-                            run_ytdlp,
-                            u, assets_dir,
-                            referer=ref,
-                            cookies_from_browser=opts.cookies_from,
-                            log=_ytdlp_safe_log,
-                        )
+                        _attempt = 0
+                        ok = False
+                        msg = ""
+                        while True:
+                            _attempt += 1
+                            log(f"  [{lbl}] attempt {_attempt}")
+                            try:
+                                _before_files = {
+                                    p.name for p in assets_dir.iterdir() if p.is_file()
+                                } if assets_dir and assets_dir.exists() else set()
+                            except Exception:
+                                _before_files = set()
+                            # yt-dlp shells out synchronously (subprocess.run);
+                            # offload to a worker thread so the asyncio loop
+                            # keeps pumping the worker's heartbeat + WS ping
+                            # response while the download runs.
+                            ok, msg = await asyncio.to_thread(
+                                run_ytdlp,
+                                u, assets_dir,
+                                referer=ref,
+                                cookies_from_browser=opts.cookies_from,
+                                timeout=_fetch_yt_timeout,
+                                log=_ytdlp_safe_log,
+                            )
+                            try:
+                                _after_files = {
+                                    p.name for p in assets_dir.iterdir() if p.is_file()
+                                } if assets_dir and assets_dir.exists() else set()
+                            except Exception:
+                                _after_files = set()
+                            for _nf in (_after_files - _before_files):
+                                _ytdlp_url_for_file[_nf] = u
+                            if ok:
+                                break
+                            # 0 B/s / stall / rate-gate kill のときだけ retry。
+                            # wall-clock timeout / Unsupported URL / 404 等は retry しない
+                            # (= 同じ結果になるか、 ファイル巨大すぎてどうにもならない)。
+                            _ml = (msg or "").lower()
+                            _is_stall = (
+                                "too slow" in _ml
+                                or "no progress" in _ml
+                                or "min_rate" in _ml
+                            )
+                            if _attempt > _yt_retry_max or not _is_stall:
+                                break
+                            log(f"  ↻ retry after stall-gate kill ({msg[:80]})")
+
                         result.ytdlp_results.append({
                             "url": u, "label": lbl,
                             "referer": ref, "ok": ok, "message": msg,
+                            "attempts": _attempt,
                         })
                         if ok:
                             log(f"  OK   {u}\n       {msg}")
                             ok_count += 1
                         else:
-                            log(f"  FAIL {u}")
+                            log(f"  FAIL {u} (after {_attempt} attempt(s))")
                             for line in msg.splitlines():
                                 log(f"       {line}")
                             fail_count += 1
                     log(f"=> yt-dlp: {ok_count} ok, {fail_count} failed")
+
+                    # merged file / direct-output file の url 解決ヘルパ:
+                    # 1) ファイル名そのままで _ytdlp_url_for_file を引く (= yt-dlp が
+                    #    最終 .mp4 を 1 ファイルで吐く典型ケース)
+                    # 2) miss → fragment 名から merged_path が推定できないので、
+                    #    成功した yt-dlp の最後の URL に振る (= 1-target ケースで正確
+                    #    & multi-target ケースでもまず妥当な近似)
+                    def _resolve_ytdlp_src_url(_fname: str) -> str | None:
+                        u = _ytdlp_url_for_file.get(_fname)
+                        if u:
+                            return u
+                        for _r in reversed(result.ytdlp_results):
+                            if _r.get("ok") and _r.get("url"):
+                                return _r["url"]
+                        return None
+                    # ----- .mp4.part 救出 -----
+                    # yt-dlp が timeout / stall / 強制 kill で中断されたケース。
+                    # `.mp4.part` はほぼ完全な mp4 (= 末尾 moov atom のみ欠落) が
+                    # 残るので、 ffprobe で再生可能性を確認して `.mp4` として
+                    # 採用する。 こうしないと 99% で kill された動画が完全に
+                    # 失われ、 storage に塩漬けされるだけになる。
+                    # コピー (rename ではない) で yt-dlp の resume を壊さない。
+                    _part_recover_min = int(os.environ.get(
+                        "PAPRIKA_YTDLP_PART_RECOVER_MIN_MB", "50"
+                    )) * 1024 * 1024
+                    if assets_dir and assets_dir.exists():
+                        for _part_file in sorted(assets_dir.glob("*.mp4.part")):
+                            try:
+                                if not _part_file.is_file():
+                                    continue
+                                if _part_file.stat().st_size < _part_recover_min:
+                                    log(f"  📦 .part skip (<{_part_recover_min//1024//1024}MB): {_part_file.name[:60]}")
+                                    continue
+                                _mp4_path = _part_file.with_suffix("")  # strip .part
+                                if _mp4_path.exists():
+                                    continue
+                                # ffprobe で再生可能 + video stream あり確認
+                                _probe = subprocess.run(
+                                    ["ffprobe", "-v", "error", "-print_format", "json",
+                                     "-show_format", "-show_streams", str(_part_file)],
+                                    capture_output=True, text=True, timeout=30,
+                                )
+                                if _probe.returncode != 0:
+                                    log(f"  📦 .part unplayable: {_part_file.name[:60]}")
+                                    continue
+                                _info = json.loads(_probe.stdout or "{}")
+                                _has_vid = any(
+                                    s.get("codec_type") == "video"
+                                    for s in (_info.get("streams") or [])
+                                )
+                                _dur = float((_info.get("format") or {}).get("duration") or 0)
+                                if not _has_vid or _dur <= 0:
+                                    log(f"  📦 .part no video / dur=0: {_part_file.name[:60]}")
+                                    continue
+                                # copy (not rename) so yt-dlp's --continue resumes if retried
+                                import shutil as _sh
+                                _sh.copy2(_part_file, _mp4_path)
+                                _sz = _mp4_path.stat().st_size
+                                result.assets_saved.append({
+                                    "name": _mp4_path.name,
+                                    "path": str(_mp4_path.resolve()),
+                                    "size": _sz,
+                                    "url": _resolve_ytdlp_src_url(_mp4_path.name),
+                                    "mime": "video/mp4",
+                                })
+                                log(
+                                    f"  📦 .part RECOVERED: {_part_file.name[:50]} "
+                                    f"→ {_mp4_path.name[:50]} "
+                                    f"({_sz / 1_048_576:.0f} MB, dur={_dur:.0f}s)"
+                                )
+                            except Exception as _re:
+                                log(f"  📦 .part recovery error: {_re}")
+
                     # Post-process: if yt-dlp downloaded individual fMP4
                     # segments (init + numbered fragments), merge them into
                     # a single playable MP4 and register each merged file
@@ -3326,7 +3455,7 @@ async def fetch(opts: FetchOptions) -> FetchResult:
                             "name": mp.name,
                             "path": str(mp.resolve()),
                             "size": mp.stat().st_size,
-                            "url": None,
+                            "url": _resolve_ytdlp_src_url(mp.name),
                             "mime": "video/mp4",
                         })
 
@@ -3411,7 +3540,7 @@ async def fetch(opts: FetchOptions) -> FetchResult:
                                 "name": _vf.name,
                                 "path": str(_vf.resolve()),
                                 "size": _sz,
-                                "url": None,
+                                "url": _resolve_ytdlp_src_url(_vf.name),
                                 "mime": _mime_v,
                             })
                             log(

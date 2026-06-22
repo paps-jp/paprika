@@ -130,6 +130,9 @@
      wall. Orange to read as "needs attention", distinct from running's yellow
      and failed's red. */
   .badge.review    { background: #ffe0b2; color: #9c4a00; box-shadow: inset 2px 0 0 #d2691e; }
+  /* downloading: fetch handler 完了後、 yt-dlp の動画 DL のみ継続中。
+     in-flight だが running とは別 (blue-ish で進行中ニュアンスを保つ)。 */
+  .badge.downloading { background: #cfe8ff; color: #1c4b80; box-shadow: inset 2px 0 0 #4ea3ff; }
   /* worker status */
   .badge.active   { background: #d4f5d8; color: #185c2c; }
   .badge.drain    { background: #ffe2b8; color: #7a4a14; }

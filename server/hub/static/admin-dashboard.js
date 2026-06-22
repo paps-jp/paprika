@@ -234,13 +234,11 @@ async function refresh() {
         // pre-dispatch and in-flight jobs together. Server accepts a
         // comma-separated status list.
         _q += '&status=running,queued';
-      } else if (_f === 'downloading') {
-        // "動画DL中" tab: server filters running jobs to those with an
-        // active video download (JobInfo.progress.download_pct set + <100).
-        // No status= param needed -- the server forces status=running when
-        // downloading=1 is set.
-        _q += '&downloading=1';
       } else if (_f !== 'all') {
+        // downloading は JobStatus enum 値 (2026-06-23 追加) なので
+        // 他の status と同じく単純に &status=downloading で取れる。
+        // 旧 ?downloading=1 virtual filter はサーバー側で互換維持されているが、
+        // フロント側は新インターフェースに統一する。
         _q += '&status=' + encodeURIComponent(_f);
       }
       // Issue the page + the summary call in parallel so the only
@@ -619,11 +617,12 @@ async function refresh() {
     const _badgeTotalForFilter = (() => {
       const _bs = (_summaryRes && _summaryRes.by_status) || null;
       if (!_bs) return null;
-      if (_filter === 'all')       return _summaryRes.total ?? null;
-      if (_filter === 'running')   return (_bs.running ?? 0) + (_bs.queued ?? 0);
-      if (_filter === 'completed') return _bs.completed ?? null;
-      if (_filter === 'failed')    return _bs.failed ?? null;
-      if (_filter === 'review')    return _bs.review ?? null;
+      if (_filter === 'all')         return _summaryRes.total ?? null;
+      if (_filter === 'running')     return (_bs.running ?? 0) + (_bs.queued ?? 0);
+      if (_filter === 'downloading') return _bs.downloading ?? null;
+      if (_filter === 'completed')   return _bs.completed ?? null;
+      if (_filter === 'failed')      return _bs.failed ?? null;
+      if (_filter === 'review')      return _bs.review ?? null;
       return null;
     })();
     const total = _badgeTotalForFilter ?? jobs.total ?? sorted.length;
@@ -863,7 +862,7 @@ let _jobsReqSeq = 0;       // ++ per /jobs page request issued
 let _jobsAppliedSeq = -1;  // seq of the most recently applied (rendered) page
 // Status badge labels. Most statuses show their raw value; ``review`` shows
 // the friendlier 課題 (its CSS class stays `review`, see .badge.review).
-const _JOB_STATUS_LABEL = { review: '課題' };
+const _JOB_STATUS_LABEL = { review: '課題', downloading: '動画DL中' };
 
 // Page-role badge for the /jobs table 種類 column. Renders the URL-based
 // classification (server/hub/_page_role.role_for_url -> `/jobs` envelope's

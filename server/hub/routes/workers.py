@@ -1358,6 +1358,7 @@ from server.hub.routes.profiles import _sync_all_profiles_to_worker
 from server.hub.sessions import SessionInfo, session_from_json
 from server.protocol import (
     ASSET_CAPTURE_MARKER,
+    IN_FLIGHT_STATUSES,
     JOB_PROGRESS_MARKER,
     LINKS_CAPTURE_MARKER,
     NET_CAPTURE_MARKER,
@@ -1812,7 +1813,7 @@ async def worker_link(ws: WebSocket, worker_id: str):
                     jinfo = None
                 if jinfo is None:
                     continue
-                if jinfo.status not in (JobStatus.queued, JobStatus.running):
+                if jinfo.status not in IN_FLIGHT_STATUSES:
                     continue  # already terminal
                 phase = getattr(jinfo.progress, "phase", "") if jinfo.progress else ""
                 if jinfo.status == JobStatus.queued:
@@ -2003,6 +2004,52 @@ async def _persist_dl_progress_payload(job_id: str, payload: dict) -> None:
         if info.progress.download_pct is not None and info.progress.download_pct < 100.0:
             info.progress.download_pct = 100.0
             changed = True
+
+    # running → downloading 遷移:
+    # yt-dlp が動画 DL 中 (= download_pct ∈ (0, 100)) のジョブは UI 上 "動画DL中"
+    # と見せたい。 fetch handler の中で yt-dlp が走ってる間は status=running の
+    # ままだったが、 download_pct > 0 が観測できた時点で動画 DL が確実に開始済
+    # なので downloading に昇格させる (= WorkerJobComplete を待たない)。
+    # phase も "queued" のまま初期値で残ってることがあるので併せて更新。
+    if (
+        info.status == JobStatus.running
+        and info.progress.download_pct is not None
+        and 0.0 < info.progress.download_pct < 100.0
+    ):
+        info.status = JobStatus.downloading
+        info.progress.phase = "downloading"
+        changed = True
+        log.info(
+            "job %s: running → downloading (yt-dlp progress at %.1f%%)",
+            job_id, float(info.progress.download_pct or 0),
+        )
+
+    # downloading → completed 遷移:
+    # WorkerJobComplete で `downloading` に振られたジョブ、 もしくは上の遷移で
+    # downloading に昇格したジョブは fetch handler 完了後の yt-dlp 進行中を
+    # 意味する。 ここで download_pct >= 100 (or state=done) が来たら DL も
+    # 終わったと判定して completed に確定させる。 こうしないと「downloading の
+    # まま放置」が出るし、 下流 (crawl.py / video pipeline) が status=completed
+    # を待ってる。
+    if (
+        info.status == JobStatus.downloading
+        and (
+            st == "done"
+            or (
+                info.progress.download_pct is not None
+                and info.progress.download_pct >= 100.0
+            )
+        )
+    ):
+        info.status = JobStatus.completed
+        info.progress.phase = "completed"
+        info.completed_at = datetime.utcnow()
+        changed = True
+        log.info(
+            "job %s: downloading → completed (yt-dlp finished at %.1f%%)",
+            job_id, float(info.progress.download_pct or 0),
+        )
+
     if not changed:
         return
     try:
@@ -2469,9 +2516,66 @@ async def _handle_worker_message(worker, msg) -> None:
                 info.status = JobStatus.running
                 info.progress.phase = "keepalive"
             else:
-                info.status = JobStatus.completed
-                info.progress.phase = "completed"
-                info.completed_at = datetime.utcnow()
+                # ※ 2026-06-23 仕様変更: yt-dlp が中断されて `.mp4.part` が残った
+                # ケースの failed 振り分けは廃止。 代わりに core/fetcher.py の
+                # ループ完了後に `.part` を ffprobe で検証 → 再生可能なら `.mp4`
+                # にコピーして `assets_saved` に積む救出処理を入れた。
+                # その結果ここに来た時点で:
+                #   - 救出成功 → 通常 completed (= 救出された `.mp4` が assets に並ぶ)
+                #   - 救出失敗 → assets には何も並ばないが、 これも通常 completed
+                #     (= fetch 自体は成功で、 動画だけが取れなかった扱い)
+                # 「`.mp4.part` 残存 = 失敗」の判定はしない。
+
+                # 動画 DL 継続中の判定: fetch handler は終わったが yt-dlp の
+                # 動画ダウンロードがまだ完了していない (= progress.download_pct が
+                # set されていて 100 未満) ケース。 こうしたジョブは:
+                #   * terminal ではない (= completed/failed と区別したい)
+                #   * fetch 本体は終わってるので running でもない
+                # → 新ステータス `downloading` に振り分ける。 後続の
+                #   WorkerJobLog (= yt-dlp 進捗ライン) で download_pct >= 100 を
+                #   受信した時点で `_persist_dl_progress_plain` 経由で
+                #   `downloading → completed` に遷移する (= 下の hook 参照)。
+                #
+                # ※ ただし `.mp4.part` 救出処理 (core/fetcher.py) で既に video が
+                # 取れている場合は、 yt-dlp は失敗して終わってるが結果として動画は
+                # ある。 後続の 100% ラインは絶対に来ないので downloading に振り分け
+                # ると永久 stuck になる。 assets に video が含まれていれば
+                # 通常 completed に進める。
+                _dl_pct = (
+                    info.progress.download_pct if info.progress is not None else None
+                )
+
+                def _name_of(_a) -> str:
+                    n = getattr(_a, "name", None)
+                    if n is None and isinstance(_a, dict):
+                        n = _a.get("name")
+                    return str(n or "")
+
+                _has_video_asset = any(
+                    _name_of(_a).lower().endswith(
+                        (".mp4", ".webm", ".mkv", ".mov", ".m4v", ".ts")
+                    )
+                    for _a in (msg.result.assets or [])
+                )
+                _dl_in_progress = (
+                    isinstance(_dl_pct, (int, float))
+                    and 0 < float(_dl_pct) < 100.0
+                    and not _has_video_asset
+                )
+
+                if _dl_in_progress:
+                    info.status = JobStatus.downloading
+                    info.progress.phase = "downloading"
+                    # completed_at は不在のまま (= まだ進行中)
+                    log.info(
+                        "job %s: fetch handler complete but yt-dlp still at "
+                        "%.1f%% — bucketed as downloading",
+                        msg.job_id, float(_dl_pct or 0),
+                    )
+                else:
+                    info.status = JobStatus.completed
+                    info.progress.phase = "completed"
+                    info.completed_at = datetime.utcnow()
                 # 課題(review): the fetch returned a result but its content was
                 # blocked by a full-screen login / age / consent / paywall
                 # overlay (measured structurally by the worker's occlusion
@@ -2733,9 +2837,7 @@ async def _handle_worker_message(worker, msg) -> None:
             or "no free lane (lane_hint=" in _err_lc
         )
         info = await state.store.get_job_info(msg.job_id)
-        if _is_no_free_lane and info is not None and info.status in (
-            JobStatus.queued, JobStatus.running,
-        ):
+        if _is_no_free_lane and info is not None and info.status in IN_FLIGHT_STATUSES:
             try:
                 _drain_s = float(os.environ.get(
                     "PAPRIKA_NO_FREE_LANE_DRAIN_S",

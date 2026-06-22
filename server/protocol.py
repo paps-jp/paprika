@@ -267,6 +267,29 @@ class JobRequest(BaseModel):
 class JobStatus(str, Enum):
     queued = "queued"
     running = "running"
+    # "downloading": fetch handler 本体が終わって yt-dlp の動画 DL のみ継続中。
+    # NOT terminal -- 任意の `in-flight` 判定 (cancel 可否 / re-dispatch 判定 /
+    # orphan 復旧 等) は `queued / running` と同じ扱いにすること。
+    # ※ running 中に並行して DL が走っているケース (fetch handler がまだ動いてる)
+    # は `running` のまま。 fetch handler が完了した時点で DL がまだ進行中 (=
+    # `progress.download_pct in (0, 100)`) のものだけ `downloading` に遷移する。
+    #
+    # 遷移ルール:
+    #   * 進入: `WorkerJobComplete` 受信時、 `keep_session=False` かつ
+    #     `progress.download_pct` が set で < 100 なら `running → downloading`。
+    #     (それ以外は完了 → `completed` or `.part` 残 → `failed`)
+    #   * 退出: 後続の `WorkerJobLog` が `download_pct >= 100` を運んできた時、
+    #     または session close 経由で `downloading → completed`。
+    #
+    # 経緯 (2026-06-23): 動画 DL は数分〜1時間続くため、 admin UI の「実行中」と
+    # 「動画DL中」を区別したいニーズが既にあって、 これまでは
+    # `status=running + progress.download_pct<100` の virtual filter
+    # (= /jobs?downloading=1) で表現していた。 enum 値として明示することで:
+    #   * /jobs?status=downloading で直接 filter 可能
+    #   * /jobs/summary の by_status に集約される (= 1 round-trip でカウント)
+    #   * mariadb_store に永続化されて hub 再起動越しに保たれる
+    #   * 下流 (crawl.py, video pipeline) も status 1 個で判別できる
+    downloading = "downloading"
     completed = "completed"
     failed = "failed"
     cancelled = "cancelled"
@@ -278,6 +301,20 @@ class JobStatus(str, Enum):
     # job is bucketed apart from clean successes. Anything enumerating
     # terminal states must include this (wait_job / events / result / etc.).
     review = "review"
+
+
+# in-flight 状態 (= まだ terminal じゃない) の集約。 cancel 可否 / re-dispatch
+# 判定 / orphan 復旧などの「進行中扱い」 set はこれを使うこと。
+# 個別に (queued, running) と書かない -- 新ステータス追加時の漏れの温床。
+IN_FLIGHT_STATUSES: frozenset[JobStatus] = frozenset({
+    JobStatus.queued, JobStatus.running, JobStatus.downloading,
+})
+
+# terminal 状態 (= もう変更されない) の集約。 events 終端判定 / result fetch
+# 可否 / 履歴集計などで使う。 ※ failed / cancelled / review も含む点に注意。
+TERMINAL_STATUSES: frozenset[JobStatus] = frozenset({
+    JobStatus.completed, JobStatus.failed, JobStatus.cancelled, JobStatus.review,
+})
 
 
 class AssetInfo(BaseModel):
