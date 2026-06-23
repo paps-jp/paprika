@@ -458,6 +458,25 @@ async def fleet_egress_allow() -> PlainTextResponse:
                         pass
         except Exception:
             pass
+    # 1b) The hub's own object-store (MinIO/S3) endpoint host. Workers PUT
+    #     assets STRAIGHT there when PAPRIKA_WORKER_MINIO_DIRECT=1, so the
+    #     egress firewall MUST allow it -- otherwise every direct PUT is
+    #     silently DROPped by the 10/8 rule and the socket leaks in SYN_SENT
+    #     for the full PUT timeout (incident 2026-06-24: egress-guard canary
+    #     workers .150/.151/.157 piled up ~50 SYN_SENT sockets each to the
+    #     MinIO .8 and churned on the fd-budget recycle). Derived from the
+    #     live settings/env, so it self-maintains across a MinIO move
+    #     (.16 -> .8) exactly like the hub IPs above. IP literals only -- a
+    #     hostname endpoint is skipped (DNS is already broadly allowed).
+    try:
+        from server.hub import objstore as _objstore
+        _ep = _objstore._s3cfg("s3_endpoint", "PAPRIKA_S3_ENDPOINT")
+        _mhost = (urlparse(_ep).hostname or "") if _ep else ""
+        if _mhost:
+            ipaddress.ip_address(_mhost)  # IP literal only; raises otherwise
+            ips.add(_mhost)
+    except Exception:
+        pass
     # 2) Operator-configured extras (MinIO / Redis / etc.) — IPs or CIDRs.
     for tok in (os.environ.get("PAPRIKA_EGRESS_EXTRA_ALLOW", "") or "").replace(",", " ").split():
         tok = tok.strip()
