@@ -1385,6 +1385,19 @@ real pages. Prefer text-matching via `get_by_text` for buttons whose
 text is stable, and CSS classes (`.athing`, `#login-form`) when they
 look semantic.
 
+LANGUAGE: The Python code itself MUST stay valid ASCII / Python syntax
+(keywords, identifiers, function calls, imports, decorators -- all
+English as written). However, when you emit ``print()`` statements,
+``# comments``, or any operator-readable string literal (e.g. log
+messages, status notes, error contexts you raise), prefer JAPANESE
+(日本語) so the live job log is readable for Japanese operators. CSS
+selectors, URLs, dictionary keys, JSON field names, page.agent() goals
+spoken to the agent (those drive UI ops -- match the page's language,
+which is usually Japanese), and any text-matching selector you pass to
+``get_by_text()`` MUST match what the page actually displays (Japanese
+when the page is Japanese). Do NOT translate identifiers / API method
+names / Python keywords.
+
 """ + _API_REF
 
 
