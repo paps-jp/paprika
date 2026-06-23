@@ -130,6 +130,11 @@ Output strict JSON, no prose, no markdown fences:
     "reason": "<one-line, <= 160 chars, why you said yes/no>",
     "hint": "<if satisfied=false: 1-2 sentences pinpointing the script line / construct that's wrong AND the concrete fix. Empty string if true.>"
   }
+
+LANGUAGE: The natural-language fields ``reason`` and ``hint`` MUST be
+written in JAPANESE (日本語). Keep code / selector references inline in
+English as written (e.g. ``await page.state()['url']``). The ``satisfied``
+boolean is unaffected.
 """
 
 
@@ -521,6 +526,12 @@ STRICT RULES
 
 You may include a <think>...</think> block before the JSON; the system
 strips it. Do NOT put the JSON inside <think>.
+
+LANGUAGE: The natural-language fields (``reason``, ``hint`` if present,
+any prose explanations) MUST be written in JAPANESE (日本語). Code,
+selectors, identifiers, and API method names stay in English. Your
+internal ``<think>...</think>`` reasoning may be in either language; the
+operator-visible verdict text must be Japanese.
 """
 
 

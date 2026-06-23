@@ -1448,7 +1448,14 @@ async def generate_script(
     hub_url: str,
     extra_context: Optional[str] = None,
     system_addendum: Optional[str] = None,
-    max_tokens: int = 15000,
+    # Tightened 2026-06-22 from 15000 -> 5000 after live observation: the
+    # LLM frequently exhausted 15000 tokens producing a 50KB+ script that
+    # then died with "SyntaxError: unterminated string literal" (the output
+    # was cut off mid-string). A smaller cap forces the model to write a
+    # FOCUSED solution; 5000 tokens (~15-20KB of Python) is plenty for any
+    # paprika-client script we actually want to run. Failures shift from
+    # silent truncation to clean "took too long" which the retry catches.
+    max_tokens: int = 5000,
     temperature: float = 0.1,
     target: Optional[LLMTarget] = None,
     download_video: bool = False,

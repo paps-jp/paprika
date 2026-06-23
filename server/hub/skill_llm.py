@@ -153,6 +153,13 @@ RULES:
 2. Strings must be properly escaped (use \\n for newlines, \\" for quotes inside code_template).
 3. code_template MUST be real Python, not a placeholder description.
 4. Do not wrap the JSON in markdown fences or any explanatory prose.
+
+LANGUAGE: All natural-language fields you produce (``description``,
+``llm_instructions``, ``applicable_when`` bullets, ``reason``, etc.) MUST
+be written in JAPANESE (日本語). Keep ``slug``, ``tags``, ``code_template``,
+``bad_example`` / ``good_example`` code, JSON field names, identifiers,
+API method names, and URLs in English as written. ``name`` can be either
+language but Japanese is preferred for operator readability.
 """
 
 
@@ -173,16 +180,32 @@ DEFAULT TO PICKING FEWER. It is better to return zero skills than
 to return irrelevant ones.
 
 When two skills are similarly relevant, PREFER the one with the higher
-success_rate. Treat a skill with a high use_count but low success_rate
-(e.g. used 5+ times yet success_rate < 0.2) as a repeated dud and avoid
-it unless it is clearly the best match. A null success_rate just means
-untried (no track record yet) -- that is not a strike against it.
+success_rate.
+
+HARD RULE: DO NOT pick a skill whose ``success_rate`` is exactly 0.0
+when its ``use_count >= 10``. That is "tried many times, never worked"
+-- an active dud. Injecting it again just pollutes the codegen prompt
+with a pattern that demonstrably failed. The only exception is when
+every other candidate ALSO has rate=0.0 (cold-start / brand-new pool);
+in that case still avoid the highest-use rate-0 entry (it's the
+"most proven failure" in the set).
+
+Also avoid skills with high use_count and low rate (e.g. used 5+ times
+but success_rate < 0.2) -- they're weak. A null success_rate just means
+untried; that is NOT a strike against it -- novel candidates are
+preferred over proven-failure ones.
+
+DEFAULT TO PICKING FEWER. It is better to return zero skills than to
+return irrelevant or dud-tier ones.
 
 Output JSON ONLY:
 
   {"slugs": ["slug-a", "slug-b"]}      // 0 to N entries
 
 Slugs must be from the provided list verbatim.
+
+LANGUAGE: This call only returns a list of slugs (English identifiers).
+No natural-language output is required.
 """
 
 

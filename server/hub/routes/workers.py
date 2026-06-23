@@ -2006,15 +2006,18 @@ async def _persist_dl_progress_payload(job_id: str, payload: dict) -> None:
             changed = True
 
     # running → downloading 遷移:
-    # yt-dlp が動画 DL 中 (= download_pct ∈ (0, 100)) のジョブは UI 上 "動画DL中"
-    # と見せたい。 fetch handler の中で yt-dlp が走ってる間は status=running の
-    # ままだったが、 download_pct > 0 が観測できた時点で動画 DL が確実に開始済
-    # なので downloading に昇格させる (= WorkerJobComplete を待たない)。
-    # phase も "queued" のまま初期値で残ってることがあるので併せて更新。
+    # yt-dlp が動画 DL 中のジョブは UI 上 "動画DL中" と見せたい。 fetch handler の
+    # 中で yt-dlp が走ってる間は status=running のままだったが、 download_pct > 0
+    # が観測できた時点で動画 DL が確実に開始済なので downloading に昇格させる
+    # (= WorkerJobComplete を待たない)。 phase も "queued" のまま初期値で残ってる
+    # ことがあるので併せて更新。
+    # pct >= 100 (= 完了直後) でも一度 downloading に通すことで、 直下の
+    # downloading→completed 遷移が同じ payload で続けて発火する (= 永遠 running
+    # 残留を防ぐ)。
     if (
         info.status == JobStatus.running
         and info.progress.download_pct is not None
-        and 0.0 < info.progress.download_pct < 100.0
+        and info.progress.download_pct > 0
     ):
         info.status = JobStatus.downloading
         info.progress.phase = "downloading"

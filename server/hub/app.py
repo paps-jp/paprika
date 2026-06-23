@@ -477,6 +477,16 @@ async def lifespan(app: FastAPI):
 
         stale_reconcile_task = asyncio.create_task(_stale_job_reconciler_loop())
 
+        # JobStatus.downloading reaper (incident 2026-06-23): jobs whose fetch
+        # handler completed but whose deferred yt-dlp keeps running forever
+        # (live stream, wedged CDN, dead worker) get force-completed after
+        # PAPRIKA_DOWNLOADING_TIMEOUT_S. Worker SIGTERMs yt-dlp + ffmpeg-
+        # remuxes the partial fragments + uploads as a normal asset; dead-
+        # worker rows are marked failed. See _reaper.py:_downloading_reaper_loop.
+        from server.hub._reaper import _downloading_reaper_loop
+
+        downloading_reaper_task = asyncio.create_task(_downloading_reaper_loop())
+
         # Success Audit: periodically sample completed video-download jobs +
         # ask a VisionAI whether the saved video is actually the page's main
         # content. Settings-gated (default OFF). See _success_audit.py.

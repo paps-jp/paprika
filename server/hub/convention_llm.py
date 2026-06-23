@@ -46,25 +46,33 @@ fix encodes a REUSABLE rule that future LLM-generated paprika-client
 scripts should follow, or whether the fix was site-specific noise
 that wouldn't help anyone else.
 
-DEFAULT TO SKIP. Only emit a convention when the rule is:
-  - General (would apply across many sites / many tasks)
-  - About paprika-client API usage, async/await, control flow, or
-    ordering of operations
-  - Atomic (one rule, one foot-gun -- not a sweeping refactor)
-  - The kind of thing a code reviewer would flag in any paprika
-    script, not just this site
+DEFAULT TO EXTRACT. Emit a convention whenever the failure→fix diff
+encodes ANY reusable lesson, even a narrow one. Better to over-extract
+and let the dedup reaper consolidate later than to lose lessons to
+over-skipping. Recent measurements showed 89% of convention_distill
+calls returning skip and the auto-tier (un-injected) pool at 53 entries
+while the curated pool stayed stuck at 7 -- that's over-correction.
 
-Skip when:
-  - The fix was a one-character typo or rename
-  - The fix swapped one CSS selector or URL for another (site-specific)
-  - The fix is essentially "add an import that was already in the
-    reference" (the LLM just forgot stdlib, no general lesson)
-  - The "failure" was a network blip / sandbox timeout / external
-    service flake -- not the script's fault
-  - Attempt 2 is a near-total rewrite (no clean diff to learn from)
-  - A similar convention is likely already present in the prompt
-    (you'll see them in the "Local conventions" block of the system
-    prompt; do not duplicate)
+Patterns worth emitting as conventions (be generous):
+  - General API usage rules (would apply across many sites / many tasks)
+  - paprika-client / async / await / control-flow / ordering rules
+  - Atomic foot-gun rules (one rule, one mistake -- no sweeping refactors)
+  - The kind of thing a code reviewer would flag in any paprika script
+  - Setup ordering patterns (e.g. await navigation completion before
+    network-trace start)
+  - Error-handling shapes (try/except around X, retry pattern for Y)
+  - Any timing / wait / scroll / iframe idiom the next LLM might miss
+
+Skip ONLY when ALL of these are true:
+  - The fix was a single-character typo / rename / hard-coded URL swap
+    with no reusable insight, AND
+  - The "failure" was a clear external blip (network, sandbox timeout,
+    third-party service flake) -- not the script's fault, AND
+  - Attempt 2 is a near-total rewrite with no clean diff to learn from,
+    AND
+  - A near-identical convention is OBVIOUSLY already in the "Local
+    conventions" block of the system prompt (don't skip on hunches --
+    when in doubt, emit; the dedup reaper merges duplicates).
 
 Output JSON ONLY (no markdown fences, no commentary). Two shapes:
 
@@ -99,6 +107,13 @@ RULES:
 3. advice MUST be imperative; rationale MUST explain the failure mode.
 4. bad_example MUST mirror what the failing attempt actually did.
 5. Do not wrap the JSON in fences or prose.
+
+LANGUAGE: All natural-language fields you produce (``advice``,
+``rationale``, ``reason``, ``applicable_when`` bullets) MUST be written in
+JAPANESE (日本語). Keep ``slug``, ``tags``, ``bad_example`` /
+``good_example`` code, JSON field names, identifiers, API method names,
+and URLs in English as written. ``name`` can be either language but
+Japanese is preferred for operator readability.
 """
 
 

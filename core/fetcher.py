@@ -3172,9 +3172,30 @@ async def fetch(opts: FetchOptions) -> FetchResult:
             seen_targets: set[str] = set()
 
             def add_target(u: str, ref: Optional[str], lbl: str):
-                if u and u not in seen_targets:
-                    seen_targets.add(u)
-                    ytdlp_targets.append((u, ref, lbl))
+                if not u or u in seen_targets:
+                    return
+                # asset_url_blacklist ALSO gates yt-dlp dispatch (job
+                # 3d9a58e6ffa0 incident 2026-06-23): a live stripchat ad
+                # widget HLS (``media-hls.saawsedge.com/...``) is blocked
+                # from CDP asset capture by the existing ``*.saawsedge.com*``
+                # rule -- but the same URL still got picked up as a video
+                # target and dispatched to yt-dlp, which then recorded the
+                # live stream forever (fragment counter monotonically
+                # increased for 13h until the operator killed it). Reusing
+                # the same matcher keeps the operator's intent ("never touch
+                # these hosts") consistent across both code paths.
+                _bl_pat = _fetch_blacklisted(u)
+                if _bl_pat is not None:
+                    try:
+                        log(
+                            f"  [video-target] SKIP (blacklist='{_bl_pat}') "
+                            f"{u[:120]}"
+                        )
+                    except Exception:
+                        pass
+                    return
+                seen_targets.add(u)
+                ytdlp_targets.append((u, ref, lbl))
 
             # The old "page-url" branch (whitelist match on the fetched
             # URL itself) and "iframe" branch (whitelist match on

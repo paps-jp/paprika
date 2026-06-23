@@ -57,7 +57,10 @@ _AUDIT_SYSTEM = (
     "actually meet the goal anyway -- e.g. the page genuinely has no video "
     "so 0 video files IS the correct outcome for a non-video page; or "
     "image-only goals are satisfied; or saved html/text suffices). Output "
-    "JSON ONLY."
+    "JSON ONLY. "
+    "LANGUAGE: the ``reason`` field MUST be written in JAPANESE (日本語); "
+    "``actually_succeeded`` is a boolean and ``confidence`` is a number, "
+    "neither needs translation."
 )
 
 _AUDIT_USER_TEMPLATE = """\

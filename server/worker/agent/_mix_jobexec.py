@@ -1140,6 +1140,55 @@ class _JobExecMixin:
                     line=f"  [downloading] error: {type(e).__name__}: {e}",
                 ))
             finally:
+                # Force-complete recovery: hub asked us to wrap up early
+                # (HubForceCompleteJob -> _force_complete_video_job set the
+                # flag + SIGTERM'd the in-flight yt-dlp). Salvage any
+                # .part / .ytdl files in tmp by remuxing them into a
+                # playable .mp4 via ffmpeg, then run them through the
+                # SAME upload loop above. The ffmpeg "-c copy" remux
+                # repackages whatever the MPEG-TS / fMP4 buffer holds
+                # without re-encoding -- typically a clean playable
+                # truncation of the stream so far.
+                _is_force = job_id in self._force_complete_job_ids
+                if _is_force:
+                    try:
+                        await self._send(WorkerJobLog(
+                            job_id=job_id,
+                            line="  [downloading] force-complete: salvaging partial...",
+                        ))
+                    except Exception:
+                        pass
+                    try:
+                        _salvaged = await self._salvage_partial_downloads(tmp)
+                    except Exception:
+                        _salvaged = []
+                    for _p in _salvaged:
+                        try:
+                            await self._upload_asset(
+                                assign, _p, _p.name,
+                                mime="video/mp4",
+                                page_url=page_url, timeout=900.0,
+                            )
+                            sz = _p.stat().st_size
+                            added.append(AssetInfo(
+                                name=_p.name, size=sz, mime="video/mp4",
+                                url=None, page_url=page_url,
+                                href=f"/jobs/{job_id}/assets/{_p.name}",
+                            ))
+                            await self._send(WorkerJobLog(
+                                job_id=job_id,
+                                line=f"  [downloading] salvaged {_p.name} "
+                                     f"({sz/1024/1024:.1f} MB)",
+                            ))
+                        except Exception as _ex:
+                            try:
+                                await self._send(WorkerJobLog(
+                                    job_id=job_id,
+                                    line=f"  [downloading] salvage upload "
+                                         f"failed for {_p.name}: {_ex}",
+                                ))
+                            except Exception:
+                                pass
                 _shutil.rmtree(tmp, ignore_errors=True)
                 # ALWAYS finish the job so it can never hang in
                 # "downloading" -- include whatever video assets landed.
@@ -1147,6 +1196,16 @@ class _JobExecMixin:
                     base_result.assets = list(base_result.assets) + added
                 except Exception:
                     pass
+                if _is_force:
+                    try:
+                        base_result.partial = True
+                    except Exception:
+                        pass
+                    # Clear the flag now that we've handled this job.
+                    try:
+                        self._force_complete_job_ids.discard(job_id)
+                    except Exception:
+                        pass
                 try:
                     await self._send(WorkerJobComplete(
                         job_id=job_id, result=base_result,
@@ -1170,6 +1229,117 @@ class _JobExecMixin:
             self._bg_video_tasks = {}
         self._bg_video_tasks[task] = job_id
         task.add_done_callback(lambda t: self._bg_video_tasks.pop(t, None))
+
+    async def _force_complete_video_job(self, job_id: str, reason: str) -> None:
+        """Hub-driven graceful wrap-up of an in-flight deferred video DL.
+
+        Flow (mirrors HubForceCompleteJob's docstring):
+          1. Stamp ``job_id`` into ``_force_complete_job_ids`` so the
+             deferred task's finally block knows to salvage partial files.
+          2. SIGTERM any yt-dlp / ffmpeg descendants whose argv mentions
+             this job's tmp dir (``paprika-vid-{job_id}``). Other jobs'
+             downloads are left alone -- belt & braces for shared-worker
+             scenarios.
+          3. The in-flight ``run_ytdlp`` returns once its subprocess exits;
+             the finally block does ffmpeg-remux + upload + JobComplete.
+        Idempotent: a second HubForceCompleteJob for the same job is a
+        no-op (set membership + already-killed subprocess).
+        """
+        from server.worker.agent.video import _terminate_ytdlp_descendants_for_job
+        try:
+            self._force_complete_job_ids.add(job_id)
+        except Exception:
+            pass
+        try:
+            await self._send(WorkerJobLog(
+                job_id=job_id,
+                line=f"  [downloading] hub force-complete: {reason or '(no reason)'}",
+            ))
+        except Exception:
+            pass
+        try:
+            _killed = await asyncio.to_thread(
+                _terminate_ytdlp_descendants_for_job, job_id,
+            )
+            _logger.info(
+                "[%s] force-complete: SIGTERM'd %d yt-dlp/ffmpeg descendants",
+                job_id, _killed,
+            )
+        except Exception:
+            _logger.warning(
+                "[%s] force-complete: descendant SIGTERM failed", job_id,
+                exc_info=True,
+            )
+
+    async def _salvage_partial_downloads(self, tmp: "Path") -> list:
+        """Remux any partial yt-dlp output in ``tmp`` into playable .mp4 files.
+
+        yt-dlp writes downloads as ``<name>.mp4.part`` (or the variant
+        ``<name>.mp4.ytdl`` index). After a SIGTERM mid-stream the ``.part``
+        file holds whatever MPEG-TS / fMP4 chunks the ffmpeg mux had already
+        committed; ``ffmpeg -c copy -fflags +genpts`` repackages that into a
+        seekable .mp4 without re-encoding. Returns the list of newly-created
+        ``.mp4`` paths the caller should upload.
+
+        Best-effort: if ffmpeg isn't installed, or remux fails (truly empty
+        / unreadable input), the file is skipped. Already-finalised ``.mp4``
+        files in tmp aren't touched (yt-dlp moves .part -> .mp4 on success).
+        """
+        import shutil as _sh
+        import subprocess as _sp
+        import asyncio as _aio
+
+        out: list = []
+        ffmpeg = _sh.which("ffmpeg")
+        if not ffmpeg:
+            return out
+        # Targets: every .part / .mp4.part / .ts in tmp (plus the rare
+        # finalised .mp4 yt-dlp may have already produced).
+        candidates = []
+        for p in sorted(tmp.iterdir()):
+            if not p.is_file():
+                continue
+            low = p.name.lower()
+            if low.endswith(".part"):
+                candidates.append(p)
+            elif low.endswith(".ts"):
+                candidates.append(p)
+        for src in candidates:
+            try:
+                # Derive output name: strip .part suffix or change .ts -> .mp4.
+                # Add `-salvaged` so it doesn't clash with any finalised file
+                # yt-dlp might have raced to write.
+                if src.name.lower().endswith(".part"):
+                    base = src.name[:-len(".part")]
+                else:
+                    base = src.stem + ".mp4"
+                if base.lower().endswith(".mp4"):
+                    stem = base[:-4]
+                else:
+                    stem = base
+                dst = src.with_name(f"{stem}-salvaged.mp4")
+                # ffmpeg copies streams (no re-encode), tolerates truncation.
+                proc = await _aio.create_subprocess_exec(
+                    ffmpeg, "-y",
+                    "-fflags", "+genpts+igndts",
+                    "-err_detect", "ignore_err",
+                    "-i", str(src),
+                    "-c", "copy",
+                    "-movflags", "+faststart",
+                    str(dst),
+                    stdout=_sp.DEVNULL, stderr=_sp.DEVNULL,
+                )
+                try:
+                    await _aio.wait_for(proc.wait(), timeout=120.0)
+                except _aio.TimeoutError:
+                    try: proc.kill()
+                    except Exception: pass
+                    continue
+                if dst.is_file() and dst.stat().st_size > 1024:
+                    out.append(dst)
+            except Exception:
+                continue
+        return out
 
     def _make_cookie_save_callback(self, assign, save_host: str, log):
         """Return an async callable suitable for FetchOptions.on_complete_dump_cookies.

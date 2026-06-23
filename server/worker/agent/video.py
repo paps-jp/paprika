@@ -155,6 +155,66 @@ def is_session_protected(session_id: str | None) -> bool:
     return (time.time() - last) < _NOVNC_PROTECTION_S
 
 
+def _terminate_ytdlp_descendants_for_job(job_id: str) -> int:
+    """Same as :func:`_terminate_ytdlp_descendants` but ONLY SIGTERMs
+    yt-dlp / ffmpeg processes whose cmdline argv mentions the given
+    ``job_id`` (via the temp dir prefix ``paprika-vid-{job_id}-``).
+    Lets HubForceCompleteJob surgically wrap up one stuck download
+    without nuking other jobs the same worker may be running."""
+    if not os.path.exists("/proc") or not job_id:
+        return 0
+    import signal as _sig
+    needle = f"paprika-vid-{job_id}".encode("utf-8")
+    my_pid = os.getpid()
+    procs: dict[int, tuple[int, bytes]] = {}
+    try:
+        entries = os.listdir("/proc")
+    except OSError:
+        return 0
+    for entry in entries:
+        if not entry.isdigit():
+            continue
+        pid = int(entry)
+        try:
+            with open(f"/proc/{pid}/stat", "rb") as f:
+                raw = f.read()
+            rp = raw.rfind(b")")
+            after = raw[rp + 2:].split()
+            ppid = int(after[1])
+            with open(f"/proc/{pid}/cmdline", "rb") as f:
+                cmd = f.read()
+            procs[pid] = (ppid, cmd)
+        except (OSError, ValueError, IndexError):
+            continue
+    children_of: dict[int, list[int]] = {}
+    for p, (pp, _) in procs.items():
+        children_of.setdefault(pp, []).append(p)
+    descendants: list[int] = []
+    seen: set[int] = set()
+    stack: list[int] = [my_pid]
+    while stack:
+        p = stack.pop()
+        for c in children_of.get(p, []):
+            if c in seen:
+                continue
+            seen.add(c)
+            descendants.append(c)
+            stack.append(c)
+    killed = 0
+    for pid in descendants:
+        _, cmd = procs.get(pid, (0, b""))
+        if not cmd or needle not in cmd:
+            continue
+        cmd_str = cmd.replace(b"\x00", b" ").decode("utf-8", errors="replace")
+        if ("yt-dlp" in cmd_str) or ("/ffmpeg" in cmd_str) or cmd_str.split(" ", 1)[0].endswith("ffmpeg"):
+            try:
+                os.kill(pid, _sig.SIGTERM)
+                killed += 1
+            except OSError:
+                pass
+    return killed
+
+
 def _terminate_ytdlp_descendants() -> int:
     """SIGTERM all yt-dlp/ffmpeg descendant processes of this worker.
 

@@ -32,6 +32,7 @@ from server.protocol import (
     AssetInfo,
     HubAssignJob,
     HubExpectedVersion,
+    HubForceCompleteJob,
     HubProfileDelete,
     HubProfileSync,
     HubRegistered,
@@ -918,6 +919,19 @@ class _RunMixin:
         if isinstance(msg, HubAssignJob):
             t = asyncio.create_task(self._run_assigned_job(msg))
             t.add_done_callback(self._on_job_task_done)
+            return
+        if isinstance(msg, HubForceCompleteJob):
+            # Hub asked us to wrap up a deferred video download for this
+            # job_id. Mark the flag so the deferred task's finally block
+            # ffmpeg-remuxes any partial .part into a playable .mp4 and
+            # uploads it. Then SIGTERM the in-flight yt-dlp / ffmpeg
+            # subprocess(es) for this job so ``run_ytdlp`` returns and the
+            # finally block runs. Best-effort: if there's no in-flight DL
+            # the SIGTERM scan is a no-op and the flag is cleared by the
+            # task's done callback (or by next force-complete arrival).
+            asyncio.create_task(self._force_complete_video_job(
+                msg.job_id, msg.reason or "",
+            ))
             return
         if isinstance(msg, HubExpectedVersion):
             # Hub re-advertised its expected worker version mid-connection

@@ -274,7 +274,13 @@ OUTPUT SCHEMA (all fields optional unless noted)
 }
 
 The url, host, perceived_at, step_index, model, and duration_ms fields are filled by the system after your response.
-Report only the schema fields listed above."""
+Report only the schema fields listed above.
+
+LANGUAGE: All natural-language values you produce (``summary``, ``visible_text_excerpt``,
+``barriers[*].evidence``, ``barriers[*].selector_hint``, ``actionable_hints[*]``,
+``content_clues[*]``, any other descriptive text) MUST be written in JAPANESE (日本語).
+Keep JSON field names, ``kind`` enums (e.g. ``login_wall`` / ``age_gate``), CSS selectors,
+identifiers, and URLs in English as written."""
 
 
 # ---------------------------------------------------------------------------

@@ -186,6 +186,14 @@ class WorkerAgent(
         # hub picks a worker that's actually full but whose last heartbeat
         # still reported "1 free" (incident 2026-06-16: w50182 mass-drain).
         self._heartbeat_kick: asyncio.Event = asyncio.Event()
+        # Set of in-flight deferred-video-DL job_ids the hub has asked us
+        # to wrap up gracefully (HubForceCompleteJob). The deferred-DL task
+        # checks this in its finally block: when set, partial .part files
+        # are ffmpeg-remuxed into playable .mp4 and uploaded so the job
+        # ends as ``completed`` with ``result.partial=True`` instead of
+        # vanishing into nothing. Cleared by the deferred task's
+        # done_callback on exit.
+        self._force_complete_job_ids: set[str] = set()
         try:
             self._recycle_after = int(os.environ.get("WORKER_RECYCLE_AFTER_JOBS", "200"))
         except (TypeError, ValueError):
