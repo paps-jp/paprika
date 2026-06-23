@@ -386,7 +386,16 @@ class _UploadsMixin:
         with open(path, "rb") as f:
             blob = f.read()
         headers = {"Content-Type": mime} if mime else None
-        pr = await self._http.put(put_url, content=blob, headers=headers, timeout=300.0)
+        # Bound the CONNECT phase separately from read/write: a bare
+        # ``timeout=300.0`` applies 300s to connect too, so if MinIO is
+        # unreachable from this worker (e.g. an egress-firewall DROP, or the
+        # NAS is down) every PUT pins a half-open socket in SYN_SENT for the
+        # full 300s, leaking fds until the worker hits its fd budget and
+        # recycles (incident 2026-06-24). A short connect timeout fails fast
+        # so the caller falls back to the bytes-through-hub POST in seconds,
+        # holding no socket; read/write stay generous for large blobs.
+        _put_timeout = httpx.Timeout(connect=10.0, read=300.0, write=300.0, pool=10.0)
+        pr = await self._http.put(put_url, content=blob, headers=headers, timeout=_put_timeout)
         pr.raise_for_status()
         # 3) complete -> hub writes the sidecar + HEAD-confirms the object
         cbody = dict(body)
