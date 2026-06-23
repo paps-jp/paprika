@@ -180,6 +180,12 @@ Output strict JSON, no prose, no markdown fences:
     "success_criteria": "<one-line testable criterion>",
     "notes": "<optional: domain pitfalls / site quirks the coder should know>"
   }
+
+LANGUAGE: All natural-language fields you produce (``description``,
+``success_criteria``, ``notes``, step explanations, any prose) MUST be
+written in JAPANESE (日本語). Keep JSON field names, ``kind`` enums,
+``tool`` names (e.g. ``page.agent``, ``page.download_video``), CSS
+selectors, identifiers, and URLs in English as written.
 """
 
 

@@ -440,6 +440,12 @@ class JobResult(BaseModel):
     # (login form, scroll-locked, overlay covers 96% of viewport)". None for
     # normal completions.
     review_reason: str | None = None
+    # True when the result represents a PARTIAL save -- the worker was told
+    # to wrap up a long-running download (HubForceCompleteJob path) and
+    # ffmpeg-remuxed whatever fragments were on disk into a playable .mp4
+    # rather than waiting for the full HLS stream to finish. Lets the UI /
+    # operators tell "100% complete" apart from "best effort cut-off".
+    partial: bool = False
 
 
 # ----------------------------------------------------------------------------
@@ -957,6 +963,37 @@ class HubCancelJob(BaseModel):
     job_id: str
 
 
+class HubForceCompleteJob(BaseModel):
+    """Tell the worker to wrap up an in-flight video download gracefully.
+
+    Sent by the hub's ``_downloading_reaper_loop`` when a job has been in
+    ``JobStatus.downloading`` longer than ``PAPRIKA_DOWNLOADING_TIMEOUT_S``.
+    The worker is expected to:
+
+      1. SIGTERM (graceful) any yt-dlp / ffmpeg subprocesses for ``job_id``.
+      2. Wait a short window for them to flush headers and close output.
+      3. Scan the job's assets dir for a partial ``.mp4`` / ``.part`` /
+         ``.ts`` fragment file produced so far.
+      4. Run ``ffmpeg -c copy`` to remux into a playable ``.mp4`` when
+         possible (HLS fragments concatenated; .part renamed to .mp4
+         if the container is already valid).
+      5. Upload the result as a normal asset (so it shows up in the
+         gallery and asset list like a regular successful download).
+      6. Send ``WorkerJobComplete`` -- the JobResult may carry
+         ``partial=True`` so the UI can mark the asset as "incomplete".
+
+    If nothing can be salvaged (no partial file on disk, ffmpeg fails, the
+    download never wrote anything), the worker sends ``WorkerJobFailed``
+    with a descriptive error instead.
+
+    ``reason`` is operator-facing text the worker may log; it has no
+    behavioural effect.
+    """
+    type: Literal["force_complete_job"] = "force_complete_job"
+    job_id: str
+    reason: str = ""
+
+
 class HubPing(BaseModel):
     type: Literal["ping"] = "ping"
 
@@ -1326,6 +1363,7 @@ HubToWorkerMsg = Annotated[
     Union[
         HubAssignJob,
         HubCancelJob,
+        HubForceCompleteJob,
         HubPing,
         HubRegistered,
         HubScreenshotRequest,

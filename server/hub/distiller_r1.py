@@ -132,6 +132,13 @@ STRICT RULES
 3. Do NOT touch stats / provenance / schema_version / created_at /
    updated_at -- those are managed elsewhere.
 4. Be conservative. If unsure, omit the update.
+
+LANGUAGE: All natural-language values you produce (``rationale``,
+``description`` fields inside ``content_extraction``, ``selector_hint``
+text, ``action`` descriptions, observation notes, anything a human
+operator will read) MUST be written in JAPANESE (日本語). Keep JSON
+field names, ``path`` values, ``kind`` enums, CSS selectors, identifiers,
+API method names, and URLs in English as written.
 """
 
 
