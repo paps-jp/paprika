@@ -66,7 +66,15 @@ _TABLES: list[tuple[str, str]] = [
             -- difference is ~500ms vs <10ms per query.
             INDEX idx_status_created (status, created_at),
             INDEX idx_mode_created   (mode, created_at),
-            INDEX idx_owner_created  (owner_id, created_at)
+            INDEX idx_owner_created  (owner_id, created_at),
+            -- Keyset (cursor) pagination for GET /jobs/completes: the pipeline
+            -- consumer polls "completed_at > cursor AND status IN (...) ORDER BY
+            -- completed_at ASC LIMIT N". completed_at leads so the range seek +
+            -- the ASC ORDER BY are served by ONE index walk (no filesort);
+            -- status trails as an in-index residual filter. O(log N + limit)
+            -- regardless of table size (vs the un-indexed range scan that took
+            -- ~1.7s at 750k rows).
+            INDEX idx_completed_at_status (completed_at, status)
         ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci
         """,
     ),
@@ -691,6 +699,10 @@ _REQUIRED_INDEXES: list[tuple[str, str, str]] = [
     ("jobs", "idx_mode_created", "(mode, created_at)"),
     # Phase 2 tenancy: "WHERE owner_id=X ORDER BY created_at DESC".
     ("jobs", "idx_owner_created", "(owner_id, created_at)"),
+    # Cursor pagination for GET /jobs/completes -- "WHERE completed_at > ?
+    # AND status IN (...) ORDER BY completed_at ASC LIMIT N". Legacy DBs
+    # (created before this line) get it applied here on next startup.
+    ("jobs", "idx_completed_at_status", "(completed_at, status)"),
 ]
 
 

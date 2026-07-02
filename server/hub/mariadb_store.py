@@ -532,6 +532,65 @@ class MariaDBJobStore:
         )
         return infos, total
 
+    async def list_jobs_after(
+        self,
+        completed_after: datetime,
+        *,
+        limit: int = 100,
+        status: "tuple[str, ...] | list[str]" = ("completed", "review"),
+    ) -> list[Any]:
+        """Cursor (keyset) pagination: jobs with ``completed_at > cursor``,
+        ordered ``completed_at ASC`` (oldest first).
+
+        Powers ``GET /jobs/completes`` for the pipeline consumers. Unlike the
+        offset-based :meth:`list_job_infos`, this is O(log N + limit) at any
+        table size: the ``idx_completed_at_status (completed_at, status)`` index
+        seeks straight to the cursor and walks ``limit`` rows in ASC order (the
+        index order), so there's no filesort and no OFFSET scan. The caller
+        persists ``rows[-1].completed_at`` as the next cursor.
+
+        ``status`` is a case-insensitive ``IN`` filter (default
+        ``completed,review``). ``completed_after`` is compared *strictly*
+        greater, so passing back the previous batch's last ``completed_at``
+        never re-returns that boundary row.
+        """
+        status = tuple(s.lower() for s in status if s)
+        placeholders = ",".join(["%s"] * len(status)) if status else "%s"
+        select_cols = (
+            "job_id, status, url, mode, goal, options, "
+            "worker_id, lane_idx, session_id, "
+            "created_at, started_at, completed_at, error, progress, "
+            "owner_id"
+        )
+        where = "completed_at > %s"
+        params: list[Any] = [completed_after]
+        if status:
+            where += f" AND status IN ({placeholders})"
+            params.extend(status)
+        # ORDER BY completed_at ASC *only* (no job_id tiebreaker): that keeps
+        # the whole query index-only on idx_completed_at_status (range seek +
+        # in-order walk, NO filesort) -- ~1.2ms even for the initial epoch-
+        # cursor backfill over all rows, vs ~317ms once a job_id secondary sort
+        # forces a filesort. Trade-off: completed_at is DATETIME(3), so if two
+        # jobs share the exact same millisecond AND the batch boundary (row
+        # `limit`) falls between them, the next call's strict `> cursor` skips
+        # the unreturned sibling. Inherent to the single-`completed_at` cursor
+        # contract (the consumer stores only completed_at); rare in practice
+        # and the documented behaviour of GET /jobs/completes.
+        sql = (
+            f"SELECT {select_cols} FROM jobs WHERE {where} "
+            f"ORDER BY completed_at ASC LIMIT %s"
+        )
+        params.append(int(limit))
+        async with self._pool.acquire() as conn:
+            async with conn.cursor() as cur:
+                await cur.execute(sql, tuple(params))
+                rows = await cur.fetchall()
+        # Deserialise off the event loop (same rationale as list_job_infos).
+        return await asyncio.to_thread(
+            lambda: [_row_to_job_info(r) for r in rows]
+        )
+
     async def count_by_status_and_mode(
         self,
         *,

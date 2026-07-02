@@ -435,6 +435,66 @@ class PaprikaClient:
                              "offset": 0, "limit": 0, "jobs": data})
         return data
 
+    async def list_completed_jobs(
+        self,
+        *,
+        completed_after: str,
+        limit: int = 100,
+        status: str = "completed,review",
+    ) -> dict:
+        """GET /jobs/completes -- cursor (keyset) pagination for consuming a
+        stream of newly-completed jobs.
+
+        Returns jobs with ``completed_at`` **strictly greater** than
+        ``completed_after``, ordered ASC (oldest first). Persist
+        ``resp.next_cursor`` (== ``resp.jobs[-1].completed_at``) and pass it
+        back as ``completed_after`` on the next call.
+
+        Prefer this over :meth:`list_jobs` when tailing completions: offset
+        pagination is O(N) as the job table grows (750k+ rows in prod), but
+        this endpoint is O(log N + limit) via an index seek on
+        ``(completed_at, status)``.
+
+        Args:
+          completed_after: ISO 8601 cursor, e.g.
+                           ``"2026-07-03T09:15:23.456000"``. Compared strictly
+                           ``>`` so the boundary row is never re-returned.
+          limit:           Max entries per call (default 100, hard cap 500).
+          status:          Comma-separated status IN-filter. Default
+                           ``"completed,review"``.
+
+        Returns an ``_AttrDict`` envelope::
+
+            {
+                "total":       None,   # meaningless for cursor pagination
+                "count":        20,
+                "offset":        0,
+                "limit":       100,
+                "next_cursor": "2026-07-03T09:15:23.456000",  # may be None
+                "jobs":        [...]   # JobInfo dicts, sorted completed_at ASC
+            }
+
+        Example -- drain everything newer than a saved watermark::
+
+            cursor = load_watermark()          # e.g. from a DB row
+            while True:
+                resp = await cli.list_completed_jobs(
+                    completed_after=cursor, limit=100
+                )
+                for job in resp.jobs:
+                    await process(job)
+                if not resp.next_cursor:
+                    break                       # caught up
+                cursor = resp.next_cursor
+                save_watermark(cursor)
+        """
+        params: dict[str, Any] = {"completed_after": completed_after}
+        if limit:
+            params["limit"] = limit
+        if status:
+            params["status"] = status
+        return await self._json("GET", "/jobs/completes", params=params)
+
     async def job_result(self, job_id: str) -> dict:
         """GET /jobs/{id}/result -- the ``JobResult`` (assets list, links,
         final url, …). 404s until the job has produced a result."""

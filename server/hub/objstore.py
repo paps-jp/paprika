@@ -43,9 +43,57 @@ from __future__ import annotations
 import asyncio
 import os
 import threading
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
 from server.hub._state import get_storage_dir, state
+
+
+# --- dedicated S3/MinIO IO thread pool --------------------------------------
+#
+# Every blocking boto3 call below runs off the event loop -- but it must NOT
+# share the *default* asyncio.to_thread() executor (a single ThreadPoolExecutor,
+# capped at min(32, cpu+4) = 32 threads on the 128-core hub hosts). The fleet's
+# per-asset uploads (boto3 ``upload_file``, seconds each for large video assets
+# to MinIO over LAN) would fill every default-pool thread during an upload
+# storm -- and then ANY other to_thread() work queues behind them, most
+# painfully ``/jobs`` row deserialisation (MariaDBJobStore hydrates rows via
+# asyncio.to_thread). That's exactly the "#jobs が数十秒フリーズする" the
+# operator hit: the SELECT is ~1.4ms but the request sat 9.6s waiting for a
+# free thread (py-spy 2026-07-03: 22 of 32 default-pool threads parked in
+# upload_file). Isolating S3 IO onto its OWN bounded pool keeps the default
+# pool free for request handlers no matter how heavy the mirror traffic gets.
+#
+# Sized independently of cpu-count (this work is IO-bound, not CPU-bound);
+# kept at/under ``max_pool_connections`` (50) so threads don't outrun the
+# botocore connection pool. Env-tunable; lazily built on first use.
+_S3_IO_EXECUTOR: "ThreadPoolExecutor | None" = None
+_S3_IO_EXECUTOR_LOCK = threading.Lock()
+
+
+def _s3_executor() -> "ThreadPoolExecutor":
+    global _S3_IO_EXECUTOR
+    if _S3_IO_EXECUTOR is not None:
+        return _S3_IO_EXECUTOR
+    with _S3_IO_EXECUTOR_LOCK:
+        if _S3_IO_EXECUTOR is None:
+            try:
+                _n = int(os.environ.get("PAPRIKA_S3_IO_THREADS") or 40)
+            except ValueError:
+                _n = 40
+            _S3_IO_EXECUTOR = ThreadPoolExecutor(
+                max_workers=max(4, _n), thread_name_prefix="objstore-s3",
+            )
+        return _S3_IO_EXECUTOR
+
+
+async def _run_io(fn):
+    """Run a blocking S3/MinIO callable on the DEDICATED objstore pool
+    (``_s3_executor``), never the shared default asyncio.to_thread() pool --
+    so mirror-upload storms can't starve request handlers. Drop-in replacement
+    for ``await asyncio.to_thread(fn)`` for the zero-arg closures below."""
+    loop = asyncio.get_running_loop()
+    return await loop.run_in_executor(_s3_executor(), fn)
 
 
 def _env_flag(name: str) -> bool:
@@ -194,7 +242,7 @@ async def mirror_file(local_path: Path | str) -> None:
             pass
 
     try:
-        await asyncio.to_thread(_put)
+        await _run_io(_put)
     except Exception:
         pass
 
@@ -249,7 +297,7 @@ async def mirror_dir(local_dir: Path | str) -> int:
         return n
 
     try:
-        return await asyncio.to_thread(_put_all)
+        return await _run_io(_put_all)
     except Exception:
         return 0
 
@@ -293,7 +341,7 @@ async def ensure_local(local_path: Path | str) -> bool:
             return False
 
     try:
-        return await asyncio.to_thread(_get)
+        return await _run_io(_get)
     except Exception:
         return False
 
@@ -325,7 +373,7 @@ async def put_object(key: str, local_path: Path | str) -> bool:
             return False
 
     try:
-        return await asyncio.to_thread(_put)
+        return await _run_io(_put)
     except Exception:
         return False
 
@@ -364,7 +412,7 @@ async def presign_put(key: str, expires_in: int = 7200) -> str | None:
             return None
 
     try:
-        return await asyncio.to_thread(_sign)
+        return await _run_io(_sign)
     except Exception:
         return None
 
@@ -395,7 +443,7 @@ async def get_object(key: str, local_path: Path | str) -> bool:
             return False
 
     try:
-        return await asyncio.to_thread(_get)
+        return await _run_io(_get)
     except Exception:
         return False
 
@@ -416,7 +464,7 @@ async def head_object(key: str) -> bool:
             return False
 
     try:
-        return await asyncio.to_thread(_head)
+        return await _run_io(_head)
     except Exception:
         return False
 
@@ -464,7 +512,7 @@ async def list_dir(job_id: str, subdir: str = "assets") -> list[dict]:
         return out
 
     try:
-        return await asyncio.to_thread(_list)
+        return await _run_io(_list)
     except Exception:
         return []
 
@@ -507,7 +555,7 @@ async def list_tree(job_id: str, subdir: str = "assets") -> list[dict]:
         return out
 
     try:
-        return await asyncio.to_thread(_list)
+        return await _run_io(_list)
     except Exception:
         return []
 
@@ -556,7 +604,7 @@ async def delete_prefix(job_id: str, *, dry_run: bool = False) -> dict:
         return {"objects": n, "bytes": total, "deleted": not dry_run}
 
     try:
-        return await asyncio.to_thread(_delete)
+        return await _run_io(_delete)
     except Exception:
         return {"objects": 0, "bytes": 0, "deleted": False}
 
@@ -589,7 +637,7 @@ async def list_job_prefixes() -> list[str]:
         return out
 
     try:
-        return await asyncio.to_thread(_list)
+        return await _run_io(_list)
     except Exception:
         return []
 
@@ -614,7 +662,7 @@ async def prefix_exists(job_id: str, subdir: str = "") -> bool:
             return False
 
     try:
-        return await asyncio.to_thread(_head)
+        return await _run_io(_head)
     except Exception:
         return False
 
@@ -673,7 +721,7 @@ async def open_object(
         }
 
     try:
-        return await asyncio.to_thread(_open)
+        return await _run_io(_open)
     except Exception:
         return None
 
@@ -715,7 +763,7 @@ async def reachable() -> tuple[bool, str]:
             return (False, type(e).__name__)
 
     try:
-        return await asyncio.to_thread(_check)
+        return await _run_io(_check)
     except Exception as e:
         return (False, type(e).__name__)
 

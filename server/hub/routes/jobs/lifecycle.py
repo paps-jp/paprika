@@ -349,6 +349,80 @@ async def list_jobs(
     }
 
 
+@router.get("/jobs/completes")
+async def list_completed_jobs(
+    request: Request,
+    completed_after: str,
+    limit: int = 100,
+    status: str = "completed,review",
+) -> dict:
+    """Cursor (keyset) pagination for stream consumers (pipeline-oss pull).
+
+    Returns jobs with ``completed_at`` **strictly greater** than
+    ``completed_after``, ordered ``completed_at ASC`` (oldest first), so the
+    caller can persist ``next_cursor`` (= ``jobs[-1].completed_at``) as a
+    watermark and pass it back on the next call.
+
+    Query params:
+      * ``completed_after`` (required, ISO 8601) -- the cursor. ``Z`` and
+        naive timestamps are accepted (naive is treated as UTC).
+      * ``limit`` -- default 100, hard cap 500.
+      * ``status`` -- CSV IN-filter, default ``"completed,review"``.
+
+    Unlike ``GET /jobs`` (offset-based, O(N) at deep pages), this is
+    O(log N + limit) at any table size via the
+    ``idx_completed_at_status (completed_at, status)`` index seek -- see
+    ``MariaDBJobStore.list_jobs_after``. Empty tail -> ``jobs: []``,
+    ``count: 0``, ``next_cursor: null``.
+
+    ``offset`` / ``limit`` are echoed for envelope parity with ``GET /jobs``;
+    ``offset`` is always 0 here (cursor pagination doesn't skip).
+    """
+    from datetime import timezone
+    assert state.store is not None
+    lister = getattr(state.store, "list_jobs_after", None)
+    if not callable(lister):
+        # In-memory / Redis stores don't implement the keyset query. Rather
+        # than silently returning a wrong page, tell the caller to use /jobs.
+        raise HTTPException(
+            501, "cursor pagination requires the MariaDB job store"
+        )
+    try:
+        ts = datetime.fromisoformat(completed_after.replace("Z", "+00:00"))
+    except ValueError:
+        raise HTTPException(
+            400,
+            f"invalid ISO 8601 datetime for completed_after: {completed_after!r}",
+        )
+    # Normalise to a naive UTC datetime: the jobs.completed_at column is a
+    # naive DATETIME(3) written from datetime.utcnow(), so comparing it against
+    # a tz-aware value would raise / mis-compare. Convert aware -> UTC -> drop
+    # tzinfo so the SQL `completed_at > %s` bind is apples-to-apples.
+    if ts.tzinfo is not None:
+        ts = ts.astimezone(timezone.utc).replace(tzinfo=None)
+    lim = 100 if int(limit or 0) <= 0 else min(int(limit), 500)
+    status_list = tuple(
+        s.strip().lower() for s in (status or "").split(",") if s.strip()
+    )
+    _own = _scope_owner(request)
+    infos = await lister(ts, limit=lim, status=status_list)
+    if _own is not None:
+        infos = [i for i in infos if getattr(i, "owner_id", "default") == _own]
+    page = [_proxy_info(i, request) for i in infos]
+    next_cursor = None
+    if infos:
+        last_dt = getattr(infos[-1], "completed_at", None)
+        next_cursor = last_dt.isoformat() if last_dt else None
+    return {
+        "total": None,
+        "count": len(page),
+        "offset": 0,
+        "limit": lim,
+        "next_cursor": next_cursor,
+        "jobs": page,
+    }
+
+
 @router.get("/jobs/summary")
 async def get_jobs_summary() -> dict:
     """Dashboard-shaped overview of the job store. One round-trip,
