@@ -223,14 +223,17 @@ async def _compute_capacity() -> dict:
 
     healthy_lanes = sum(_cap(w) * _health(w) for w in eligible)
 
-    # Best-effort queued backlog (one indexed COUNT; never fail the endpoint).
+    # Best-effort queued backlog + in-flight video-DL tail (indexed COUNTs;
+    # never fail the endpoint).
     queued = None
+    downloading = None
     try:
         _lji = getattr(state.store, "list_job_infos", None)
         if callable(_lji):
             _, queued = await _lji(status=["queued"], limit=1)
+            _, downloading = await _lji(status=["downloading"], limit=1)
     except Exception:
-        queued = None
+        pass
 
     # Back off further when queue depth approaches hard cap — adding more
     # work just stacks behind redrive. Floor 0.7 so a momentary spike
@@ -247,11 +250,22 @@ async def _compute_capacity() -> dict:
     # admission as a single boolean check. ``recommended_free`` is the
     # *advisory* free-slot count keyed on the recommended cap (not the
     # hard ``available``); ``accept_new`` is its boolean form so client
-    # SDKs can write ``if caps['accept_new']: submit()``. Strict (running
-    # only, ignoring queued) because ``queue_health`` above already
-    # pulls ``recommended`` down as the queue grows -- subtracting
-    # ``queued`` here too would double-count.
-    recommended_free = max(0, recommended - running)
+    # SDKs can write ``if caps['accept_new']: submit()``.
+    #
+    # Occupancy = ``running`` (active fetches holding a lane) PLUS the
+    # ``downloading`` tail. A video-DL job releases its lane the instant the
+    # fetch handler returns -- so it's absent from ``running`` (worker
+    # in_flight) -- yet keeps a yt-dlp burning worker CPU/disk/net for minutes.
+    # Counting it here is what makes admission back off as the background-
+    # download pile grows; without it ``accept_new`` reads "lanes free" and
+    # keeps inviting work, letting downloads accumulate unbounded (2026-06-26).
+    # ``fetch_downloading_weight`` (Settings/env, default 1.0 = a download costs
+    # a full slot) tunes aggressiveness; a failed count is fail-open (0).
+    # ``queued`` is NOT subtracted -- ``queue_health`` already pulls
+    # ``recommended`` down as the queue grows, so doing both would double-count.
+    dl_weight = max(0.0, _setting_f("fetch_downloading_weight", 1.0))
+    dl_occupancy = round((downloading or 0) * dl_weight)
+    recommended_free = max(0, recommended - running - dl_occupancy)
     accept_new = recommended_free > 0
 
     return {
@@ -274,6 +288,8 @@ async def _compute_capacity() -> dict:
             "alive": sum(1 for w in workers if w.get("alive")),
         },
         "queued": queued,
+        "downloading": downloading,
+        "dl_occupancy": dl_occupancy,
         "note": (
             "1 fetch = 1 lane; any free lane runs a fetch. Check "
             "`accept_new` (or `recommended_free > 0`) before POSTing; "

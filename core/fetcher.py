@@ -3273,6 +3273,20 @@ async def fetch(opts: FetchOptions) -> FetchResult:
                 )
                 for u, _ref, lbl in ytdlp_targets:
                     log(f"     [{lbl}] deferred: {u}")
+            elif ytdlp_targets and not opts.download_video:
+                # download_video=false で video URL を検出した場合は yt-dlp を
+                # 起動しない (= image-only fetch ジョブが偶発的に動画サイトを
+                # 踏んでも 20+ 分の inline DL に巻き込まれない)。 検出だけ
+                # 残してログに出す。 incident 2026-06-23 (job 0efc5f0bf0aa):
+                # missav123.com への download_video=false fetch が auto yt-dlp
+                # で広告 iframe (myavlive) + 本動画 HLS を 3 並列で取り始め
+                # 20 分タイムアウトで打ち切られた。
+                log(
+                    f"\n=== {len(ytdlp_targets)} video target(s) detected; "
+                    f"download_video=false → skipping yt-dlp ==="
+                )
+                for u, _ref, lbl in ytdlp_targets:
+                    log(f"     [{lbl}] not downloaded: {u}")
             elif ytdlp_targets:
                 if not shutil.which("yt-dlp"):
                     log(
