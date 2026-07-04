@@ -74,6 +74,12 @@ URL directly" beats "look for alternative endpoints").
 
 Tone: terse, operator-readable, no hedging. Skip "consider" / "might
 be useful" -- give direct guidance.
+
+LANGUAGE: The full digest MUST be written in JAPANESE (日本語) so the
+operator can scan it quickly. Keep code / selectors / URLs / API method
+names / dictionary keys in English as written. Bullet points,
+strategies, recommendations, and any prose explanations -- all
+Japanese.
 """
 
 
