@@ -105,6 +105,25 @@ from .workerid import WORKER_ID_FILE, _WorkerIdReassigned, hub_http_base
 _cpu_last_sample: tuple[int, int] | None = None
 
 
+# Proactive disk-cleanup thresholds (see _heartbeat_loop). A worker whose
+# disk crosses _DISK_PRESSURE_FAIL_PCT (90%) is skipped by the hub's
+# pick_worker, so it can no longer be handed a job -- and the per-job
+# preflight was the ONLY trigger for _emergency_disk_cleanup(). That left an
+# IDLE, full CT frozen out of dispatch with nothing left to fire the
+# cleanup: it sat at ~100% disk indefinitely (w51149, 2026-07-04). The
+# heartbeat runs the same cleanup a little BELOW the 90% cliff so a pressured
+# but idle worker sheds transient bloat and re-earns dispatch on its own.
+# Only fires while in_flight <= 0 so it can never yank cache/scratch out from
+# under an active download (a BUSY pressured worker is still covered by the
+# next per-job preflight). Off the event loop (blocking FS walk), throttled.
+_DISK_PROACTIVE_CLEANUP_PCT = float(
+    os.environ.get("PAPRIKA_DISK_PROACTIVE_CLEANUP_PCT", "85")
+)
+_DISK_CLEANUP_MIN_INTERVAL_S = float(
+    os.environ.get("PAPRIKA_DISK_CLEANUP_MIN_INTERVAL_S", "120")
+)
+
+
 def _sample_resources() -> tuple[float, float, float, float, float]:
     """Return (cpu_pct, mem_pct, disk_pct, disk_free_gb, load1) for this CT.
 
@@ -623,6 +642,37 @@ class _RunMixin:
                     self._last_resources = (
                         cpu_pct, mem_pct, disk_pct, disk_free_gb, load1,
                     )
+                    # Proactive disk self-heal for an IDLE, disk-pressured
+                    # worker. Without this a CT that crosses the 90%
+                    # dispatch-exclusion line stops receiving jobs and so
+                    # never hits the per-job preflight that runs the cleanup
+                    # -- it freezes at ~100% forever (w51149, 2026-07-04).
+                    # in_flight<=0 guard: only reclaim when no job is running,
+                    # so we never delete cache/scratch mid-download (busy
+                    # pressured workers stay covered by the preflight path).
+                    if (
+                        disk_pct >= _DISK_PROACTIVE_CLEANUP_PCT
+                        and self._in_flight <= 0
+                    ):
+                        _now_m = time.monotonic()
+                        if (
+                            _now_m - getattr(self, "_last_disk_cleanup_m", 0.0)
+                            >= _DISK_CLEANUP_MIN_INTERVAL_S
+                        ):
+                            self._last_disk_cleanup_m = _now_m
+                            _logger.warning(
+                                f"[worker {self.worker_id}] disk {disk_pct:.0f}%"
+                                f" >= {_DISK_PROACTIVE_CLEANUP_PCT:.0f}% and idle"
+                                f" -- running proactive disk cleanup"
+                            )
+                            try:
+                                from ._mix_jobexec import _emergency_disk_cleanup
+                                await asyncio.to_thread(_emergency_disk_cleanup)
+                            except Exception:
+                                _logger.debug(
+                                    "proactive disk cleanup raised",
+                                    exc_info=True,
+                                )
                     await self._send(
                         WorkerHeartbeat(
                             in_flight=eff_in_flight,
