@@ -273,7 +273,12 @@ def download(
     # Live recordings are exempt -- the rate gate would constantly fire
     # on a sliding-window manifest that genuinely outputs slowly, and
     # the deadline above already clamps live to rec_s + 45s.
-    _no_progress_s = float(os.environ.get("PAPRIKA_YTDLP_NO_PROGRESS_S", "90"))
+    # 45s no-progress abandon (operator rule 2026-07-04): a video whose
+    # download % has not advanced for 45s is treated as stuck -- kill yt-dlp
+    # and hand the stream to the ffmpeg fallback below (parallel-hls segment
+    # fetch + local ffmpeg mux), which beats the per-connection CDN rate cap
+    # that yt-dlp's single reader gets throttled by. Env-overridable.
+    _no_progress_s = float(os.environ.get("PAPRIKA_YTDLP_NO_PROGRESS_S", "45"))
     _min_rate_kibs = float(os.environ.get("PAPRIKA_YTDLP_MIN_RATE_KIBS", "50"))
     _min_rate_grace_s = float(os.environ.get("PAPRIKA_YTDLP_MIN_RATE_GRACE_S", "60"))
     if live_flags:
@@ -284,6 +289,11 @@ def download(
     _last_pct: float | None = None
     _last_pct_at = time.monotonic()
     _slow_rate_since: float | None = None
+    # Set when the stall / min-rate gate SIGTERMs yt-dlp. Routes the failure
+    # into the ffmpeg fallback below (instead of just returning failure) so a
+    # stalled/glacial HLS stream gets a second chance via parallel-segment
+    # fetch + ffmpeg mux.
+    _kill_reason: str | None = None
 
     returncode = -1
     try:
@@ -346,8 +356,9 @@ def download(
                                 f"for {_no_progress_s:.0f}s "
                                 f"(PAPRIKA_YTDLP_NO_PROGRESS_S)"
                             )
-                            _log(f"  !! {msg}")
-                            return {"ok": False, "message": msg, "log_lines": lines}
+                            _log(f"  !! {msg} -- handing to ffmpeg fallback")
+                            _kill_reason = "stalled"
+                            break
 
                 # ---- Min-rate gate (download too slow for too long) ----
                 if _min_rate_kibs > 0 and rate_kibs is not None:
@@ -371,8 +382,9 @@ def download(
                                     f"{_min_rate_grace_s:.0f}s "
                                     f"(PAPRIKA_YTDLP_MIN_RATE_KIBS / GRACE_S)"
                                 )
-                                _log(f"  !! {msg}")
-                                return {"ok": False, "message": msg, "log_lines": lines}
+                                _log(f"  !! {msg} -- handing to ffmpeg fallback")
+                                _kill_reason = "slow"
+                                break
                     else:
                         # Rate recovered above the floor; reset the grace.
                         _slow_rate_since = None
@@ -408,7 +420,15 @@ def download(
         for ln in lines
     )
     _is_hls = bool(re.search(r"\.m3u8($|\?)", url, re.I))
-    if _is_hls and _looks_like_ext_blocked and not live_flags:
+    # Try the ffmpeg fallback for any HLS non-live failure that the
+    # parallel-segment path can actually help with:
+    #   * ext-blocked  -- disguised .js/AES-128 segments yt-dlp/ffmpeg reject
+    #   * stalled/slow -- the stall (45s no-progress) or min-rate gate SIGTERM'd
+    #     yt-dlp; a 16-way parallel segment fetch beats the per-connection CDN
+    #     rate cap that was throttling yt-dlp's single reader (operator rule
+    #     2026-07-04: 45s no progress -> terminate -> ffmpeg).
+    _stalled_or_slow = _kill_reason in ("stalled", "slow")
+    if _is_hls and not live_flags and (_looks_like_ext_blocked or _stalled_or_slow):
         # First try the PARALLEL downloader: fetch all segments + key
         # concurrently to local disk (ffmpeg-direct's single connection
         # is rate-limited by the CDN to ~1x realtime; 16-way parallel
@@ -416,9 +436,13 @@ def download(
         # mux from local files.  This beats the CDN's per-connection
         # rate cap AND finishes before short-lived segment tokens
         # expire.  Falls back to ffmpeg-direct if anything goes wrong.
+        _reason_txt = (
+            "disguised segment extensions" if _looks_like_ext_blocked
+            else f"yt-dlp {_kill_reason} (gate SIGTERM)"
+        )
         _log(
-            "  ↻ yt-dlp/ffmpeg rejected disguised segment extensions; "
-            "trying parallel segment download + local decrypt"
+            f"  ↻ {_reason_txt}; trying parallel segment download "
+            f"+ local ffmpeg mux"
         )
         _pd_timeout = max(60, int(deadline - time.monotonic()))
         pd_result = _parallel_hls_to_mp4(
