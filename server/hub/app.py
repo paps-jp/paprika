@@ -112,6 +112,104 @@ async def _host_lan_ip_via_redis(redis_client) -> str | None:
         return None
 
 
+# --- Store auto-heal: re-promote a Redis/in-memory fallback -> MariaDB --------
+# The job store is chosen ONCE at startup; if MariaDB (.20) is down/restarting
+# then, make_store falls back to Redis/in-memory and STAYS there (sticky). That
+# hub serves only a partial job set + /jobs/summary 500s, and with nginx
+# round-robin the admin #jobs page flips between degraded and healthy hubs
+# (incident 2026-06-24, a .20 reboot). This loop heals it WITHOUT a manual
+# rolling restart: while the store isn't mariadb it keeps probing MariaDB and,
+# the instant it's reachable, atomically swaps the live job store back to it.
+async def _try_build_mariadb_store():
+    """Create + VALIDATE a MariaDB pool and build the job store from it. Returns
+    (store, pool) on success, (None, None) if MariaDB is unreachable / not
+    configured. Never mutates ``state`` -- a failed probe can't disturb the
+    running fallback store; the caller performs the atomic swap."""
+    if state.settings is None:
+        return None, None
+    _host = state.settings.get("mariadb_host", "")
+    _user = state.settings.get("mariadb_username", "")
+    if not (_host and _user):
+        return None, None  # MariaDB not configured (dev) -> nothing to promote to
+    pool = None
+    try:
+        from server.hub.mariadb import create_pool as _create_pool
+
+        pool = await _create_pool(
+            host=_host,
+            port=int(state.settings.get("mariadb_port", 3306)),
+            database=state.settings.get("mariadb_database", "paprika"),
+            username=_user,
+            password=state.settings.get("mariadb_password", ""),
+        )
+        # Prove the pool actually talks to MariaDB before trusting it.
+        async with pool.acquire() as _conn:
+            async with _conn.cursor() as _cur:
+                await _cur.execute("SELECT 1")
+                await _cur.fetchone()
+        store, kind = await make_store(
+            config.redis_url, mariadb_pool=pool, storage_dir_fn=get_storage_dir,
+        )
+        if kind != "mariadb":
+            raise RuntimeError("make_store returned %r, not mariadb" % (kind,))
+        return store, pool
+    except Exception as e:
+        log.warning("store auto-heal: MariaDB probe failed (%s)", e)
+        if pool is not None:
+            try:
+                from server.hub.mariadb import close_pool as _close_pool
+
+                await _close_pool(pool)
+            except Exception:
+                pass
+        return None, None
+
+
+async def _store_repromote_loop():
+    """Promote a Redis/in-memory fallback job store back to MariaDB the moment
+    MariaDB is reachable again. No-op while already on mariadb or when MariaDB
+    isn't configured. Env: PAPRIKA_STORE_REPROMOTE_DISABLE=1 off;
+    PAPRIKA_STORE_REPROMOTE_INTERVAL_S tune (default 30s)."""
+    import os as _os
+
+    if _os.environ.get("PAPRIKA_STORE_REPROMOTE_DISABLE"):
+        return
+    try:
+        interval = float(_os.environ.get("PAPRIKA_STORE_REPROMOTE_INTERVAL_S") or 30.0)
+    except Exception:
+        interval = 30.0
+    while True:
+        try:
+            await asyncio.sleep(interval)
+            if getattr(state, "store_kind", None) == "mariadb":
+                continue  # healthy -- nothing to heal
+            if state.settings is None:
+                continue
+            if not (
+                state.settings.get("mariadb_host")
+                and state.settings.get("mariadb_username")
+            ):
+                continue  # MariaDB not configured (dev) -> never promote
+            store, pool = await _try_build_mariadb_store()
+            if store is not None and pool is not None:
+                _old = getattr(state, "store_kind", "?")
+                # Atomic swap (plain reference reassignment): concurrent request
+                # handlers each read state.store once and finish on whichever
+                # store they grabbed -- both are valid; new requests use MariaDB.
+                state.mariadb_pool = pool
+                state.store = store
+                state.store_kind = "mariadb"
+                log.warning(
+                    "STORE AUTO-HEAL: job store promoted %s -> mariadb "
+                    "(MariaDB reachable again; no restart needed)",
+                    _old,
+                )
+        except asyncio.CancelledError:
+            break
+        except Exception as e:
+            log.warning("store re-promote loop error: %s", e)
+
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     # Bypass docker's flaky embedded DNS (127.0.0.11) BEFORE the SSRF guard,
@@ -553,6 +651,12 @@ async def lifespan(app: FastAPI):
 
         invalidate_task = asyncio.create_task(run_invalidation_subscriber())
 
+    # Store auto-heal: if this hub started on the Redis/in-memory fallback
+    # (MariaDB was down/restarting at boot), promote it back to MariaDB the
+    # moment MariaDB is reachable -- no manual rolling restart. No-op once on
+    # mariadb / when MariaDB isn't configured.
+    repromote_task = asyncio.create_task(_store_repromote_loop())
+
     # Recover from previous hub crash / deploy: any job persisted as
     # `status=running` but no longer driven by a local task is an
     # orphan from a killed orchestrator. Mark it failed so it doesn't
@@ -601,7 +705,7 @@ async def lifespan(app: FastAPI):
     for _t in (reaper_task, retire_task, dead_worker_task, job_lease_task,
                invalidate_task, preview_sub_task, cache_evict_task,
                stale_reconcile_task, redrive_task, salvage_task,
-               storage_metrics_task, nightly_review_task):
+               storage_metrics_task, nightly_review_task, repromote_task):
         if _t is not None:
             _t.cancel()
     # Stop hub heartbeat + drop the registry row so peers see us as
