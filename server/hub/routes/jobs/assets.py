@@ -356,6 +356,18 @@ async def _backfill_source_urls_from_network(job_id: str, items: list[dict]) -> 
             it["mime"] = pick["mime"]
 
 
+# ④ Short-TTL per-job cache for assets.json. The live panel polls this every
+# few seconds; without it each poll re-issues the MinIO list/GET calls below.
+# job_id -> (expiry_monotonic, result). TTL is short so newly-captured assets
+# on a RUNNING job still surface within a couple seconds.
+_ASSETS_JSON_CACHE: dict[str, tuple[float, dict]] = {}
+_ASSETS_JSON_TTL_S = 3.0
+_ASSETS_JSON_CACHE_MAX = 2048
+# ③ Cap concurrent MinIO sidecar GETs so a big-asset job can't exhaust the
+# boto3 thread pool (see [[hub-eventloop-stalls]]).
+_ASSETS_SIDECAR_CONC = 16
+
+
 @router.get("/jobs/{job_id}/assets.json")
 async def job_assets_json(job_id: str) -> dict:
     """JSON view of captured assets -- powers the inline live panel's
@@ -366,26 +378,37 @@ async def job_assets_json(job_id: str) -> dict:
     came with that metadata (session captures emit it via the passive
     CDP listener). The admin UI's click-through popup shows them.
 
+    MinIO-call budget (the endpoint was timing out at ~30s for big-asset /
+    cold-cache jobs while MinIO was under video-DL write load, 2026-06-28):
+      * resolve ∥ asset-list run concurrently (1 MinIO list in the common case);
+      * source_url is filled from the DURABLE job result FIRST (DB, no MinIO),
+        so fetch-path jobs SKIP the ``.meta`` list + per-asset sidecar GETs
+        entirely;
+      * the residual sidecar GETs (session / worker->MinIO-direct uploads whose
+        URL lives only in the sidecar) run CONCURRENTLY, bounded, not in a
+        sequential await-per-asset loop;
+      * a 3s per-job cache absorbs the live panel's repeated polls.
+
     Note: the legacy ``/jobs/{id}/gallery.json`` path is kept as an alias
     below for older integrations -- prefer ``assets.json`` going forward.
     """
-    await _soft_resolve_job(job_id, require_subdir="assets")
+    # ④ cache hit
+    _now = time.monotonic()
+    _hit = _ASSETS_JSON_CACHE.get(job_id)
+    if _hit is not None and _hit[0] > _now:
+        return _hit[1]
+
+    # ① resolve (DB-fast for store-resident jobs) ∥ enumerate assets (1 MinIO
+    # list). Independent -> run concurrently. _soft_resolve_job raises 404 when
+    # the job exists nowhere; gather propagates it.
+    _, assets = await asyncio.gather(
+        _soft_resolve_job(job_id, require_subdir="assets"),
+        _gather_assets(job_id),
+    )
     meta_dir = get_storage_dir() / job_id / "assets" / ".meta"
-    # Which .meta sidecars exist in MinIO (ONE list call). Lets a NON-owner hub
-    # surface source_url for assets uploaded worker->MinIO-direct (via /complete)
-    # or whose local sidecar was cache-evicted -- the per-asset read below pulls
-    # only those from the bucket. Empty when S3 off (= the old local-only path).
-    _minio_meta: set[str] = set()
-    if objstore.enabled():
-        try:
-            _minio_meta = {
-                (o.get("name") or "")
-                for o in await objstore.list_dir(job_id, "assets/.meta")
-            }
-        except Exception:
-            _minio_meta = set()
+
     items: list[dict] = []
-    for a in await _gather_assets(job_id):
+    for a in assets:
         name = a["name"]
         sz = a["size"]
         ext = Path(name).suffix.lower().lstrip(".")
@@ -396,20 +419,11 @@ async def job_assets_json(job_id: str) -> dict:
             kind = "video"
         elif ext in _AUDIO_EXTS:
             kind = "audio"
-        # Pull sidecar metadata if it exists. The fetch path saves source
-        # URLs straight onto the asset row; session captures + worker->MinIO
-        # direct uploads use the .meta/ sidecar (minted by upload_asset /
-        # /complete). Local copy first; pull from MinIO when the sidecar is in
-        # the bucket but not local (MinIO-direct / evicted / a peer hub wrote it).
+        # Local sidecar is free (FS) -- authoritative when present locally.
         source_url = None
         mime = None
         page_url = None
         meta_path = meta_dir / f"{name}.json"
-        if not meta_path.exists() and f"{name}.json" in _minio_meta:
-            try:
-                await objstore.ensure_local(meta_path)
-            except Exception:
-                pass
         if meta_path.exists():
             try:
                 meta = json.loads(meta_path.read_text(encoding="utf-8"))
@@ -431,18 +445,71 @@ async def job_assets_json(job_id: str) -> dict:
                 "mime": mime,
             }
         )
-    # Recovery pass 1 (durable, primary): fill source_url from the job result's
-    # assets[].url for items whose .meta sidecar was missing/evicted.
+
+    # ② result-first: fill source_url/page_url/mime from the DURABLE job result
+    # (DB, no MinIO). For fetch-path jobs this covers everything, so the MinIO
+    # ``.meta`` list + per-asset sidecar GETs below are SKIPPED entirely.
     await _backfill_source_urls_from_result(job_id, items)
-    # Recovery pass 2: session network dump (network.jsonl) -- recovers assets
-    # captured by the session passive listener (widget/iframe resources, e.g.
-    # FundraiseUp emoji) that aren't in the fetcher result OR netcap markers.
+
+    # ②+③ Only for items STILL missing source_url (session-capture /
+    # worker->MinIO-direct uploads whose URL lives in the sidecar, not the
+    # result): one ``.meta`` list, then pull the residual sidecars CONCURRENTLY
+    # (bounded) instead of one sequential await per asset.
+    missing = [it for it in items if not it.get("source_url")]
+    if missing and objstore.enabled():
+        try:
+            _minio_meta = {
+                (o.get("name") or "")
+                for o in await objstore.list_dir(job_id, "assets/.meta")
+            }
+        except Exception:
+            _minio_meta = set()
+        to_pull = [
+            it for it in missing
+            if f"{it['name']}.json" in _minio_meta
+            and not (meta_dir / f"{it['name']}.json").exists()
+        ]
+        if to_pull:
+            _sem = asyncio.Semaphore(_ASSETS_SIDECAR_CONC)
+
+            async def _pull(it: dict) -> None:
+                async with _sem:
+                    try:
+                        await objstore.ensure_local(meta_dir / f"{it['name']}.json")
+                    except Exception:
+                        pass
+
+            await asyncio.gather(*[_pull(it) for it in to_pull])
+        # Re-read the now-local sidecars for the still-missing items.
+        for it in missing:
+            mp = meta_dir / f"{it['name']}.json"
+            if not mp.exists():
+                continue
+            try:
+                meta = json.loads(mp.read_text(encoding="utf-8"))
+            except Exception:
+                continue
+            if not it.get("source_url"):
+                it["source_url"] = meta.get("source_url")
+            if not it.get("mime"):
+                it["mime"] = meta.get("mime")
+            if not it.get("page_url"):
+                it["page_url"] = meta.get("page_url")
+
+    # Recovery passes (gated: no-op + no MinIO once every item has source_url).
+    # Session network dump first (widget/iframe resources, e.g. FundraiseUp
+    # emoji), then log.txt netcap markers.
     await _backfill_source_urls_from_network(job_id, items)
-    # Recovery pass 3 (fallback): parse the fetcher's network-event markers out
-    # of log.txt for anything the prior passes didn't cover. No-op for items
-    # that already have a source_url.
     await _backfill_source_urls_from_log(job_id, items)
-    return {"job_id": job_id, "count": len(items), "items": items}
+
+    result = {"job_id": job_id, "count": len(items), "items": items}
+
+    # ④ cache store (+ cheap bound: prune expired when the map grows).
+    if len(_ASSETS_JSON_CACHE) > _ASSETS_JSON_CACHE_MAX:
+        for _k in [k for k, v in _ASSETS_JSON_CACHE.items() if v[0] <= _now]:
+            _ASSETS_JSON_CACHE.pop(_k, None)
+    _ASSETS_JSON_CACHE[job_id] = (_now + _ASSETS_JSON_TTL_S, result)
+    return result
 
 
 @router.get("/jobs/{job_id}/gallery.json", include_in_schema=False)
