@@ -413,8 +413,12 @@ async def job_assets_json(job_id: str) -> dict:
         sz = a["size"]
         ext = Path(name).suffix.lower().lstrip(".")
         kind = "other"
-        if ext in _IMG_EXTS:
+        if ext in _RASTER_IMG_EXTS:
             kind = "image"
+        elif ext in _VECTOR_IMG_EXTS:
+            kind = "vector"      # SVG logos / UI icons -- not a raster photo
+        elif ext in _ICON_IMG_EXTS:
+            kind = "icon"        # favicon / .ico -- decoration
         elif ext in _VIDEO_EXTS:
             kind = "video"
         elif ext in _AUDIO_EXTS:

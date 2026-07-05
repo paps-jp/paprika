@@ -486,7 +486,16 @@ def _append_line(job_dir: Path, filename: str, line: str) -> None:
         f.write("\n")
 
 
-_IMG_EXTS = {"png", "jpg", "jpeg", "webp", "avif", "gif", "svg", "bmp", "ico"}
+# Raster (photo) image extensions -- the face-searchable set the downstream
+# image pipeline can Image.open(). Kept separate from vector / icon so
+# assets.json classifies them distinctly: SVG logos and favicons are
+# decoration, not photos, and were choking the raster pipeline.
+_RASTER_IMG_EXTS = {"png", "jpg", "jpeg", "webp", "avif", "gif", "bmp"}
+_VECTOR_IMG_EXTS = {"svg"}
+_ICON_IMG_EXTS = {"ico"}
+# Union -- for "is this an image-ish file at all" checks (e.g. the
+# screenshots.json listing). Value unchanged from before the split.
+_IMG_EXTS = _RASTER_IMG_EXTS | _VECTOR_IMG_EXTS | _ICON_IMG_EXTS
 
 
 _VIDEO_EXTS = {"mp4", "webm", "mov", "m4v", "mkv"}
@@ -819,6 +828,9 @@ __all__ = [
     '_append_network_jsonl',
     '_append_line',
     '_IMG_EXTS',
+    '_RASTER_IMG_EXTS',
+    '_VECTOR_IMG_EXTS',
+    '_ICON_IMG_EXTS',
     '_VIDEO_EXTS',
     '_AUDIO_EXTS',
     '_human_size',

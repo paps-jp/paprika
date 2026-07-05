@@ -1241,6 +1241,39 @@ async def pick_stream_urls_async(urls: list[str], client=None) -> list[str]:
 SAVE_MIME_PREFIXES = ("image/", "audio/")
 
 
+# Decorative / non-photo assets that match SAVE_MIME_PREFIXES ("image/*")
+# but are never useful raster content for the downstream image pipeline
+# (face search): vector logos / UI icons (SVG) and favicons (.ico). These
+# are excluded from asset capture so they are never saved, uploaded, or
+# published as "image" assets -- the pipeline was choking on SVG bytes in
+# Image.open() (UnidentifiedImageError). Tiny raster sprites are left to
+# the min_asset_size_bytes filter. This is the network-capture-side twin
+# of the in-page BAD regex used during DOM image discovery.
+_DECORATIVE_ASSET_MIMES = {
+    "image/svg+xml",
+    "image/x-icon",
+    "image/vnd.microsoft.icon",
+    "image/ico",
+}
+
+
+def _is_decorative_asset(mime: str, url: str) -> bool:
+    """True for SVG / favicon / .ico assets -- decoration, not photos."""
+    m = (mime or "").split(";", 1)[0].strip().lower()
+    if m in _DECORATIVE_ASSET_MIMES:
+        return True
+    try:
+        path = urlparse(url).path.lower()
+    except Exception:
+        path = (url or "").lower()
+    base = path.rsplit("/", 1)[-1]
+    if path.endswith((".svg", ".ico")):
+        return True
+    if base.startswith("favicon"):
+        return True
+    return False
+
+
 # Extension → MIME fallback for the (surprisingly common) case where the
 # server returns a binary image with NO Content-Type header at all.
 # Cloudflare-fronted WordPress with newer image formats was the canonical
@@ -2469,7 +2502,9 @@ async def fetch(opts: FetchOptions) -> FetchResult:
                     "document_url": "",
                     "timestamp": time.time(),
                 })
-            if any(mime.startswith(p) for p in SAVE_MIME_PREFIXES):
+            if any(
+                mime.startswith(p) for p in SAVE_MIME_PREFIXES
+            ) and not _is_decorative_asset(mime, evt_url):
                 metadata[event.request_id] = {
                     "url": event.response.url,
                     "mime": mime,
