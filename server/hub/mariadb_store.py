@@ -292,6 +292,19 @@ class MariaDBJobStore:
             return None
         return _row_to_job_info(row)
 
+    async def job_exists(self, job_id: str) -> bool:
+        """Cheap existence check -- SELECT 1, no columns, no row->JobInfo
+        pydantic build. For callers that only need the 404 gate (e.g. the
+        per-asset ``complete_asset_upload``, thousands/min): get_job_info's
+        ``_row_to_job_info`` (json.loads options/progress + pydantic) was the
+        top remaining MainThread on-CPU cost (py-spy 2026-07-08); this keeps it
+        off the event loop for the hot asset-upload path."""
+        async with self._pool.acquire() as conn:
+            async with conn.cursor() as cur:
+                await cur.execute(
+                    "SELECT 1 FROM jobs WHERE job_id=%s LIMIT 1", (job_id,))
+                return (await cur.fetchone()) is not None
+
     async def claim_queued_job(
         self, job_id: str, worker_id: str, started_at: Any
     ) -> bool:

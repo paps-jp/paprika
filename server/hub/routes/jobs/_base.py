@@ -420,6 +420,8 @@ async def _require_job_info(job_id: str) -> JobInfo:
 async def _soft_resolve_job(
     job_id: str,
     require_subdir: str = "",
+    *,
+    need_info: bool = True,
 ) -> JobInfo | None:
     """Soft-404 lookup: accept the request when a JobInfo record exists
     OR a session-routed parent_job_id's directory was pre-created by
@@ -437,9 +439,23 @@ async def _soft_resolve_job(
     extraction; deferring this DRY made the asset-gallery debugging
     saga ~one commit longer than it needed to be."""
     assert state.store is not None
-    info = await state.store.get_job_info(job_id)
-    if info is not None:
-        return info
+    # need_info=False (e.g. complete_asset_upload, thousands/min): the caller
+    # only needs the soft-404 gate, not the JobInfo value. Use a cheap SELECT-1
+    # existence check -- get_job_info's row->JobInfo pydantic build (json.loads
+    # options/progress + model construction) was the top remaining MainThread
+    # on-CPU cost (py-spy 2026-07-08). Falls back to get_job_info on stores
+    # without job_exists (unchanged behaviour).
+    if need_info:
+        info = await state.store.get_job_info(job_id)
+        if info is not None:
+            return info
+    else:
+        _exists = getattr(state.store, "job_exists", None)
+        if _exists is not None:
+            if await _exists(job_id):
+                return None
+        elif await state.store.get_job_info(job_id) is not None:
+            return None
     check_dir = get_storage_dir() / job_id
     if require_subdir:
         check_dir = check_dir / require_subdir

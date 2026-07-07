@@ -359,7 +359,11 @@ async def complete_asset_upload(job_id: str, body: dict) -> dict:
         raise HTTPException(401, "bad secret")
     if not objstore.enabled():
         raise HTTPException(503, "object store not enabled")
-    await _soft_resolve_job(job_id, require_subdir="assets")
+    # Existence gate only -- we ignore the JobInfo. need_info=False uses a cheap
+    # SELECT-1 instead of the row->pydantic build (this runs once per asset,
+    # thousands/min; py-spy 2026-07-08 flagged get_job_info as the top MainThread
+    # on-CPU cost after the sidecar-FS fix).
+    await _soft_resolve_job(job_id, require_subdir="assets", need_info=False)
     import re
 
     raw_name = (body.get("filename") or body.get("asset_name") or "").strip()
@@ -381,10 +385,18 @@ async def complete_asset_upload(job_id: str, body: dict) -> dict:
     # gallery / get_page_meta / delian source_url cascade read it unchanged.
     # Best-effort: a sidecar failure must not fail the (already-stored) asset.
     if source_url or mime or page_url:
-        try:
+        # The sidecar write is synchronous filesystem I/O (mkdir + write_text).
+        # complete_asset_upload runs once per asset -> thousands/min under load,
+        # and doing this ON the event loop made it the #1 intermittent hub-stall
+        # source (py-spy 2026-07-08: uploads.py mkdir/open dominated MainThread
+        # on-CPU time; a slow-disk moment blocked the loop for 100s of ms). Do
+        # the local FS work in a thread so it can never block the loop; the
+        # MinIO mirror below is already off-loop.
+        def _write_sidecar() -> Path:
             meta_dir = get_storage_dir() / job_id / "assets" / ".meta"
             meta_dir.mkdir(parents=True, exist_ok=True)
-            (meta_dir / f"{name}.json").write_text(
+            p = meta_dir / f"{name}.json"
+            p.write_text(
                 json.dumps(
                     {
                         "name": name,
@@ -397,7 +409,11 @@ async def complete_asset_upload(job_id: str, body: dict) -> dict:
                 ),
                 encoding="utf-8",
             )
-            await objstore.mirror_file(meta_dir / f"{name}.json")
+            return p
+
+        try:
+            _sidecar = await asyncio.to_thread(_write_sidecar)
+            await objstore.mirror_file(_sidecar)
         except Exception:
             pass
     return {"ok": True, "name": name, "key": key, "size": size}
