@@ -641,6 +641,21 @@ def _make_video_downloader(
         # monotonic time of the last throttled progress marker (see below)
         _dl_last_marker = [0.0]
 
+        # Doomed-download give-up gate (#1, 2026-07-08). A stream whose
+        # fragments all 403 (expired token / geo / auth) makes yt-dlp retry
+        # each fragment N times then advance to the next -- FOREVER. That
+        # produces constant output which keeps ``last_progress`` fresh, so the
+        # stall watchdog (no-progress timer) NEVER fires; observed a worker
+        # churning 20+ min on one such video until the 1h hard timeout, its
+        # heartbeat starved by the WS log-torrent into a hub-side ghost. Count
+        # consecutive fragment-retry failures (reset on real progress) and
+        # abort the download once the streak passes the threshold.
+        _frag_fail = [0]
+        _giveup_fired = [False]
+        _FRAG_FAIL_GIVEUP = int(
+            os.environ.get("PAPRIKA_YTDLP_FRAG_FAIL_GIVEUP", "40")
+        )
+
         def _ytdlp_log(line: str) -> None:
             # Runs in asyncio.to_thread (a plain OS thread), so we
             # cannot call log()/_both() directly -- they use
@@ -648,6 +663,32 @@ def _make_video_downloader(
             # the event loop.  call_soon_threadsafe is the correct
             # cross-thread bridge.
             last_progress[target_url] = time.time()
+            # #1 give-up: tally fragment-retry failures. yt-dlp emits one
+            # "... HTTP Error 403 ... Retrying fragment N (k/M)" line per retry;
+            # a doomed stream produces a torrent of them with no real bytes.
+            _low = line.lower()
+            if (
+                "retrying fragment" in _low
+                or "http error 403" in _low
+                or ("giving up after" in _low and "fragment" in _low)
+            ):
+                _frag_fail[0] += 1
+                if _frag_fail[0] >= _FRAG_FAIL_GIVEUP and not _giveup_fired[0]:
+                    _giveup_fired[0] = True
+
+                    def _giveup_kill() -> None:
+                        killed = _terminate_ytdlp_descendants()
+                        _both(
+                            f"  !! aborting doomed video download: "
+                            f"{_frag_fail[0]} fragment retries with no progress "
+                            f"(likely 403 / expired auth) — SIGTERM'd {killed} "
+                            f"descendant(s)"
+                        )
+
+                    try:
+                        _loop.call_soon_threadsafe(_giveup_kill)
+                    except RuntimeError:
+                        pass
             _logger.info(f"[{job_id_for_logs} yt-dlp] {line}")
             # ffmpeg/yt-dlp emit a torrent of low-level demuxer chatter
             # (per-frame progress, per-segment "Opening ..." / "[hls]
@@ -691,6 +732,7 @@ def _make_video_downloader(
                         except RuntimeError:
                             pass
                     if _st in ("downloading", "muxing", "done"):
+                        _frag_fail[0] = 0  # real bytes flowing -> not doomed
                         return
             _spam = (
                 _stripped.startswith("frame=")
@@ -710,6 +752,11 @@ def _make_video_downloader(
                 # download progress visible in the LiveLog.
                 or "Skip ('#EXT" in line
                 or "#EXT-X-PROGRAM-DATE-TIME" in line
+                # #2: suppress the 403/retry torrent from a doomed stream --
+                # one WorkerJobLog per retry line floods the hub WS and starves
+                # the heartbeat until the worker ghosts. Worker-log only; the
+                # give-up gate above surfaces one clear abort line instead.
+                or "retrying fragment" in _low
             )
             sink = log if _spam else _both
             try:
@@ -832,6 +879,11 @@ def _make_video_downloader(
                         f"{(_cand_ref or '(none)')[:80]}"
                     )
                 last_progress[target_url] = time.time()
+                # Fresh give-up budget per referer attempt: each candidate
+                # spawns its own yt-dlp, so a doomed first referer must not
+                # burn the abort so the 2nd/3rd attempt loses its gate.
+                _frag_fail[0] = 0
+                _giveup_fired[0] = False
                 wd_task = asyncio.create_task(_stall_watchdog())
                 try:
                     # is_protected is keyword-only; older core/fetcher.py
