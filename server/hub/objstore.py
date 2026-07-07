@@ -139,13 +139,15 @@ def reset_client() -> None:
     """Drop the cached boto3 client so the next call rebuilds it from the
     current Settings/env config. Called after the operator saves S3
     settings so endpoint / credential changes take effect immediately."""
-    global _client
+    global _client, _nv_client
     with _client_lock:
         _client = None
+        _nv_client = None
 
 
 # --- lazy boto3 client (created once, on first use) -------------------------
 _client = None
+_nv_client = None
 _client_lock = threading.Lock()
 
 
@@ -190,6 +192,123 @@ def _get_client():
         return _client
 
 
+# --- video / non-video tier routing (2026-07-06) ----------------------------
+# The primary client above (s3_endpoint) is the durable/HDD tier -- it holds
+# ALL existing objects + video. When a non-video hot tier is configured
+# (s3_nonvideo_endpoint, e.g. a fast SSD MinIO), NON-VIDEO objects (images /
+# HTML / HAR / json / ...) are WRITTEN there and READ from there first, falling
+# back to the primary for pre-split objects. Video always stays on the primary.
+# Listing/delete union BOTH tiers. Off (no nonvideo endpoint) => single-tier,
+# identical to before.
+_VIDEO_EXTS = frozenset(
+    {".mp4", ".webm", ".m3u8", ".ts", ".mkv", ".mov", ".avi", ".m4v", ".mpd", ".flv"}
+)
+
+
+def _is_video_key(key: str) -> bool:
+    """True when the object key names a video artifact (-> primary/HDD tier)."""
+    k = (key or "").lower()
+    dot = k.rfind(".")
+    return dot >= 0 and k[dot:] in _VIDEO_EXTS
+
+
+def _nonvideo_endpoint() -> str:
+    return _s3cfg("s3_nonvideo_endpoint", "PAPRIKA_S3_NONVIDEO_ENDPOINT", "")
+
+
+def _nonvideo_bucket() -> str:
+    # Blank -> reuse the primary bucket (the common case: same bucket, diff host).
+    return _s3cfg("s3_nonvideo_bucket", "PAPRIKA_S3_NONVIDEO_BUCKET", "") or _bucket()
+
+
+def _nonvideo_enabled() -> bool:
+    """The non-video hot tier is active only when S3 is on AND an endpoint for
+    it is configured (Settings/env). Otherwise everything stays single-tier."""
+    return enabled() and bool(_nonvideo_endpoint())
+
+
+def _get_nv_client():
+    """Process-wide boto3 client for the non-video hot tier (built on first
+    use). None when the tier isn't configured or boto3 is unavailable."""
+    global _nv_client
+    if _nv_client is not None:
+        return _nv_client
+    with _client_lock:
+        if _nv_client is not None:
+            return _nv_client
+        ep = _nonvideo_endpoint()
+        if not ep:
+            return None
+        try:
+            import boto3
+            from botocore.config import Config as _BotoConfig
+
+            _nv_client = boto3.client(
+                "s3",
+                endpoint_url=ep or None,
+                aws_access_key_id=_s3cfg(
+                    "s3_nonvideo_access_key", "PAPRIKA_S3_NONVIDEO_ACCESS_KEY"
+                ) or None,
+                aws_secret_access_key=_s3cfg(
+                    "s3_nonvideo_secret_key", "PAPRIKA_S3_NONVIDEO_SECRET_KEY"
+                ) or None,
+                region_name=_s3cfg(
+                    "s3_nonvideo_region", "PAPRIKA_S3_NONVIDEO_REGION", "us-east-1"
+                ),
+                config=_BotoConfig(
+                    signature_version="s3v4",
+                    s3={"addressing_style": "path"},
+                    retries={"max_attempts": 2, "mode": "standard"},
+                    max_pool_connections=int(
+                        os.environ.get("PAPRIKA_S3_MAX_POOL_CONNECTIONS") or 50
+                    ),
+                ),
+            )
+        except Exception:
+            _nv_client = None
+        return _nv_client
+
+
+def _write_cb(key: str):
+    """(client, bucket) to WRITE ``key`` to: non-video -> hot tier when
+    configured, else primary; video -> primary. (None, bucket) when no client."""
+    if not _is_video_key(key) and _nonvideo_enabled():
+        c = _get_nv_client()
+        if c is not None:
+            return c, _nonvideo_bucket()
+    return _get_client(), _bucket()
+
+
+def _read_cbs(key: str) -> list:
+    """[(client, bucket), ...] to try IN ORDER when READING ``key``. Non-video:
+    hot tier first, then primary (fallback for pre-split objects). Video:
+    primary only. Empty when no client is available."""
+    out: list = []
+    if not _is_video_key(key) and _nonvideo_enabled():
+        c = _get_nv_client()
+        if c is not None:
+            out.append((c, _nonvideo_bucket()))
+    pc = _get_client()
+    if pc is not None:
+        out.append((pc, _bucket()))
+    return out
+
+
+def _all_cbs() -> list:
+    """All configured (client, bucket) tiers -- for prefix LIST / DELETE, which
+    must union both because a job's assets are split video(primary) /
+    non-video(hot)."""
+    out: list = []
+    pc = _get_client()
+    if pc is not None:
+        out.append((pc, _bucket()))
+    if _nonvideo_enabled():
+        c = _get_nv_client()
+        if c is not None:
+            out.append((c, _nonvideo_bucket()))
+    return out
+
+
 def _key_for(local_path: Path) -> str | None:
     """Map an on-disk artifact path to its object key.
 
@@ -230,13 +349,13 @@ async def mirror_file(local_path: Path | str) -> None:
         key = _key_for(path)
         if key is None:
             return
-        client = _get_client()
+        client, bucket = _write_cb(key)
         if client is None:
             return
         try:
             if not path.is_file():
                 return
-            client.upload_file(str(path), _bucket(), key)
+            client.upload_file(str(path), bucket, key)
         except Exception:
             # Swallow: the local copy already satisfies single-hub serves.
             pass
@@ -262,11 +381,7 @@ async def mirror_dir(local_dir: Path | str) -> int:
     root = Path(local_dir)
 
     def _put_all() -> int:
-        client = _get_client()
-        if client is None:
-            return 0
         n = 0
-        bucket = _bucket()
         try:
             for p in root.rglob("*"):
                 try:
@@ -274,6 +389,9 @@ async def mirror_dir(local_dir: Path | str) -> int:
                         continue
                     key = _key_for(p)
                     if key is None:
+                        continue
+                    client, bucket = _write_cb(key)  # video->primary, else hot tier
+                    if client is None:
                         continue
                     # INCREMENTAL: skip files already in the bucket at the same
                     # size (the per-file mirror already sent most assets). This
@@ -322,23 +440,22 @@ async def ensure_local(local_path: Path | str) -> bool:
         return False
 
     def _get() -> bool:
-        client = _get_client()
-        if client is None:
-            return False
-        try:
-            path.parent.mkdir(parents=True, exist_ok=True)
-            tmp = path.with_suffix(path.suffix + ".s3part")
-            client.download_file(_bucket(), key, str(tmp))
-            tmp.replace(path)
-            return True
-        except Exception:
+        for client, bucket in _read_cbs(key):
             try:
+                path.parent.mkdir(parents=True, exist_ok=True)
                 tmp = path.with_suffix(path.suffix + ".s3part")
-                if tmp.exists():
-                    tmp.unlink()
-            except OSError:
-                pass
-            return False
+                client.download_file(bucket, key, str(tmp))
+                tmp.replace(path)
+                return True
+            except Exception:
+                try:
+                    tmp = path.with_suffix(path.suffix + ".s3part")
+                    if tmp.exists():
+                        tmp.unlink()
+                except OSError:
+                    pass
+                continue
+        return False
 
     try:
         return await _run_io(_get)
@@ -363,11 +480,11 @@ async def put_object(key: str, local_path: Path | str) -> bool:
     path = Path(local_path)
 
     def _put() -> bool:
-        client = _get_client()
+        client, bucket = _write_cb(key)
         if client is None or not path.is_file():
             return False
         try:
-            client.upload_file(str(path), _bucket(), key)
+            client.upload_file(str(path), bucket, key)
             return True
         except Exception:
             return False
@@ -399,13 +516,13 @@ async def presign_put(key: str, expires_in: int = 7200) -> str | None:
         return None
 
     def _sign() -> str | None:
-        client = _get_client()
+        client, bucket = _write_cb(key)
         if client is None:
             return None
         try:
             return client.generate_presigned_url(
                 "put_object",
-                Params={"Bucket": _bucket(), "Key": key},
+                Params={"Bucket": bucket, "Key": key},
                 ExpiresIn=int(expires_in),
             )
         except Exception:
@@ -425,22 +542,21 @@ async def get_object(key: str, local_path: Path | str) -> bool:
     path = Path(local_path)
 
     def _get() -> bool:
-        client = _get_client()
-        if client is None:
-            return False
         tmp = path.with_suffix(path.suffix + ".s3part")
-        try:
-            path.parent.mkdir(parents=True, exist_ok=True)
-            client.download_file(_bucket(), key, str(tmp))
-            tmp.replace(path)
-            return True
-        except Exception:
+        for client, bucket in _read_cbs(key):
             try:
-                if tmp.exists():
-                    tmp.unlink()
-            except OSError:
-                pass
-            return False
+                path.parent.mkdir(parents=True, exist_ok=True)
+                client.download_file(bucket, key, str(tmp))
+                tmp.replace(path)
+                return True
+            except Exception:
+                try:
+                    if tmp.exists():
+                        tmp.unlink()
+                except OSError:
+                    pass
+                continue
+        return False
 
     try:
         return await _run_io(_get)
@@ -454,14 +570,13 @@ async def head_object(key: str) -> bool:
         return False
 
     def _head() -> bool:
-        client = _get_client()
-        if client is None:
-            return False
-        try:
-            client.head_object(Bucket=_bucket(), Key=key)
-            return True
-        except Exception:
-            return False
+        for client, bucket in _read_cbs(key):
+            try:
+                client.head_object(Bucket=bucket, Key=key)
+                return True
+            except Exception:
+                continue
+        return False
 
     try:
         return await _run_io(_head)
@@ -493,23 +608,21 @@ async def list_dir(job_id: str, subdir: str = "assets") -> list[dict]:
     prefix = _job_prefix(job_id, subdir)
 
     def _list() -> list[dict]:
-        client = _get_client()
-        if client is None:
-            return []
-        out: list[dict] = []
-        try:
-            paginator = client.get_paginator("list_objects_v2")
-            for page in paginator.paginate(
-                Bucket=_bucket(), Prefix=prefix, Delimiter="/"
-            ):
-                for o in page.get("Contents", []):
-                    name = o["Key"][len(prefix):]
-                    if not name or "/" in name:
-                        continue  # directory marker / nested -- skip
-                    out.append({"name": name, "size": int(o.get("Size", 0))})
-        except Exception:
-            return []
-        return out
+        seen: dict = {}
+        for client, bucket in _all_cbs():
+            try:
+                paginator = client.get_paginator("list_objects_v2")
+                for page in paginator.paginate(
+                    Bucket=bucket, Prefix=prefix, Delimiter="/"
+                ):
+                    for o in page.get("Contents", []):
+                        name = o["Key"][len(prefix):]
+                        if not name or "/" in name:
+                            continue  # directory marker / nested -- skip
+                        seen.setdefault(name, int(o.get("Size", 0)))
+            except Exception:
+                continue
+        return [{"name": n, "size": s} for n, s in seen.items()]
 
     try:
         return await _run_io(_list)
@@ -531,28 +644,26 @@ async def list_tree(job_id: str, subdir: str = "assets") -> list[dict]:
     prefix = _job_prefix(job_id, subdir)
 
     def _list() -> list[dict]:
-        client = _get_client()
-        if client is None:
-            return []
-        out: list[dict] = []
-        try:
-            paginator = client.get_paginator("list_objects_v2")
-            for page in paginator.paginate(Bucket=_bucket(), Prefix=prefix):
-                for o in page.get("Contents", []):
-                    rel = o["Key"][len(prefix):]
-                    if not rel:
-                        continue
-                    lm = o.get("LastModified")
-                    try:
-                        mtime = lm.timestamp() if lm is not None else 0.0
-                    except Exception:
-                        mtime = 0.0
-                    out.append(
-                        {"rel": rel, "size": int(o.get("Size", 0)), "mtime": mtime}
-                    )
-        except Exception:
-            return []
-        return out
+        seen: dict = {}
+        for client, bucket in _all_cbs():
+            try:
+                paginator = client.get_paginator("list_objects_v2")
+                for page in paginator.paginate(Bucket=bucket, Prefix=prefix):
+                    for o in page.get("Contents", []):
+                        rel = o["Key"][len(prefix):]
+                        if not rel:
+                            continue
+                        lm = o.get("LastModified")
+                        try:
+                            mtime = lm.timestamp() if lm is not None else 0.0
+                        except Exception:
+                            mtime = 0.0
+                        seen.setdefault(
+                            rel, (int(o.get("Size", 0)), mtime)
+                        )
+            except Exception:
+                continue
+        return [{"rel": r, "size": v[0], "mtime": v[1]} for r, v in seen.items()]
 
     try:
         return await _run_io(_list)
@@ -574,33 +685,30 @@ async def delete_prefix(job_id: str, *, dry_run: bool = False) -> dict:
     prefix = _job_prefix(job_id)
 
     def _delete() -> dict:
-        client = _get_client()
-        if client is None:
-            return {"objects": 0, "bytes": 0, "deleted": False}
-        bucket = _bucket()
         n = 0
         total = 0
-        batch: list[dict] = []
-        try:
-            paginator = client.get_paginator("list_objects_v2")
-            for page in paginator.paginate(Bucket=bucket, Prefix=prefix):
-                for o in page.get("Contents", []):
-                    n += 1
-                    total += int(o.get("Size", 0))
-                    if not dry_run:
-                        batch.append({"Key": o["Key"]})
-                        if len(batch) >= 1000:  # S3 delete_objects caps at 1000
-                            client.delete_objects(
-                                Bucket=bucket,
-                                Delete={"Objects": batch, "Quiet": True},
-                            )
-                            batch = []
-            if not dry_run and batch:
-                client.delete_objects(
-                    Bucket=bucket, Delete={"Objects": batch, "Quiet": True}
-                )
-        except Exception:
-            return {"objects": n, "bytes": total, "deleted": False}
+        for client, bucket in _all_cbs():
+            batch: list[dict] = []
+            try:
+                paginator = client.get_paginator("list_objects_v2")
+                for page in paginator.paginate(Bucket=bucket, Prefix=prefix):
+                    for o in page.get("Contents", []):
+                        n += 1
+                        total += int(o.get("Size", 0))
+                        if not dry_run:
+                            batch.append({"Key": o["Key"]})
+                            if len(batch) >= 1000:  # S3 delete_objects caps at 1000
+                                client.delete_objects(
+                                    Bucket=bucket,
+                                    Delete={"Objects": batch, "Quiet": True},
+                                )
+                                batch = []
+                if not dry_run and batch:
+                    client.delete_objects(
+                        Bucket=bucket, Delete={"Objects": batch, "Quiet": True}
+                    )
+            except Exception:
+                continue
         return {"objects": n, "bytes": total, "deleted": not dry_run}
 
     try:
@@ -619,22 +727,20 @@ async def list_job_prefixes() -> list[str]:
     base = (p + "/") if p else ""
 
     def _list() -> list[str]:
-        client = _get_client()
-        if client is None:
-            return []
-        out: list[str] = []
-        try:
-            paginator = client.get_paginator("list_objects_v2")
-            for page in paginator.paginate(
-                Bucket=_bucket(), Prefix=base, Delimiter="/"
-            ):
-                for cp in page.get("CommonPrefixes", []):
-                    jid = cp["Prefix"][len(base):].rstrip("/")
-                    if jid:
-                        out.append(jid)
-        except Exception:
-            return out
-        return out
+        seen: set = set()
+        for client, bucket in _all_cbs():
+            try:
+                paginator = client.get_paginator("list_objects_v2")
+                for page in paginator.paginate(
+                    Bucket=bucket, Prefix=base, Delimiter="/"
+                ):
+                    for cp in page.get("CommonPrefixes", []):
+                        jid = cp["Prefix"][len(base):].rstrip("/")
+                        if jid:
+                            seen.add(jid)
+            except Exception:
+                continue
+        return list(seen)
 
     try:
         return await _run_io(_list)
@@ -652,14 +758,14 @@ async def prefix_exists(job_id: str, subdir: str = "") -> bool:
     prefix = _job_prefix(job_id, subdir)
 
     def _head() -> bool:
-        client = _get_client()
-        if client is None:
-            return False
-        try:
-            r = client.list_objects_v2(Bucket=_bucket(), Prefix=prefix, MaxKeys=1)
-            return int(r.get("KeyCount", 0) or 0) > 0
-        except Exception:
-            return False
+        for client, bucket in _all_cbs():
+            try:
+                r = client.list_objects_v2(Bucket=bucket, Prefix=prefix, MaxKeys=1)
+                if int(r.get("KeyCount", 0) or 0) > 0:
+                    return True
+            except Exception:
+                continue
+        return False
 
     try:
         return await _run_io(_head)
@@ -682,15 +788,18 @@ async def open_object(
     key = _job_prefix(job_id).rstrip("/") + "/" + rel_path.lstrip("/")
 
     def _open():
-        client = _get_client()
-        if client is None:
-            return None
-        kwargs = {"Bucket": _bucket(), "Key": key}
-        if range_header:
-            kwargs["Range"] = range_header
-        try:
-            obj = client.get_object(**kwargs)
-        except Exception:
+        obj = None
+        for client, bucket in _read_cbs(key):
+            kwargs = {"Bucket": bucket, "Key": key}
+            if range_header:
+                kwargs["Range"] = range_header
+            try:
+                obj = client.get_object(**kwargs)
+                break
+            except Exception:
+                obj = None
+                continue
+        if obj is None:
             return None
         body = obj["Body"]
         content_range = obj.get("ContentRange")

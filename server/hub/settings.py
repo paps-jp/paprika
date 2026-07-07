@@ -310,6 +310,17 @@ _SCHEMA: dict[str, tuple[Any, str]] = {
     "s3_access_key": ("", "str"),
     "s3_secret_key": ("", "str"),
     "s3_region": ("us-east-1", "str"),
+    # ---- non-video hot tier (2026-07-06) --------------------------------
+    # Route images / HTML / HAR / json to a FAST MinIO; video (.mp4 etc.)
+    # stays on the primary/HDD tier above. Active only when
+    # s3_nonvideo_endpoint is set. Reads try the hot tier then fall back to
+    # the primary (so pre-split / video objects still resolve). Bucket blank
+    # -> reuse s3_bucket. See server/hub/objstore.py routing.
+    "s3_nonvideo_endpoint": ("", "str"),        # e.g. http://10.10.50.17:9000
+    "s3_nonvideo_bucket": ("", "str"),          # blank -> reuse s3_bucket
+    "s3_nonvideo_access_key": ("", "str"),
+    "s3_nonvideo_secret_key": ("", "str"),
+    "s3_nonvideo_region": ("us-east-1", "str"),
     # ---- Windows portable: Chrome headless ------------------------------
     # When True, the bundled Chromium starts with ``--headless=new`` so
     # the operator's physical desktop isn't taken over by paprika's job
@@ -406,6 +417,11 @@ def _env_default(key: str, fallback: Any) -> Any:
         "s3_access_key": ("PAPRIKA_S3_ACCESS_KEY", "str"),
         "s3_secret_key": ("PAPRIKA_S3_SECRET_KEY", "str"),
         "s3_region": ("PAPRIKA_S3_REGION", "str"),
+        "s3_nonvideo_endpoint": ("PAPRIKA_S3_NONVIDEO_ENDPOINT", "str"),
+        "s3_nonvideo_bucket": ("PAPRIKA_S3_NONVIDEO_BUCKET", "str"),
+        "s3_nonvideo_access_key": ("PAPRIKA_S3_NONVIDEO_ACCESS_KEY", "str"),
+        "s3_nonvideo_secret_key": ("PAPRIKA_S3_NONVIDEO_SECRET_KEY", "str"),
+        "s3_nonvideo_region": ("PAPRIKA_S3_NONVIDEO_REGION", "str"),
         # Worker salvage SSH: settings.json -> env vars -> static default.
         "worker_ssh_user": ("PAPRIKA_WORKER_SSH_USER", "str"),
         "worker_ssh_port": ("PAPRIKA_WORKER_SSH_PORT", "int"),

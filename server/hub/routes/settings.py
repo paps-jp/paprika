@@ -23,7 +23,7 @@ router = APIRouter(tags=["Settings"])
 # endpoint is unauthenticated on the LAN). Redacted to "" in the GET
 # payload; the UI uses the companion ``secrets_set`` map to show whether
 # one is stored. PUT still accepts the real value to (re)set it.
-_SECRET_KEYS = frozenset({"mariadb_password", "s3_secret_key", "worker_ssh_key_pem"})
+_SECRET_KEYS = frozenset({"mariadb_password", "s3_secret_key", "s3_nonvideo_secret_key", "worker_ssh_key_pem"})
 
 
 def _require_settings() -> SettingsRegistry:
