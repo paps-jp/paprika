@@ -1218,25 +1218,87 @@ async def create_job(req: JobRequest, request: Request) -> JobInfo:
             503, "fleet at capacity (all lanes busy); retry with backoff"
         )
 
-    # download_video resolution (operator design 2026-06-10): an explicit
-    # opts value (True/False) wins; the default None falls back to the target
-    # host's HostRecord.download_video flag (default False). Stops the
+    # download_video resolution (operator design 2026-06-10, refined 2026-07-06):
+    # an explicit opts value (True/False) wins; the default None falls back to
+    # the target host's HostRecord.download_video flag (default False). Stops the
     # indiscriminate download_video=True that bumped every fetch/escalation to
     # a 1h lane-hogging timeout on non-video pages -- a fetch now pulls video
     # only when asked OR the host is a registered video host. The auto-escalator
     # inherits this resolved value via model_copy.
+    #
+    # 2026-07-06: on a registered video host, resolve None -> video ONLY for
+    # DETAIL pages. Listing / category / tag / top pages never trigger a
+    # (lane-hogging) video DL even on a video host -- the crawl hits far more
+    # index pages than detail pages, and a DL on a listing page is wasted lane
+    # time (see the dispatch-starvation investigation). Role comes from the
+    # per-host page-role classifier (server/hub/_page_role.py); require a trusted
+    # detail verdict (confidence >= a floor, default 0.6, env-tunable via
+    # PAPRIKA_DL_VIDEO_ROLE_MIN_CONF) so a low-signal guess -- or `unknown` --
+    # resolves to False. Non-video hosts stay False regardless.
     if req.options.download_video is None:
         _dv = False
         try:
             from urllib.parse import urlparse as _urlparse
             _dvh = _normalise_host(_urlparse(req.url).hostname or "")
             _dvrec = state.hosts.get(_dvh) if (_dvh and state.hosts is not None) else None
-            _dv = bool(getattr(_dvrec, "download_video", False)) if _dvrec else False
+            _host_wants_video = bool(getattr(_dvrec, "download_video", False)) if _dvrec else False
+            if _host_wants_video:
+                from server.hub._page_role import role_for_url as _role_for_url
+                # Default 0.6, NOT ROLE_TRUST_THRESHOLD (0.85): the classifier
+                # gives a genuine detail page only 0.4-0.6 confidence until it
+                # has enough per-host template observations (then the "video
+                # evidence" signal bumps that template to 0.95). 0.85 would
+                # download almost nothing; 0.6 accepts a multiple-observation
+                # detail verdict while still rejecting the weakest single-obs
+                # guess and `unknown`. Env-tunable via PAPRIKA_DL_VIDEO_ROLE_MIN_CONF.
+                _min_conf = float(
+                    os.environ.get("PAPRIKA_DL_VIDEO_ROLE_MIN_CONF") or 0.6
+                )
+                _role, _conf, _ = await _role_for_url(req.url)
+                _dv = (_role == "detail" and _conf >= _min_conf)
         except Exception:
             _dv = False
         req.options.download_video = _dv
         if _dv and not req.options.capture_assets:
             req.options.capture_assets = True
+
+    # C (2026-07-06): never pull video on a confident LISTING / index page, even
+    # when the client asked (download_video=True). An index / category / tag /
+    # top page has no single video -- a DL there is wasted lane time (yt-dlp
+    # scans, finds nothing or many) AND wasted video-detection time in the fetch
+    # phase. Overrides an explicit True on a listing-role page so the crawl's
+    # index hits stay fast; detail / unknown are left untouched. Kill-switch
+    # PAPRIKA_NO_VIDEO_ON_LISTING=0. (role_for_url is per-host cached, so the
+    # extra call is cheap even when the None-branch above already ran it.)
+    if req.options.download_video and (
+        (os.environ.get("PAPRIKA_NO_VIDEO_ON_LISTING", "1") or "1")
+        .strip().lower() not in ("0", "false", "no", "off")
+    ):
+        try:
+            from server.hub._page_role import role_for_url as _role_for_url2
+            _lr, _lc, _ = await _role_for_url2(req.url)
+            if _lc >= 0.85 and _lr in ("listing", "category", "tag", "top"):
+                req.options.download_video = False
+        except Exception:
+            pass
+
+    # A (2026-07-06): clamp the fetch wait knobs to a fleet ceiling. The dominant
+    # lane-hold was wait_seconds + the max_wait_seconds network-idle wait (up to
+    # 80s), most of which is ad/tracker traffic never going idle -- not content
+    # (measured: 131s median lane-hold on the crawl, ~94 jobs/min ceiling).
+    # Capping them frees lanes far sooner (higher throughput / less queue
+    # starvation) for a small completeness trade-off on genuinely slow pages.
+    # Env-tunable; a client asking for LESS than the cap keeps its smaller value.
+    if (req.options.mode or "fetch") == "fetch":
+        try:
+            _mw_cap = float(os.environ.get("PAPRIKA_MAX_WAIT_SECONDS_CAP") or 30.0)
+            if req.options.max_wait_seconds and req.options.max_wait_seconds > _mw_cap:
+                req.options.max_wait_seconds = _mw_cap
+            _w_cap = int(float(os.environ.get("PAPRIKA_WAIT_SECONDS_CAP") or 10))
+            if req.options.wait_seconds and req.options.wait_seconds > _w_cap:
+                req.options.wait_seconds = _w_cap
+        except Exception:
+            pass
 
     # v2 Phase 5: HostKnowledge consultation.
     # If we have learned knowledge for this URL's host, apply hints
