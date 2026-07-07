@@ -77,7 +77,7 @@ active: architecture
 flowchart TD
   POST["POST /jobs"]
   POST --> mode{"options.mode?"}
-  mode -->|fetch (既定)| fetch["fleet capacity チェック<br/>+ pick_worker(grace)"]
+  mode -->|"fetch (既定)"| fetch["fleet capacity チェック<br/>+ pick_worker(grace)"]
   mode -->|codegen-loop| cg["spawn _run_codegen_loop_job task<br/>(GPU gate あり)"]
   mode -->|rerun| rr["spawn _run_rerun_loop_job task<br/>(既存 script を再生)"]
   fetch --> AB["PATH A or PATH B"]

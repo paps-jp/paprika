@@ -88,7 +88,7 @@ flowchart TB
     H6["hub-F"]
   end
   cl -->|round-robin| H1 & H2 & H3
-  wk -->|hash $worker_id consistent (sticky)| H1 & H2 & H3
+  wk -->|"hash $worker_id consistent (sticky)"| H1 & H2 & H3
 </div>
 <div class="callout tip"><strong>sticky は worker WS だけ</strong>: client は rr で OK(session はミドルウェアが転送、jobs は store-shared)。 worker は sticky で hub_id を安定させ、heartbeat と version gate の往復をシンプルに保つ。</div>
 

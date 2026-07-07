@@ -115,7 +115,7 @@ flowchart TD
   obj -->|video intent + valid .mp4 &gt;= 1| objok["✅ verdict=OK<br/>(客観ゲート判定)"]
   obj -->|video intent + 0 .mp4| objng["❌ verdict=NG"]
   obj -->|該当無し| llm["judge_attempt (LLM)"]
-  llm -->|blind_mode=true (既定)| blind["screenshot + asset count のみ<br/>script/stdout/stderr 隠蔽"]
+  llm -->|"blind_mode=true (既定)"| blind["screenshot + asset count のみ<br/>script/stdout/stderr 隠蔽"]
   llm -->|blind_mode=false| full["script + stdout/stderr 含む"]
   blind --> v[Verdict]
   full --> v

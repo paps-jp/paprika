@@ -145,8 +145,8 @@ flowchart TD
 <h2 id="engine">5. engine routing — thermal + 停止 + フェイルオーバ</h2>
 <div class="mermaid">
 flowchart TD
-  call["page.agent / codegen / perception / judge"]
-  call --> role["役割→engine 順序解決<br/>(_roles.resolve_role_engine_slug)"]
+  entry["page.agent / codegen / perception / judge"]
+  entry --> role["役割→engine 順序解決<br/>(_roles.resolve_role_engine_slug)"]
   role --> chk1{"engine 停止中?<br/>(settings.engines_disabled の csv)"}
   chk1 -->|disabled| nxt[次候補へ]
   chk1 -->|ok| chk2{"GPU thermal?<br/>現温度 &gt;= 受付停止温度?"}

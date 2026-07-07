@@ -88,7 +88,7 @@ flowchart LR
   W -->|HTTP POST asset_upload_base| HC
   HC --> SC
   HC -->|mirror_file| M
-  SC -->|mirror_file (meta)| M
+  SC -->|"mirror_file (meta)"| M
   HC -.->|reads| Gal["Gallery / SDK"]
   M -.->|cache miss フォールバック| Gal
   HC --> DB
