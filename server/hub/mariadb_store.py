@@ -21,7 +21,7 @@ import asyncio
 import json
 import logging
 from collections.abc import AsyncIterator
-from datetime import datetime
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Callable
 
@@ -615,8 +615,16 @@ class MariaDBJobStore:
         where_sql = ""
         where_params: tuple = ()
         if created_after_ts is not None:
-            where_sql = " WHERE created_at >= FROM_UNIXTIME(%s)"
-            where_params = (float(created_after_ts),)
+            # UTC-consistent cutoff (see summary_counts): created_at is a naive
+            # UTC DATETIME, so avoid FROM_UNIXTIME()'s session-tz conversion,
+            # which otherwise skews the recent-window counts on a non-UTC
+            # MariaDB session.
+            where_sql = " WHERE created_at >= %s"
+            where_params = (
+                datetime.fromtimestamp(
+                    float(created_after_ts), tz=timezone.utc
+                ).strftime("%Y-%m-%d %H:%M:%S"),
+            )
         async with self._pool.acquire() as conn:
             async with conn.cursor() as cur:
                 await cur.execute(
@@ -649,42 +657,66 @@ class MariaDBJobStore:
 
         Returns ``(by_status, by_mode, total, windows)`` where ``windows[i]`` is
         ``(by_status, total)`` for jobs with ``created_at >=
-        FROM_UNIXTIME(window_ts[i])``. Conditional aggregation folds every recent
-        window into the ONE GROUP-BY-status query (plus one GROUP-BY-mode), so
-        the whole summary is 2 queries on 1 connection instead of the old
-        3-queries-per-window (9 queries, ~2 s of round-trips at ~8.5k rows --
-        which made the admin "最近のジョブ" tab block until it returned)."""
+        FROM_UNIXTIME(window_ts[i])``.
+
+        Query plan (rewritten 2026-07-08 for the ~859k-row jobs table): the
+        base per-status / per-mode counts are plain ``GROUP BY`` (idx_status /
+        idx_mode_created), and each recent window is a SEPARATE
+        ``WHERE created_at >= ? GROUP BY status`` that range-scans only the
+        recent tail via idx_status_created -- NOT the whole table. The older
+        one-query form folded the windows in via
+        ``SUM(created_at >= FROM_UNIXTIME(?))``, which read created_at for
+        EVERY row and forced a full index scan; fine at ~8.5k rows, but at
+        859k it dominated the admin Jobs tab poll (~520 ms each, and the 2 s
+        per-hub cache is defeated by nginx round-robin across the hub fleet so
+        it ran on nearly every poll). All queries still share ONE pool
+        acquire. Contract (return shape + absent-status == 0) is unchanged."""
         wins = [float(t) for t in (window_ts or [])]
-        win_sel = "".join(
-            f", SUM(created_at >= FROM_UNIXTIME(%s)) AS w{i}"
-            for i in range(len(wins))
-        )
         by_status: dict[str, int] = {}
         by_mode: dict[str, int] = {}
         total = 0
-        windows: list[list] = [[{}, 0] for _ in wins]
+        windows: list[tuple[dict[str, int], int]] = []
         async with self._pool.acquire() as conn:
             async with conn.cursor() as cur:
-                await cur.execute(
-                    f"SELECT status, COUNT(*) AS c{win_sel} "
-                    "FROM jobs GROUP BY status",
-                    tuple(wins),
-                )
-                for row in await cur.fetchall():
-                    s = row[0]
+                # Base per-status counts -- idx_status, no created_at read.
+                await cur.execute("SELECT status, COUNT(*) FROM jobs GROUP BY status")
+                for s, c in await cur.fetchall():
                     if not s:
                         continue
-                    c = int(row[1] or 0)
+                    c = int(c or 0)
                     by_status[s] = c
                     total += c
-                    for i in range(len(wins)):
-                        wc = int(row[2 + i] or 0)
-                        windows[i][0][s] = wc
-                        windows[i][1] += wc
+                # Base per-mode counts -- idx_mode_created prefix.
                 await cur.execute("SELECT mode, COUNT(*) FROM jobs GROUP BY mode")
                 for m, n in await cur.fetchall():
-                    by_mode[m or "fetch"] = int(n)
-        return by_status, by_mode, total, [(w[0], w[1]) for w in windows]
+                    by_mode[m or "fetch"] = int(n or 0)
+                # Recent windows -- range-scan only the recent tail per window
+                # (idx_status_created / idx_created_at), not the full 859k table.
+                for ts in wins:
+                    # created_at is a naive UTC DATETIME (the hub writes UTC
+                    # timestamps). FROM_UNIXTIME() converts ts in the MariaDB
+                    # SESSION time_zone (the .20 server default is not UTC),
+                    # which skewed the window so recent_1h read 0. Compare
+                    # against a Python-computed UTC datetime string so the
+                    # cutoff matches created_at regardless of the session tz.
+                    cutoff = datetime.fromtimestamp(ts, tz=timezone.utc).strftime(
+                        "%Y-%m-%d %H:%M:%S"
+                    )
+                    await cur.execute(
+                        "SELECT status, COUNT(*) FROM jobs "
+                        "WHERE created_at >= %s GROUP BY status",
+                        (cutoff,),
+                    )
+                    w_by_status: dict[str, int] = {}
+                    w_total = 0
+                    for s, c in await cur.fetchall():
+                        if not s:
+                            continue
+                        c = int(c or 0)
+                        w_by_status[s] = c
+                        w_total += c
+                    windows.append((w_by_status, w_total))
+        return by_status, by_mode, total, windows
 
     async def delete_job(self, job_id: str) -> bool:
         async with self._pool.acquire() as conn:

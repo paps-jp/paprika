@@ -577,6 +577,16 @@ _JOBS_SUMMARY_CACHE: dict = {"ts": 0.0, "value": None}
 _JOBS_SUMMARY_TTL_S = 2.0
 
 
+# L2 cache: the ``/jobs/summary`` result is also memoised in Redis so the
+# ~350-500 ms full-table aggregation runs at most once per TTL FLEET-WIDE, not
+# once per hub. The in-process L1 above (2 s) is defeated by nginx round-robin
+# (each hub is only hit every ~n_hubs*poll seconds, so its cache is always
+# cold); the shared L2 is what actually cuts the DB load. ``as_of`` in the
+# cached value tells the operator how stale the counts are (<= TTL seconds).
+_JOBS_SUMMARY_REDIS_KEY = "paprika:jobs_summary:v1"
+_JOBS_SUMMARY_REDIS_TTL_S = 4
+
+
 _JOBS_SUMMARY_RUNNING_PREVIEW = 5
 
 
@@ -838,6 +848,8 @@ __all__ = [
     '_gather_assets',
     '_JOBS_SUMMARY_CACHE',
     '_JOBS_SUMMARY_TTL_S',
+    '_JOBS_SUMMARY_REDIS_KEY',
+    '_JOBS_SUMMARY_REDIS_TTL_S',
     '_JOBS_SUMMARY_RUNNING_PREVIEW',
     '_JOBS_SUMMARY_RECENT_WINDOWS_H',
     '_summary_python_count',

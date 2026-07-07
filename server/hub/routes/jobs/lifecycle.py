@@ -472,6 +472,25 @@ async def get_jobs_summary() -> dict:
     if cached is not None and (now - _JOBS_SUMMARY_CACHE.get("ts", 0.0)) < _JOBS_SUMMARY_TTL_S:
         return cached
 
+    # L2: shared Redis cache. Under the multi-hub deployment nginx round-robins
+    # /jobs/summary across every hub, so the in-process L1 above is almost
+    # always cold (a given hub is only hit every ~n_hubs*poll s). The Redis
+    # copy lets ONE hub's ~350-500 ms full-table aggregation serve the whole
+    # fleet for the TTL instead of every hub re-running it on nearly every
+    # 2 s poll. A Redis blip just falls through to a local recompute -- it
+    # never fails the request.
+    _redis = getattr(state.store, "_r", None)
+    if _redis is not None:
+        try:
+            _raw = await _redis.get(_JOBS_SUMMARY_REDIS_KEY)
+            if _raw:
+                _val = json.loads(_raw)
+                _JOBS_SUMMARY_CACHE["ts"] = now
+                _JOBS_SUMMARY_CACHE["value"] = _val
+                return _val
+        except Exception:
+            log.debug("jobs/summary: redis L2 read failed", exc_info=True)
+
     assert state.store is not None
     wall_now = _time.time()
 
@@ -591,6 +610,16 @@ async def get_jobs_summary() -> dict:
     }
     _JOBS_SUMMARY_CACHE["ts"] = now
     _JOBS_SUMMARY_CACHE["value"] = result
+    # Publish to the shared L2 so peer hubs skip the aggregation for the TTL.
+    if _redis is not None:
+        try:
+            await _redis.set(
+                _JOBS_SUMMARY_REDIS_KEY,
+                json.dumps(result),
+                ex=_JOBS_SUMMARY_REDIS_TTL_S,
+            )
+        except Exception:
+            log.debug("jobs/summary: redis L2 write failed", exc_info=True)
     return result
 
 

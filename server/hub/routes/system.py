@@ -518,6 +518,34 @@ async def admin_self_restart() -> dict:
     return {"restarting": True, "exit_code": 42}
 
 
+# /overview is polled by the admin header every ~2 s. ``count_jobs()`` is a
+# COUNT(*) over the (859k-row) jobs table; like /jobs/summary it was being
+# recomputed on every hub on nearly every poll -- the per-hub result isn't
+# shared and nginx round-robins requests across the fleet. Memoise the total
+# in Redis with a short TTL so the COUNT runs at most once per TTL fleet-wide.
+# Best-effort: any Redis hiccup falls through to a direct count.
+_OVERVIEW_TOTAL_REDIS_KEY = "paprika:jobs_total:v1"
+_OVERVIEW_TOTAL_TTL_S = 4
+
+
+async def _cached_jobs_total() -> int:
+    redis = getattr(state.store, "_r", None)
+    if redis is not None:
+        try:
+            raw = await redis.get(_OVERVIEW_TOTAL_REDIS_KEY)
+            if raw is not None:
+                return int(raw)
+        except Exception:
+            pass
+    n = await state.store.count_jobs()
+    if redis is not None:
+        try:
+            await redis.set(_OVERVIEW_TOTAL_REDIS_KEY, str(n), ex=_OVERVIEW_TOTAL_TTL_S)
+        except Exception:
+            pass
+    return n
+
+
 @router.get("/overview")
 async def overview() -> dict:
     """Aggregated admin-poll snapshot in ONE response: health + workers +
@@ -536,7 +564,7 @@ async def overview() -> dict:
     except Exception:
         workers = {"count": 0, "workers": []}
     try:
-        jobs_total = await state.store.count_jobs()
+        jobs_total = await _cached_jobs_total()
     except Exception:
         jobs_total = 0
     try:
