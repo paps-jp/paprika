@@ -55,14 +55,51 @@ def apply(path: str = _RESOLV) -> bool:
             return False
         servers = [s.strip() for s in cfg.split(",") if s.strip()] or _DEFAULT
 
+        # Start the local DNS->DoH forwarder (server/worker/doh_proxy.py). The
+        # worker's :53 resolver can't reach many external video-CDN hosts (only
+        # Chrome's DoH can), so yt-dlp downloads die on "name resolution". When
+        # the forwarder is up AND DoH is reachable, query it FIRST and keep the
+        # direct resolvers as fallback (so a DoH blip only degrades to today's
+        # behaviour). Best-effort + kill-switchable (PAPRIKA_DOH_FORWARDER=off).
+        doh_ok = False
+        if (os.environ.get("PAPRIKA_DOH_FORWARDER") or "").strip().lower() not in _DISABLE:
+            try:
+                from server.worker.doh_proxy import start_doh_forwarder
+                doh_ok = bool(start_doh_forwarder())
+            except Exception:
+                doh_ok = False
+        want = (["127.0.0.1"] if doh_ok else []) + servers
+
         try:
             with open(path) as f:
                 cur = f.read()
         except OSError:
             return False  # no resolv.conf (not a container) -> leave alone
 
-        if "127.0.0.11" not in cur:
-            return False  # not on docker's embedded resolver -> nothing to bypass
+        # Current nameserver lines (matched as lines, not a substring: our own
+        # comment contains the text "127.0.0.11", so a whole-file ``in`` check
+        # would false-positive on it).
+        cur_ns = [
+            ln.split()[1] for ln in cur.splitlines()
+            if ln.lstrip().startswith("nameserver") and len(ln.split()) > 1
+        ]
+
+        # Manage this file only when it's clearly a container resolver we own:
+        # docker's embedded DNS is the resolver, OR we've stamped it before, OR
+        # the operator explicitly opted in via PAPRIKA_WORKER_DNS. Never clobber
+        # a real host's resolv.conf on a non-container deploy. (The old guard
+        # was ``"127.0.0.11" in cur`` only, which skipped already-fixed workers
+        # -- but we now must re-run to prepend the DoH forwarder on restarts.)
+        managed = (
+            "127.0.0.11" in cur_ns
+            or "paprika worker dns_fix" in cur
+            or bool(cfg)
+        )
+        if not managed:
+            return False
+
+        if cur_ns == want:
+            return False  # already correct -> don't churn the file every restart
 
         # Preserve search / options lines; replace only the nameserver lines.
         keep = [
@@ -71,15 +108,19 @@ def apply(path: str = _RESOLV) -> bool:
             and not ln.lstrip().startswith("nameserver")
             and not ln.lstrip().startswith("#")
         ]
+        comment = (
+            "# paprika worker dns_fix: bypass docker embedded DNS 127.0.0.11"
+            + ("; +local DoH forwarder 127.0.0.1:53" if doh_ok else "")
+        )
         new = "\n".join(
-            ["# paprika worker dns_fix: bypass docker embedded DNS 127.0.0.11"]
-            + [f"nameserver {s}" for s in servers]
-            + keep
+            [comment] + [f"nameserver {s}" for s in want] + keep
         ) + "\n"
 
         with open(path, "w") as f:
             f.write(new)
-        log.info("dns_fix: resolv.conf nameservers -> %s (bypassed 127.0.0.11)", servers)
+        log.info(
+            "dns_fix: resolv.conf nameservers -> %s (doh_forwarder=%s)", want, doh_ok,
+        )
         return True
     except Exception as e:  # pragma: no cover - defensive
         log.warning("dns_fix: skipped (%s: %s)", type(e).__name__, e)
