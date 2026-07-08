@@ -841,10 +841,33 @@ class WorkerEngineUsage(BaseModel):
     source: str = ""  # "ask" | "observe" | "extract" | "agent" (debug/future)
 
 
+class WorkerVideoProbe(BaseModel):
+    """Worker -> hub: no-browser reachability classification for ONE captured
+    HLS/DASH manifest (measurement "E", 2026-07-08). Lets the hub measure, per
+    host, what fraction of video streams are downloadable WITHOUT a live Chrome
+    lane -- the feasibility signal for splitting video downloads onto a
+    Chrome-less download tier. Telemetry only; does NOT affect download
+    behaviour. ``verdict`` in {decouplable, tokened, gated, drm, error};
+    ``enc_method`` in {none, aes-128, sample-aes, ...}."""
+    type: Literal["video_probe"] = "video_probe"
+    job_id: str = ""
+    host: str = ""
+    manifest_url: str = ""
+    verdict: str = ""
+    enc_method: str = ""
+    is_live: bool = False
+    token_hint: bool = False
+    manifest_status: int = 0
+    segment_status: int = 0
+    key_status: int = 0
+    tls: str = ""
+
+
 WorkerToHubMsg = Annotated[
     Union[
         WorkerRegister,
         WorkerEngineUsage,
+        WorkerVideoProbe,
         WorkerHeartbeat,
         WorkerJobAccepted,
         WorkerJobProgress,

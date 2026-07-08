@@ -1389,6 +1389,7 @@ from server.protocol import (
     WorkerJobComplete,
     WorkerJobFailed,
     WorkerEngineUsage,
+    WorkerVideoProbe,
     WorkerJobLog,
     WorkerJobProgress,
     WorkerPreviewFrame,
@@ -3020,6 +3021,26 @@ async def _handle_worker_message(worker, msg) -> None:
                         pass
                 _schedule_engine_usage_db(
                     slug, msg.prompt_tokens or 0, msg.completion_tokens or 0
+                )
+        except Exception:
+            pass
+        return
+
+    if isinstance(msg, WorkerVideoProbe):
+        # No-browser reachability verdict for one captured video manifest
+        # (measurement "E"). Fold into the shared per-host video_probe_stats
+        # counter (MariaDB, cross-hub) so the fleet total tells us what
+        # fraction of streams are downloadable without a live Chrome lane.
+        # Best-effort telemetry.
+        try:
+            from server.hub.mariadb import video_probe_record
+            pool = getattr(state, "mariadb_pool", None)
+            if pool is not None and (msg.host or "").strip():
+                asyncio.create_task(
+                    video_probe_record(
+                        pool, msg.host.strip(),
+                        msg.verdict or "error", msg.enc_method or "none",
+                    )
                 )
         except Exception:
             pass

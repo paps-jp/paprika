@@ -2560,6 +2560,38 @@ async def engine_usage_record(
             )
 
 
+# --- video-download-decouple measurement ("E", 2026-07-08) -----------------
+_VIDEO_PROBE_DDL = (
+    "CREATE TABLE IF NOT EXISTS video_probe_stats ("
+    "host VARCHAR(255) NOT NULL, verdict VARCHAR(24) NOT NULL, "
+    "enc_method VARCHAR(24) NOT NULL DEFAULT 'none', "
+    "n BIGINT NOT NULL DEFAULT 0, last_seen DATETIME(3), "
+    "PRIMARY KEY (host, verdict, enc_method)"
+    ") ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci"
+)
+
+
+async def video_probe_record(pool: Any, host: str, verdict: str, enc_method: str = "none") -> None:
+    """Atomically +1 the shared ``(host, verdict, enc_method)`` counter for the
+    video-download-decouple measurement (no-browser reachability of a captured
+    manifest). Cross-hub safe: every hub increments the same row, so the row IS
+    the fleet total. Best-effort -- never raises."""
+    if not host:
+        return
+    try:
+        async with pool.acquire() as conn:
+            async with conn.cursor() as cur:
+                await cur.execute(_VIDEO_PROBE_DDL)
+                await cur.execute(
+                    "INSERT INTO video_probe_stats (host, verdict, enc_method, n, last_seen) "
+                    "VALUES (%s, %s, %s, 1, UTC_TIMESTAMP(3)) "
+                    "ON DUPLICATE KEY UPDATE n = n + 1, last_seen = UTC_TIMESTAMP(3)",
+                    (str(host)[:255], str(verdict or "error")[:24], str(enc_method or "none")[:24]),
+                )
+    except Exception:
+        pass
+
+
 async def load_engine_usage(pool: Any, days: int = 14) -> dict:
     """Return the shared per-day, per-slug counters for the last ``days``
     days as ``{date_str: {slug: {prompt, completion, requests}}}``.

@@ -321,6 +321,15 @@ class WorkerAgent(
         # run a job yet. None = no default set, lanes stay on the
         # baked-in chrome-lane-N user-data-dir.
         self._ambient_default_name: str | None = None
+        # Register this agent as the sink for core.video_probe telemetry so
+        # no-browser reachability verdicts (measurement "E") reach the hub as
+        # WorkerVideoProbe. Best-effort; a missing module must never break
+        # worker start.
+        try:
+            from core.video_probe import set_probe_sink
+            set_probe_sink(self._on_video_probe)
+        except Exception:
+            pass
 
     async def _send(self, msg) -> None:
         ws = self._ws
@@ -354,6 +363,29 @@ class WorkerAgent(
                     prompt_tokens=max(0, int(prompt_tokens or 0)),
                     completion_tokens=max(0, int(completion_tokens or 0)),
                     source=str(source or ""),
+                )
+            )
+        except Exception:
+            pass
+
+    async def _on_video_probe(self, res: dict) -> None:
+        """Sink for core.video_probe: ship ONE no-browser reachability verdict
+        to the hub as WorkerVideoProbe (measurement "E"). Best-effort
+        telemetry -- never raises, never affects a download."""
+        try:
+            from server.protocol import WorkerVideoProbe
+            await self._send(
+                WorkerVideoProbe(
+                    host=str(res.get("host") or ""),
+                    manifest_url=str(res.get("manifest_url") or "")[:512],
+                    verdict=str(res.get("verdict") or "error"),
+                    enc_method=str(res.get("enc_method") or "none"),
+                    is_live=bool(res.get("is_live")),
+                    token_hint=bool(res.get("token_hint")),
+                    manifest_status=int(res.get("manifest_status") or 0),
+                    segment_status=int(res.get("segment_status") or 0),
+                    key_status=int(res.get("key_status") or 0),
+                    tls=str(res.get("tls") or ""),
                 )
             )
         except Exception:

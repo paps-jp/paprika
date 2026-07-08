@@ -3294,6 +3294,21 @@ async def fetch(opts: FetchOptions) -> FetchResult:
             for s in _dedup_targets:
                 add_target(s, url, "network-stream")
 
+            # Classification probe (measurement "E", 2026-07-08): fire-and-
+            # forget a no-browser reachability test per detected target so the
+            # hub can measure, per host, what fraction of video streams are
+            # downloadable WITHOUT a live Chrome lane (the download-tier
+            # feasibility signal). PURE OBSERVATION -- never gates or delays
+            # the real download; kill-switch PAPRIKA_VIDEO_PROBE=0.
+            if ytdlp_targets and (
+                opts.download_video or getattr(opts, "defer_video_download", False)
+            ):
+                try:
+                    from core.video_probe import spawn_probes
+                    spawn_probes(ytdlp_targets, url)
+                except Exception:
+                    pass
+
             if ytdlp_targets and opts.defer_video_download:
                 # Detect-only: hand the targets back to the caller, which
                 # releases the lane and downloads them in a detached
