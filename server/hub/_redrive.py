@@ -69,6 +69,14 @@ _INTERVAL_S = _num("PAPRIKA_QUEUE_REDRIVE_INTERVAL_S", 3.0)
 # Safety cap on placements per pass so one hub can't monopolise a shared queue;
 # the next pass (≈3s later) continues. 0 = unbounded (place every free lane).
 _MAX_PER_PASS = int(_num("PAPRIKA_QUEUE_REDRIVE_MAX_PER_PASS", 0))
+# Bounded-parallel dispatch fan-out (2026-07-08). Serial dispatch capped the
+# redrive at ~5-14/s (each job = a DB CAS claim + host/profile lookups + a
+# worker send, ~100ms, awaited one at a time), so a burst of queued jobs waited
+# 30-50s for a lane even with 150+ free lanes. pick_worker(reserve_for_job=)
+# reserves the lane atomically and claim_queued_job is an atomic cross-hub CAS,
+# so concurrent dispatch is over-dispatch-safe. This caps in-flight dispatches
+# (the DB pool + fleet size are the real ceilings).
+_DISPATCH_CONCURRENCY = int(_num("PAPRIKA_QUEUE_REDRIVE_CONCURRENCY", 24))
 # Don't touch a queued job until it's older than this. Used to be 90s as belt-
 # and-braces against the POST race -- POST blindly upserted the row after WS
 # assign, which could overwrite a redrive's CAS-flipped running+W2 back to
@@ -352,6 +360,11 @@ async def _redrive_pass() -> int:
     now = datetime.utcnow()  # JobInfo.created_at is naive-UTC (mirrors the reaper)
     placed = 0
     reclaimed_count = 0
+    # ---- Phase 1 (serial, cheap): age gate + stale-worker_id reclaim -----------
+    # Kept serial: the age gate breaks on the first too-young job (sorted
+    # oldest-first) and the stale reclaim mutates ``info`` per row -- both rare
+    # and cheap. Produces the ``eligible`` list ready for dispatch.
+    eligible: list = []
     for info in infos:  # oldest first
         try:
             age = (now - info.created_at).total_seconds() if info.created_at else 1e9
@@ -387,19 +400,40 @@ async def _redrive_pass() -> int:
                 info.job_id, stale_worker, age,
             )
             reclaimed_count += 1
-            # Mirror the DB change into the in-memory ``info`` so the dispatch
-            # below sees a NULL worker_id (avoids re-tripping our own guard
-            # one line up if this loop ever fans out to multiple infos).
+            # Mirror the DB change into the in-memory ``info`` so dispatch sees
+            # a NULL worker_id.
             info.worker_id = None
             info.started_at = None
-        if _MAX_PER_PASS and placed >= _MAX_PER_PASS:
+        eligible.append(info)
+        if _MAX_PER_PASS and len(eligible) >= _MAX_PER_PASS:
             break
-        if state.registry.pick_worker() is None:
-            break  # all local lanes full -> stop; next pass continues
-        if await _redrive_dispatch_one(info):
-            placed += 1
+
+    # ---- Phase 2 (bounded-parallel): dispatch eligible jobs concurrently -------
+    # Each _redrive_dispatch_one reserves its OWN lane atomically (pick_worker,
+    # sync no-await) BEFORE its claim await, and claim_queued_job is an atomic
+    # cross-hub CAS -- so concurrent dispatch never over-assigns or double-claims.
+    # Jobs that find no free lane return False and stay queued for the next pass.
+    # Fixes the serial ~5-14/s dispatch ceiling (queue-wait 30-50s under burst
+    # despite 150+ free lanes).
+    if eligible:
+        sem = asyncio.Semaphore(max(1, _DISPATCH_CONCURRENCY))
+
+        async def _guarded(info) -> bool:
+            async with sem:
+                try:
+                    return await _redrive_dispatch_one(info)
+                except Exception:
+                    log.debug("redrive: dispatch(%s) crashed", info.job_id, exc_info=True)
+                    return False
+
+        results = await asyncio.gather(*[_guarded(i) for i in eligible])
+        placed = sum(1 for r in results if r is True)
+
     if placed:
-        log.info("redrive: placed %d stranded queued job(s) onto free lanes", placed)
+        log.info(
+            "redrive: placed %d queued job(s) onto free lanes (parallel<=%d)",
+            placed, _DISPATCH_CONCURRENCY,
+        )
     elif reclaimed_count:
         # Only log the reclaim summary when no placements followed -- otherwise
         # the per-job reclaim line above is enough and the next pass will pick
