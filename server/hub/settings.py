@@ -174,6 +174,17 @@ _SCHEMA: dict[str, tuple[Any, str]] = {
     "fetch_load_factor": (0.7, "float"),
     "fetch_load_ref":    (24.0, "float"),
     "fetch_mem_ref":     (75.0, "float"),
+    # fetch_downloading_weight: how much a background video-download (yt-dlp;
+    #   its Chrome lane is ALREADY released, but it keeps burning worker
+    #   CPU/disk/net for minutes) counts toward accept-capacity. Occupancy =
+    #   ``downloading * this``, subtracted from ``recommended`` so admission
+    #   backs off as the download pile grows (prevents unbounded pileup, the
+    #   2026-06-26 incident). 1.0 = a download costs a FULL lane (max
+    #   backpressure, but throttles fetch utilisation well below the lane count
+    #   when downloads are present); LOWER (e.g. 0.3) lets the fleet admit more
+    #   fetches alongside downloads since they released their lane and are
+    #   mostly network-bound. 0 = downloads don't count (pileup risk).
+    "fetch_downloading_weight": (1.0, "float"),
     # ---- Codegen web_search tool (SearXNG-backed) ------------------------
     # When ``searxng_url`` is non-empty AND the Coder's engine has
     # supports_tools=True, the hub attaches a ``web_search`` OpenAI tool
@@ -390,6 +401,7 @@ def _env_default(key: str, fallback: Any) -> Any:
         "web_search_max_calls": ("WEB_SEARCH_MAX_CALLS", "int"),
         # Capacity recommendation knobs: settings.json -> env vars -> default.
         "fetch_load_factor": ("PAPRIKA_FETCH_LOAD_FACTOR", "float"),
+        "fetch_downloading_weight": ("PAPRIKA_FETCH_DOWNLOADING_WEIGHT", "float"),
         "fetch_load_ref":    ("PAPRIKA_FETCH_LOAD_REF",    "float"),
         "fetch_mem_ref":     ("PAPRIKA_FETCH_MEM_REF",     "float"),
         # Reasoning judge: settings.json -> env vars -> static default.
