@@ -18,6 +18,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import os
 import random
 import time
 from collections import deque
@@ -38,6 +39,19 @@ from server.protocol import (
 
 # Heartbeat-related constants (seconds)
 WORKER_TTL = 120  # if no heartbeat for this long, worker is considered dead
+# A "no free lane in pool" auto-drained worker (Case C, see workers.py) is
+# flipped back to "active" by heartbeat() the instant it reports a free lane
+# again -- UNLESS it has rejected this many assigns in a row while still
+# claiming a free lane (no successful WorkerJobAccepted in between). That
+# pattern means a logically-broken lane pool (reports idle but can't actually
+# spawn/serve a lane), which must STAY drained instead of thrashing the
+# dispatcher. Reset to 0 on any accept. Env override for ops tuning.
+try:
+    _NO_FREE_LANE_MAX_STRIKES = max(
+        1, int(os.environ.get("PAPRIKA_NO_FREE_LANE_MAX_STRIKES") or 3)
+    )
+except (TypeError, ValueError):
+    _NO_FREE_LANE_MAX_STRIKES = 3
 # How long stats_async() may reuse the last GOOD cross-hub (redis) worker
 # aggregation when a fresh fetch times out, instead of collapsing the list to
 # this hub's local connections only. Bridges transient redis stalls so the
@@ -278,6 +292,14 @@ class ConnectedWorker:
     # status back to "active" the moment it passes (lazy clear, no reaper
     # task needed). 0.0 = no auto-clear (operator-set drain stays).
     drain_until: float = 0.0
+    # Consecutive "no free lane in pool" assign rejections (Case C) with NO
+    # successful WorkerJobAccepted in between. heartbeat() returns a drained
+    # worker to "active" the moment it reports a free lane -- but only while
+    # this stays below ``_NO_FREE_LANE_MAX_STRIKES``. A worker that keeps
+    # claiming a free lane yet rejecting every assign has a broken lane pool
+    # and is left drained (until its deadline / operator). Reset to 0 by the
+    # WorkerJobAccepted handler (proof the lane pool actually works).
+    no_free_lane_strikes: int = 0
     # True between WS handshake and the worker's first WorkerSessionAnnounce.
     # The announce is what populates ``committed_jobs`` from the worker's
     # actually-running sessions; until it arrives, ``committed_jobs`` is
@@ -771,6 +793,23 @@ class WorkerRegistry:
         worker.disk_pct = disk_pct
         worker.disk_free_gb = disk_free_gb
         worker.load1 = load1
+        # Lane-freed auto-recovery (operator ask 2026-07-08): a worker that was
+        # auto-drained for "no free lane in pool" (Case C sets drain_until > 0)
+        # returns to "active" the instant its own heartbeat proves a lane is
+        # free again (in_flight < capacity) -- no need to sit out the full
+        # PAPRIKA_NO_FREE_LANE_DRAIN_S (900s) deadline while healthy. Operator-
+        # and prepare-restart-set drains keep drain_until == 0.0 and are never
+        # touched here. The strike gate leaves a logically-broken worker (claims
+        # a free lane but keeps rejecting assigns) drained. The status change is
+        # mirrored into Redis by the block below (it stamps worker.status).
+        if (
+            worker.status == "drain"
+            and worker.drain_until
+            and in_flight < worker.capabilities.max_concurrent
+            and worker.no_free_lane_strikes < _NO_FREE_LANE_MAX_STRIKES
+        ):
+            worker.status = "active"
+            worker.drain_until = 0.0
         if self._r is not None:
             try:
                 await self._r.zadd(_k_index(), {worker_id: time.time()})

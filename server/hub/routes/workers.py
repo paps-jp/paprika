@@ -2348,6 +2348,10 @@ async def _handle_worker_message(worker, msg) -> None:
         try:
             worker.pending_assigns.discard(msg.job_id)
             worker.committed_jobs.add(msg.job_id)
+            # A successful accept proves the lane pool actually works, so clear
+            # the no-free-lane strike counter that heartbeat()'s lane-freed
+            # auto-recovery consults (see scheduler.ConnectedWorker).
+            worker.no_free_lane_strikes = 0
         except Exception:
             pass
         try:
@@ -2867,6 +2871,14 @@ async def _handle_worker_message(worker, msg) -> None:
             try:
                 worker.status = "drain"
                 worker.drain_until = time.monotonic() + max(60.0, _drain_s)
+                # Count consecutive no-free-lane rejections so heartbeat()'s
+                # lane-freed auto-recovery can tell a transiently-full worker
+                # (returns to active as soon as a lane frees) from a logically
+                # broken lane pool (keeps rejecting despite claiming free lanes,
+                # left drained). Reset on the next WorkerJobAccepted.
+                worker.no_free_lane_strikes = (
+                    getattr(worker, "no_free_lane_strikes", 0) + 1
+                )
             except Exception:
                 pass
             log.info(
