@@ -628,9 +628,22 @@ async def create_pool(
     username: str,
     password: str,
 ) -> Any:
-    """Create an ``aiomysql.Pool``.  Returns the pool object."""
-    import aiomysql
+    """Create an ``aiomysql.Pool``.  Returns the pool object.
 
+    Pool size is env-tunable via ``PAPRIKA_MARIADB_POOL_MAXSIZE`` (default 15,
+    raised from a hardcoded 5 on 2026-07-08). maxsize=5 capped a hub to 5
+    concurrent DB ops, which throttled the newly-parallel redrive dispatch
+    (its claim_queued_job round-trips queued behind the 5-conn pool) and any
+    burst of concurrent queries. .20 ``max_connections`` = 300 with a peak-ever
+    of 84, so 7 hubs x 15 = ~105 leaves ample headroom (and stays safe as the
+    hub count grows)."""
+    import aiomysql
+    import os
+
+    try:
+        _maxsize = max(1, int(os.environ.get("PAPRIKA_MARIADB_POOL_MAXSIZE") or 15))
+    except (TypeError, ValueError):
+        _maxsize = 15
     return await aiomysql.create_pool(
         host=host,
         port=port,
@@ -638,7 +651,7 @@ async def create_pool(
         user=username,
         password=password,
         minsize=1,
-        maxsize=5,
+        maxsize=_maxsize,
         autocommit=True,
         charset="utf8mb4",
     )
