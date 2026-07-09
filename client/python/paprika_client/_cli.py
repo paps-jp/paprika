@@ -399,6 +399,32 @@ def _cmd_capacity(args: argparse.Namespace) -> int:
     return 0
 
 
+def _cmd_throughput(args: argparse.Namespace) -> int:
+    """GET /jobs/throughput -- the fleet's job accept rate (queued->running)."""
+    import httpx  # lazy so --help stays fast
+    import json
+    hub = _resolve_hub(args.hub)
+    try:
+        r = httpx.get(
+            f"{hub}/jobs/throughput",
+            params={"window_s": getattr(args, "window", 60)},
+            headers=_auth_headers(args), timeout=30,
+        )
+    except Exception as e:  # noqa: BLE001
+        print(f"error: {e}", file=sys.stderr)
+        return 1
+    if r.status_code != 200:
+        print(f"error {r.status_code}: {r.text}", file=sys.stderr)
+        return 1
+    d = r.json()
+    if getattr(args, "quiet", False):
+        # just the accepts/min number, for scripting: N=$(paprika-client throughput -q)
+        print(d.get("accepted_last_min"))
+    else:
+        print(json.dumps(d, indent=2))
+    return 0
+
+
 # ---------------------------------------------------------------- main
 
 def main(argv: Optional[list[str]] = None) -> int:
@@ -517,6 +543,20 @@ def main(argv: Optional[list[str]] = None) -> int:
         help="Print ONLY recommended_concurrency (for scripting)",
     )
     cap.set_defaults(func=_cmd_capacity)
+
+    tp = sub.add_parser(
+        "throughput",
+        help="Job accept rate (queued->running) per minute, fleet-wide",
+    )
+    tp.add_argument(
+        "--window", type=int, default=60,
+        help="Window in seconds for accepted_last_<window>s (default 60)",
+    )
+    tp.add_argument(
+        "-q", "--quiet", action="store_true",
+        help="Print ONLY accepted_last_min (for scripting)",
+    )
+    tp.set_defaults(func=_cmd_throughput)
 
     args = p.parse_args(argv)
     return args.func(args)

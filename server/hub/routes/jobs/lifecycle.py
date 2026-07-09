@@ -423,6 +423,55 @@ async def list_completed_jobs(
     }
 
 
+@router.get("/jobs/throughput")
+async def get_jobs_throughput(window_s: int = 60) -> dict:
+    """Fleet-wide job ACCEPT rate: how many jobs went queued->running recently.
+
+    Reads per-second Redis buckets written on each ``WorkerJobAccepted`` (the
+    queued->running confirmation) -- O(window) Redis GETs, NO jobs-table scan --
+    and aggregates ALL hubs (shared Redis). ``accepted_last_min`` is the count
+    in the last 60s; ``accepted_last_10s`` is the fast gauge (x6 ~= per-min).
+    ``source`` is ``"redis"`` when live, ``"unavailable"`` on a single-hub /
+    no-Redis deploy."""
+    try:
+        window_s = max(1, min(int(window_s), 3600))
+    except (TypeError, ValueError):
+        window_s = 60
+    now = int(time.time())
+    r = getattr(state.store, "_r", None)
+    if r is None:
+        return {
+            "accepted_last_10s": 0, "accepted_last_min": 0,
+            f"accepted_last_{window_s}s": 0,
+            "window_s": window_s, "ts": now, "source": "unavailable",
+        }
+    span = max(60, window_s)
+    keys = [f"paprika:tp:accepts:{now - i}" for i in range(span)]
+    try:
+        vals = await r.mget(keys)
+    except Exception:
+        vals = None
+    if not vals:
+        return {
+            "accepted_last_10s": 0, "accepted_last_min": 0,
+            f"accepted_last_{window_s}s": 0,
+            "window_s": window_s, "ts": now, "source": "unavailable",
+        }
+    counts = [int(v or 0) for v in vals]  # index i == second (now - i)
+
+    def _sum(w: int) -> int:
+        return sum(counts[: max(0, min(w, len(counts)))])
+
+    return {
+        "accepted_last_10s": _sum(10),
+        "accepted_last_min": _sum(60),
+        f"accepted_last_{window_s}s": _sum(window_s),
+        "window_s": window_s,
+        "ts": now,
+        "source": "redis",
+    }
+
+
 @router.get("/jobs/summary")
 async def get_jobs_summary() -> dict:
     """Dashboard-shaped overview of the job store. One round-trip,

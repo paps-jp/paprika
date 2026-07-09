@@ -288,6 +288,31 @@ class PaprikaClient:
         fleet-wide (aggregated across all hubs)."""
         return await self._json("GET", "/workers/capacity")
 
+    async def throughput(self, *, window_s: int = 60) -> dict:
+        """GET /jobs/throughput -- the fleet's job ACCEPT rate (how many jobs
+        went queued->running recently). Cheap (Redis buckets, no jobs-table
+        scan) and fleet-wide (aggregated across all hubs).
+
+        Returns a dict::
+
+            {
+              "accepted_last_10s": 8,     # fast gauge (x6 ~= per-min)
+              "accepted_last_min": 42,    # accepts in the last 60s
+              "accepted_last_60s": 42,    # == accepted_last_<window_s>s
+              "window_s": 60,
+              "ts": 1783550000,           # server epoch seconds
+              "source": "redis",          # "unavailable" on no-Redis deploys
+            }
+
+        Typical use -- watch the dispatch rate::
+
+            t = await cli.throughput()
+            print(f"{t['accepted_last_min']} jobs/min accepted")
+        """
+        return await self._json(
+            "GET", f"/jobs/throughput?window_s={int(window_s)}"
+        )
+
     async def recommended_concurrency(self, *, default: int = 8) -> int:
         """The fleet's recommended max concurrent fetches
         (``capacity()['recommended_concurrency']``). Falls back to ``default``

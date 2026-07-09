@@ -2354,6 +2354,20 @@ async def _handle_worker_message(worker, msg) -> None:
             worker.no_free_lane_strikes = 0
         except Exception:
             pass
+        # Throughput metric: count this queued->running acceptance into a
+        # shared per-second Redis bucket (TTL 120s) so GET /jobs/throughput can
+        # report the fleet-wide accept rate (accepts/min) without scanning the
+        # jobs table. Best-effort -- never block dispatch on it.
+        try:
+            _r = getattr(state.store, "_r", None)
+            if _r is not None:
+                _k = f"paprika:tp:accepts:{int(time.time())}"
+                _p = _r.pipeline()
+                _p.incr(_k)
+                _p.expire(_k, 120)
+                await _p.execute()
+        except Exception:
+            pass
         try:
             jid_short = (msg.job_id or "")[:8]
             lane = msg.lane_idx if msg.lane_idx is not None else "?"
