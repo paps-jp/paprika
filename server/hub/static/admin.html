@@ -3302,6 +3302,26 @@ table.aitbl code { font-size:0.95em; }
          ============================================================ -->
     <div class="settings-subpane" data-settings-subpane="storage" style="display:none;">
 
+    <!-- B6b. Auto job-retention GC -->
+    <div class="settings-card">
+    <h3><iconify-icon icon="lucide:trash-2"></iconify-icon> ジョブ自動削除 (Retention)
+      <small>古い終端ジョブを DB + MinIO + キャッシュごと自動 GC</small>
+    </h3>
+    <p style="font-size:12px; color:#888; margin:4px 0 10px;">
+      ON にすると、指定日数より古い <b>完了 / 失敗 / 課題 / キャンセル</b> ジョブを、
+      DB 行・MinIO オブジェクト・ローカルキャッシュごと <b>完全削除</b> します
+      (取り消し不可)。実行中 / 待機中 / DL中は対象外。初回は既存の古いジョブを
+      徐々に (1 時間ごと最大 5000 件) 削除します。手動の「古いジョブ削除」ボタンの
+      自動版です。
+    </p>
+    <div style="display:grid; grid-template-columns: 200px 1fr; gap:8px 12px; align-items:center; padding:4px;">
+      <label for="setJobRetentionEnabled">自動削除を有効化:</label>
+      <div><input type="checkbox" id="setJobRetentionEnabled"></div>
+      <label for="setJobRetentionDays" title="この日数より古い終端ジョブを削除 (既定 10)">保持日数:</label>
+      <div><input type="number" id="setJobRetentionDays" placeholder="10" min="1" max="3650" style="width:120px; padding:4px 8px;"> 日</div>
+    </div>
+    </div>
+
     <!-- B7. Database: MariaDB -->
     <div class="settings-card">
     <h3><iconify-icon icon="lucide:database"></iconify-icon> Database (MariaDB)

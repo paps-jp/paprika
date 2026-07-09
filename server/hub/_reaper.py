@@ -1133,3 +1133,130 @@ async def _fail_orphan_job(info, reason: str) -> None:
             pass
     except Exception:
         log.debug("job-lease: fail_orphan_job(%s) failed", getattr(info, "job_id", "?"), exc_info=True)
+
+
+# --------------------------------------------------------------------------- #
+# Auto job-retention GC
+# --------------------------------------------------------------------------- #
+# Permanently delete terminal jobs older than settings["job_retention_days"]
+# -- DB row (+CASCADE job_results/job_logs) + MinIO/S3 objects + local cache --
+# so the jobs table (800k+ rows, job_results ~15 GB) + the bucket don't grow
+# unbounded. Opt-in (settings["job_retention_enabled"], default OFF) because it
+# is irreversible. SQL-selected + batched (list_deletable_job_ids) so it scales
+# where the manual O(N) /jobs/cleanup times out. A redis lock runs ONE hub per
+# tick (delete is idempotent, but this avoids 7x MinIO churn). Kill-switch env
+# PAPRIKA_JOB_RETENTION_DISABLE=1.
+_RETENTION_INTERVAL_S = float(
+    os.environ.get("PAPRIKA_JOB_RETENTION_INTERVAL_S", "3600") or 3600
+)
+_RETENTION_BATCH = int(os.environ.get("PAPRIKA_JOB_RETENTION_BATCH", "500") or 500)
+# Cap per tick so a huge first-run backlog drains GRADUALLY instead of one
+# multi-hour delete storm hammering MariaDB + MinIO.
+_RETENTION_MAX_PER_TICK = int(
+    os.environ.get("PAPRIKA_JOB_RETENTION_MAX_PER_TICK", "5000") or 5000
+)
+_RETENTION_STATUSES = ["completed", "failed", "cancelled", "review"]
+_RETENTION_LOCK_KEY = "paprika:retention:lock"
+
+_last_retention_run_at: datetime | None = None
+_last_retention_deleted = 0
+
+
+async def _job_retention_loop() -> None:
+    """Background auto-retention GC. Idempotent; wired only on non-admin hubs."""
+    if os.environ.get("PAPRIKA_JOB_RETENTION_DISABLE") == "1":
+        return
+    first = True
+    while True:
+        try:
+            await asyncio.sleep(300 if first else _RETENTION_INTERVAL_S)
+        except asyncio.CancelledError:
+            return
+        first = False
+        try:
+            await _run_job_retention_once()
+        except Exception:
+            log.debug("job-retention pass failed", exc_info=True)
+
+
+async def _run_job_retention_once() -> int:
+    """One retention pass. Returns #jobs deleted. Extracted for dry-run/test."""
+    global _last_retention_run_at, _last_retention_deleted
+    store = state.store
+    if store is None or not hasattr(store, "list_deletable_job_ids"):
+        return 0
+    # Settings gate (cross-hub shared; OFF by default).
+    if state.settings is None or not bool(
+        state.settings.get("job_retention_enabled", False)
+    ):
+        return 0
+    try:
+        days = int(state.settings.get("job_retention_days", 10) or 10)
+    except (TypeError, ValueError):
+        days = 10
+    if days <= 0:
+        return 0
+    # Elect ONE hub per tick. Delete is idempotent so a missing lock only costs
+    # duplicate work, never correctness -> best-effort; proceed if redis absent.
+    r = getattr(store, "_r", None)
+    if r is not None:
+        try:
+            got = await r.set(
+                _RETENTION_LOCK_KEY, config.hub_id or "1",
+                nx=True, ex=max(60, int(_RETENTION_INTERVAL_S * 0.9)),
+            )
+            if not got:
+                return 0
+        except Exception:
+            pass
+    from datetime import timedelta as _td
+    from server.hub import objstore
+    from server.hub._state import get_storage_dir
+    import shutil as _shutil
+
+    cutoff = datetime.utcnow() - _td(days=days)
+    deleted = 0
+    while deleted < _RETENTION_MAX_PER_TICK:
+        try:
+            ids = await store.list_deletable_job_ids(
+                cutoff, _RETENTION_STATUSES, _RETENTION_BATCH
+            )
+        except Exception:
+            log.debug("job-retention: candidate query failed", exc_info=True)
+            break
+        if not ids:
+            break
+        for jid in ids:
+            try:
+                if objstore.enabled():
+                    try:
+                        await objstore.delete_prefix(jid)
+                    except Exception:
+                        log.debug(
+                            "job-retention: MinIO purge %s failed", jid, exc_info=True
+                        )
+                await store.delete_job(jid)
+                try:
+                    d = get_storage_dir() / jid
+                    if d.exists():
+                        await asyncio.to_thread(_shutil.rmtree, d, True)
+                except Exception:
+                    pass
+                deleted += 1
+            except Exception:
+                log.debug("job-retention: delete %s failed", jid, exc_info=True)
+        # Yield between batches so we never monopolise the DB pool / loop.
+        try:
+            await asyncio.sleep(0.5)
+        except asyncio.CancelledError:
+            raise
+        if len(ids) < _RETENTION_BATCH:
+            break  # backlog drained for this window
+    _last_retention_run_at = datetime.utcnow()
+    _last_retention_deleted = deleted
+    if deleted:
+        log.info(
+            "job-retention: deleted %d jobs older than %d days (DB + MinIO + cache)",
+            deleted, days,
+        )
+    return deleted

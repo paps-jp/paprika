@@ -87,6 +87,10 @@ async function loadSettingsPanel() {
       document.getElementById('setConventionAutoExtract').checked = !!hub.convention_auto_extract_enabled;
       const _aeEl = document.getElementById('setAutoEscalate');
       if (_aeEl) _aeEl.checked = !!hub.auto_escalate_enabled;
+      const _jrEl = document.getElementById('setJobRetentionEnabled');
+      if (_jrEl) _jrEl.checked = !!hub.job_retention_enabled;
+      const _jrdEl = document.getElementById('setJobRetentionDays');
+      if (_jrdEl) _jrdEl.value = hub.job_retention_days ?? 10;
       document.getElementById('setSkillTopK').value               = hub.skill_retrieval_top_k ?? 3;
       document.getElementById('setMinAssetSize').value            = hub.min_asset_size_bytes ?? 0;
       // V: URL blacklist textarea
@@ -356,6 +360,8 @@ async function saveSettingsHub() {
     skill_auto_extract_enabled:      document.getElementById('setSkillAutoExtract').checked,
     convention_auto_extract_enabled: document.getElementById('setConventionAutoExtract').checked,
     auto_escalate_enabled:           document.getElementById('setAutoEscalate')?.checked ?? false,
+    job_retention_enabled:           document.getElementById('setJobRetentionEnabled')?.checked ?? false,
+    job_retention_days:              parseInt(document.getElementById('setJobRetentionDays')?.value, 10) || 10,
     skill_retrieval_top_k:           parseInt(document.getElementById('setSkillTopK').value, 10) || 3,
   };
   try {

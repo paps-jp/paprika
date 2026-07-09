@@ -761,6 +761,33 @@ class MariaDBJobStore:
         self._log_locks.pop(job_id, None)
         return deleted
 
+    async def list_deletable_job_ids(
+        self, cutoff, status_in: list[str], limit: int
+    ) -> list[str]:
+        """Oldest terminal-status jobs created before ``cutoff`` -- the GC
+        candidate batch for the auto-retention loop.
+
+        SQL-selected + LIMITed (uses idx_created_at) so it scales to 800k+
+        rows WITHOUT the O(N) full-table enumeration the manual /jobs/cleanup
+        does (that one loads every job + a per-job FS stat and times out at
+        this table size). Ascending by created_at so repeated calls drain the
+        backlog oldest-first. Terminal statuses only -- never running /
+        queued / downloading."""
+        if not status_in or int(limit) <= 0:
+            return []
+        placeholders = ",".join(["%s"] * len(status_in))
+        sql = (
+            f"SELECT job_id FROM jobs "
+            f"WHERE created_at < %s AND status IN ({placeholders}) "
+            f"ORDER BY created_at ASC LIMIT %s"
+        )
+        args = [cutoff, *status_in, int(limit)]
+        async with self._pool.acquire() as conn:
+            async with conn.cursor() as cur:
+                await cur.execute(sql, args)
+                rows = await cur.fetchall()
+        return [r[0] for r in rows]
+
     # ------------------------------------------------------------------ #
     # Job result
     # ------------------------------------------------------------------ #

@@ -47,6 +47,15 @@ _SCHEMA: dict[str, tuple[Any, str]] = {
     # knob is a CSV subset of {video_dl, auth_gate}; empty = both.
     "auto_escalate_enabled": (False, "bool"),
     "auto_escalate_categories": ("video_dl,auth_gate", "str"),
+    # Auto job-retention GC: when ON, a background loop permanently deletes
+    # terminal jobs (completed/failed/cancelled/review) older than
+    # job_retention_days -- their DB rows AND their MinIO/S3 objects AND local
+    # cache. OFF by default (opt-in: destructive + irreversible). Cross-hub, a
+    # redis lock runs ONE hub per tick; SQL-selected + batched so it scales to
+    # 800k+ rows. On first enable it drains the existing backlog gradually
+    # (capped per tick). See server/hub/_reaper.py:_job_retention_loop.
+    "job_retention_enabled": (False, "bool"),
+    "job_retention_days": (10, "int"),
     # When ON, the reasoning distiller translates a newly-learned, replayable
     # barrier strategy (kind=click/sequence) into a per-host fetch_recipe so
     # plain mode=fetch jobs replay it and get past the barrier (age gate /

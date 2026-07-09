@@ -78,38 +78,70 @@ async def _host_lan_ip_via_redis(redis_client) -> str | None:
     zero per-clone config -- just give the clone its own IP. Returns the dotted
     IPv4 (e.g. ``10.10.50.36``) or None.
     """
-    if redis_client is None:
-        return None
-    try:
-        import re
+    import re
 
-        info = await redis_client.execute_command("CLIENT", "INFO")
-        addr = None
-        if isinstance(info, dict):
-            addr = info.get("addr") or info.get(b"addr")
-        else:
-            if isinstance(info, (bytes, bytearray)):
-                info = info.decode(errors="replace")
-            m = re.search(r"(?:^|\s)addr=(\S+)", str(info))
-            addr = m.group(1) if m else None
-        if isinstance(addr, (bytes, bytearray)):
-            addr = addr.decode(errors="replace")
-        if not addr:
+    def _valid_lan_ip(cand) -> str | None:
+        """Dotted IPv4 host-LAN IP, or None for empty / malformed /
+        loopback / link-local / Docker-bridge (172.16/12) addresses."""
+        if isinstance(cand, (bytes, bytearray)):
+            cand = cand.decode(errors="replace")
+        if not cand:
             return None
-        ip = str(addr).rsplit(":", 1)[0].strip("[]")
+        ip = str(cand).rsplit(":", 1)[0].strip("[]")
         parts = ip.split(".")
         if len(parts) != 4:
             return None
-        o = [int(p) for p in parts]
-        # loopback / link-local / Docker-bridge (172.16/12) = NOT a host LAN IP
-        # (Redis co-located on this host) -> keep the import-time default.
+        try:
+            o = [int(p) for p in parts]
+        except ValueError:
+            return None
+        if not all(0 <= x <= 255 for x in o):
+            return None
         if o[0] == 127 or (o[0] == 169 and o[1] == 254) or (
             o[0] == 172 and 16 <= o[1] <= 31
         ):
             return None
         return ip
-    except Exception:
+
+    # 0) Explicit override -- deterministic and Redis-INDEPENDENT. Pin
+    #    PAPRIKA_HOST_IP=10.10.50.NN in a hub's .env so its identity never
+    #    depends on the flaky one-shot CLIENT INFO below. This is the escape
+    #    hatch for the orphan bug: a hub that fails derivation keeps its random
+    #    import-time hub_id, never publishes its ip, and is INVISIBLE to the
+    #    nginx reconciler for its whole lifetime (workers can never reach it).
+    env_ip = _valid_lan_ip(os.environ.get("PAPRIKA_HOST_IP"))
+    if env_ip:
+        return env_ip
+
+    if redis_client is None:
         return None
+    # 1) Retry CLIENT INFO. A SIMULTANEOUS multi-hub restart hammers the shared
+    #    Redis (or the MariaDB store's _r isn't ready yet at this point in
+    #    lifespan), so a single call races/times-out -> None -> the hub orphans
+    #    itself PERMANENTLY (derivation runs once at startup, never again).
+    #    Retrying a handful of times with backoff absorbs the blip so a hub
+    #    reliably picks up its real LAN IP even under a fleet-wide restart.
+    for _attempt in range(8):
+        try:
+            info = await redis_client.execute_command("CLIENT", "INFO")
+            addr = None
+            if isinstance(info, dict):
+                addr = info.get("addr") or info.get(b"addr")
+            else:
+                if isinstance(info, (bytes, bytearray)):
+                    info = info.decode(errors="replace")
+                m = re.search(r"(?:^|\s)addr=(\S+)", str(info))
+                addr = m.group(1) if m else None
+            ip = _valid_lan_ip(addr)
+            if ip:
+                return ip
+        except Exception:
+            pass
+        try:
+            await asyncio.sleep(0.5 + 0.5 * _attempt)
+        except Exception:
+            pass
+    return None
 
 
 # --- Store auto-heal: re-promote a Redis/in-memory fallback -> MariaDB --------
@@ -548,7 +580,7 @@ async def lifespan(app: FastAPI):
     reaper_task = retire_task = dead_worker_task = job_lease_task = None
     preview_sub_task = cache_evict_task = stale_reconcile_task = None
     redrive_task = salvage_task = storage_metrics_task = None
-    nightly_review_task = None
+    nightly_review_task = retention_task = None
     if not _ADMIN_MODE:
         reaper_task = asyncio.create_task(_session_reaper_loop())
         retire_task = asyncio.create_task(_skill_convention_reaper_loop())
@@ -584,6 +616,16 @@ async def lifespan(app: FastAPI):
         from server.hub._reaper import _downloading_reaper_loop
 
         downloading_reaper_task = asyncio.create_task(_downloading_reaper_loop())
+
+        # Auto job-retention GC (opt-in via settings.job_retention_enabled):
+        # permanently delete terminal jobs older than job_retention_days --
+        # DB row + MinIO/S3 objects + local cache -- so the jobs table +
+        # bucket don't grow unbounded. SQL-selected + batched (scales where
+        # the manual O(N) /jobs/cleanup times out); a redis lock runs ONE hub
+        # per tick. See _reaper.py:_job_retention_loop.
+        from server.hub._reaper import _job_retention_loop
+
+        retention_task = asyncio.create_task(_job_retention_loop())
 
         # Success Audit: periodically sample completed video-download jobs +
         # ask a VisionAI whether the saved video is actually the page's main
@@ -705,7 +747,8 @@ async def lifespan(app: FastAPI):
     for _t in (reaper_task, retire_task, dead_worker_task, job_lease_task,
                invalidate_task, preview_sub_task, cache_evict_task,
                stale_reconcile_task, redrive_task, salvage_task,
-               storage_metrics_task, nightly_review_task, repromote_task):
+               storage_metrics_task, nightly_review_task, repromote_task,
+               retention_task):
         if _t is not None:
             _t.cancel()
     # Stop hub heartbeat + drop the registry row so peers see us as
