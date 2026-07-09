@@ -36,8 +36,8 @@ _disc_hubs() {
     docker exec paprika-redis-1 redis-cli GET "$_k" 2>/dev/null | grep -oE '"ip"[[:space:]]*:[[:space:]]*"10\.10\.50\.[0-9]+"' | grep -oE '10\.10\.50\.[0-9]+'
   done
 }
-HUBS=($(printf '%s\n' 10.10.50.35 10.10.50.36 10.10.50.37 $(_disc_hubs) | grep -E '^10\.10\.50\.[0-9]+$' | grep -vx 10.10.50.34 | sort -u))
-[ "${#HUBS[@]}" -eq 0 ] && HUBS=(10.10.50.35 10.10.50.36 10.10.50.37)
+HUBS=($(printf '%s\n' 10.10.50.35 10.10.50.36 10.10.50.37 10.10.50.38 10.10.50.39 $(_disc_hubs) | grep -E '^10\.10\.50\.[0-9]+$' | grep -vx 10.10.50.34 | sort -u))
+[ "${#HUBS[@]}" -eq 0 ] && HUBS=(10.10.50.35 10.10.50.36 10.10.50.37 10.10.50.38 10.10.50.39)
 HUB_CONTAINER=hub-hub-a-1
 FRONT=http://127.0.0.1:8000
 SSHO=(-o BatchMode=yes -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o ConnectTimeout=10)

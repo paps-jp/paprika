@@ -63,10 +63,28 @@ def make_redis_client(url: str, *, decode_responses: bool = True):
     control-plane phase 4 (Redis HA). Lazy ``import redis.asyncio`` so the
     dependency is only required when a Redis backend is actually used.
     """
+    import os
     import redis.asyncio as redis
 
+    # Connection-resilience knobs (2026-07-09 incident). Without a health check,
+    # a pooled connection that silently dies -- a Redis restart, a NAT/firewall
+    # idle-drop, a transient network blip -- is never evicted: every later
+    # command reuses the dead socket and reads hang or return empty. That is how
+    # 5 of 7 hubs held a stale client for ~12h, their cross-hub fleet view
+    # collapsed to empty, and they fell out of nginx while salvage mass-restarted
+    # the fleet. ``health_check_interval`` PINGs idle connections and evicts dead
+    # ones; ``socket_keepalive`` lets the OS surface a half-open TCP link. Both
+    # are safe for pub/sub (redis-py health-checks the pubsub connection too).
+    try:
+        _hc = int(os.environ.get("PAPRIKA_REDIS_HEALTH_CHECK_INTERVAL") or 30)
+    except (TypeError, ValueError):
+        _hc = 30
+    _resilience = {"health_check_interval": _hc, "socket_keepalive": True}
+
     if not _is_sentinel_url(url):
-        return redis.from_url(url, decode_responses=decode_responses)
+        return redis.from_url(
+            url, decode_responses=decode_responses, **_resilience
+        )
 
     from urllib.parse import urlsplit, unquote
 
@@ -101,7 +119,7 @@ def make_redis_client(url: str, *, decode_responses: bool = True):
         _, _, pw = auth.partition(":")
         password = unquote(pw) if pw else None
 
-    conn_kwargs: dict = {"decode_responses": decode_responses, "db": db}
+    conn_kwargs: dict = {"decode_responses": decode_responses, "db": db, **_resilience}
     if password:
         conn_kwargs["password"] = password
     sentinel_kwargs: dict = {}

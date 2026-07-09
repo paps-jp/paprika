@@ -67,6 +67,12 @@ class HubRegistry:
             "version": version,
         }
         self._task: asyncio.Task | None = None
+        # Consecutive heartbeat-write failures. A sustained streak means this
+        # hub is silently de-registering (its TTL row expires -> nginx drops it
+        # from the upstream). Escalated to WARNING in _heartbeat_once so it can't
+        # hide the way it did on 2026-07-09 (a stale Redis client swallowed every
+        # SET for 12h behind a log.debug).
+        self._hb_fail_streak: int = 0
 
     # ----- runtime ---------------------------------------------------------
 
@@ -91,8 +97,37 @@ class HubRegistry:
                 ex=_HUB_TTL_SECONDS,
             )
             await self._r.zadd(_HUB_INDEX_KEY, {self.hub_id: time.time()})
+            if self._hb_fail_streak:
+                # Recovered after a run of failures -- surface the recovery too
+                # so the operator sees the de-registration window close.
+                log.warning(
+                    "hub heartbeat RECOVERED for %s after %d consecutive "
+                    "misses -- registration restored",
+                    self.hub_id, self._hb_fail_streak,
+                )
+                self._hb_fail_streak = 0
         except Exception as e:
-            log.debug("hub heartbeat write failed: %s", e)
+            self._hb_fail_streak += 1
+            streak = self._hb_fail_streak
+            # A single blip is noise (debug). A SUSTAINED failure means this hub
+            # is de-registering: its ~90s TTL row expires and nginx drops it from
+            # the upstream (the 2026-07-09 incident -- .35-.39 fell out while a
+            # stale Redis client swallowed every SET, hidden 12h at debug level).
+            # Escalate to WARNING once the misses exceed the TTL window, then
+            # periodically, so it can't hide again.
+            if streak * _HUB_HEARTBEAT_INTERVAL >= _HUB_TTL_SECONDS and (
+                streak == 3 or streak % 10 == 0
+            ):
+                log.warning(
+                    "hub heartbeat FAILING for %s: %d consecutive misses (~%ds) "
+                    "-- this hub is de-registering from the fleet/nginx; Redis "
+                    "client likely stale (a hub restart re-registers it). "
+                    "last err: %s",
+                    self.hub_id, streak, streak * _HUB_HEARTBEAT_INTERVAL, e,
+                )
+            else:
+                log.debug(
+                    "hub heartbeat write failed (streak=%d): %s", streak, e)
 
     async def _loop(self) -> None:
         # Run forever; cancelled on lifespan shutdown.

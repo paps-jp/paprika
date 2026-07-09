@@ -57,6 +57,13 @@ def _int(name: str, default: int) -> int:
         return default
 
 
+def _float(name: str, default: float) -> float:
+    try:
+        return float(os.environ.get(name) or default)
+    except (TypeError, ValueError):
+        return default
+
+
 def _salvage_armed() -> bool:
     """Salvage ON if the Settings toggle (salvage_enabled, shared cross-hub via
     settings) OR the env flag is set. Checked EVERY pass so the operator can
@@ -262,6 +269,12 @@ async def _salvage_one(wid: str, ip: str) -> str:
 # don't restart-loop a worker that keeps landing back on a stale-upstream hub.
 _SALVAGE_FAIL_GIVEUP = _int("PAPRIKA_SALVAGE_FAIL_GIVEUP", 3)
 
+# SAFETY (2026-07-09): skip a salvage pass when the cross-hub "alive" set has
+# collapsed to below this fraction of the ledger -- an almost-certain sign of a
+# stale/blipped Redis view rather than a real mass-ghost event. 0 disables the
+# ratio check (the empty-set guard in _salvage_pass always applies).
+_SALVAGE_MIN_ALIVE_RATIO = _float("PAPRIKA_SALVAGE_MIN_ALIVE_RATIO", 0.2)
+
 
 async def _resolve_pending(r, alive: set) -> None:
     """案D: confirm or fail previously-issued restarts. A restarted worker is
@@ -341,6 +354,33 @@ async def _salvage_pass() -> int:
     except Exception:
         log.warning("salvage: stats_async failed -- pass aborted", exc_info=True)
         return 0
+    # MariaDB ledger -- recently-seen workers (cross-hub, durable). Fetched
+    # BEFORE issuing/resolving anything so the collapse-guard below can compare
+    # the live alive-set against the ledger size.
+    try:
+        meta = await state.store.get_workers_meta()
+    except Exception:
+        log.warning("salvage: get_workers_meta failed -- pass aborted", exc_info=True)
+        return 0
+    # SAFETY (2026-07-09 incident): a COLLAPSED alive set is almost always a
+    # stale/blipped cross-hub Redis view, NOT a real mass-ghost. When .35-.39's
+    # hubs held a stale Redis client, stats_async read alive=0 while the ledger
+    # still held 167 workers -- so salvage SSH-restarted the ENTIRE fleet in a
+    # churn loop. The reconciler already skips its orphan pass on this exact
+    # signal; salvage lacked the guard. Skip when alive has collapsed to empty,
+    # or to a tiny fraction of the ledger (both = degraded view, not real mass
+    # death). Tunable via PAPRIKA_SALVAGE_MIN_ALIVE_RATIO (0 = empty-guard only).
+    if meta:
+        alive_ratio = len(alive) / max(1, len(meta))
+        if not alive or alive_ratio < _SALVAGE_MIN_ALIVE_RATIO:
+            log.warning(
+                "salvage: alive set collapsed (alive=%d ledger=%d ratio=%.2f) -- "
+                "likely a stale/blipped Redis view, NOT a real mass-ghost; "
+                "skipping pass (safety). If this hub's fleet view is genuinely "
+                "this small, restart it for a fresh Redis client.",
+                len(alive), len(meta), alive_ratio,
+            )
+            return 0
     # 案D: resolve restarts issued in earlier passes (confirm re-register = ok,
     # or count a re-ghost failure -> eventually give up) BEFORE issuing new ones.
     if r is not None:
@@ -348,12 +388,6 @@ async def _salvage_pass() -> int:
             await _resolve_pending(r, alive)
         except Exception:
             log.warning("salvage: resolve_pending failed", exc_info=True)
-    # MariaDB ledger -- recently-seen workers (cross-hub, durable).
-    try:
-        meta = await state.store.get_workers_meta()
-    except Exception:
-        log.warning("salvage: get_workers_meta failed -- pass aborted", exc_info=True)
-        return 0
     now = time.time()
     min_age = _int("PAPRIKA_SALVAGE_GHOST_MIN_AGE_S", 300)
     # 24h default (was 1h): a ghost whose VM is still alive (answers HTTP/SSH)
