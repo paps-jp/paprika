@@ -124,6 +124,14 @@ _DISK_CLEANUP_MIN_INTERVAL_S = float(
 )
 
 
+# Host CPU core count, sampled once at import (it doesn't change) and sent in
+# every heartbeat so the hub can normalise the host-level load1 into "load per
+# core" for I/O-aware dispatch. os.cpu_count() returns the SYSTEM total, which
+# for an LXC CT is the Proxmox node's core count (matching load1's host scope)
+# and for bare-metal is the box's own -- exactly the denominator we want in both.
+_NPROC = os.cpu_count() or 0
+
+
 def _sample_resources() -> tuple[float, float, float, float, float]:
     """Return (cpu_pct, mem_pct, disk_pct, disk_free_gb, load1) for this CT.
 
@@ -683,6 +691,7 @@ class _RunMixin:
                             disk_pct=disk_pct,
                             disk_free_gb=disk_free_gb,
                             load1=load1,
+                            nproc=_NPROC,
                         )
                     )
                     # A successful heartbeat == the hub link is alive.
@@ -747,13 +756,26 @@ class _RunMixin:
             return
         try:
             miss_threshold = int(
-                os.environ.get("PAPRIKA_WORKER_SELFCHECK_MISS_THRESHOLD") or 3
+                os.environ.get("PAPRIKA_WORKER_SELFCHECK_MISS_THRESHOLD") or 4
             )
         except (TypeError, ValueError):
-            miss_threshold = 3
+            miss_threshold = 4
         miss_threshold = max(2, miss_threshold)
+        # Sliding window of recent CONCLUSIVE probe outcomes (True == we were
+        # absent-or-not-alive in /workers). Fire when missing in >=
+        # miss_threshold of the last window_n probes. Replaces the old
+        # CONSECUTIVE streak, which a FLAPPING ghost defeated: its stale redis
+        # /workers row intermittently reappeared and reset the streak to 0 so it
+        # never reached the threshold. window_n >= miss_threshold so the
+        # threshold is reachable.
+        try:
+            window_n = int(os.environ.get("PAPRIKA_WORKER_SELFCHECK_WINDOW") or 6)
+        except (TypeError, ValueError):
+            window_n = 6
+        window_n = max(miss_threshold, window_n)
         url = f"{self.hub_http_url}/workers"
-        missing_streak = 0
+        recent: list[bool] = []
+        was_missing = False
         # Grace: skip the first probe so the freshly-connected WS has time to be
         # picked up across hubs via redis aggregation (~1-2s typically).
         await asyncio.sleep(interval + random.uniform(0.0, 10.0))
@@ -768,35 +790,47 @@ class _RunMixin:
                         continue
                     payload = r.json()
                     ws_list = payload.get("workers") or []
+                    # Require alive=True, not mere presence: a ghost lingers in
+                    # /workers as an alive=False row (stale cross-hub redis
+                    # aggregation). The old "present if worker_id appears at all"
+                    # check saw that ghost row as ourselves-present -> never
+                    # counted a miss -> never self-restarted. We must be LISTED
+                    # AND ALIVE to count as genuinely served.
                     me_present = any(
-                        (w.get("worker_id") == self.worker_id) for w in ws_list
+                        (w.get("worker_id") == self.worker_id) and bool(w.get("alive"))
+                        for w in ws_list
                     )
+                    recent.append(not me_present)   # True == a miss
+                    if len(recent) > window_n:
+                        recent.pop(0)
+                    misses = sum(1 for m in recent if m)
                     if me_present:
-                        if missing_streak:
+                        if was_missing and misses == 0:
                             _logger.info(
                                 f"[worker {self.worker_id}] self-check: back in "
-                                f"hub registry (streak was {missing_streak})"
+                                f"hub registry"
                             )
-                        missing_streak = 0
+                        was_missing = False
                     else:
-                        missing_streak += 1
+                        was_missing = True
                         _logger.warning(
-                            f"[worker {self.worker_id}] self-check: NOT in hub "
-                            f"/workers (streak={missing_streak}/{miss_threshold}) "
-                            f"-- WS believed alive but hub does not serve us"
+                            f"[worker {self.worker_id}] self-check: NOT alive in hub "
+                            f"/workers ({misses}/{len(recent)} recent probes missing, "
+                            f"fire at {miss_threshold}) -- WS believed alive but hub "
+                            f"does not serve us"
                         )
-                        if missing_streak >= miss_threshold:
-                            try:
-                                _logger.critical(
-                                    f"[worker {self.worker_id}] self-check: missing "
-                                    f"from hub for {missing_streak} consecutive "
-                                    f"checks (~{missing_streak * interval:.0f}s) -> "
-                                    f"exit({WORKER_EXIT_CODE_VERSION_MISMATCH}) for "
-                                    f"clean re-register"
-                                )
-                            except Exception:
-                                pass
-                            os._exit(WORKER_EXIT_CODE_VERSION_MISMATCH)
+                    if misses >= miss_threshold:
+                        try:
+                            _logger.critical(
+                                f"[worker {self.worker_id}] self-check: missing from "
+                                f"hub in {misses}/{len(recent)} recent probes "
+                                f"(~{window_n * interval:.0f}s window) -> "
+                                f"exit({WORKER_EXIT_CODE_VERSION_MISMATCH}) for clean "
+                                f"re-register"
+                            )
+                        except Exception:
+                            pass
+                        os._exit(WORKER_EXIT_CODE_VERSION_MISMATCH)
                 except asyncio.CancelledError:
                     raise
                 except Exception as e:
