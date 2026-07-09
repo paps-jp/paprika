@@ -27,7 +27,7 @@ Paprika が Playwright / Selenium と本質的に違うところは 5 つです�
 - **AI コード生成（`codegen-loop`）** — URL と自然言語の `goal` だけ渡せば、LLM がスクリプトを生成・実行・失敗時に再生成。成功したスクリプトは `mode: rerun` で次回から決定的に再利用。
 - **二度取りしない passive 回収** — ブラウザが実際に読み込んだレスポンスを CDP の `Network.responseReceived` で横取り。`<img>` URL から再 GET しないので、帯域半分、認証/Referer 必須の画像も、JS で差し込まれた lazy-load・`background-image`・iframe 内も全部拾える。
 - **収集に最適化** — `yt-dlp` + 通信トレース統合で動画も画像と同じ感覚で取得、スクロール・最小サイズ・遅延ロード対策が既定機能。管理画面・ライブ noVNC が標準付属。
-- **普段使い Chrome の環境ごと持ち込み** — `--load-extension` で既存拡張 (uBlock / Bitwarden 等) が動き、`use_profile` で User Data フォルダごとアップロードできるので、**ログイン済みの状態でいきなり収集**を始められます。
+- **普段使い Chrome の環境ごと持ち込み** — `--load-extension` で既存拡張 (uBlock / Bitwarden 等) が動き、`use_profile` で User Data フォルダごとアップロードできるので、認証が必要なサイトでも**自分の正規のログイン状態を引き継いだまま**収集を始められます。
 
 書き味は Playwright とほぼ同じ（`locator` / `get_by_*` / `fill` / `press` / `wait_for` …）。違うのは「Hub に接続している」点と、結果が「ジョブ」単位で積み上がる点だけです。
 
@@ -49,7 +49,7 @@ Paprika が Playwright / Selenium と本質的に違うところは 5 つです�
 | **API スタイル** | Playwright 風（同じ書き味） | Playwright | WebDriver |
 | **ジョブモデル** | **REST/SDK で投入 → 完了待ち → アセット回収** | 自分でプロセス管理 | 自分でプロセス管理 |
 | **JS 注入の範囲** | **拡張権限まで使える**（userScripts / declarativeNetRequest） | `addInitScript`（ページコンテキスト）のみ | `execute_script` のみ |
-| **検出回避** | **`nodriver`**（webdriver シグナルを抑える） | パッチが必要 | パッチが必要 |
+| **bot 判定対策** | **`nodriver`**（webdriver シグナルを抑え、正規アクセスを安定化） | パッチが必要 | パッチが必要 |
 
 > Playwright や Selenium が悪い、という話ではありません。**「複数台で長く回す収集ワークロード」** が用途のとき、その上に組むべき配管が **標準で揃っている** のが Paprika の立ち位置です。
 
@@ -60,7 +60,7 @@ Paprika が Playwright / Selenium と本質的に違うところは 5 つです�
 | 複数サイト × 複数ホストで数千〜数百万ページを収集 | **Paprika** |
 | 画像 / 動画 / リンクをまとめて回収（HLS/DASH 含む） | **Paprika** |
 | 未知サイトにとりあえず投げて AI に拾ってもらう | **Paprika** |
-| ログイン継続・年代/確認画面・ポップアップを乗り越える | **Paprika** |
+| 認証が必要なサイトを正規のログイン状態のまま巡回する | **Paprika** |
 | 何が起きているか目で見える運用にしたい | **Paprika** |
 | アプリの E2E テスト（CI で 1 台 / 短時間） | Playwright / Selenium |
 | 1 つのスクリプトを自前のジョブキューで十分に回せる | Playwright / Selenium |
