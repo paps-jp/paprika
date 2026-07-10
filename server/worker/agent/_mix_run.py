@@ -773,9 +773,28 @@ class _RunMixin:
         except (TypeError, ValueError):
             window_n = 6
         window_n = max(miss_threshold, window_n)
+        # A probe that ERRORS (ReadTimeout / connection refused) means "I could
+        # not even reach the hub to confirm I'm served" -- distinct from a 200
+        # that omits me (a genuine presence-miss). The original code counted
+        # ONLY presence-misses, never errors, to keep a network blip from
+        # becoming a fleet-wide exit storm -- but that left an OVERLOADED worker
+        # (event loop starved by a yt-dlp download pile-up, so its OWN probe
+        # times out) unable to EVER self-recover: it ghosted for hours (the
+        # 2026-07-10 overnight decline 105->78 with zero self-recovery). Count
+        # CONSECUTIVE probe errors on a SEPARATE, higher threshold: a brief blip
+        # still can't fire (reset on the next reply), but a sustained inability
+        # to probe self-heals via the same clean re-register exit.
+        try:
+            error_threshold = int(
+                os.environ.get("PAPRIKA_WORKER_SELFCHECK_ERROR_THRESHOLD") or 8
+            )
+        except (TypeError, ValueError):
+            error_threshold = 8
+        error_threshold = max(3, error_threshold)
         url = f"{self.hub_http_url}/workers"
         recent: list[bool] = []
         was_missing = False
+        probe_errors = 0  # consecutive probe failures; reset on any HTTP reply
         # Grace: skip the first probe so the freshly-connected WS has time to be
         # picked up across hubs via redis aggregation (~1-2s typically).
         await asyncio.sleep(interval + random.uniform(0.0, 10.0))
@@ -784,6 +803,7 @@ class _RunMixin:
                 try:
                     assert self._http is not None
                     r = await self._http.get(url, timeout=10.0)
+                    probe_errors = 0  # got an HTTP reply -> hub is reachable
                     if r.status_code != 200:
                         # transient nginx/hub blip -> do NOT count as a miss
                         await asyncio.sleep(interval)
@@ -834,12 +854,33 @@ class _RunMixin:
                 except asyncio.CancelledError:
                     raise
                 except Exception as e:
-                    # Transient HTTP errors do not count as a miss; that would
-                    # turn a network blip into a fleet-wide exit storm. Only a
-                    # successful 200 that omits our id counts.
+                    # A probe error means we could not confirm we're served. A
+                    # single blip must NOT exit (that would turn a hub/network
+                    # hiccup into a fleet-wide exit storm), so count CONSECUTIVE
+                    # errors and only self-restart once they persist past
+                    # error_threshold (~error_threshold*interval s) -- long
+                    # enough to distinguish a real outage from a blip, bounded
+                    # so an overloaded worker whose own probe keeps timing out
+                    # finally self-heals instead of ghosting forever. Any HTTP
+                    # reply (incl. non-200) resets the counter above.
+                    probe_errors += 1
+                    if probe_errors >= error_threshold:
+                        try:
+                            _logger.critical(
+                                f"[worker {self.worker_id}] self-check: probe "
+                                f"unreachable {probe_errors}x consecutively "
+                                f"(~{probe_errors * interval:.0f}s, last "
+                                f"{type(e).__name__}: {e}) -> "
+                                f"exit({WORKER_EXIT_CODE_VERSION_MISMATCH}) for "
+                                f"clean re-register"
+                            )
+                        except Exception:
+                            pass
+                        os._exit(WORKER_EXIT_CODE_VERSION_MISMATCH)
                     _logger.info(
                         f"[worker {self.worker_id}] self-check probe transient "
-                        f"error ({type(e).__name__}: {e}); will retry"
+                        f"error ({type(e).__name__}: {e}); "
+                        f"{probe_errors}/{error_threshold} before re-register"
                     )
                 await asyncio.sleep(interval + random.uniform(0.0, 5.0))
         except asyncio.CancelledError:
