@@ -136,6 +136,22 @@ def _parse_dl_progress(line: str) -> dict | None:
     return None
 
 
+_YTDLP_ETA_SECS_RE = _re.compile(r"ETA\s+(\d+):(\d{2})(?::(\d{2}))?")
+
+
+def _eta_line_to_s(line: str) -> float | None:
+    """Projected seconds-remaining from a yt-dlp ``... ETA MM:SS`` /
+    ``ETA HH:MM:SS`` progress line, or ``None`` when the line has no numeric
+    ETA. Feeds the slow-download early-abort gate in ``_ytdlp_log``."""
+    m = _YTDLP_ETA_SECS_RE.search(line)
+    if not m:
+        return None
+    a, b, c = m.group(1), m.group(2), m.group(3)
+    if c is not None:  # HH:MM:SS
+        return int(a) * 3600 + int(b) * 60 + int(c)
+    return int(a) * 60 + int(b)  # MM:SS
+
+
 def is_session_protected(session_id: str | None) -> bool:
     """Return True if the operator interacted with ``session_id`` via
     noVNC within the protection window. Used by all three stall gates
@@ -656,6 +672,25 @@ def _make_video_downloader(
             os.environ.get("PAPRIKA_YTDLP_FRAG_FAIL_GIVEUP", "40")
         )
 
+        # Slow-download early-abort gate (#3, 2026-07-10). yt-dlp's own
+        # smoothed ETA is the cleanest "this download will monopolise the
+        # lane + bandwidth for far too long" signal -- it catches the
+        # large-but-moderate-speed case a raw rate floor misses (a 2 GB file
+        # at 300 KiB/s reports ETA ~2 h yet never trips the 50 KiB/s min-rate
+        # gate). Overnight ~200 such downloads piled up (141 KiB/s / ETA 4 h),
+        # overloading the shared Proxmox nodes until workers heartbeat-starved
+        # into hub-side ghosts and the fleet drained 105->78. Abort once the
+        # projected ETA stays above the cap for a grace window (transient
+        # early over-estimates before the rate settles don't count). noVNC
+        # operator interaction defers the kill, same as the stall/min-rate
+        # gates. Env PAPRIKA_YTDLP_MAX_ETA_S (0 disables) / _MAX_ETA_GRACE_S.
+        _MAX_ETA_S = float(os.environ.get("PAPRIKA_YTDLP_MAX_ETA_S", "1500"))
+        _ETA_GRACE_S = float(
+            os.environ.get("PAPRIKA_YTDLP_MAX_ETA_GRACE_S", "45")
+        )
+        _slow_eta_since = [None]  # monotonic time ETA first crossed the cap
+        _eta_fired = [False]
+
         def _ytdlp_log(line: str) -> None:
             # Runs in asyncio.to_thread (a plain OS thread), so we
             # cannot call log()/_both() directly -- they use
@@ -689,6 +724,41 @@ def _make_video_downloader(
                         _loop.call_soon_threadsafe(_giveup_kill)
                     except RuntimeError:
                         pass
+            # Slow-download early-abort: projected ETA above the cap for a
+            # sustained window -> SIGTERM the yt-dlp/ffmpeg tree (config +
+            # rationale at the gate state above). "ETA" substring pre-check
+            # keeps this cheap on the non-progress log torrent.
+            if _MAX_ETA_S > 0 and not _eta_fired[0] and "ETA" in line:
+                _eta_s = _eta_line_to_s(line)
+                if _eta_s is not None:
+                    if _eta_s > _MAX_ETA_S:
+                        _now_e = time.monotonic()
+                        if _slow_eta_since[0] is None:
+                            _slow_eta_since[0] = _now_e
+                        elif _now_e - _slow_eta_since[0] > _ETA_GRACE_S:
+                            if is_session_protected(session_id):
+                                _slow_eta_since[0] = _now_e  # operator watching
+                            else:
+                                _eta_fired[0] = True
+                                _eta_min = _eta_s / 60.0
+
+                                def _slow_kill() -> None:
+                                    killed = _terminate_ytdlp_descendants()
+                                    _both(
+                                        f"  !! aborting slow video download: "
+                                        f"projected ETA {_eta_min:.0f} min > "
+                                        f"{_MAX_ETA_S / 60:.0f} min for "
+                                        f"{_ETA_GRACE_S:.0f}s "
+                                        f"(PAPRIKA_YTDLP_MAX_ETA_S) — SIGTERM'd "
+                                        f"{killed} descendant(s)"
+                                    )
+
+                                try:
+                                    _loop.call_soon_threadsafe(_slow_kill)
+                                except RuntimeError:
+                                    pass
+                    else:
+                        _slow_eta_since[0] = None  # ETA recovered below cap
             _logger.info(f"[{job_id_for_logs} yt-dlp] {line}")
             # ffmpeg/yt-dlp emit a torrent of low-level demuxer chatter
             # (per-frame progress, per-segment "Opening ..." / "[hls]
@@ -884,6 +954,8 @@ def _make_video_downloader(
                 # burn the abort so the 2nd/3rd attempt loses its gate.
                 _frag_fail[0] = 0
                 _giveup_fired[0] = False
+                _slow_eta_since[0] = None
+                _eta_fired[0] = False
                 wd_task = asyncio.create_task(_stall_watchdog())
                 try:
                     # is_protected is keyword-only; older core/fetcher.py
