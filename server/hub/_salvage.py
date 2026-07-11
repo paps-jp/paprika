@@ -276,6 +276,26 @@ _SALVAGE_FAIL_GIVEUP = _int("PAPRIKA_SALVAGE_FAIL_GIVEUP", 3)
 _SALVAGE_MIN_ALIVE_RATIO = _float("PAPRIKA_SALVAGE_MIN_ALIVE_RATIO", 0.2)
 
 
+def _alive_collapsed(alive_count: int, ledger_count: int, min_ratio: float) -> bool:
+    """True when the live cross-hub "alive" worker set has collapsed relative to
+    the durable ledger -- the 2026-07-09 signature of a stale/blipped Redis view
+    rather than a real mass-ghost. Salvage skips its pass on this so it never
+    SSH-restarts the whole fleet on a degraded view.
+
+    - Empty ledger  -> not collapsed (nothing to compare against; guard off).
+    - Empty alive with a non-empty ledger -> collapsed (the incident signature).
+    - Otherwise collapsed iff the alive fraction is below ``min_ratio``.
+
+    Pure so the guard is regression-testable without a live Redis/registry
+    (see tests/test_salvage_guard.py).
+    """
+    if ledger_count <= 0:
+        return False
+    if alive_count <= 0:
+        return True
+    return (alive_count / ledger_count) < min_ratio
+
+
 async def _resolve_pending(r, alive: set) -> None:
     """案D: confirm or fail previously-issued restarts. A restarted worker is
     only RECOVERED once it re-registers (back in the alive set) -- only THEN do
@@ -370,17 +390,15 @@ async def _salvage_pass() -> int:
     # signal; salvage lacked the guard. Skip when alive has collapsed to empty,
     # or to a tiny fraction of the ledger (both = degraded view, not real mass
     # death). Tunable via PAPRIKA_SALVAGE_MIN_ALIVE_RATIO (0 = empty-guard only).
-    if meta:
-        alive_ratio = len(alive) / max(1, len(meta))
-        if not alive or alive_ratio < _SALVAGE_MIN_ALIVE_RATIO:
-            log.warning(
-                "salvage: alive set collapsed (alive=%d ledger=%d ratio=%.2f) -- "
-                "likely a stale/blipped Redis view, NOT a real mass-ghost; "
-                "skipping pass (safety). If this hub's fleet view is genuinely "
-                "this small, restart it for a fresh Redis client.",
-                len(alive), len(meta), alive_ratio,
-            )
-            return 0
+    if _alive_collapsed(len(alive), len(meta), _SALVAGE_MIN_ALIVE_RATIO):
+        log.warning(
+            "salvage: alive set collapsed (alive=%d ledger=%d ratio=%.2f) -- "
+            "likely a stale/blipped Redis view, NOT a real mass-ghost; "
+            "skipping pass (safety). If this hub's fleet view is genuinely "
+            "this small, restart it for a fresh Redis client.",
+            len(alive), len(meta), len(alive) / max(1, len(meta)),
+        )
+        return 0
     # 案D: resolve restarts issued in earlier passes (confirm re-register = ok,
     # or count a re-ghost failure -> eventually give up) BEFORE issuing new ones.
     if r is not None:

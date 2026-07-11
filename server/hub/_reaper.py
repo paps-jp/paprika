@@ -1156,6 +1156,14 @@ _RETENTION_MAX_PER_TICK = int(
     os.environ.get("PAPRIKA_JOB_RETENTION_MAX_PER_TICK", "5000") or 5000
 )
 _RETENTION_STATUSES = ["completed", "failed", "cancelled", "review"]
+# Per-job MinIO purge timeout. A hung delete (slow / unreachable object tier)
+# must never STALL the whole pass on one job -- past this it skips that object
+# purge (logged) and moves on; the DB row is still deleted and a rare skipped
+# prefix is reclaimable by a later pass. Defense-in-depth added 2026-07-11 while
+# hardening auto-retention against a silent stall.
+_RETENTION_MINIO_TIMEOUT_S = float(
+    os.environ.get("PAPRIKA_JOB_RETENTION_MINIO_TIMEOUT_S", "30") or 30
+)
 _RETENTION_LOCK_KEY = "paprika:retention:lock"
 
 _last_retention_run_at: datetime | None = None
@@ -1176,7 +1184,9 @@ async def _job_retention_loop() -> None:
         try:
             await _run_job_retention_once()
         except Exception:
-            log.debug("job-retention pass failed", exc_info=True)
+            # WARNING (not debug): a silent pass failure is exactly what made a
+            # non-draining retention loop invisible for hours (2026-07-11).
+            log.warning("job-retention pass failed", exc_info=True)
 
 
 async def _run_job_retention_once() -> int:
@@ -1222,7 +1232,7 @@ async def _run_job_retention_once() -> int:
                 cutoff, _RETENTION_STATUSES, _RETENTION_BATCH
             )
         except Exception:
-            log.debug("job-retention: candidate query failed", exc_info=True)
+            log.warning("job-retention: candidate query failed", exc_info=True)
             break
         if not ids:
             break
@@ -1230,8 +1240,12 @@ async def _run_job_retention_once() -> int:
             try:
                 if objstore.enabled():
                     try:
-                        await objstore.delete_prefix(jid)
+                        await asyncio.wait_for(
+                            objstore.delete_prefix(jid),
+                            timeout=_RETENTION_MINIO_TIMEOUT_S,
+                        )
                     except Exception:
+                        # Includes TimeoutError: a hung tier can't stall the pass.
                         log.debug(
                             "job-retention: MinIO purge %s failed", jid, exc_info=True
                         )
