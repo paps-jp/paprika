@@ -62,6 +62,23 @@ try:
     _DOWNLOAD_CAP = max(1, int(os.environ.get("PAPRIKA_WORKER_DOWNLOAD_CAP") or 6))
 except (TypeError, ValueError):
     _DOWNLOAD_CAP = 6
+
+
+def _download_cap() -> int:
+    """Live per-worker download cap: the cross-hub Setting ``worker_download_cap``
+    (admin Settings tab -- raise it to lift the dispatch ceiling when the fleet
+    is download-bound, no restart) first, else the env/static default. Lazy
+    ``state`` import avoids a scheduler<->_state import cycle; the module is
+    fully loaded by the time pick_worker calls this per dispatch."""
+    try:
+        from server.hub._state import state
+        if state.settings is not None:
+            v = state.settings.get("worker_download_cap", None)
+            if isinstance(v, (int, float)) and v:
+                return max(1, int(v))
+    except Exception:
+        pass
+    return _DOWNLOAD_CAP
 # I/O-aware dispatch (Phase 1, 2026-07-09). ``load1`` is a PHYSICAL-HOST signal:
 # an LXC CT shares its Proxmox node's getloadavg, and a bare-metal worker reports
 # its own box -- so ``io_sat = load1 / nproc`` (host load per core) lets pick_worker
@@ -1082,6 +1099,8 @@ class WorkerRegistry:
             ):
                 _w.status = "active"
                 _w.drain_until = 0.0
+        # Live per-worker download cap (Setting worker_download_cap, else env).
+        _dl_cap = _download_cap()
         candidates = [
             w
             for w in self.alive_workers()
@@ -1094,9 +1113,9 @@ class WorkerRegistry:
             and not w.awaiting_announce
             and _load(w) < w.capabilities.max_concurrent
             # Off-lane download backpressure: skip a worker already holding
-            # _DOWNLOAD_CAP downloading jobs (their Chrome lanes are free, but
-            # yt-dlp is eating its CPU/net/disk) so we don't pile more on.
-            and len(w.downloading_jobs) < _DOWNLOAD_CAP
+            # worker_download_cap downloading jobs (their Chrome lanes are free,
+            # but yt-dlp is eating its CPU/net/disk) so we don't pile more on.
+            and len(w.downloading_jobs) < _dl_cap
             and (
                 len(w.capabilities.lane_novnc_urls or []) > 0
                 or bool(w.capabilities.novnc_url)

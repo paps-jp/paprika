@@ -194,6 +194,13 @@ _SCHEMA: dict[str, tuple[Any, str]] = {
     #   fetches alongside downloads since they released their lane and are
     #   mostly network-bound. 0 = downloads don't count (pileup risk).
     "fetch_downloading_weight": (1.0, "float"),
+    # worker_download_cap: max concurrent off-lane video downloads (yt-dlp) a
+    # single worker holds before pick_worker skips it. Its Chrome lane is free,
+    # but each download burns CPU/net/disk, so this caps the per-worker pileup.
+    # When the fleet is download-bound (idle lanes but dispatch stalled because
+    # download-heavy workers are skipped), raising this -- with I/O headroom --
+    # lifts the dispatch ceiling. env PAPRIKA_WORKER_DOWNLOAD_CAP; default 6.
+    "worker_download_cap": (6, "int"),
     # ---- Codegen web_search tool (SearXNG-backed) ------------------------
     # When ``searxng_url`` is non-empty AND the Coder's engine has
     # supports_tools=True, the hub attaches a ``web_search`` OpenAI tool
@@ -411,6 +418,7 @@ def _env_default(key: str, fallback: Any) -> Any:
         # Capacity recommendation knobs: settings.json -> env vars -> default.
         "fetch_load_factor": ("PAPRIKA_FETCH_LOAD_FACTOR", "float"),
         "fetch_downloading_weight": ("PAPRIKA_FETCH_DOWNLOADING_WEIGHT", "float"),
+        "worker_download_cap": ("PAPRIKA_WORKER_DOWNLOAD_CAP", "int"),
         "fetch_load_ref":    ("PAPRIKA_FETCH_LOAD_REF",    "float"),
         "fetch_mem_ref":     ("PAPRIKA_FETCH_MEM_REF",     "float"),
         # Reasoning judge: settings.json -> env vars -> static default.
