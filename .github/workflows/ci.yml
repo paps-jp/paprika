@@ -33,9 +33,13 @@ jobs:
 
       - uses: actions/setup-python@v5
         with:
-          python-version: '3.12'
+          # Match the production images (docker/{hub,worker}/Dockerfile use
+          # python:3.13-slim). Testing on 3.12 while prod runs 3.13 let
+          # version-specific breakage slip through.
+          python-version: '3.13'
           cache: pip
           cache-dependency-path: |
+            requirements.lock
             requirements.txt
             client/python/pyproject.toml
 
@@ -43,10 +47,10 @@ jobs:
         run: |
           python -m pip install --upgrade pip
           pip install ruff pytest pytest-asyncio
-          # Hub deps so py_compile + import-time checks pass. Some of
-          # these (arq, redis) only matter at runtime; install them
-          # anyway to keep CI deterministic.
-          pip install -r requirements.txt
+          # Hub deps so py_compile + import-time checks pass. Install the
+          # pinned lock (same set the images build from) so CI exercises the
+          # exact versions that ship to prod.
+          pip install -r requirements.lock
           # Editable install of the client SDK so tests can ``import
           # paprika_client``.
           pip install -e client/python

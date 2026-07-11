@@ -25,8 +25,10 @@ RUN set -eux \
  && apt-get remove -y curl \
  && rm -rf /var/lib/apt/lists/*
 
-COPY requirements.txt /app/requirements.txt
-RUN pip install --no-cache-dir -r /app/requirements.txt
+# Install the pinned lock (reproducible), not the loose requirements.txt.
+# requirements.txt is carried too, as the human-editable intent record.
+COPY requirements.txt requirements.lock /app/
+RUN pip install --no-cache-dir -r /app/requirements.lock
 
 # Source
 COPY core /app/core

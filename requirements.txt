@@ -1,3 +1,6 @@
+# Dependency *intent* (loose ranges). The images do NOT install this file --
+# they install requirements.lock (exact pins). Edit a range here, rebuild,
+# re-freeze into requirements.lock, then commit both. See requirements.lock.
 nodriver>=0.38
 yt-dlp>=2024.1.0
 curl_cffi>=0.10,<0.15

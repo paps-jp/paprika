@@ -23,15 +23,16 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
  && rm -rf /var/lib/apt/lists/*
 
 WORKDIR /app
-COPY requirements.txt /app/requirements.txt
-RUN pip install --no-cache-dir -r /app/requirements.txt
+# Install the pinned lock (reproducible), not the loose requirements.txt.
+COPY requirements.txt requirements.lock /app/
+RUN pip install --no-cache-dir -r /app/requirements.lock
 # Worker-only: opencv (headless build, no GUI deps) for nodriver's
 # verify_cf() -- template-matches the Cloudflare Turnstile checkbox
 # in a screenshot so we can click it by coordinate (the checkbox
 # lives in a cross-origin iframe / shadow DOM and can't be reached
 # via the DOM). Hub / runner images don't need it, so it's not in
-# the shared requirements.txt.
-RUN pip install --no-cache-dir opencv-python-headless
+# the shared lock. Pinned (with its numpy) to match the known-good fleet.
+RUN pip install --no-cache-dir opencv-python-headless==4.13.0.92 numpy==2.4.6
 
 # Patch yt-dlp extractors that crash on missing keys.
 # xhamster: KeyError('title') when window.initials JSON lacks the field.
