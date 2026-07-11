@@ -2043,6 +2043,14 @@ async def _persist_dl_progress_payload(job_id: str, payload: dict) -> None:
             "job %s: running → downloading (yt-dlp progress at %.1f%%)",
             job_id, float(info.progress.download_pct or 0),
         )
+        # Release the Chrome lane from the scheduler's lane budget here too:
+        # download progress can arrive before/without the explicit
+        # WorkerJobProgress(phase="downloading"). Idempotent with that handler.
+        try:
+            if state.registry is not None and info.worker_id:
+                state.registry.mark_downloading(info.worker_id, job_id)
+        except Exception:
+            pass
 
     # downloading → completed 遷移:
     # WorkerJobComplete で `downloading` に振られたジョブ、 もしくは上の遷移で
@@ -2285,6 +2293,7 @@ async def _handle_worker_message(worker, msg) -> None:
             disk_pct=msg.disk_pct,
             disk_free_gb=msg.disk_free_gb,
             load1=msg.load1,
+            nproc=msg.nproc,
         )
         # Keep the MariaDB ledger's last_seen_at fresh on heartbeat (NOT just on
         # register) so salvage's age-window can tell a just-ghosted worker from a
@@ -2421,6 +2430,18 @@ async def _handle_worker_message(worker, msg) -> None:
             info.progress.assets_saved = msg.assets_saved
             info.progress.assets_failed = msg.assets_failed
             await state.store.save_job_info(info)
+        # Lane-release signal: the worker defers the video download, releases
+        # its Chrome lane, then sends phase="downloading" (_mix_jobexec.py).
+        # Move the job out of the scheduler's Chrome-lane budget so pick_worker
+        # can dispatch onto the freed lane instead of stranding it until the
+        # >180s redrive reaper kills the queued jobs (fix 2026-07-09). Only the
+        # deferred fetch path (lane released) sends this; session/operator
+        # downloads keep the lane and are not fetch jobs, so untouched.
+        if msg.phase == "downloading" and state.registry is not None:
+            try:
+                state.registry.mark_downloading(worker.worker_id, msg.job_id)
+            except Exception:
+                pass
         return
 
     if isinstance(msg, WorkerJobLog):

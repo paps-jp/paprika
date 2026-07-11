@@ -52,6 +52,39 @@ try:
     )
 except (TypeError, ValueError):
     _NO_FREE_LANE_MAX_STRIKES = 3
+# A worker whose Chrome lanes are free (a video download released them, running
+# off-lane via yt-dlp) can still be resource-strained by many concurrent
+# downloads. pick_worker no longer counts downloading jobs against the Chrome-
+# lane budget (they moved to ``downloading_jobs``), but it DOES skip a worker
+# holding at least this many of them, so an off-lane download pile-up still
+# throttles new dispatch onto that box. Env override for ops tuning.
+try:
+    _DOWNLOAD_CAP = max(1, int(os.environ.get("PAPRIKA_WORKER_DOWNLOAD_CAP") or 6))
+except (TypeError, ValueError):
+    _DOWNLOAD_CAP = 6
+# I/O-aware dispatch (Phase 1, 2026-07-09). ``load1`` is a PHYSICAL-HOST signal:
+# an LXC CT shares its Proxmox node's getloadavg, and a bare-metal worker reports
+# its own box -- so ``io_sat = load1 / nproc`` (host load per core) lets pick_worker
+# steer off an I/O-saturated physical host UNIFORMLY across both topologies, with
+# no physical-topology model needed. Sibling of the existing ``disk_pct > 90`` gate,
+# but for host load instead of CT disk fullness.
+#   _IO_SAT_SOFT       = start applying the soft rank penalty above this load-per-core
+#   _IO_SAT_CEIL       = two-tier hard gate: prefer hosts under this; fall back to
+#                        saturated ones only when no under-ceil worker has a free lane
+#   _IO_PENALTY_WEIGHT = how hard the soft penalty biases vs the integer lane load
+# Set PAPRIKA_IO_AWARE_DISPATCH_DISABLE=1 to restore the pure lane-count pick.
+def _io_env_float(name: str, default: float) -> float:
+    try:
+        return float(os.environ.get(name) or default)
+    except (TypeError, ValueError):
+        return default
+_IO_SAT_SOFT = _io_env_float("PAPRIKA_IO_SAT_SOFT", 1.5)
+_IO_SAT_CEIL = _io_env_float("PAPRIKA_IO_SAT_CEIL", 4.0)
+_IO_PENALTY_WEIGHT = _io_env_float("PAPRIKA_IO_PENALTY_WEIGHT", 1.0)
+_IO_DISPATCH_DISABLED = (
+    (os.environ.get("PAPRIKA_IO_AWARE_DISPATCH_DISABLE") or "").strip().lower()
+    in ("1", "true", "yes", "on")
+)
 # How long stats_async() may reuse the last GOOD cross-hub (redis) worker
 # aggregation when a fresh fetch times out, instead of collapsing the list to
 # this hub's local connections only. Bridges transient redis stalls so the
@@ -223,6 +256,11 @@ class ConnectedWorker:
     disk_pct: float = 0.0
     disk_free_gb: float = 0.0
     load1: float = 0.0
+    # Host CPU core count (os.cpu_count), heartbeat-reported. Lets the hub
+    # normalise the host-level load1 into "load per core" (io_sat) for I/O-aware
+    # dispatch -- essential for a fleet mixing Proxmox nodes and bare-metal boxes
+    # of differing core counts. 0 = pre-2026-07-09 build (treated as healthy).
+    nproc: int = 0
     send_lock: asyncio.Lock = field(default_factory=asyncio.Lock)
     # Operator-controlled status set from the admin UI:
     #   active   = normal -- receives new jobs (default)
@@ -283,6 +321,18 @@ class ConnectedWorker:
     # undo a reservation.
     pending_assigns: set[str] = field(default_factory=set)
     committed_jobs: set[str] = field(default_factory=set)
+    # Jobs this worker ACCEPTED that have entered the "downloading" phase: the
+    # video is being fetched in a DETACHED task (yt-dlp) and the Chrome LANE HAS
+    # BEEN RELEASED (see _spawn_deferred_video_download). Moved here OUT of
+    # ``committed_jobs`` on the worker's WorkerJobProgress(phase="downloading")
+    # -- its lane-release signal -- so pick_worker's ``_load`` stops counting
+    # them against the Chrome-lane budget. Counting downloads as lane-occupancy
+    # stranded free lanes on download-busy workers, so ``pick_worker`` returned
+    # None while lanes sat idle and the >180s redrive reaper killed the queued
+    # jobs (incident 2026-07-09: recurring 40-50% failure spikes). Still bounded
+    # per-worker by ``_DOWNLOAD_CAP`` (off-lane downloads eat CPU/net/disk).
+    # Discarded by :meth:`release` on complete/failed.
+    downloading_jobs: set[str] = field(default_factory=set)
     # Monotonic deadline (``time.monotonic()`` epoch) for an auto-clearing
     # ``status="drain"``. The "no free lane in pool" recovery (Case C,
     # 2026-06-15) sets status="drain" + drain_until = now + 900s when a
@@ -782,6 +832,7 @@ class WorkerRegistry:
         disk_pct: float = 0.0,
         disk_free_gb: float = 0.0,
         load1: float = 0.0,
+        nproc: int = 0,
     ) -> None:
         worker = self.connections.get(worker_id)
         if worker is None:
@@ -793,6 +844,10 @@ class WorkerRegistry:
         worker.disk_pct = disk_pct
         worker.disk_free_gb = disk_free_gb
         worker.load1 = load1
+        # nproc is static; a heartbeat may omit it (default 0) -- keep the last
+        # known non-zero value so io_sat stays computable across such beats.
+        if nproc:
+            worker.nproc = nproc
         # Lane-freed auto-recovery (operator ask 2026-07-08): a worker that was
         # auto-drained for "no free lane in pool" (Case C sets drain_until > 0)
         # returns to "active" the instant its own heartbeat proves a lane is
@@ -997,6 +1052,23 @@ class WorkerRegistry:
         def _load(w: ConnectedWorker) -> int:
             return len(w.pending_assigns) + max(w.in_flight, len(w.committed_jobs))
 
+        # I/O-aware dispatch (Phase 1): io_sat = load1 / nproc = the worker's
+        # PHYSICAL-HOST load per core. For an LXC CT that's the Proxmox node's
+        # load (shared getloadavg); for bare-metal it's the box itself -- so the
+        # same number steers dispatch off an I/O-saturated host uniformly, no
+        # topology model. 0 (old worker / no signal) reads as healthy so a rolling
+        # deploy is non-disruptive; the whole thing is off if the env kill-switch
+        # is set. The soft penalty (in _key) biases ranking; the hard ceiling (a
+        # two-tier gate below) keeps jobs off severely-slammed hosts unless the
+        # fleet is otherwise full.
+        def _io_sat(w: ConnectedWorker) -> float:
+            return (w.load1 / w.nproc) if (w.nproc and w.load1) else 0.0
+
+        def _io_penalty(w: ConnectedWorker) -> float:
+            if _IO_DISPATCH_DISABLED:
+                return 0.0
+            return _IO_PENALTY_WEIGHT * max(0.0, _io_sat(w) - _IO_SAT_SOFT)
+
         # Lazy auto-clear of the "no-free-lane" auto-drain: any worker whose
         # ``drain_until`` deadline has passed flips back to "active" the
         # instant pick_worker scans it. Operator-set drains keep
@@ -1021,6 +1093,10 @@ class WorkerRegistry:
             # WS handshake).
             and not w.awaiting_announce
             and _load(w) < w.capabilities.max_concurrent
+            # Off-lane download backpressure: skip a worker already holding
+            # _DOWNLOAD_CAP downloading jobs (their Chrome lanes are free, but
+            # yt-dlp is eating its CPU/net/disk) so we don't pile more on.
+            and len(w.downloading_jobs) < _DOWNLOAD_CAP
             and (
                 len(w.capabilities.lane_novnc_urls or []) > 0
                 or bool(w.capabilities.novnc_url)
@@ -1036,9 +1112,22 @@ class WorkerRegistry:
         if not candidates:
             return None
 
-        # Rank key: smaller effective load first, then larger capacity.
+        # Two-tier host-I/O gate: prefer workers whose PHYSICAL host is under the
+        # saturation ceiling; fall back to the saturated ones ONLY if no healthy
+        # worker has a free lane (never drop a job for I/O). This is what keeps
+        # dispatch off the "free Chrome lane but host load ~300" boxes while they
+        # thrash, without stranding work when the whole fleet is hot.
+        if not _IO_DISPATCH_DISABLED:
+            _healthy = [w for w in candidates if _io_sat(w) < _IO_SAT_CEIL]
+            if _healthy:
+                candidates = _healthy
+
+        # Rank key: smaller EFFECTIVE load first, then larger capacity. Effective
+        # load = lane load + host-I/O soft penalty, so a free lane on an I/O-hot
+        # host ranks below a free lane on a cool one (below the soft threshold the
+        # penalty is 0, so a healthy fleet ranks exactly as it did pre-change).
         def _key(w: ConnectedWorker) -> tuple:
-            return (_load(w), -w.capabilities.max_concurrent)
+            return (_load(w) + _io_penalty(w), -w.capabilities.max_concurrent)
 
         best = min(_key(w) for w in candidates)
         tied = [w for w in candidates if _key(w) == best]
@@ -1113,6 +1202,10 @@ class WorkerRegistry:
                     "disk_pct": w.disk_pct,
                     "disk_free_gb": w.disk_free_gb,
                     "load1": w.load1,
+                    "nproc": w.nproc,
+                    # Host load per core (io_sat) -- the I/O-aware dispatch signal.
+                    # None when nproc unknown (old worker) so the UI shows "—".
+                    "io_sat": round(w.load1 / w.nproc, 2) if w.nproc else None,
                     # Which hub owns this worker's control WS. A live
                     # connection in THIS process is owned by THIS hub, so the
                     # admin can show which hub each worker is connected to.
@@ -1307,6 +1400,7 @@ class WorkerRegistry:
                 "disk_pct": float(data.get("disk_pct") or 0.0),
                 "disk_free_gb": float(data.get("disk_free_gb") or 0.0),
                 "load1": float(data.get("load1") or 0.0),
+                "nproc": int(data.get("nproc") or 0),
             })
         return out
 
@@ -1453,17 +1547,34 @@ class WorkerRegistry:
             return False
         return True
 
+    def mark_downloading(self, worker_id: str, job_id: str) -> None:
+        """The job's Chrome lane has been released -- its video is now
+        downloading OFF-LANE (yt-dlp in a detached task). Move it out of the
+        Chrome-lane budget (``committed_jobs``) into ``downloading_jobs`` so
+        pick_worker stops treating the worker as lane-full while the download
+        runs, letting the freed lane take new fetches. Idempotent; keyed on the
+        worker's WorkerJobProgress(phase="downloading") lane-release signal.
+        release() clears both sets on complete/failed."""
+        worker = self.connections.get(worker_id)
+        if worker is None:
+            return
+        worker.committed_jobs.discard(job_id)
+        worker.downloading_jobs.add(job_id)
+
     def release(self, worker_id: str, job_id: str) -> None:
         """A job is no longer running on the worker (WorkerJobComplete /
         WorkerJobFailed / post-assign guard reclaiming a stranded assign).
-        Discards from BOTH ``pending_assigns`` (the never-acked case) and
-        ``committed_jobs`` (the normal acked-and-ran case) so the scheduler
-        sees the slot free. Also legacy-decrements the heartbeat-driven
-        ``in_flight`` for display continuity; the next heartbeat reconciles."""
+        Discards from ``pending_assigns`` (the never-acked case),
+        ``committed_jobs`` (the normal acked-and-ran case) AND
+        ``downloading_jobs`` (the off-lane video-download case) so the
+        scheduler sees the slot free. Also legacy-decrements the heartbeat-
+        driven ``in_flight`` for display continuity; the next heartbeat
+        reconciles."""
         worker = self.connections.get(worker_id)
         if worker:
             if worker.in_flight > 0:
                 worker.in_flight -= 1
             worker.pending_assigns.discard(job_id)
             worker.committed_jobs.discard(job_id)
+            worker.downloading_jobs.discard(job_id)
         self.assignments.get(worker_id, set()).discard(job_id)

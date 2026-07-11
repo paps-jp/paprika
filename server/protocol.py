@@ -557,6 +557,10 @@ class WorkerHeartbeat(BaseModel):
     disk_pct: float = 0.0
     disk_free_gb: float = 0.0
     load1: float = 0.0
+    # Host CPU core count (os.cpu_count). Lets the hub normalise the host-level
+    # load1 into "load per core" for I/O-aware dispatch across a fleet mixing
+    # Proxmox nodes and bare-metal boxes of different sizes. 0 = older worker.
+    nproc: int = 0
 
 
 class WorkerJobAccepted(BaseModel):
