@@ -382,6 +382,36 @@ async function saveSettingsHub() {
   flashSavedHint();
 }
 
+// Retention lives in its own settings-card (separate from 学習動作), so it needs
+// its own save button/handler -- previously the checkbox was only persisted by
+// the 学習動作を保存 button in the OTHER card, so checking it here and reloading
+// looked like it "reverted" (nothing in this card saved it). PUTs only the two
+// retention keys so it doesn't quietly re-save unrelated 学習動作 fields.
+async function saveSettingsRetention() {
+  const errEl = document.getElementById('setRetentionErr');
+  if (errEl) errEl.textContent = '';
+  const body = {
+    job_retention_enabled: document.getElementById('setJobRetentionEnabled')?.checked ?? false,
+    job_retention_days:    parseInt(document.getElementById('setJobRetentionDays')?.value, 10) || 10,
+  };
+  try {
+    const r = await fetch(SETTINGS_URL, {
+      method: 'PUT',
+      headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify(body),
+    });
+    if (!r.ok) {
+      const t = await r.text();
+      if (errEl) errEl.textContent = 'save failed (' + r.status + '): ' + t.slice(0, 200);
+      return;
+    }
+  } catch (e) {
+    if (errEl) errEl.textContent = 'save failed: ' + (e.message || e);
+    return;
+  }
+  flashSavedHint();
+}
+
 async function saveSettingsAssetCapture() {
   const errEl = document.getElementById('setAssetErr');
   if (errEl) errEl.textContent = '';
@@ -847,6 +877,7 @@ async function mdbRefreshTableCounts() {
   const saveUi = document.getElementById('setSaveUiBtn');
   const resetUi = document.getElementById('setResetUiBtn');
   const saveHub = document.getElementById('setSaveHubBtn');
+  const saveRetention = document.getElementById('setSaveRetentionBtn');
   const saveAsset = document.getElementById('setSaveAssetBtn');
   const saveProxy = document.getElementById('setSaveProxyBtn');
   const saveFetch = document.getElementById('setSaveFetchBtn');
@@ -854,6 +885,7 @@ async function mdbRefreshTableCounts() {
   if (saveUi) saveUi.addEventListener('click', saveSettingsUi);
   if (resetUi) resetUi.addEventListener('click', resetSettingsUi);
   if (saveHub) saveHub.addEventListener('click', saveSettingsHub);
+  if (saveRetention) saveRetention.addEventListener('click', saveSettingsRetention);
   if (saveAsset) saveAsset.addEventListener('click', saveSettingsAssetCapture);
   if (saveProxy) saveProxy.addEventListener('click', saveSettingsProxyPool);
   if (saveFetch) saveFetch.addEventListener('click', saveSettingsFetchDefaults);
