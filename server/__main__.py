@@ -163,8 +163,41 @@ def _build_parser() -> argparse.ArgumentParser:
     return parser
 
 
+def _purge_stale_part_files(base: Path) -> int:
+    """Delete leftover ``*.part*`` download partials under ``base`` at startup.
+    An interrupted yt-dlp video download leaves a big ``.mp4.part`` (hundreds of
+    MB); across restarts these pile up and fill the disk -- a hub's /data/jobs
+    filling with .part is what killed its Redis client and took the whole fleet
+    down (2026-07-12 incident). Safe on a CLEAN start: no job runs yet, so every
+    .part is from a dead prior run. Best-effort; never fatal. Returns #deleted."""
+    n = 0
+    freed = 0
+    try:
+        for f in base.rglob("*.part*"):
+            try:
+                if f.is_file():
+                    freed += f.stat().st_size
+                    f.unlink()
+                    n += 1
+            except OSError:
+                pass
+    except Exception:
+        pass
+    if n:
+        log.info(
+            "startup: purged %d stale .part file(s) (%.0f MB reclaimed) under %s",
+            n, freed / 1e6, base,
+        )
+    return n
+
+
 def _run_hub_only(args) -> int:
     import uvicorn
+
+    # Reboot-safety: clear interrupted video-download partials from the durable
+    # cache before serving. Left unbounded they filled the disk on 2026-07-12
+    # and broke the hub's Redis client -> fleet-wide outage.
+    _purge_stale_part_files(args.data_dir)
 
     from server.hub import app as hub_app_module
 
@@ -248,6 +281,35 @@ def _run_worker(args) -> int:
         dns_fix.apply()
     except Exception as e:
         log.warning("dns_fix: init failed (continuing): %s", e)
+
+    # Reboot-safety: wipe leftover per-job tempdirs from a prior run. Each holds
+    # an interrupted yt-dlp ``.mp4.part`` (hundreds of MB) under a
+    # ``paprika-<job>-*`` mkdtemp; across crashes/restarts these pile up and
+    # fill the CT disk (cf. the hub-side .part fill that took the fleet down
+    # 2026-07-12). On a clean start no job is running, so every such tempdir is
+    # abandoned -> safe to remove wholesale. Best-effort; never fatal.
+    try:
+        import tempfile as _tf
+        import shutil as _sh
+        _wiped = 0
+        for _d in Path(_tf.gettempdir()).glob("paprika-*"):
+            # ONLY per-job workdirs (mkdtemp prefix "paprika-<job_id>-"). Do NOT
+            # touch the live prefetched infra that also lives under /tmp:
+            # paprika-profile-cache (~80 MB), paprika-profile-* lane clones,
+            # paprika-extensions -- wiping those just forces a needless re-fetch
+            # on every restart. A hex job_id can't collide with these prefixes.
+            if _d.name.startswith(("paprika-profile", "paprika-extensions")):
+                continue
+            if _d.is_dir():
+                _sh.rmtree(_d, ignore_errors=True)
+                _wiped += 1
+        if _wiped:
+            log.info(
+                "startup: wiped %d abandoned per-job tempdir(s) (interrupted "
+                "downloads/.part) under %s", _wiped, _tf.gettempdir(),
+            )
+    except Exception as e:
+        log.warning("startup tempdir purge failed (continuing): %s", e)
 
     from server.worker.agent import WorkerAgent, default_worker_id
 
