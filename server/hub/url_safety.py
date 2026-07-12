@@ -28,4 +28,19 @@ def assert_public_url(url: str) -> None:
         raise HTTPException(status_code=400, detail=reason)
 
 
-__all__ = ["validate_public_url", "assert_public_url"]
+async def assert_public_url_async(url: str) -> None:
+    """Async variant: run the SSRF check in a worker thread so its BLOCKING
+    ``socket.getaddrinfo`` (validate_public_url -> ssrf_guard.resolve_all's OS
+    fallback) can never stall the asyncio event loop. A single job submit with
+    a dead/slow-DNS host (e.g. a crawl target that stopped resolving) otherwise
+    froze getaddrinfo for ~40s ON the loop, hanging EVERY other request on that
+    hub -- /workers/capacity, /health, worker-WS keepalives (2026-07-12
+    incident, root-caused via py-spy: create_job -> getaddrinfo on MainThread).
+    Async route handlers must ``await assert_public_url_async(url)`` instead of
+    calling the sync form directly."""
+    import asyncio
+
+    await asyncio.to_thread(assert_public_url, url)
+
+
+__all__ = ["validate_public_url", "assert_public_url", "assert_public_url_async"]

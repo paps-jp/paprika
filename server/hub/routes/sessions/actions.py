@@ -101,8 +101,8 @@ async def session_navigate(session_id: str, body: dict) -> dict:
     # ..., JS redirects, fetch('http://10.0.0.5/')) which don't go
     # through this endpoint -- the worker iptables egress firewall is
     # the defense for those.
-    from server.hub.url_safety import assert_public_url
-    assert_public_url(url)
+    from server.hub.url_safety import assert_public_url_async
+    await assert_public_url_async(url)  # off-loop: getaddrinfo mustn't stall the loop
     action = _route_to_page({"kind": "navigate", "url": url}, body)
     return await _send_session_action(session_id, action, timeout=60.0)
 

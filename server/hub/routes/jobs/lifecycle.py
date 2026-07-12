@@ -1211,8 +1211,8 @@ async def create_job(req: JobRequest, request: Request) -> JobInfo:
     # script could just put http://10.0.0.5/ in page.goto() anyway,
     # so the URL check is just operator courtesy. The deeper defense
     # is the worker-side iptables egress firewall.
-    from server.hub.url_safety import assert_public_url
-    assert_public_url(req.url)
+    from server.hub.url_safety import assert_public_url_async
+    await assert_public_url_async(req.url)  # off-loop: getaddrinfo mustn't stall the loop
     assert state.store is not None and state.registry is not None
 
     # Same-URL dedup (operator policy 2026-06-06): if the EXACT same URL is

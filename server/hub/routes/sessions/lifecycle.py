@@ -144,8 +144,8 @@ async def create_session(body: dict, request: Request = None) -> dict:
     # page.goto() calls aren't validated here -- the deeper defense
     # is the worker's iptables egress firewall.
     if initial_url:
-        from server.hub.url_safety import assert_public_url
-        assert_public_url(initial_url)
+        from server.hub.url_safety import assert_public_url_async
+        await assert_public_url_async(initial_url)  # off-loop: getaddrinfo mustn't stall the loop
 
     if pin_worker:
         worker = state.registry.connections.get(pin_worker)
