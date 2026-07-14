@@ -223,7 +223,11 @@ async def _list_candidates() -> list[dict]:
     """Return recent codegen-loop jobs across BOTH outcomes -- ``completed``
     (catch false positives) AND ``failed`` / ``review`` (catch false
     negatives). Whether to audit a particular job is decided downstream
-    (cheap fs check for "has any assets at all")."""
+    (cheap fs check for "has any assets at all").
+
+    Returns a FLAT list; the per-status split (fair sampling) happens in
+    run_one_pass() so that a system dominated by completed doesn't drown
+    out failed/review, and vice versa."""
     from server.hub._state import state
     if state.store is None:
         return []
@@ -260,6 +264,40 @@ async def _list_candidates() -> list[dict]:
                 "reported_status": st,
             })
     return out
+
+
+def _fair_sample(cands: list[dict], take_total: int) -> list[dict]:
+    """Split a candidate pool into per-status buckets and sample fairly
+    across them so a numerous status (usually ``completed``) doesn't
+    drown out the sparse ones (``review``, ``failed``).
+
+    Distribution rule: equal quota per non-empty bucket; if a bucket has
+    fewer than its quota, redistribute the remainder to buckets that
+    still have candidates. This guarantees we exercise every direction
+    of the 4-quadrant matrix when candidates exist for it."""
+    from collections import defaultdict
+    buckets: dict[str, list[dict]] = defaultdict(list)
+    for c in cands:
+        buckets[c.get("reported_status") or "unknown"].append(c)
+    non_empty = [b for b in buckets.values() if b]
+    if not non_empty:
+        return []
+    per_bucket = max(1, take_total // len(non_empty))
+    picked: list[dict] = []
+    leftovers: list[list[dict]] = []
+    for b in non_empty:
+        n = min(per_bucket, len(b))
+        picked.extend(random.sample(b, n))
+        if len(b) > n:
+            leftovers.append([x for x in b if x not in picked[-n:]])
+    # Fill the remainder from richer buckets
+    remaining = take_total - len(picked)
+    if remaining > 0 and leftovers:
+        flat = [x for lo in leftovers for x in lo]
+        extra = min(remaining, len(flat))
+        if extra > 0:
+            picked.extend(random.sample(flat, extra))
+    return picked
 
 
 def _summarize_assets(job_id: str) -> tuple[dict, Path | None]:
@@ -567,7 +605,11 @@ async def run_one_pass() -> dict:
     pct = _sample_pct()
     max_n = _max_per_run()
     take = max(1, min(max_n, int(round(len(cands) * pct))))
-    sample = random.sample(cands, min(take, len(cands)))
+    # Fair sampling across (completed / failed / review) buckets so the
+    # numerous status doesn't crowd out the sparse ones. Falls back to
+    # plain random.sample if the fair sampler returns empty (shouldn't
+    # happen but be defensive).
+    sample = _fair_sample(cands, take) or random.sample(cands, min(take, len(cands)))
     audited = 0
     counts = {
         VERDICT_TRUE_OK: 0, VERDICT_FALSE_POSITIVE: 0,

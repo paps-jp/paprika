@@ -298,13 +298,22 @@ def _objective_pregate(
     of cases from judge oversight):
 
       * video-intent goal + ≥1 video asset → True
-      * video-intent goal + 0 video assets → False
+      * video-intent goal + 0 video assets → None (defer to LLM judge)
+
+    NOTE (2026-07-14): the "0 videos → False" gate was removed. success
+    audit revealed that 54% of failed/review verdicts were actually
+    successes (false negatives) -- most commonly because the DL had not
+    yet flushed when this gate fired, or the goal was ambiguous ("save
+    the page" with videos-as-decoration). Defer to LLM judge so it can
+    look at cover/screenshot/HTML and rule on ambiguous cases.
     """
     if _is_video_intent(goal):
         n = _count_video_assets(assets_dir)
         if n >= 1:
             return True, f"objective: {n} video file(s) saved"
-        return False, "objective: video-intent goal but 0 video files in assets"
+        # 0 videos is NO LONGER an objective failure -- fall through to
+        # LLM judge which can see the final screenshot and decide.
+        return None, ""
     return None, ""
 
 
@@ -999,6 +1008,20 @@ async def run_iterative_codegen(
                 f"completion_tok={usage.get('completion_tokens', '?')} "
                 f"latency={llm_ms}ms code_bytes={len(code)}"
             )
+            # TRUNCATION WARNING: OpenAI/vLLM returns finish_reason="length"
+            # when max_tokens was hit; the tail of the code is silently cut,
+            # usually producing SyntaxError at runtime. Post-2026-07-14
+            # max_tokens is 5000 (down from 15000), so a "length" finish now
+            # signals a genuinely large script that needs more budget rather
+            # than a runaway prompt. Log it prominently so the operator can
+            # investigate patterns in the ai_io_log dashboard.
+            if finish == "length":
+                _log(
+                    f"  ⚠️  LLM output TRUNCATED (finish=length, "
+                    f"completion_tok={usage.get('completion_tokens', '?')}). "
+                    f"Code likely has SyntaxError at tail. Consider raising "
+                    f"max_tokens if pattern persists for this host / goal."
+                )
             # Surface web_search calls the model made (if any). Showing
             # the queries in the live log is important for transparency:
             # the operator can see what external context the model

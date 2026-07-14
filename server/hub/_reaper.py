@@ -670,13 +670,19 @@ async def _reconcile_stale_jobs() -> tuple[int, int]:
 _RETIRE_INTERVAL_S = 3600
 # Need at least this many injections before a low success_rate is trusted
 # as a real "dud" verdict (small samples are noise).
-_RETIRE_MIN_USE = 5
+# Lowered 5 -> 3 on 2026-07-14: the middle-tier of never-won skills
+# (use=3..9 succ=0) was accumulating and injecting noise; tighter dud
+# threshold catches them earlier.
+_RETIRE_MIN_USE = 3
 # Higher water mark: a skill repeatedly injected this many times with
 # success_count == 0 is a "high-use never-won" dud and is retired even
 # under the cold-start guard (otherwise an early-stuck-at-0 system can
 # never escape the dud loop -- exactly what happened with
 # age-gate-media-extraction at use=45 / succ=0).
-_RETIRE_HIGH_USE_DUD = 20
+# Lowered 20 -> 10 on 2026-07-14: 10 uses is already enough signal to
+# call a skill dead, and the top-5 winners routinely hit 30-70 uses so
+# we won't false-positive them.
+_RETIRE_HIGH_USE_DUD = 10
 # success_rate at/below this (with >= _RETIRE_MIN_USE uses) = repeatedly
 # rode along yet rarely correlated with success.
 _RETIRE_MAX_RATE = 0.15
