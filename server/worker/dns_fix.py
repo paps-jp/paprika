@@ -30,7 +30,7 @@ graceful self-update — no direct worker-container modification (CLAUDE.md).
 Controlled by env ``PAPRIKA_WORKER_DNS``:
   * unset / empty -> default ``["1.1.1.1", "8.8.8.8"]``
   * ``"off"`` / ``"0"`` / ``"false"`` -> disabled (no-op)
-  * ``"1.1.1.1,8.8.8.8,10.10.50.1"`` -> use exactly those (e.g. append the
+  * ``"1.1.1.1,8.8.8.8,192.168.50.1"`` -> use exactly those (e.g. append the
     gateway last if some deployment DOES need LAN-name resolution)
 """
 from __future__ import annotations

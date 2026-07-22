@@ -3,18 +3,18 @@ r"""URL blacklist matcher — shared by worker session capture and fetch mode.
 Supports four pattern syntaxes (chosen at compile time per line):
 
 * **Plain substring** — no special chars. Case-insensitive ``in`` test.
-  Example: ``media-hls.saawsedge.com``   → blocks any URL containing it.
+  Example: ``media-hls.example-cdn.com``   → blocks any URL containing it.
 
 * **Glob with ``*`` / ``?``** — any pattern containing ``*`` or ``?`` is
   compiled via :mod:`fnmatch` against the full URL. ``*`` matches any
   run of chars (including ``/``), ``?`` matches one char.
-  Example: ``https://media-hls.saawsedge.com*`` → blocks any URL with
+  Example: ``https://media-hls.example-cdn.com*`` → blocks any URL with
   that prefix.
   Example: ``*/ads/*.js`` → blocks ad scripts anywhere.
 
 * **Regex (``/.../``)** — wrap with forward slashes. Compiled with
   ``re.IGNORECASE``. Use when glob isn't expressive enough.
-  Example: ``/saawsedge\.com/(media|preview)/.*\.ts/``
+  Example: ``/example-cdn\.com/(media|preview)/.*\.ts/``
 
 * **Anchored prefix / suffix** — ``^`` (URL must start) / ``$`` (URL
   must end). May combine with glob. Just sugar over building the
@@ -162,7 +162,7 @@ def compile_blacklist(patterns: Iterable[str] | None) -> BlacklistMatcher:
 # manifest URL flow through to yt-dlp candidate collection EVEN WHEN the
 # operator's blacklist matched it via a general host/path pattern.
 #
-# Why: a rule like ``https://*.saawsedge.com*`` (added to suppress noisy
+# Why: a rule like ``https://*.example-cdn.com*`` (added to suppress noisy
 # .ts / .mp4 segments + preview thumbs from polluting the gallery) also
 # matched the main video's ``.m3u8`` manifest -- which silently dropped it
 # from ``video_urls_seen`` / ``on_stream_detected``, so yt-dlp never saw the
@@ -195,6 +195,6 @@ def pattern_targets_manifests(pattern: str) -> bool:
     The check is intentionally textual on the pattern source (NOT a match
     against compiled regex) so a glob like ``*/trailer*.m3u8`` is detected
     independently of how the matcher decomposes it. A host-only pattern
-    like ``*.saawsedge.com*`` returns False even though it would match
+    like ``*.example-cdn.com*`` returns False even though it would match
     manifest URLs at runtime."""
     return bool(_MANIFEST_PATTERN_RE.search(pattern or ""))

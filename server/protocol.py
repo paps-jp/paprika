@@ -981,7 +981,7 @@ class HubAssignJob(BaseModel):
         "stamped onto the job so a Settings edit mid-fleet "
         "takes effect on the next job. Match is plain "
         "case-insensitive substring (e.g. "
-        "'media-hls.saawsedge.com').",
+        "'media-hls.example-cdn.com').",
     )
 
 

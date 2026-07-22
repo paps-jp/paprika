@@ -13,7 +13,7 @@ The point of this sample is the pair:
 Run:
 
     pip install -e ./client/python
-    export PAPRIKA_HUB=http://10.10.50.34:8000        # or pass --hub
+    export PAPRIKA_HUB=http://192.168.50.34:8000        # or pass --hub
     python client/python/examples/capacity_fetch.py https://example.com https://en.wikipedia.org/wiki/Cat
     # no URLs given -> a small built-in demo list
 

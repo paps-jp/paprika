@@ -321,7 +321,7 @@ async def install_session_asset_capture(
             # URL re-appears across navigations.
             #
             # Manifest passthrough (2026-06-14): a general host/path rule
-            # like ``*.saawsedge.com*`` (intended for .ts segment noise)
+            # like ``*.example-cdn.com*`` (intended for .ts segment noise)
             # would otherwise silently drop the main video's .m3u8
             # manifest -- on_stream_detected never fires + yt-dlp never
             # downloads (job 63f9bf436c2f post-mortem). Manifest URLs
@@ -528,8 +528,8 @@ async def install_session_asset_capture(
 
     # Same-origin iframe XHR / fetch hook + poller. CDP's Network
     # domain on the parent target SHOULD surface same-origin iframe
-    # requests, but in practice (observed on 7mmtv.sx → play.php iframe
-    # hosting hls.js → streamsuperpro.com m3u8) the iframe's hls.js
+    # requests, but in practice (observed on a play.php iframe
+    # hosting hls.js → third-party CDN m3u8) the iframe's hls.js
     # XHRs don't appear in Network.responseReceived events for reasons
     # that look like a Chromium quirk. Inject a fetch/XHR monkey-patch
     # via Page.addScriptToEvaluateOnNewDocument and poll the result
@@ -606,10 +606,10 @@ async def install_session_asset_capture(
                 # separate capture surface from CDP Network — it has its
                 # own bucket and its own poller, so the on_response gate
                 # above misses these. Apply the same matcher here so a
-                # `https://*.saawsedge.com*` rule blocks both the CDP-
+                # `https://*.example-cdn.com*` rule blocks both the CDP-
                 # observed playlist and the iframe-captured one. Pre-
                 # blacklist log was leaking via this exact path
-                # (job 9dc8d38174e4 / edge-hls.saawsedge.com).
+                # (job 9dc8d38174e4 / edge-hls.example-cdn.com).
                 #
                 # Manifest passthrough (2026-06-14): same rationale as
                 # the on_response gate above. A general host pattern

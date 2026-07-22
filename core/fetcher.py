@@ -874,7 +874,7 @@ def run_ytdlp(
     # ------------------------------------------------------------------
     # Stall / slow-download early-kill knobs.
     # ------------------------------------------------------------------
-    # Observed on 10.10.50.143 / .152: yt-dlp dribbling a 34 MB mp4 at
+    # Observed on 192.168.50.143 / .152: yt-dlp dribbling a 34 MB mp4 at
     # 20 KiB/s -> ETA 24 minutes, asyncio thread pool stuck the whole
     # time, worker heartbeat blocked, hub TTL'd the worker. The plain
     # ``timeout`` (1 hour) doesn't trip because yt-dlp KEEPS emitting
@@ -2453,7 +2453,7 @@ async def fetch(opts: FetchOptions) -> FetchResult:
             # leak the URL into operator view, so silent skip is correct.
             #
             # Manifest passthrough (2026-06-14): a GENERAL pattern like
-            # ``*.saawsedge.com*`` (intended for .ts/.mp4 segment noise)
+            # ``*.example-cdn.com*`` (intended for .ts/.mp4 segment noise)
             # would otherwise silently drop the main video's .m3u8
             # manifest -- yt-dlp then fell back to iframe-generic ad URLs
             # and produced no video (job 63f9bf436c2f post-mortem).
@@ -2696,7 +2696,7 @@ async def fetch(opts: FetchOptions) -> FetchResult:
             # iframe + nested-iframe deep network trace. ON whenever we
             # are capturing assets (assets_dir is not None, guaranteed
             # here) so cross-origin iframe resources -- thumbnail images,
-            # preview screenshots from DMM litevideo, etc. -- surface via
+            # preview screenshots from embedded video widgets, etc. -- surface via
             # on_response just like main-frame assets.
             # Previously gated on download_video=True only; broadened so
             # plain asset-capture fetches also see sub-frame network events.
@@ -2714,7 +2714,7 @@ async def fetch(opts: FetchOptions) -> FetchResult:
                 )
             # Same-origin iframe fetch/XHR hook -- complements the CDP
             # deep-trace above for cross-origin iframes.  Some sites
-            # (e.g. 7mmtv.sx → play.php iframe with hls.js) hide their
+            # (a play.php iframe loading hls.js, for example) hide their
             # HLS manifest fetch inside a same-origin iframe whose XHR
             # doesn't surface in Network.responseReceived. The hook
             # captures every fetch/XHR URL into a global bucket which
@@ -2781,7 +2781,7 @@ async def fetch(opts: FetchOptions) -> FetchResult:
                         # Blacklist gate (Y bugfix): the JS fetch/XHR
                         # hook is a separate capture surface that
                         # bypasses the CDP on_response gate. Without
-                        # this check, `https://*.saawsedge.com*` etc.
+                        # this check, `https://*.example-cdn.com*` etc.
                         # are still leaked into network_log + video_urls_seen
                         # via this poller (job 9dc8d38174e4 post-mortem).
                         # Manifest passthrough (2026-06-14): see the
@@ -3211,8 +3211,8 @@ async def fetch(opts: FetchOptions) -> FetchResult:
                     return
                 # asset_url_blacklist ALSO gates yt-dlp dispatch (job
                 # 3d9a58e6ffa0 incident 2026-06-23): a live stripchat ad
-                # widget HLS (``media-hls.saawsedge.com/...``) is blocked
-                # from CDP asset capture by the existing ``*.saawsedge.com*``
+                # widget HLS (``media-hls.example-cdn.com/...``) is blocked
+                # from CDP asset capture by the existing ``*.example-cdn.com*``
                 # rule -- but the same URL still got picked up as a video
                 # target and dispatched to yt-dlp, which then recorded the
                 # live stream forever (fragment counter monotonically

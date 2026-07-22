@@ -80,7 +80,7 @@ def classify_ip(ip: "ipaddress._BaseAddress | str") -> str:
 # OS resolver via ``socket.getaddrinfo`` tries ``/etc/resolv.conf`` nameservers
 # SEQUENTIALLY -- if the first nameserver is slow or returns an empty answer,
 # the OS waits a full timeout (default 5s) before falling to the next. With
-# upstream public DNS flapping (observed 40% failures on javmix.tv at
+# upstream public DNS flapping (observed 40% failures on one target host at
 # 1.1.1.1 even with no docker-DNS hop), that puts the SSRF guard's
 # ``resolve_all`` into 5-40s stalls and the codegen-loop sandbox sees a
 # "host does not resolve" 400 anyway.

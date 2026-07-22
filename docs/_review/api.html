@@ -712,7 +712,7 @@ data  = page.evaluate("fetch('/api').then(r=>r.json())", await_promise=True)</co
       <h3><code>page.download_video(url=None, *, referer=None, timeout_s=1800)</code> <span class="pw-ret">&rarr; dict</span></h3>
       <p>yt-dlp / httpx で動画を取得・保存します。<code>url</code> 省略時は検出済みストリームを使います。</p>
       <div class="pw-label">Usage</div>
-      <pre><code>await page.download_video(referer="https://supjav.com/")</code></pre>
+      <pre><code>await page.download_video(referer="https://example.com/")</code></pre>
       <div class="pw-label">Arguments</div>
       <ul class="pw-args">
         <li><code class="arg">url</code> <span class="pw-type">str</span> <span class="pw-opt">(optional, None)</span> &mdash; 省略で検出済みストリーム</li>
@@ -850,7 +850,7 @@ cur = await page.get_state("cursor")</code></pre>
       <code>installed_extensions</code> / <code>download_status</code>）だけは <code>list</code> を直接返します。
     </div>
     <div class="ex-async"><pre><code># CDN が iframe URL を Referer に取って弾くプレーヤーを救う（HLS の 403 対策）
-await page.set_referer("https://supjav.com/")
+await page.set_referer("https://example.com/")
 
 # リダイレクト連鎖で開く popup を素通しさせる
 await page.allow_popups()
@@ -864,7 +864,7 @@ await page.block_hosts(["ads.example.net", "track.example.com"])
 # 型付きラッパーの無い機能は汎用 ext() で（例: 画像読み込みをブロック）
 reply = await page.ext("setContentSetting", {"type": "images", "setting": "block"})
 print(reply["result"])</code></pre></div>
-    <div class="ex-sync"><pre><code>page.set_referer("https://supjav.com/")
+    <div class="ex-sync"><pre><code>page.set_referer("https://example.com/")
 page.allow_popups()
 page.zoom(0.5)
 page.block_hosts(["ads.example.net"])
@@ -905,7 +905,7 @@ await page.zoom(1.0)   # 等倍に戻す</code></pre>
       <h3><code>page.set_referer(value, *, url_filter="*")</code> <span class="pw-ret">&rarr; dict</span></h3>
       <p>マッチする URL に <code>Referer</code> リクエストヘッダを強制します。CDN/HLS が iframe の URL を Referer に取って 403 を返すプレーヤーの救済に使います。</p>
       <div class="pw-label">Usage</div>
-      <pre><code>await page.set_referer("https://supjav.com/")</code></pre>
+      <pre><code>await page.set_referer("https://example.com/")</code></pre>
       <div class="pw-label">Arguments</div>
       <ul class="pw-args">
         <li><code class="arg">value</code> <span class="pw-type">str</span> &mdash; 設定する Referer の値</li>

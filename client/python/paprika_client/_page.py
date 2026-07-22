@@ -609,8 +609,8 @@ class Page:
         Implemented on the worker via CDP
         ``Emulation.setPageScaleFactor`` -- it scales the actual paint
         output, so unlike CSS ``zoom`` it ALSO magnifies full-viewport
-        (100vw/100vh) cross-origin iframe players (e.g. supjav's
-        supremejav embed). Reset to normal with ``zoom(1.0)``.
+        (100vw/100vh) cross-origin iframe players. Reset to normal
+        with ``zoom(1.0)``.
 
         Allowed even while a fetch owns the session (it's a viewing aid,
         not a navigation/write action).

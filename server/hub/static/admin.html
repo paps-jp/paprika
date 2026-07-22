@@ -902,7 +902,7 @@ asyncio.run(main())"
       </label>
       <label style="display:flex; gap:8px; align-items:center; font-size:.88em; margin-bottom:8px;">
         <span data-i18n="oprec.worker">ワーカー (空 = 自動、要 v0.4.0):</span>
-        <input type="text" id="opRecWorkerIp" placeholder="例: 10.10.50.147"
+        <input type="text" id="opRecWorkerIp" placeholder="例: 192.168.50.147"
                style="width:200px; padding:4px 8px;">
         <small style="color:#888;" data-i18n="oprec.worker.hint">未指定だと最も古い Chrome v0.3.1 拡張のワーカーに当たることがあります</small>
       </label>
@@ -3246,18 +3246,18 @@ table.aitbl code { font-size:0.95em; }
       <label for="setAssetUrlBlacklist" style="align-self:start; padding-top:6px;">URL ブラックリスト:</label>
       <div>
         <textarea id="setAssetUrlBlacklist" rows="6"
-          placeholder="例:&#10;media-hls.saawsedge.com           # 部分一致&#10;https://media-hls.saawsedge.com*  # ワイルドカード (前方一致)&#10;*/ads/*.js                        # glob (どこにあっても)&#10;^https://tracker.                 # ^ で先頭固定&#10;/saawsedge\.com/(media|preview)/.*\.ts/  # /regex/&#10;# 行頭 # はコメント"
+          placeholder="例:&#10;media-hls.example-cdn.com           # 部分一致&#10;https://media-hls.example-cdn.com*  # ワイルドカード (前方一致)&#10;*/ads/*.js                        # glob (どこにあっても)&#10;^https://tracker.                 # ^ で先頭固定&#10;/example-cdn\.com/(media|preview)/.*\.ts/  # /regex/&#10;# 行頭 # はコメント"
           style="width:100%; max-width:680px; padding:5px 8px; font-family:monospace; font-size:12px;"></textarea>
         <div style="color:#888; font-size:.85em; margin-top:4px; max-width:680px;">
           マッチした URL は <strong>asset 保存スキップ</strong> & <strong>yt-dlp も発火しない</strong>。
           1 行 1 パターン。<code>#</code> 行頭はコメント。シンタックス:
           <ul style="margin:4px 0 0 18px; padding:0; font-size:.95em;">
             <li><b>部分一致</b>: 特殊文字なし → URL 中にその文字列があれば block (case-insensitive)。<br>
-                例: <code>media-hls.saawsedge.com</code></li>
+                例: <code>media-hls.example-cdn.com</code></li>
             <li><b>glob ワイルドカード</b>: <code>*</code> 任意文字列 / <code>?</code> 1 文字 / <code>^</code> 先頭固定 / <code>$</code> 末尾固定。<br>
-                例: <code>https://media-hls.saawsedge.com*</code> · <code>*/ads/*.js</code> · <code>^https://tracker.</code></li>
+                例: <code>https://media-hls.example-cdn.com*</code> · <code>*/ads/*.js</code> · <code>^https://tracker.</code></li>
             <li><b>正規表現</b>: <code>/.../</code> で囲む。case-insensitive。<br>
-                例: <code>/saawsedge\.com/(media|preview)/.*\.ts/</code></li>
+                例: <code>/example-cdn\.com/(media|preview)/.*\.ts/</code></li>
           </ul>
         </div>
       </div>
@@ -3342,7 +3342,7 @@ table.aitbl code { font-size:0.95em; }
     <div style="display:grid; grid-template-columns: 200px 1fr; gap:8px 12px; align-items:center; padding:8px 4px;">
       <label for="setMariadbHost" title="MariaDB サーバーの IP またはホスト名">ホスト:</label>
       <div>
-        <input type="text" id="setMariadbHost" placeholder="例: 10.10.50.16" style="width:240px; padding:4px 8px;">
+        <input type="text" id="setMariadbHost" placeholder="例: 192.168.50.16" style="width:240px; padding:4px 8px;">
       </div>
 
       <label for="setMariadbPort" title="MariaDB ポート番号">ポート:</label>
@@ -3451,7 +3451,7 @@ table.aitbl code { font-size:0.95em; }
       <div><label style="font-weight:normal;"><input type="checkbox" id="setS3Enabled"> S3 / MinIO を使用する</label></div>
 
       <label for="setS3Endpoint" title="S3 互換エンドポイント URL">エンドポイント:</label>
-      <div><input type="text" id="setS3Endpoint" placeholder="例: http://10.10.50.16:9100" style="width:280px; padding:4px 8px;"></div>
+      <div><input type="text" id="setS3Endpoint" placeholder="例: http://192.168.50.16:9100" style="width:280px; padding:4px 8px;"></div>
 
       <label for="setS3Bucket" title="バケット名">バケット:</label>
       <div><input type="text" id="setS3Bucket" placeholder="paprika" style="width:240px; padding:4px 8px;"></div>

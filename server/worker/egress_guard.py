@@ -53,7 +53,7 @@ def _enabled() -> bool:
 
 
 def _hub_http_and_host(hub_ws_url: str) -> tuple[str, str]:
-    """``ws://10.10.50.34:8000`` -> (``http://10.10.50.34:8000``, ``10.10.50.34``)."""
+    """``ws://192.168.50.34:8000`` -> (``http://192.168.50.34:8000``, ``192.168.50.34``)."""
     u = urlparse(hub_ws_url or "")
     host = u.hostname or ""
     scheme = "https" if u.scheme in ("wss", "https") else "http"

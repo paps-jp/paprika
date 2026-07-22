@@ -130,7 +130,7 @@ _SCHEMA: dict[str, tuple[Any, str]] = {
     #   - 動画プレーヤーの preview thumbnail などノイズアセット
     # Pulled into HubAssignJob.asset_url_blacklist at dispatch so a
     # Settings edit takes effect on the next job. Example values:
-    #   media-hls.saawsedge.com
+    #   media-hls.example-cdn.com
     #   /tracker.gif
     #   .cloudfront.net/ads/
     "asset_url_blacklist": ("", "str"),
@@ -331,7 +331,7 @@ _SCHEMA: dict[str, tuple[Any, str]] = {
     # PAPRIKA_S3_* env var via _env_default. The secret key is stored in
     # settings.json and redacted from GET /settings.
     "s3_enabled": (False, "bool"),
-    "s3_endpoint": ("", "str"),            # e.g. http://10.10.50.16:9100
+    "s3_endpoint": ("", "str"),            # e.g. http://192.168.50.16:9100
     "s3_bucket": ("paprika", "str"),
     "s3_prefix": ("jobs", "str"),
     "s3_access_key": ("", "str"),
@@ -343,7 +343,7 @@ _SCHEMA: dict[str, tuple[Any, str]] = {
     # s3_nonvideo_endpoint is set. Reads try the hot tier then fall back to
     # the primary (so pre-split / video objects still resolve). Bucket blank
     # -> reuse s3_bucket. See server/hub/objstore.py routing.
-    "s3_nonvideo_endpoint": ("", "str"),        # e.g. http://10.10.50.17:9000
+    "s3_nonvideo_endpoint": ("", "str"),        # e.g. http://192.168.50.17:9000
     "s3_nonvideo_bucket": ("", "str"),          # blank -> reuse s3_bucket
     "s3_nonvideo_access_key": ("", "str"),
     "s3_nonvideo_secret_key": ("", "str"),

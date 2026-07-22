@@ -162,7 +162,7 @@ async def install_iframe_deep_trace(tab, log: LogFn | None = None) -> bool:
                 # RECURSE: tell THIS sub-session to auto-attach to its
                 # OWN children too. Without this, only direct children
                 # of the top tab are traced -- a nested player (e.g.
-                # supjav -> sptvp/supremejav iframe -> inner video
+                # index page -> player iframe -> inner video
                 # iframe whose HLS/MP4 stream is the real content) stays
                 # invisible because its AttachedToTarget never fires.
                 # flatten=True keeps the grandchildren's events on the
@@ -359,7 +359,7 @@ _AUTOPLAY_CLICK_JS = r"""
 (function(){
   try {
     // Only operate on REAL-PLAYER-SIZED videos.  A media detail page
-    // (e.g. 7mmtv) is a grid of dozens of small related-work preview
+    // (common on video index sites) is a grid of dozens of small related-work preview
     // <video> thumbnails; a blanket play() on every <video> starts them
     // all, which then each get auto-downloaded -- flooding the gallery
     // with the wrong videos and spawning many parallel yt-dlp procs.

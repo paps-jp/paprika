@@ -13,7 +13,7 @@ keep extending it live. The exporter is a single process per GPU box, so
 this history is the one consistent source every hub reads -- no Redis, no
 per-hub buffer drift under nginx round-robin.
 
-**Per-GPU addressing** (for boxes with >1 card, e.g. balcony=10.10.50.31
+**Per-GPU addressing** (for boxes with >1 card, e.g. balcony=192.168.50.31
 runs 2x RTX 3090, one vLLM engine pinned per GPU): pass ``?gpu=N`` to
 target a single card. ``/?gpu=1`` reports that card's temp *as*
 ``max_temp_c`` (so ``thermal.read_temp`` targets it unchanged) and
@@ -21,7 +21,7 @@ target a single card. ``/?gpu=1`` reports that card's temp *as*
 param the endpoints keep their original box-wide ("hottest GPU")
 behaviour, so single-GPU boxes and old callers are unaffected.
 
-Runs on each GPU/vLLM box (e.g. 10.10.50.26, 10.10.50.31). No deps.
+Runs on each GPU/vLLM box (e.g. 192.168.50.26, 192.168.50.31). No deps.
 
   GET /            -> {"max_temp_c", "gpus":[{temp_c,util_pct,power_w,power_limit_w}], "ts"}
   GET /?gpu=N      -> same shape but max_temp_c = GPU N's temp, gpus=[GPU N]

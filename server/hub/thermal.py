@@ -54,7 +54,7 @@ def exporter_url_for(rec) -> str:
     resolves.
 
     For a multi-GPU box, set the engine's ``gpu_temp_url`` to the card it
-    runs on, e.g. ``http://10.10.50.31:9402/?gpu=0`` -- ``read_temp`` then
+    runs on, e.g. ``http://192.168.50.31:9402/?gpu=0`` -- ``read_temp`` then
     reads that card's temp and ``read_history`` its own series (both honour
     the ``?gpu=N`` query; the derived/blank form stays box-wide)."""
     url = (getattr(rec, "gpu_temp_url", "") or "").strip()

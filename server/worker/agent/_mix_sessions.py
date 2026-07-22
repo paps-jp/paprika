@@ -358,7 +358,7 @@ class _SessionsMixin:
                 job_log=_maybe_send_job_log,
                 session_id=sid,
                 # Top-level page URL referer fallback for cross-origin
-                # iframe player streams (e.g. supjav's supremejav iframe).
+                # iframe player streams (cross-origin player iframes).
                 # state.last_response tracks the most recent top-level
                 # document load, so its url is the page the operator is
                 # actually on -- the referer the CDN expects.
@@ -440,8 +440,8 @@ class _SessionsMixin:
                 on_stream_detected=maybe_download_video_session,
                 # iframe + nested-iframe deep network trace. ALWAYS on
                 # for a capturing session: the asset dir is always
-                # present here, and many video sites (supjav, DMM
-                # litevideo, embedded players) stream HLS *inside a
+                # present here, and many video sites (embedded
+                # players, litevideo-style widgets) stream HLS *inside a
                 # cross-origin iframe*. Without deep-trace the parent
                 # CDP target never sees those .m3u8 requests, so
                 # on_stream_detected never fires and a video that

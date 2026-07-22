@@ -27,7 +27,7 @@ Configuration (all via env; only ``PAPRIKA_S3_ENABLED`` is required to
 turn it on):
 
     PAPRIKA_S3_ENABLED      "1"/"true"/"yes" to activate (default off)
-    PAPRIKA_S3_ENDPOINT     e.g. http://10.10.50.16:9000
+    PAPRIKA_S3_ENDPOINT     e.g. http://192.168.50.16:9000
     PAPRIKA_S3_BUCKET       bucket name (default "paprika")
     PAPRIKA_S3_PREFIX       key prefix within the bucket (default "jobs")
     PAPRIKA_S3_ACCESS_KEY   access key id

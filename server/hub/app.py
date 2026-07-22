@@ -76,7 +76,7 @@ async def _host_lan_ip_via_redis(redis_client) -> str | None:
     so Redis reports .35 / .36 (not the 172.x container IP) in ``CLIENT INFO``'s
     ``addr`` field. This lets a CLONED hub VM auto-pick a distinct identity with
     zero per-clone config -- just give the clone its own IP. Returns the dotted
-    IPv4 (e.g. ``10.10.50.36``) or None.
+    IPv4 (e.g. ``192.168.50.36``) or None.
     """
     import re
 
@@ -104,7 +104,7 @@ async def _host_lan_ip_via_redis(redis_client) -> str | None:
         return ip
 
     # 0) Explicit override -- deterministic and Redis-INDEPENDENT. Pin
-    #    PAPRIKA_HOST_IP=10.10.50.NN in a hub's .env so its identity never
+    #    PAPRIKA_HOST_IP=<this hub LAN IP> in a hub's .env so its identity never
     #    depends on the flaky one-shot CLIENT INFO below. This is the escape
     #    hatch for the orphan bug: a hub that fails derivation keeps its random
     #    import-time hub_id, never publishes its ip, and is INVISIBLE to the

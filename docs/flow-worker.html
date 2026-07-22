@@ -64,7 +64,7 @@ active: architecture
 <div class="tldr">
   <span class="tldr-label">概要</span>
   <ul>
-    <li><strong>worker_id は LAN IP から派生</strong>: <code>10.10.50.150</code> → <code>w50150</code>。self-update / 再起動 / id-file 喪失を跨いで安定。</li>
+    <li><strong>worker_id は LAN IP から派生</strong>: <code>192.168.50.150</code> → <code>w50150</code>。self-update / 再起動 / id-file 喪失を跨いで安定。</li>
     <li><strong>version gate は heartbeat 経由でゼロダウンタイム</strong>: Hub が <code>HubExpectedVersion</code> を毎 heartbeat で push。worker は 順次ドレイン → exit(42) で自己更新。Hub の再起動は不要。</li>
     <li><strong>ghost 検知は両側に必要</strong>: 送信側からは ESTABLISHED に見える failure mode を、Hub 側回収プロセス + worker 側 inbound 沈黙 watchdog の両方で潰す。</li>
   </ul>
@@ -93,7 +93,7 @@ sequenceDiagram
   end
 </div>
 <p class="flow-ref">server/hub/routes/workers.py:1485–1591 / server/scheduler.py:549–573</p>
-<div class="callout tip"><strong>stable worker_id</strong>: 例えば <code>10.10.50.150</code> なら常に <code>w50150</code>。LAN /16 衝突時はフル IP フォールバック。self-update や再起動を跨いで安定し、一貫ハッシュの再帰属がきれいに収束する。</div>
+<div class="callout tip"><strong>stable worker_id</strong>: 例えば <code>192.168.50.150</code> なら常に <code>w50150</code>。LAN /16 衝突時はフル IP フォールバック。self-update や再起動を跨いで安定し、一貫ハッシュの再帰属がきれいに収束する。</div>
 
 <h2 id="version">2. VERSION GATE + 順次セルフアップデート</h2>
 <div class="mermaid">

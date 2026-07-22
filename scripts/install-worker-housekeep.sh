@@ -5,7 +5,7 @@
 #
 # Usage:
 #   # Install on a single worker:
-#   bash scripts/install-worker-housekeep.sh 10.10.50.150
+#   bash scripts/install-worker-housekeep.sh 192.168.50.150
 #
 #   # Install on every connected worker (queries hub for the IP list):
 #   bash scripts/install-worker-housekeep.sh --all

@@ -410,7 +410,7 @@ const HANDLERS = {
       const bbox = tgt.bbox;
       // Prefer the element's bbox. Some sites use absolutely-positioned
       // elements (CSS transforms, transparent overlays for video player
-      // hit-boxes -- e.g. supjav.com's #vserver play button) whose
+      // hit-boxes -- e.g. an overlay play button) whose
       // getBoundingClientRect returns 0x0. Fall back to a small square
       // around the cursor so the visual neighbourhood is still
       // captured -- this is "what the operator was looking at" rather

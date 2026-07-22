@@ -1,4 +1,4 @@
-# nginx upstream auto-reconciler -- run on the router host (10.10.50.34).
+# nginx upstream auto-reconciler -- run on the router host (192.168.50.34).
 #
 # Watches the Redis hub-presence registry (paprika:hubs:*) and keeps nginx's
 # `hubs` / `hubs_sticky` upstreams in sync, so a cloned / newly-booted hub VM

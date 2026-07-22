@@ -1582,9 +1582,9 @@ def _ip_derived_worker_id(ip: str | None, registry) -> str | None:
     history AND the consistent-hash worker-WS routing (re-homing / hub
     imbalance). The IP is stable, so we pin the id to it: same IP -> same id.
 
-    Format ``w<3rd><4th>`` (e.g. 10.10.50.150 -> ``w50150``). If that short form
+    Format ``w<3rd><4th>`` (e.g. 192.168.50.150 -> ``w50150``). If that short form
     is already held by a DIFFERENT, still-alive IP (only possible across /16s,
-    e.g. 10.10.5.150 vs 10.10.51.50), fall back to the full IP
+    e.g. 192.168.5.150 vs 192.168.51.50), fall back to the full IP
     ``w<1>-<2>-<3>-<4>``. Returns None when ``ip`` isn't a usable IPv4 (the
     caller then keeps the worker's current id). Assumes one worker per IP
     (true for the LXC fleet)."""
@@ -1646,7 +1646,7 @@ async def worker_link(ws: WebSocket, worker_id: str):
     # subsumes clone-collision handling: two hosts presenting the same persisted
     # id get DIFFERENT ids because their IPs differ. Source the real IP from
     # X-Real-IP / first X-Forwarded-For hop -- behind the nginx front
-    # ws.client.host is the proxy IP (e.g. 10.10.50.34) for EVERY worker.
+    # ws.client.host is the proxy IP (e.g. 192.168.50.34) for EVERY worker.
     _new_real_ip = (
         ws.headers.get("x-real-ip")
         or (ws.headers.get("x-forwarded-for") or "").split(",")[0]

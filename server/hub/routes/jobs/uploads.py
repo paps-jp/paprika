@@ -348,7 +348,7 @@ async def complete_asset_upload(job_id: str, body: dict) -> dict:
     """Record metadata for an asset the worker uploaded DIRECTLY to MinIO via a
     presigned PUT (see /presign) -- the second half of the worker->MinIO-direct
     path. The hub writes the ``.meta`` sidecar (source_url / page_url / mime /
-    size) the gallery + delian read, after CONFIRMING the object is in the
+    size) the gallery + the downstream takedown service read, after CONFIRMING the object is in the
     bucket. NO bytes flow through the hub. The asset itself already shows in the
     gallery because ``_gather_assets`` unions the MinIO listing.
 
@@ -382,7 +382,7 @@ async def complete_asset_upload(job_id: str, body: dict) -> dict:
     except (TypeError, ValueError):
         size = 0
     # Sidecar metadata -- written + mirrored EXACTLY like upload_asset so the
-    # gallery / get_page_meta / delian source_url cascade read it unchanged.
+    # gallery / get_page_meta / downstream source_url cascade read it unchanged.
     # Best-effort: a sidecar failure must not fail the (already-stored) asset.
     if source_url or mime or page_url:
         # The sidecar write is synchronous filesystem I/O (mkdir + write_text).

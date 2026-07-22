@@ -28,7 +28,7 @@ rollout — no direct hub-container modification (CLAUDE.md absolute rule).
 Controlled by env ``PAPRIKA_HUB_DNS``:
   * unset / empty -> default ``["1.1.1.1", "8.8.8.8"]``
   * ``"off"`` / ``"0"`` / ``"false"`` -> disabled (no-op)
-  * ``"1.1.1.1,8.8.8.8,10.10.50.1"`` -> use exactly those (append the LAN
+  * ``"1.1.1.1,8.8.8.8,192.168.50.1"`` -> use exactly those (append the LAN
     gateway last if some deployment DOES need docker-name resolution)
 """
 from __future__ import annotations

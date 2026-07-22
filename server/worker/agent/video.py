@@ -606,7 +606,7 @@ def _make_video_downloader(
         from core.fetcher import run_ytdlp, _hls_is_live
 
         # Passive sniffer skips live HLS streams.  Many AV preview
-        # sites (7mmtv -> saawsedge, similar) deliver short looping
+        # sites (index page -> stream CDN, similar) deliver short looping
         # CMAF/HLS live previews that are NOT the actual video the
         # operator wants.  If we record one, yt-dlp adds
         # --hls-use-mpegts so the file is a TS stream saved with a
@@ -835,12 +835,12 @@ def _make_video_downloader(
                 pass  # loop already stopped (job was cancelled)
 
         # Referer fallback chain. A stream loaded inside a cross-origin
-        # iframe player (supjav -> lk1.supremejav.com -> saawsedge HLS)
+        # iframe player (index page -> player domain -> CDN HLS)
         # carries the IFRAME's document URL as ``referer``; the CDN
         # 403s it and yt-dlp writes no file. The top-level page URL is
-        # the referer the CDN actually expects -- proven on supjav: a
-        # saawsedge main-content m3u8 that yields 0 bytes with the
-        # iframe referer downloads in full with the supjav.com page
+        # the referer the CDN actually expects -- proven in the field: a
+        # CDN main-content m3u8 that yields 0 bytes with the iframe
+        # referer downloads in full with the top-level page
         # referer. So: try the frame referer first (correct for normal
         # / same-origin players, and the sidebar-preview streams that
         # already work), then fall back to the top page URL, then to no

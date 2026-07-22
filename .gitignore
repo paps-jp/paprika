@@ -33,6 +33,10 @@ data/tools/installed/*/venv/
 data/tools/installed/*/lib/
 data/tools/installed/*/__pycache__/
 data/tools/invocations.jsonl
+# Pipeline-coupled plugins kept OUT of this (public) repo -- they depend on the
+# downstream pipeline's DB schema. Versioned in the private companion repo
+# paps-jp/paprika-internal (internal/plugins/) and shipped to hubs out-of-band.
+data/tools/installed/video-gc/
 assets/
 downloaded-paps/
 downloaded/
@@ -52,7 +56,9 @@ scripts/workers.env
 scripts/extra-hosts.env
 scripts/llm.env
 
-# Local-only ops notes (contains internal IPs / SSH key paths)
+# Local-only ops notes (contains internal IPs / SSH key paths). The file itself
+# is version-controlled in the private companion repo paps-jp/paprika-internal
+# (internal/CLAUDE.md is a hardlink to this one).
 CLAUDE.md
 .claude/
 
@@ -75,7 +81,11 @@ windows/bin/redis/
 windows/bin/vnc/
 *.spec.bak
 
-# Internal-only docs / notes (contains real site names, IPs, etc.)
+# Private companion repo, nested here as its own git repo:
+#   internal/ = paps-jp/paprika-internal (private)
+# Holds design notes, real-infrastructure ops scripts and operator docs that
+# must never land in this public repo. See internal/README.md for the
+# public/private decision rule.
 internal/
 
 # Private keys (CRX signing keys, TLS keys, SSH keys, …). The CRX

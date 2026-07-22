@@ -40,7 +40,7 @@ function _opRecClearError() {
 }
 
 async function _opRecLookupWorkerIdByIp(ip) {
-  // Resolve "10.10.50.147" -> worker_id by scanning /workers. Returns
+  // Resolve "192.168.50.147" -> worker_id by scanning /workers. Returns
   // null if no alive worker matches.
   if (!ip) return null;
   try {

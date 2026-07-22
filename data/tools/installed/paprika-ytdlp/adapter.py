@@ -401,7 +401,7 @@ def download(
     # ------------------------------------------------------------------
     # ffmpeg-direct fallback for "extension-disguised AES-128 HLS".
     #
-    # Some video hosts (e.g. 7mmtv.sx → streamsuperpro.com) serve an
+    # Some video hosts (index page → third-party stream CDN) serve an
     # HLS manifest whose segments use a ``.js`` extension AND are
     # AES-128 encrypted.  yt-dlp delegates such streams to ffmpeg,
     # which by default rejects non-media segment extensions:
@@ -413,7 +413,7 @@ def download(
     # whitelist disabled and the Referer header injected so the AES
     # key + segments fetch succeeds.  ffmpeg's ``crypto+https://``
     # protocol then transparently decrypts the AES-128 stream.
-    # Proven on streamsuperpro: produces a clean h264/aac MP4.
+    # Proven on the stream CDN: produces a clean h264/aac MP4.
     _looks_like_ext_blocked = any(
         "allowed_segment_extensions" in ln
         or "Invalid data found when processing input" in ln
@@ -432,7 +432,7 @@ def download(
         # First try the PARALLEL downloader: fetch all segments + key
         # concurrently to local disk (ffmpeg-direct's single connection
         # is rate-limited by the CDN to ~1x realtime; 16-way parallel
-        # measured 21x on streamsuperpro), then let ffmpeg decrypt +
+        # measured 21x on the stream CDN), then let ffmpeg decrypt +
         # mux from local files.  This beats the CDN's per-connection
         # rate cap AND finishes before short-lived segment tokens
         # expire.  Falls back to ffmpeg-direct if anything goes wrong.
@@ -499,11 +499,11 @@ def _parallel_hls_to_mp4(
     local temp dir, rewrite the manifest to point at the local files,
     then let ffmpeg decrypt + mux from disk.
 
-    Why: CDNs like streamsuperpro rate-limit each connection to ~1x
+    Why: CDNs like the stream CDN rate-limit each connection to ~1x
     realtime, so ffmpeg's single-connection HLS read crawls (a 79-min
     video takes ~79 min and often outlives the segment token).  A
     16-way parallel fetch saturates the link instead of the per-stream
-    cap -- measured 21x on streamsuperpro -- so the whole stream lands
+    cap -- measured 21x on the stream CDN -- so the whole stream lands
     in a couple minutes, well inside the token TTL.  ffmpeg then muxes
     from local files in seconds (no network), reusing its built-in
     AES-128 + arbitrary-extension handling so we need no crypto lib.

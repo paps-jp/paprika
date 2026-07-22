@@ -20,7 +20,7 @@ Engine selection
 ----------------
 Reads the 'qwen' engine record from ``state.engines``. That record
 points at the local vLLM (currently Qwen3-VL-32B FP8 on
-10.10.50.26:15082, served-model-name 'qwen3.5'). Operator changes
+192.168.50.26:15082, served-model-name 'qwen3.5'). Operator changes
 visible via /engines/qwen are picked up automatically.
 
 Failure mode
