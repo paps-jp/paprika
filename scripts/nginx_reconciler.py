@@ -22,6 +22,21 @@ Hub backend IP resolution: prefer an explicit ``ip`` in the hub's presence
 payload; else derive from the IP-encoded hub_id (``hub-36`` -> ``<subnet>.36``)
 produced by the host-IP auto-derivation in app.py. Subnet via env.
 
+Membership is decided by an ACTIVE ``/health`` probe, not by Redis presence
+alone (RECONCILER_HEALTH_PROBE=0 disables, restoring presence-only behaviour).
+Redis presence -- plus the hubs currently in nginx.conf and the
+``paprika:hubs:index`` ZSET -- only supplies the CANDIDATE set; whether a
+candidate goes into the upstream is settled by talking to it. This exists
+because presence and reachability failed in OPPOSITE directions on 2026-07-24:
+``.40/.41`` heartbeated happily while fd-exhausted (EMFILE -> accept() dead)
+and ``.35-.39`` served ``/health`` 200 for 28 h while de-registered (they booted
+during a Redis ``LOADING`` window, mis-derived their hub_id and never
+registered). Trusting presence alone, this reconciler kept the two dead hubs
+and dropped the five live ones -- "no live upstreams", a full 502 outage.
+Streaks damp the flapping: a REGISTERED hub is only dropped after
+``RECONCILER_DROP_STREAK`` consecutive probe failures, and an UNREGISTERED one
+is only rescued after ``RECONCILER_RESCUE_STREAK`` consecutive successes.
+
 Reuses the paprika-hub image (python + redis-py + docker CLI already inside);
 needs the Docker socket (to ``docker exec <nginx> nginx -t / -s reload``) and
 the deploy dir (to read/write nginx.conf) mounted.
@@ -48,21 +63,27 @@ HUB_PORT = os.environ.get("RECONCILER_HUB_PORT", "8100")
 HUB_SUBNET = os.environ.get("RECONCILER_HUB_SUBNET", "10.10.50")
 INTERVAL_S = int(os.environ.get("RECONCILER_INTERVAL_S", "20"))
 HUB_TTL_S = int(os.environ.get("RECONCILER_HUB_TTL_S", "90"))
+HEALTH_PROBE = os.environ.get("RECONCILER_HEALTH_PROBE", "1") not in ("0", "false", "")
+HEALTH_TIMEOUT_S = float(os.environ.get("RECONCILER_HEALTH_TIMEOUT_S", "4"))
+DROP_STREAK = int(os.environ.get("RECONCILER_DROP_STREAK", "3"))
+RESCUE_STREAK = int(os.environ.get("RECONCILER_RESCUE_STREAK", "2"))
 
+_HUB_INDEX_KEY = "paprika:hubs:index"  # ZSET of every hub_id ever seen (_hubs.py)
 _HUB_ID_OCTET = re.compile(r"^hub-(\d{1,3})$")
 _BLK_HUBS = re.compile(r"upstream hubs \{.*?\n    \}", re.DOTALL)
 _BLK_STICKY = re.compile(r"upstream hubs_sticky \{.*?\n    \}", re.DOTALL)
+_CONF_SERVER = re.compile(r"^\s*server\s+(\d+\.\d+\.\d+\.\d+):\d+", re.MULTILINE)
 
 
 def _log(msg: str) -> None:
     print(f"reconciler: {msg}", flush=True)
 
 
-def live_backends(r) -> list[str] | None:
-    """Sorted, de-duped ``<ip>:<port>`` for hubs alive in Redis.
+def registered_ips(r) -> "set[str] | None":
+    """De-duped backend IPs for hubs alive in the Redis presence registry.
 
     Returns None on a Redis error (caller then leaves the config untouched);
-    an empty list when Redis is reachable but reports no live hubs.
+    an empty set when Redis is reachable but reports no live hubs.
     """
     now = time.time()
     ips: set[str] = set()
@@ -94,7 +115,99 @@ def live_backends(r) -> list[str] | None:
                 ip = f"{HUB_SUBNET}.{m.group(1)}"
         if ip:
             ips.add(str(ip))
-    return sorted(f"{ip}:{HUB_PORT}" for ip in ips)
+    return ips
+
+
+def indexed_ips(r) -> "set[str]":
+    """Backend IPs for every hub EVER seen (``paprika:hubs:index`` ZSET).
+
+    Candidate source only -- an entry here is ancient history until a live
+    ``/health`` probe says otherwise. This is what lets a hub that lost its
+    registration (2026-07-24: mis-derived hub_id after booting into a Redis
+    ``LOADING`` window) be found again without a subnet scan. Random-hostname
+    hub_ids don't resolve to an IP and are simply skipped."""
+    out: set[str] = set()
+    try:
+        for m in r.zrange(_HUB_INDEX_KEY, 0, -1):
+            hub_id = m.decode() if isinstance(m, bytes) else str(m)
+            mo = _HUB_ID_OCTET.match(hub_id)
+            if mo:
+                out.add(f"{HUB_SUBNET}.{mo.group(1)}")
+    except Exception:
+        pass
+    return out
+
+
+def conf_ips(conf: str) -> "set[str]":
+    """Backend IPs currently written into nginx.conf. A hub already carrying
+    traffic is a candidate even if its presence row just expired -- dropping a
+    hub that is visibly serving requests is exactly the 2026-07-24 mistake."""
+    return set(_CONF_SERVER.findall(conf))
+
+
+def probe_health(ip: str) -> bool:
+    """True iff the hub at ``ip`` answers ``/health`` with a paprika-shaped
+    200. Body-shape check (``status`` == ok) so an unrelated service that
+    happens to listen on the hub port can't be adopted into the upstream."""
+    import urllib.request
+
+    url = f"http://{ip}:{HUB_PORT}/health"
+    try:
+        with urllib.request.urlopen(url, timeout=HEALTH_TIMEOUT_S) as resp:
+            if resp.status != 200:
+                return False
+            body = resp.read(4096).decode("utf-8", "replace")
+    except Exception:
+        return False
+    try:
+        return (json.loads(body).get("status") or "") == "ok"
+    except Exception:
+        return False
+
+
+# ip -> [consecutive_ok, consecutive_fail]; damps probe flapping across ticks.
+_STREAKS: dict[str, list[int]] = {}
+
+
+def _probe_all(ips: "set[str]") -> dict[str, bool]:
+    """Probe every candidate CONCURRENTLY so one hung hub can't stretch the
+    tick past INTERVAL_S (7 hubs x 4 s serial would)."""
+    from concurrent.futures import ThreadPoolExecutor
+
+    ordered = sorted(ips)
+    if not ordered:
+        return {}
+    with ThreadPoolExecutor(max_workers=min(16, len(ordered))) as pool:
+        return dict(zip(ordered, pool.map(probe_health, ordered)))
+
+
+def decide_members(registered: "set[str]", candidates: "set[str]") -> "set[str]":
+    """Settle upstream membership from presence + live probes.
+
+    Registered + healthy  -> in.
+    Registered + failing   -> out only after DROP_STREAK consecutive failures
+                              (a single blip must not evict a busy hub).
+    Unregistered + healthy -> in after RESCUE_STREAK consecutive successes
+                              (rescues a hub whose registration broke).
+    Unregistered + failing -> out.
+    """
+    if not HEALTH_PROBE:
+        return set(registered)
+    probes = _probe_all(candidates)
+    for ip in list(_STREAKS):
+        if ip not in probes:
+            del _STREAKS[ip]  # no longer a candidate -> forget its history
+    members: set[str] = set()
+    for ip, ok in probes.items():
+        st = _STREAKS.setdefault(ip, [0, 0])
+        st[0] = st[0] + 1 if ok else 0
+        st[1] = 0 if ok else st[1] + 1
+        if ip in registered:
+            if st[1] < DROP_STREAK:
+                members.add(ip)
+        elif st[0] >= RESCUE_STREAK:
+            members.add(ip)
+    return members
 
 
 _DRAIN_KEY = "paprika:hubs:draining"
@@ -160,18 +273,29 @@ def _nginx(*args: str) -> subprocess.CompletedProcess:
 
 
 def reconcile_once(r) -> None:
-    backends = live_backends(r)
-    if backends is None:
+    registered = registered_ips(r)
+    if registered is None:
         return  # Redis error -> leave config untouched
-    if not backends:
-        _log("0 live hubs reported; leaving nginx upstreams unchanged")
-        return
     try:
         with open(NGINX_CONF, "r", encoding="utf-8") as f:
             cur = f.read()
     except Exception as exc:
         _log(f"read {NGINX_CONF} failed: {exc}")
         return
+    # Presence is a candidate source, not the verdict: also consider the hubs
+    # already in nginx.conf and every hub the index has ever seen, then let the
+    # /health probe settle who actually serves traffic.
+    members = decide_members(registered, registered | conf_ips(cur) | indexed_ips(r))
+    backends = sorted(f"{ip}:{HUB_PORT}" for ip in members)
+    if not backends:
+        _log("0 live hubs reported; leaving nginx upstreams unchanged")
+        return
+    rescued = sorted(members - registered)
+    dropped = sorted(registered - members)
+    if rescued:
+        _log(f"rescued unregistered but /health-OK hub(s): {rescued}")
+    if dropped:
+        _log(f"dropping registered but /health-DEAD hub(s): {dropped}")
     try:
         new = render(cur, backends, _drained_ips(r))
     except Exception as exc:
@@ -195,7 +319,10 @@ def reconcile_once(r) -> None:
 def main() -> int:
     _log(
         f"start redis={REDIS_URL} conf={NGINX_CONF} nginx={NGINX_CONTAINER} "
-        f"port={HUB_PORT} subnet={HUB_SUBNET} interval={INTERVAL_S}s ttl={HUB_TTL_S}s"
+        f"port={HUB_PORT} subnet={HUB_SUBNET} interval={INTERVAL_S}s ttl={HUB_TTL_S}s "
+        f"health_probe={'on' if HEALTH_PROBE else 'off'} "
+        f"(timeout={HEALTH_TIMEOUT_S}s drop_streak={DROP_STREAK} "
+        f"rescue_streak={RESCUE_STREAK})"
     )
     r = redis.from_url(REDIS_URL, socket_timeout=5, socket_connect_timeout=5)
     while True:
