@@ -23,7 +23,16 @@ router = APIRouter(tags=["Settings"])
 # endpoint is unauthenticated on the LAN). Redacted to "" in the GET
 # payload; the UI uses the companion ``secrets_set`` map to show whether
 # one is stored. PUT still accepts the real value to (re)set it.
-_SECRET_KEYS = frozenset({"mariadb_password", "s3_secret_key", "s3_nonvideo_secret_key", "worker_ssh_key_pem"})
+_SECRET_KEYS = frozenset({
+    "mariadb_password",
+    "s3_secret_key",
+    "s3_nonvideo_secret_key",
+    "s3_spill_secret_key",
+    "s3_nonvideo_spill_secret_key",
+    "worker_ssh_key_pem",
+    # Reaches the hypervisor (pct reboot), so if anything is a secret, it is.
+    "proxmox_ssh_key_pem",
+})
 
 
 def _require_settings() -> SettingsRegistry:
@@ -220,16 +229,40 @@ async def s3_test(body: dict | None = None) -> dict:
     """Test S3 / MinIO connectivity. Uses body values (endpoint, bucket,
     access_key, secret_key, region) when provided -- so the operator can
     verify before saving -- else the saved settings. A blank secret_key in
-    the body falls back to the stored one. Does head_bucket + a 1-key list."""
+    the body falls back to the stored one. Does head_bucket + a 1-key list.
+
+    ``tier`` selects which stored keys the blank-field fallback reads:
+    ``"main"`` (default) -> ``s3_*``; ``"nonvideo"`` -> ``s3_nonvideo_*`` so
+    a blank secret reuses the SAVED non-video secret (not the main tier's).
+    The non-video bucket falls back to the main bucket when blank, matching
+    the objstore routing (see server/hub/objstore.py + settings s3_nonvideo_*).
+    """
     import asyncio
 
-    reg = _require_settings()
+    _require_settings()  # ensure state.settings is bound (raises 503 if not)
+    from server.hub import objstore as _obj
     b = body or {}
-    endpoint = (b.get("endpoint") or reg.get("s3_endpoint", "")).strip()
-    bucket = (b.get("bucket") or reg.get("s3_bucket", "paprika")).strip()
-    region = (b.get("region") or reg.get("s3_region", "us-east-1")).strip() or "us-east-1"
-    access_key = (b.get("access_key") or reg.get("s3_access_key", "")).strip()
-    secret_key = b.get("secret_key") or reg.get("s3_secret_key", "")
+    tier = (b.get("tier") or "main").strip().lower()
+    # Resolve blank body fields against the SAME env-aware path the live client
+    # uses (objstore._s3cfg: empty setting -> PAPRIKA_S3_* env). Reading reg.get()
+    # directly returned a stored empty string WITHOUT the env fallback, which
+    # surfaced as a spurious "PartialCredentialsError: missing aws_access_key_id"
+    # whenever the access key is env-provided (its Setting left blank).
+    if tier in ("nonvideo", "nv", "non_video"):
+        endpoint = (b.get("endpoint") or _obj._s3cfg("s3_nonvideo_endpoint", "PAPRIKA_S3_NONVIDEO_ENDPOINT")).strip()
+        bucket = (b.get("bucket") or _obj._s3cfg("s3_nonvideo_bucket", "PAPRIKA_S3_NONVIDEO_BUCKET")
+                  or _obj._s3cfg("s3_bucket", "PAPRIKA_S3_BUCKET", "paprika")).strip()
+        region = (b.get("region") or _obj._s3cfg("s3_nonvideo_region", "PAPRIKA_S3_NONVIDEO_REGION", "us-east-1")).strip() or "us-east-1"
+        access_key = (b.get("access_key") or _obj._s3cfg("s3_nonvideo_access_key", "PAPRIKA_S3_NONVIDEO_ACCESS_KEY")).strip()
+        secret_key = b.get("secret_key") or _obj._s3cfg("s3_nonvideo_secret_key", "PAPRIKA_S3_NONVIDEO_SECRET_KEY")
+        if not endpoint:
+            return {"ok": False, "message": "非動画 tier のエンドポイントが未設定です (= 分離OFF)"}
+    else:
+        endpoint = (b.get("endpoint") or _obj._s3cfg("s3_endpoint", "PAPRIKA_S3_ENDPOINT")).strip()
+        bucket = (b.get("bucket") or _obj._s3cfg("s3_bucket", "PAPRIKA_S3_BUCKET", "paprika")).strip()
+        region = (b.get("region") or _obj._s3cfg("s3_region", "PAPRIKA_S3_REGION", "us-east-1")).strip() or "us-east-1"
+        access_key = (b.get("access_key") or _obj._s3cfg("s3_access_key", "PAPRIKA_S3_ACCESS_KEY")).strip()
+        secret_key = b.get("secret_key") or _obj._s3cfg("s3_secret_key", "PAPRIKA_S3_SECRET_KEY")
 
     if not bucket:
         return {"ok": False, "message": "バケット名が未設定です"}
@@ -240,6 +273,12 @@ async def s3_test(body: dict | None = None) -> dict:
             from botocore.config import Config as _BotoConfig
         except ImportError:
             return {"ok": False, "message": "boto3 がインストールされていません"}
+        # Per-call client -> must be closed. A boto3 client owns a urllib3
+        # pool; dropping the reference leaves its sockets to the GC, where they
+        # sit in CLOSE-WAIT after MinIO drops the keep-alive. The operator can
+        # press "テスト" many times while tuning endpoints, and each press used
+        # to cost the hub a permanent fd (2026-07-24 EMFILE outage).
+        client = None
         try:
             client = boto3.client(
                 "s3",
@@ -255,14 +294,36 @@ async def s3_test(body: dict | None = None) -> dict:
                     read_timeout=5,
                 ),
             )
+            # head_bucket is the connectivity gate: endpoint + credentials +
+            # bucket all good (sub-second even on a huge bucket).
             client.head_bucket(Bucket=bucket)
+        except Exception as e:
+            if client is not None:
+                try:
+                    client.close()
+                except Exception:
+                    pass
+            return {"ok": False, "message": f"{type(e).__name__}: {e}"}
+        # The follow-up list is a BONUS (list permission / object presence). A
+        # whole-bucket list -- even MaxKeys=1 -- can take tens of seconds on a
+        # large bucket over slow storage (.8 paprika measured ~40s), so a list
+        # failure AFTER a good head_bucket must NOT fail the test.
+        try:
             r = client.list_objects_v2(Bucket=bucket, MaxKeys=1)
             return {
                 "ok": True,
                 "message": f"接続成功 (bucket={bucket}, objects≧{r.get('KeyCount', 0)})",
             }
-        except Exception as e:
-            return {"ok": False, "message": f"{type(e).__name__}: {e}"}
+        except Exception as le:
+            return {
+                "ok": True,
+                "message": f"接続成功 (bucket={bucket}; head OK / list 応答遅延: {type(le).__name__})",
+            }
+        finally:
+            try:
+                client.close()
+            except Exception:
+                pass
 
     return await asyncio.to_thread(_test)
 

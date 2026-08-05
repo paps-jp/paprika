@@ -718,6 +718,110 @@ async def set_worker_status(worker_id: str, body: dict, request: Request) -> dic
     return {"worker_id": worker_id, "status": status}
 
 
+async def _worker_ip_for_ct(worker_id: str) -> str:
+    """The LAN address to hand the Proxmox resolver for this worker.
+
+    Prefers the durable MariaDB ledger over the live connection: behind nginx a
+    connection's client address can be the proxy's, and resolving THAT would
+    point the hypervisor stage at the wrong container.
+    """
+    if state.store is not None:
+        try:
+            meta = await state.store.get_workers_meta()
+            ip = (meta.get(worker_id) or {}).get("ledger_ip")
+            if ip:
+                return str(ip)
+        except Exception:
+            pass
+    if state.registry is not None:
+        w = state.registry.connections.get(worker_id)
+        if w is not None and w.client_address:
+            return str(w.client_address)
+    raise HTTPException(404, f"no known address for worker '{worker_id}'")
+
+
+@router.get("/workers/{worker_id}/ct")
+async def worker_ct_diagnose(worker_id: str) -> dict:
+    """Ask the owning Proxmox node what is wrong with this worker's container.
+
+    Read-only. Exists because the three failures an operator actually has to
+    tell apart -- host down, CT wedged, CT networking dead -- are
+    indistinguishable from the hub: every probe times out identically. The
+    evidence lives host-side, so this fetches it (see
+    ``scripts/paprika-ct-reboot.sh``). ``exec=hang`` means the container cannot
+    spawn a process (IO starvation); ``gw=no link=down`` means networking; no
+    answer at all means the node itself is down.
+    """
+    from server.hub import _salvage
+    ip = await _worker_ip_for_ct(worker_id)
+    resolved = await _salvage._resolve_ct(ip)
+    if resolved is None:
+        raise HTTPException(
+            503,
+            "cannot reach a Proxmox node for this worker -- check the "
+            "proxmox_nodes / proxmox_ssh_key_pem settings",
+        )
+    node, ctid = resolved
+    return {
+        "worker_id": worker_id, "ip": ip, "node": node, "ctid": ctid,
+        "diagnosis": await _salvage._diagnose_ct(ip),
+    }
+
+
+@router.post("/workers/{worker_id}/ct/restart")
+async def worker_ct_restart(worker_id: str) -> dict:
+    """Operator-initiated ``pct stop`` + ``pct start`` of the worker's CT.
+
+    The last-resort recovery, made available as a button because it is the ONLY
+    thing that reaches a wedged container: its TCP stack still accepts, so the
+    box looks alive, but sshd cannot get far enough to send a banner and the
+    HTTP self-restart port is dead. Measured on the 2026-08-03 balcony
+    incident, where 11 CTs were in exactly that state and every IP-based stage
+    failed; ``pct`` goes over the hypervisor's LXC channel instead.
+
+    Deliberately NOT gated on ``ct_reboot_enabled``: that setting arms the
+    AUTOMATIC ladder, and an operator who wants the manual tool should not have
+    to arm the robot to get it. The node-side wrapper still enforces every
+    safety check (must be a container on that node, must be a paprika worker
+    hostname, must not be on the node's deny list), and the automatic
+    rate limits are skipped because those exist to stop a bad signal from
+    walking a node down, not to stop a human who is looking at the diagnosis.
+    """
+    from server.hub import _salvage
+    ip = await _worker_ip_for_ct(worker_id)
+    resolved = await _salvage._resolve_ct(ip)
+    if resolved is None:
+        raise HTTPException(
+            503,
+            "cannot resolve this worker to a Proxmox container -- check the "
+            "proxmox_nodes / proxmox_ssh_key_pem settings",
+        )
+    node, ctid = resolved
+    user, port, key = _salvage._proxmox_ssh()
+    log.warning(
+        "operator-initiated CT restart: worker %s (%s) = CT %s on %s",
+        worker_id, ip, ctid, node,
+    )
+    ok = await _salvage._ssh_run(
+        node, user, port, key, f"restart {ctid}",
+        timeout=180.0, what="operator-ct-restart",
+    )
+    if state.store is not None:
+        try:
+            await state.store.record_recovery_event(
+                worker_id,
+                hub_id=getattr(state.registry, "_hub_id", "") or "",
+                ip=ip, method="operator-ct-restart",
+                result="ok" if ok else "failed",
+                detail=f"CT {ctid} on {node} (admin UI)",
+            )
+        except Exception:
+            pass
+    if not ok:
+        raise HTTPException(502, f"CT {ctid} restart failed on {node}")
+    return {"ok": True, "worker_id": worker_id, "node": node, "ctid": ctid}
+
+
 @router.delete("/workers/{worker_id}")
 async def delete_worker(worker_id: str, request: Request) -> dict:
     """Forget a worker entirely (Redis row + index + in-process logs).
@@ -1370,6 +1474,7 @@ from datetime import datetime
 from fastapi import WebSocket, WebSocketDisconnect
 
 from server.hub._state import config, get_storage_dir
+from server.hub._helpers import _asset_upload_url
 from server.hub.routes.profiles import _sync_all_profiles_to_worker
 from server.hub.sessions import SessionInfo, session_from_json
 from server.protocol import (
@@ -1390,6 +1495,9 @@ from server.protocol import (
     WorkerJobFailed,
     WorkerEngineUsage,
     WorkerVideoProbe,
+    WorkerVideoHandoff,
+    WorkerVideoDownloadComplete,
+    HubAssignVideoDownload,
     WorkerJobLog,
     WorkerJobProgress,
     WorkerPreviewFrame,
@@ -2294,6 +2402,14 @@ async def _handle_worker_message(worker, msg) -> None:
             disk_free_gb=msg.disk_free_gb,
             load1=msg.load1,
             nproc=msg.nproc,
+            mem_scope=msg.mem_scope,
+            mem_current_mb=msg.mem_current_mb,
+            mem_anon_mb=msg.mem_anon_mb,
+            mem_psi_some_avg60=msg.mem_psi_some_avg60,
+            mem_psi_full_avg60=msg.mem_psi_full_avg60,
+            mem_majfault_per_s=msg.mem_majfault_per_s,
+            mem_refault_per_s=msg.mem_refault_per_s,
+            memguard=msg.memguard,
         )
         # Keep the MariaDB ledger's last_seen_at fresh on heartbeat (NOT just on
         # register) so salvage's age-window can tell a just-ghosted worker from a
@@ -2708,7 +2824,11 @@ async def _handle_worker_message(worker, msg) -> None:
                     try:
                         h = host_from_url(jurl)
                         if h:
-                            record_job_outcome(
+                            # os.fsync + history.jsonl append -> off the loop.
+                            # Fires for EVERY completed job (~56k/24h); the sync
+                            # write was a top event-loop staller (py-spy 2026-07-27).
+                            await asyncio.to_thread(
+                                record_job_outcome,
                                 host=h,
                                 success=jsuccess,
                                 job_id=jid,
@@ -2986,7 +3106,10 @@ async def _handle_worker_message(worker, msg) -> None:
                     try:
                         h = host_from_url(jurl)
                         if h:
-                            record_job_outcome(
+                            # Sync fsync/history write off the loop (see the
+                            # WorkerJobComplete twin above).
+                            await asyncio.to_thread(
+                                record_job_outcome,
                                 host=h,
                                 success=False,
                                 job_id=jid,
@@ -3091,6 +3214,75 @@ async def _handle_worker_message(worker, msg) -> None:
                 )
         except Exception:
             pass
+        return
+
+    if isinstance(msg, WorkerVideoHandoff):
+        # A browse worker detected a downloadable video and is handing it to
+        # the ramdisk download tier so it can free its Chrome lane NOW
+        # (docs/ramdisk-video-tier.md §3). Route it to a downloader worker with
+        # a free slot in its shared tmpfs pool.
+        #
+        # ADDITIVE BY DESIGN: if no downloader is connected, every pool is at
+        # capacity, or the stream is DRM, we simply do nothing here -- the
+        # browse worker's own fallback keeps the legacy in-browser download.
+        # A handoff must never be able to lose a video.
+        try:
+            if (msg.verdict or "").lower() == "drm":
+                return
+            dl_worker = state.scheduler.pick_downloader(
+                reserve_download_id=f"{msg.parent_job_id}:{msg.url}"
+            )
+            if dl_worker is None:
+                log.info(
+                    "video handoff for job=%s not taken (no downloader slot); "
+                    "browse worker keeps it", msg.parent_job_id,
+                )
+                return
+            download_id = f"{msg.parent_job_id}:{msg.url}"
+            base = dl_worker.public_base_url or config.public_base_url or ""
+            cookies_url = (
+                f"{base.rstrip('/')}/hosts/{msg.host}/cookies.txt"
+                if (base and msg.host) else None
+            )
+            assign = HubAssignVideoDownload(
+                download_id=download_id,
+                parent_job_id=msg.parent_job_id,
+                url=msg.url,
+                referer_chain=list(msg.referer_chain or []),
+                user_agent=msg.user_agent,
+                host=msg.host,
+                min_asset_size=msg.min_asset_size,
+                is_live=msg.is_live,
+                asset_upload_base=_asset_upload_url(base, msg.parent_job_id),
+                cookies_url=cookies_url,
+                # Only gated streams need the live snapshot; decouplable /
+                # tokened rebuild the jar from the host registry.
+                cookies=msg.cookies_snapshot,
+            )
+            try:
+                await state.scheduler.send(dl_worker.worker_id, assign)
+            except Exception:
+                # Send failed -> release the reserved slot so it isn't leaked.
+                state.scheduler.release_download(dl_worker.worker_id, download_id)
+                raise
+        except Exception as e:
+            log.warning("video handoff dispatch failed: %s", e)
+        return
+
+    if isinstance(msg, WorkerVideoDownloadComplete):
+        # Terminal result from the download tier. Always free the pool slot;
+        # a failure (ok=False) is logged for the operator -- the asset, if any,
+        # was already uploaded by the downloader through the normal
+        # /jobs/{id}/assets path, so there's nothing to attach here.
+        try:
+            state.scheduler.release_download(worker.worker_id, msg.download_id)
+        except Exception:
+            pass
+        if not msg.ok:
+            log.info(
+                "video download tier FAILED job=%s: %s",
+                msg.parent_job_id, msg.message,
+            )
         return
 
     if isinstance(msg, WorkerSessionStartAck):

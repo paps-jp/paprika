@@ -35,9 +35,9 @@ install_one() {
     scp $SSH_OPTS "$HOUSEKEEP_SH" "root@$ip:/usr/local/sbin/paprika-worker-housekeep" >/dev/null
     ssh $SSH_OPTS "root@$ip" "chmod 0755 /usr/local/sbin/paprika-worker-housekeep"
 
-    # Write the systemd unit + timer in one shot. OnCalendar=daily picks a
-    # randomized time within the day (RandomizedDelaySec) so the fleet doesn't
-    # all prune at once and saturate the IO subsystem on each Proxmox node.
+    # Write the systemd unit + timer in one shot. RandomizedDelaySec spreads the
+    # fleet out so they don't all prune at once and saturate the IO subsystem on
+    # each Proxmox node.
     ssh $SSH_OPTS "root@$ip" 'cat > /etc/systemd/system/paprika-worker-housekeep.service' <<'UNIT'
 [Unit]
 Description=Paprika worker disk housekeep (prune stale containerd snapshots)
@@ -55,13 +55,18 @@ UNIT
 
     ssh $SSH_OPTS "root@$ip" 'cat > /etc/systemd/system/paprika-worker-housekeep.timer' <<'UNIT'
 [Unit]
-Description=Daily paprika worker disk housekeep
+Description=Paprika worker disk housekeep
 Documentation=https://github.com/paps-jp/paprika
 
 [Timer]
-OnBootSec=15min
-OnCalendar=daily
-RandomizedDelaySec=4h
+# 2026-08-05: was OnCalendar=daily + RandomizedDelaySec=4h. Measured leak is
+# ~19G/day/CT of Chrome /tmp scratch against a 32G rootfs, so one CT can go
+# 15% -> 78% between two daily runs. Worse, N CTs share one LVM-thin pool, so
+# the fleet hits pool-100% (-> emergency_ro on EVERY CT) long before any single
+# CT looks full to itself -- that is how loft lost all 20 workers at once.
+OnBootSec=10min
+OnCalendar=hourly
+RandomizedDelaySec=10m
 Persistent=true
 Unit=paprika-worker-housekeep.service
 

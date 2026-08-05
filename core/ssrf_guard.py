@@ -101,7 +101,13 @@ _DNS_PARALLEL_ENABLED = (
 _DNS_UPSTREAMS = [
     s.strip()
     for s in (
-        os.environ.get("PAPRIKA_DNS_UPSTREAMS") or "1.1.1.1,8.8.8.8,9.9.9.9"
+        # LAN gateway (RTX1300) first: near-100 % warm-cache hit + zero DPI
+        # on the LAN hop, so it almost always wins the race and public
+        # resolvers only get queried when the gateway itself is unreachable.
+        # Fixes the 2026-07-13 "dead-domain misjudgement" incident where the
+        # 1.1.1.1/8.8.8.8/9.9.9.9 race fell fully silent ~25 % of the time
+        # under submit-burst load, dead-marking 693 k live URLs.
+        os.environ.get("PAPRIKA_DNS_UPSTREAMS") or "10.10.50.1,1.1.1.1,8.8.8.8"
     ).split(",")
     if s.strip()
 ]

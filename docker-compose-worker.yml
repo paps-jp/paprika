@@ -17,6 +17,19 @@ services:
       dockerfile: docker/worker/Dockerfile
     image: paprika-worker:latest
     restart: unless-stopped
+    # Cap the container log. Docker's json-file driver defaults to UNLIMITED,
+    # and nothing else rotates it: measured 2026-08-03 on garage CT383, a
+    # single 366MB json.log, and the same defect had already filled a hub's
+    # disk to "No space" at 1.6GB ([[hub-docker-json-log-bloat]]). On a worker
+    # this lands on the CT's LVM-thin rootfs, which is the resource whose
+    # exhaustion previously put a CT's ext4 into emergency_ro and cascaded into
+    # ghost workers ([[worker-ct-thinpool-emergency-ro]]).
+    # Takes effect on container RE-CREATION, not restart.
+    logging:
+      driver: json-file
+      options:
+        max-size: "50m"
+        max-file: "3"
     # Run tini as PID 1 so reparented Chrome children (renderers/zygotes
     # killed via process-group kill, plus any stragglers) are reaped
     # instead of piling up as zombies. The worker python is the app, not
@@ -43,12 +56,40 @@ services:
     ports:
       # Match LANE_POOL — bump both together if you want more lanes.
       - "6080-6081:6080-6081"
+      # Salvage stage 2: the worker's HTTP self-restart endpoint
+      # (_start_selfrestart_server in agent/_mix_run.py). WITHOUT this line the
+      # server binds inside the container and nothing outside can reach it, so
+      # the hub's first and cheapest recovery stage fails 100% of the time --
+      # measured 2026-08-03 across the whole fleet: `docker port` showed only
+      # 6080/6081, and :9099/healthz returned nothing on every worker tried,
+      # healthy ones included. Every recovery_events row therefore read
+      # "http+ssh+dockerd failed" with the http stage never having had a
+      # chance. This stage matters because it needs NO disk IO (a resident
+      # thread calling os._exit), which is exactly what survives on a box whose
+      # SSD is saturated.
+      #
+      # NOTE: with PAPRIKA_WORKER_SECRET unset -- which it currently is fleet
+      # wide -- this endpoint accepts any LAN POST. Set the secret on ALL
+      # workers BEFORE setting it on the hubs (see PAPRIKA_WORKER_SECRET below)
+      # if that is not acceptable.
+      - "9099:9099"
     environment:
       - HUB_URL=${HUB_URL:-ws://paprika.lan:8000}
       # Worker<->hub shared secret. MUST match the hub's PAPRIKA_WORKER_SECRET.
       # Empty (default) keeps the handshake check OFF. Roll to ALL workers
       # BEFORE setting it on the hubs, or the hub rejects the fleet.
       - PAPRIKA_WORKER_SECRET=${PAPRIKA_WORKER_SECRET:-}
+      # Both opt-in, both no-ops when empty -- declared here only so a CT can
+      # turn them on from its .env instead of hand-editing this file. They were
+      # previously set by editing the compose on one CT (loft CT563), which is
+      # how that worker ended up 70 lines behind the fleet and, among other
+      # things, missing the json-file log cap below.
+      #   DNS: unset/empty keeps resolv.conf as-is; "off" disables the fixup;
+      #        "ip1,ip2" overrides. See server/worker/dns_fix.py.
+      #   MINIO_DIRECT: "1" uploads assets worker->MinIO directly, with a
+      #        hub fallback. See server/worker/agent/_mix_uploads.py.
+      - PAPRIKA_WORKER_DNS=${PAPRIKA_WORKER_DNS:-}
+      - PAPRIKA_WORKER_MINIO_DIRECT=${PAPRIKA_WORKER_MINIO_DIRECT:-}
       # SSRF deep-defence firewall (see docker/worker/egress-firewall.sh).
       - PAPRIKA_WORKER_EGRESS_FIREWALL=${PAPRIKA_WORKER_EGRESS_FIREWALL:-0}
       - PAPRIKA_FIREWALL_ALLOW_HOSTS=${PAPRIKA_FIREWALL_ALLOW_HOSTS:-}
@@ -117,10 +158,67 @@ services:
       # MIME. Useful when investigating "saved nothing despite
       # popup-follow landing on a video URL". Off by default.
       - SESSION_ASSETS_DEBUG=${SESSION_ASSETS_DEBUG:-0}
+      # Shared node-tmpfs scratch pool. The video download (1-2GB per job,
+      # the writer that fills the CT's thin-pool) goes to a tmpfs living on
+      # the Proxmox NODE and bind-mounted into every worker CT, so the bytes
+      # are charged to host RAM instead of the thin-pool -- and one big
+      # download can use space the node's idle CTs aren't using.
+      # Entirely inert until the CT actually has the mount
+      # (docs/ramdisk-scratch-pool.md); see server/worker/scratch_pool.py.
+      - PAPRIKA_SCRATCH_POOL_DIR=${PAPRIKA_SCRATCH_POOL_DIR:-/var/paprika/dl}
+      - PAPRIKA_SCRATCH_DISABLE=${PAPRIKA_SCRATCH_DISABLE:-}
+      - PAPRIKA_SCRATCH_MIN_FREE_MB=${PAPRIKA_SCRATCH_MIN_FREE_MB:-512}
+      - PAPRIKA_SCRATCH_VIDEO_RESERVE_MB=${PAPRIKA_SCRATCH_VIDEO_RESERVE_MB:-2600}
+      # Per-job workdirs on the pool: leave off until the pool is grown past
+      # the video reserve (a 4GB pool has room for one download, no more).
+      - PAPRIKA_SCRATCH_JOB=${PAPRIKA_SCRATCH_JOB:-0}
+      # Second node tmpfs, for Chrome's user-data-dirs. Once the video
+      # download is on the pool above, Chrome IS the remaining writer to the
+      # CT's LVM-thin rootfs: measured on loft 2026-08-04, 20 CTs pushed
+      # 47 MB/s with browsing active vs 0.6 MB/s with 42 yt-dlp downloads
+      # running but browsing idle. Unset (or pointed at anything that isn't a
+      # real tmpfs) keeps the historical /tmp behaviour, so this is safe to
+      # ship ahead of the infra. See docs/ramdisk-chrome-lane.md.
+      - PAPRIKA_CHROME_LANE_ROOT=${PAPRIKA_CHROME_LANE_ROOT:-/var/paprika/chrome}
+      - PAPRIKA_CHROME_ROOT_MIN_FREE_MB=${PAPRIKA_CHROME_ROOT_MIN_FREE_MB:-256}
+      # Memory guard (server/worker/cgroup_mem.py + agent/_mix_run.py). A
+      # daemon thread watches THIS container's cgroup and recycles the worker
+      # -- drain, let in-flight finish, exit, docker restarts -- on sustained
+      # memory distress. Three independent triggers: anonymous memory (the
+      # known python RSS leak), major-fault rate and PSI (the refault storm
+      # that starved heartbeats on 2026-08-02). Thresholds are ABSOLUTE
+      # because the 8GB cap lives on the parent CT cgroup, invisible from in
+      # here; the defaults assume the fleet's 8GB CTs, so a differently-sized
+      # box wants them adjusted. Kill switch: PAPRIKA_MEMGUARD_DISABLE=1.
+      - PAPRIKA_MEMGUARD_DISABLE=${PAPRIKA_MEMGUARD_DISABLE:-}
+      - PAPRIKA_MEMGUARD_ANON_MB=${PAPRIKA_MEMGUARD_ANON_MB:-}
+      - PAPRIKA_MEMGUARD_MAJFAULT_PER_S=${PAPRIKA_MEMGUARD_MAJFAULT_PER_S:-}
+      - PAPRIKA_MEMGUARD_PSI_PCT=${PAPRIKA_MEMGUARD_PSI_PCT:-}
+      # Page-cache refaults/s -- the DIRECT thrash measure (0.0/s on every
+      # healthy CT measured). Deliberately NOT a memory.current threshold:
+      # a memcg fills with clean cache up to its limit by design, so that
+      # would recycle healthy workers. See docs/worker-memory-guard.md.
+      - PAPRIKA_MEMGUARD_REFAULT_PER_S=${PAPRIKA_MEMGUARD_REFAULT_PER_S:-}
+      - PAPRIKA_MEMGUARD_SUSTAIN_S=${PAPRIKA_MEMGUARD_SUSTAIN_S:-}
+      - PAPRIKA_MEMGUARD_DRAIN_DEADLINE_S=${PAPRIKA_MEMGUARD_DRAIN_DEADLINE_S:-}
+      # Cosmetic only: lets the Workers tab show a real memory percentage by
+      # declaring the CT's cap (the container cannot read it). 8192 on this
+      # fleet. Never affects the guard's own thresholds.
+      - PAPRIKA_WORKER_MEM_LIMIT_MB=${PAPRIKA_WORKER_MEM_LIMIT_MB:-}
       - PYTHONUNBUFFERED=1
     volumes:
       # Auto-generated WORKER_ID is persisted here.
       - paprika-worker-state:/root/.paprika
+      # The node ramdisk (Proxmox host tmpfs -> CT mp0 -> here). When the mp0
+      # isn't set up yet docker just creates an empty dir on the CT disk, and
+      # scratch_pool refuses to use anything that isn't a real tmpfs -- so
+      # this line is safe to ship ahead of the infra.
+      - /var/paprika/dl:/var/paprika/dl
+      # Per-CT node tmpfs for Chrome profiles (mp1). Same "safe before the
+      # infra exists" property as the line above: with no mp1 docker just
+      # creates an empty dir on the CT disk and lanes.py refuses to use
+      # anything that isn't a real tmpfs.
+      - /var/paprika/chrome:/var/paprika/chrome
       # Bind-mount the Python source from the host so iterating on
       # agent_runner.py etc. only needs `docker compose restart worker`
       # (no rebuild = no Chrome reinstall). The image still ships a copy

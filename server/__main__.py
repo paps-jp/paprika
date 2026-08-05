@@ -313,7 +313,47 @@ def _run_worker(args) -> int:
 
     from server.worker.agent import WorkerAgent, default_worker_id
 
-    worker_id = args.worker_id or default_worker_id()
+    # hub_url is passed so the id can be derived from this CT's LAN IP as the
+    # HUB reports it (GET /health -> client_ip). From inside the bridge-
+    # networked container the kernel's own answer is 172.18.0.2 on EVERY
+    # worker, which is how the whole fleet ended up claiming one identity and
+    # fighting over one Chrome profile dir on the shared ramdisk (2026-08-05).
+    worker_id = args.worker_id or default_worker_id(args.hub_url)
+
+    # Same reboot-safety for the shared node-tmpfs pool, but it has to wait
+    # for worker_id: the pool is shared with every other worker CT on this
+    # Proxmox node, so the purge is OWNER-SCOPED. Our own leftovers are from
+    # a dead prior process (no job runs yet); a neighbour's directory may be
+    # a live 2-hour download and is never touched. No-op when the pool isn't
+    # mounted. See server/worker/scratch_pool.py.
+    try:
+        from server.worker import scratch_pool as _scratch_pool
+
+        log.info("%s", _scratch_pool.status_line())
+        _n, _freed = _scratch_pool.purge_own(worker_id)
+        if _n:
+            log.info(
+                "startup: purged %d abandoned scratch-pool dir(s) "
+                "(%.0f MB reclaimed from the shared ramdisk)",
+                _n, _freed / 1e6,
+            )
+    except Exception as e:
+        log.warning("startup scratch-pool purge failed (continuing): %s", e)
+
+    # Second node tmpfs, same idea applied to Chrome's user-data-dirs -- the
+    # dominant remaining writer to the CT's thin pool once video downloads are
+    # on the pool above. Owner-scoped by worker_id for the same reason the
+    # pool is: one ramdisk is shared by every worker CT on the node, so an
+    # unscoped directory would collide. Resolved once here, before any lane
+    # spawns, so the decision (and the reason for any fallback) is visible in
+    # the startup log. See docs/ramdisk-chrome-lane.md.
+    try:
+        from server.worker import lanes as _lanes
+
+        _lanes.init_chrome_lane_root(worker_id)
+        log.info("%s", _lanes.chrome_lane_status_line())
+    except Exception as e:
+        log.warning("chrome lane root probe failed (continuing): %s", e)
 
     # Phase 3 E (Approach B): apply the self-maintaining egress firewall BEFORE
     # any Chrome lane spawns, so private-IP egress (redirects / fetch() /
@@ -338,6 +378,20 @@ def _run_worker(args) -> int:
     if args.slot_pool and not args.lane_pool:
         log.warning("--slot-pool is deprecated, use --lane-pool")
 
+    # Downloader-role workers (PAPRIKA_WORKER_ROLE=downloader) serve ONLY
+    # HubAssignVideoDownload handoffs, writing to the shared host-tmpfs
+    # ramdisk. They run no Xvfb/Chrome/x11vnc, so the lane pool is skipped
+    # entirely and concurrency comes from the pool's slot budget instead of
+    # the lane count. See docs/ramdisk-video-tier.md.
+    from server.worker.agent._mix_videodl import (
+        download_slots_from_env,
+        role_from_env,
+    )
+
+    worker_role = role_from_env()
+    if worker_role == "downloader":
+        n_lanes = 0
+
     lane_pool = None
     if n_lanes > 0:
         from server.worker.lanes import LanePool
@@ -348,10 +402,16 @@ def _run_worker(args) -> int:
             base_novnc_port=args.novnc_base_port,
         )
 
+    if worker_role == "downloader":
+        _dl_slots = download_slots_from_env()
+        max_concurrent = _dl_slots or args.max_concurrent
+    else:
+        max_concurrent = n_lanes or args.max_concurrent
+
     agent = WorkerAgent(
         hub_ws_url=args.hub_url,
         worker_id=worker_id,
-        max_concurrent=n_lanes or args.max_concurrent,
+        max_concurrent=max_concurrent,
         labels=labels,
         chrome_host=args.chrome_host,
         chrome_port=args.chrome_port,
@@ -360,10 +420,11 @@ def _run_worker(args) -> int:
         lane_pool=lane_pool,
     )
     log.info(
-        "mode=worker  worker_id=%s  hub=%s  max_concurrent=%d  labels=%s%s",
+        "mode=worker  worker_id=%s  role=%s  hub=%s  max_concurrent=%d  labels=%s%s",
         worker_id,
+        worker_role,
         args.hub_url,
-        n_lanes or args.max_concurrent,
+        max_concurrent,
         labels,
         f"  lanes={n_lanes}" if n_lanes else "",
     )

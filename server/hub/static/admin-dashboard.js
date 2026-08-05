@@ -462,7 +462,52 @@ async function refresh() {
           return `<span${title} style="color:${c};background:${bg};padding:1px 5px;border-radius:3px;font-variant-numeric:tabular-nums;">${Math.round(v)}%</span>`;
         };
         const cpuCell = _fmtPct(w.cpu_pct);
-        const memCell = _fmtPct(w.mem_pct);
+        // Memory cell. mem_pct is only a real per-worker percentage when
+        // mem_scope === 'cgroup'. On the docker-in-LXC fleet the container has
+        // no cgroup limit of its own, so the worker reports scope 'host' and
+        // mem_pct is the PROXMOX NODE's memory -- identical across every
+        // worker on that node, and ~15% while a CT is seconds from OOM. That
+        // is what hid the 2026-08-02 refault storm, so never render it as if
+        // it described this worker. In that case show the absolute cgroup
+        // figures instead, banded against the worker-side memory-guard
+        // thresholds (anon 5500MB, PSI some avg60 20).
+        const _fmtMem = () => {
+          if (w.memguard) {
+            return `<span title="memory guard tripped: ${esc(w.memguard)} — worker is draining, then docker restarts it" `
+              + `style="color:#c00;background:#fde7e7;padding:1px 5px;border-radius:3px;white-space:nowrap;">`
+              + `⚠ recycling</span>`;
+          }
+          if (w.mem_scope === 'cgroup') return _fmtPct(w.mem_pct);
+          const anon = w.mem_anon_mb || 0;
+          const psi = w.mem_psi_some_avg60 || 0;
+          if (w.mem_scope !== 'host' || anon <= 0) {
+            // Pre-2026-08-03 worker: all we have is the node-wide number.
+            return _fmtPct(w.mem_pct, {
+              title: 'node-wide (this worker predates cgroup-scoped reporting)',
+            });
+          }
+          // Refault rate is the direct thrash measure and reads 0.0 on every
+          // healthy worker, so ANY sustained value is worth surfacing -- band
+          // it far below the guard's 500/s trip so a building storm is visible
+          // in the tab before the worker recycles itself.
+          const rf = w.mem_refault_per_s || 0;
+          const crit = anon >= 5500 || psi >= 20 || rf >= 500;
+          const warn = anon >= 4000 || psi >= 5 || rf >= 50;
+          const c = crit ? '#c00' : (warn ? '#a04a00' : '#444');
+          const bg = crit ? '#fde7e7' : (warn ? '#fff4d9' : 'transparent');
+          const title = `anon ${Math.round(anon)} MB, cgroup total `
+            + `${Math.round(w.mem_current_mb || 0)} MB (total near the limit is `
+            + `NORMAL — a memcg fills with clean cache by design), `
+            + `PSI some avg60 ${psi.toFixed(2)}, refault ${rf.toFixed(1)}/s, `
+            + `majfault ${(w.mem_majfault_per_s || 0).toFixed(0)}/s`
+            + ` — guard trips at anon 5500 MB / refault 500/s / majfault 1000/s`
+            + ` / PSI 20 (sustained 5 min)`;
+          return `<span title="${esc(title)}" style="color:${c};background:${bg};padding:1px 5px;border-radius:3px;font-variant-numeric:tabular-nums;white-space:nowrap;">`
+            + `${(anon / 1024).toFixed(1)}G`
+            + `${rf >= 1 ? ` <small>rf ${rf.toFixed(0)}</small>` : ''}`
+            + `${psi >= 1 ? ` <small>psi ${psi.toFixed(0)}</small>` : ''}</span>`;
+        };
+        const memCell = _fmtMem();
         const diskTitle = (w.disk_free_gb != null && w.disk_free_gb > 0)
           ? `${w.disk_free_gb.toFixed(1)} GB free`
           : '';
@@ -508,6 +553,13 @@ async function refresh() {
               <div class="menu">
                 <button onclick="window.openWorkerDetailModal('${wid}')" title="この worker の状態とログを表示">
                   <span class="ico"><iconify-icon icon="lucide:info"></iconify-icon></span> 詳細
+                </button>
+                <div class="divider"></div>
+                <button onclick="window.diagnoseWorkerCT('${wid}')" title="Proxmox ノードに問い合わせて、なぜ落ちているかを判別する（読み取りのみ）">
+                  <span class="ico"><iconify-icon icon="lucide:stethoscope"></iconify-icon></span> CT 診断
+                </button>
+                <button class="danger" onclick="window.restartWorkerCT('${wid}')" title="pct stop + start。SSH も :9099 も届かない wedge した CT を回復する最後の手段">
+                  <span class="ico"><iconify-icon icon="lucide:power"></iconify-icon></span> CT 再起動
                 </button>
                 <div class="divider"></div>
                 ${deleteItem}
@@ -1529,6 +1581,56 @@ window.deleteWorker = async function(workerId) {
     }
   } catch (e) {
     alert('delete failed: ' + e.message);
+    return;
+  }
+  refresh();
+};
+
+// Ask the owning Proxmox node what is actually wrong. Read-only.
+// Worth its own button because the three failures an operator has to tell
+// apart -- host down / CT wedged / CT networking dead -- all look identical
+// from the hub: every probe just times out. The evidence is host-side.
+window.diagnoseWorkerCT = async function(workerId) {
+  try {
+    const r = await fetch('/workers/' + encodeURIComponent(workerId) + '/ct');
+    const d = await r.json().catch(() => null);
+    if (!r.ok) { alert('診断できません: ' + ((d && d.detail) || r.status)); return; }
+    const dg = d.diagnosis || '';
+    let verdict = '判定できません';
+    if (dg.includes('exec=hang')) {
+      verdict = '⚠ CT が wedge しています（プロセスを起動できない = IO 枯渇）。\n'
+              + 'SSH も :9099 も届きません。CT 再起動が唯一の回復手段です。';
+    } else if (dg.includes('status=absent') || dg.includes('host down')) {
+      verdict = '⚠ ノードまたは CT が存在しない / ホストが落ちています。';
+    } else if (dg.includes('link=down') || dg.includes('gw=no')) {
+      verdict = '⚠ CT の networking が死んでいます（中身は健全）。';
+    } else if (dg.includes('container=absent') || dg.includes('container=stopped')) {
+      verdict = 'CT は健全ですが worker コンテナが動いていません。';
+    } else if (dg.includes('exec=ok')) {
+      verdict = '✅ CT は健全です（ハブから見えない原因は別のところにあります）。';
+    }
+    alert(`${workerId}  →  ${d.node} / CT ${d.ctid}\n\n${verdict}\n\n--- raw ---\n${dg}`);
+  } catch (e) {
+    alert('診断できません: ' + e.message);
+  }
+};
+
+// pct stop + start. The only thing that reaches a wedged container.
+window.restartWorkerCT = async function(workerId) {
+  if (!confirm(
+    `${workerId} の CT を pct stop + start しますか？\n\n`
+    + `この worker の実行中ジョブは失われます。\n`
+    + `SSH も :9099 も届かない wedge 状態の CT を回復する最後の手段です。\n\n`
+    + `先に「CT 診断」で状態を確認することを勧めます。`)) return;
+  try {
+    const r = await fetch('/workers/' + encodeURIComponent(workerId) + '/ct/restart',
+                          { method: 'POST' });
+    const d = await r.json().catch(() => null);
+    if (!r.ok) { alert('CT 再起動に失敗: ' + ((d && d.detail) || r.status)); return; }
+    alert(`CT ${d.ctid} (${d.node}) を再起動しました。\n`
+        + `worker が再接続するまで 30 秒ほどかかります。`);
+  } catch (e) {
+    alert('CT 再起動に失敗: ' + e.message);
     return;
   }
   refresh();

@@ -3319,6 +3319,22 @@ table.aitbl code { font-size:0.95em; }
       <div><input type="checkbox" id="setJobRetentionEnabled"></div>
       <label for="setJobRetentionDays" title="この日数より古い終端ジョブを削除 (既定 10)">保持日数:</label>
       <div><input type="number" id="setJobRetentionDays" placeholder="10" min="1" max="3650" style="width:120px; padding:4px 8px;"> 日</div>
+    </div>
+    <hr style="border:none; border-top:1px solid #eee; margin:14px 0 10px;">
+    <p style="font-size:12px; color:#888; margin:0 0 10px;">
+      <b>課題(review) 専用の期限切れ</b>: 上の一括 GC は「全終端ステータスを古い順」に消すため、
+      review 行はテーブル全体の削除フロンティアが追いつくまで残り、実効 TTL が
+      完了ジョブの滞留量に引きずられます (実測 ~12日)。これは review だけを
+      <b>独立した短い日数</b>で消す別パスです (同じ DB 行 + MinIO + キャッシュ削除)。
+      既定 OFF・<b>ドライラン既定 ON</b> (最初はログに件数だけ出力、実削除はしません)。
+    </p>
+    <div style="display:grid; grid-template-columns: 200px 1fr; gap:8px 12px; align-items:center; padding:4px;">
+      <label for="setReviewRetentionEnabled">課題の自動期限切れ:</label>
+      <div><input type="checkbox" id="setReviewRetentionEnabled"></div>
+      <label for="setReviewRetentionDryRun" title="ON の間は実削除せず候補件数をログ出力するだけ">ドライラン (安全確認):</label>
+      <div><input type="checkbox" id="setReviewRetentionDryRun"></div>
+      <label for="setReviewRetentionDays" title="この日数より古い review ジョブを削除 (既定 7)">review 保持日数:</label>
+      <div><input type="number" id="setReviewRetentionDays" placeholder="7" min="1" max="3650" style="width:120px; padding:4px 8px;"> 日</div>
       <div></div>
       <div>
         <button id="setSaveRetentionBtn" class="pill" style="background:#eef8ee; border-color:#7ab68a; color:#196b2c;"><iconify-icon icon="lucide:save"></iconify-icon> 自動削除設定を保存</button>
@@ -3471,10 +3487,106 @@ table.aitbl code { font-size:0.95em; }
         <button type="button" id="setS3SecretToggle" class="pill" style="padding:2px 8px; font-size:.8em; margin-left:4px; background:#f5f5fa; border-color:#ccd; color:#555;" title="表示/非表示">👁</button>
       </div>
 
+      <!-- 非動画 hot tier (2026-07-06): 画像/HTML/HAR/json を別MinIOへ。動画(.mp4等)は上の主tierのまま。 -->
+      <div style="grid-column:1 / -1; margin-top:12px; padding-top:10px; border-top:1px dashed #ccd;">
+        <strong style="font-size:.92em; color:#445;">非動画 tier <span style="color:#888; font-weight:normal;">(任意)</span></strong>
+        <span style="color:#888; font-size:.82em; margin-left:6px;">画像 / HTML / HAR / JSON を別の高速 MinIO へ振り分け。動画 (.mp4 等) は上の主tierのまま。<b>エンドポイント空 = 分離OFF</b> (主tierに一本化)。読みは 非動画→主 の順にフォールバック。</span>
+      </div>
+
+      <label for="setS3NvEndpoint" title="非動画アセット用 S3 互換エンドポイント (空 = 分離OFF)">エンドポイント:</label>
+      <div><input type="text" id="setS3NvEndpoint" placeholder="例: http://192.168.50.17:9000 (空=OFF)" style="width:280px; padding:4px 8px;"></div>
+
+      <label for="setS3NvBucket" title="非動画バケット (空 = 主バケットを再利用)">バケット:</label>
+      <div><input type="text" id="setS3NvBucket" placeholder="(空=主バケットを再利用)" style="width:240px; padding:4px 8px;"></div>
+
+      <label for="setS3NvRegion" title="リージョン名 (MinIO は任意)">リージョン:</label>
+      <div><input type="text" id="setS3NvRegion" placeholder="us-east-1" style="width:160px; padding:4px 8px;"></div>
+
+      <label for="setS3NvAccessKey" title="非動画 tier アクセスキー ID">アクセスキー:</label>
+      <div><input type="text" id="setS3NvAccessKey" placeholder="" style="width:280px; padding:4px 8px;" autocomplete="off"></div>
+
+      <label for="setS3NvSecretKey" title="非動画 tier シークレットキー">シークレットキー:</label>
+      <div>
+        <input type="password" id="setS3NvSecretKey" placeholder="" style="width:280px; padding:4px 8px;" autocomplete="off">
+        <button type="button" id="setS3NvSecretToggle" class="pill" style="padding:2px 8px; font-size:.8em; margin-left:4px; background:#f5f5fa; border-color:#ccd; color:#555;" title="表示/非表示">👁</button>
+      </div>
+
+      <!-- RAM ディスク退避 (2026-07-21): 退避先MinIO の空き容量が細ったとき、
+           job 単位で通常tier→退避tier へ切替 (ヒステリシス付き)。 -->
+      <div style="grid-column:1 / -1; margin-top:12px; padding-top:10px; border-top:1px dashed #ccd;">
+        <strong style="font-size:.92em; color:#445;">RAM ディスク退避 (spill-over) <span style="color:#888; font-weight:normal;">(任意)</span></strong>
+        <span style="color:#888; font-size:.82em; margin-left:6px;">通常tier (RAM ディスク) の使用率が<b>高しきい値</b>を超えたら、以降のアップロードを退避先へ切替。<b>低しきい値</b>を下回るまで通常tierには戻りません (ヒステリシス)。振り分けは <b>job 単位で固定</b> (同一 job のアセットが両tierに散らばらない)。<b>バケット / 認証を空</b>にすると対応する非退避tier の値を再利用します。</span>
+      </div>
+
+      <label for="setSpillEnabled" title="RAM ディスク退避の有効/無効">有効化:</label>
+      <div><label style="font-weight:normal;"><input type="checkbox" id="setSpillEnabled"> 空き容量が細ったら退避先へ切り替える</label></div>
+
+      <label for="setSpillHighPct" title="この使用率(%)を超えたら退避先へ切替">高しきい値 (%):</label>
+      <div><input type="number" id="setSpillHighPct" placeholder="80" min="1" max="100" step="0.1" style="width:120px; padding:4px 8px;"></div>
+
+      <label for="setSpillLowPct" title="この使用率(%)を下回るまで通常tierへ戻さない (ヒステリシス)">低しきい値 (%):</label>
+      <div><input type="number" id="setSpillLowPct" placeholder="60" min="0" max="100" step="0.1" style="width:120px; padding:4px 8px;"></div>
+
+      <label for="setSpillInterval" title="使用率サンプリング間隔 (秒)">サンプリング間隔 (秒):</label>
+      <div><input type="number" id="setSpillInterval" placeholder="30" min="1" style="width:120px; padding:4px 8px;"></div>
+
+      <label for="setSpillProbeTimeout" title="使用率プローブのタイムアウト (秒)">プローブ timeout (秒):</label>
+      <div><input type="number" id="setSpillProbeTimeout" placeholder="5" min="0.1" step="0.1" style="width:120px; padding:4px 8px;"></div>
+
+      <label for="setSpillStaleAfter" title="この秒数より古いサンプルは無効扱い (判定に使わない)">サンプル失効 (秒):</label>
+      <div><input type="number" id="setSpillStaleAfter" placeholder="180" min="1" style="width:120px; padding:4px 8px;"></div>
+
+      <div style="grid-column:1 / -1; margin-top:10px;">
+        <strong style="font-size:.9em; color:#556;">画像退避先</strong>
+        <span style="color:#888; font-size:.82em; margin-left:6px;">非動画 tier があふれた時の退避先。<b>エンドポイント空 = 退避OFF</b>。</span>
+      </div>
+
+      <label for="setS3NvSpillEndpoint" title="画像退避先 S3 互換エンドポイント (空 = 退避OFF)">エンドポイント:</label>
+      <div><input type="text" id="setS3NvSpillEndpoint" placeholder="例: http://192.168.50.17:9000 (空=OFF)" style="width:280px; padding:4px 8px;"></div>
+
+      <label for="setS3NvSpillBucket" title="画像退避先バケット (空 = 非動画バケットを再利用)">バケット:</label>
+      <div><input type="text" id="setS3NvSpillBucket" placeholder="(空=非動画バケットを再利用)" style="width:240px; padding:4px 8px;"></div>
+
+      <label for="setS3NvSpillAccessKey" title="画像退避先 アクセスキー ID (空 = 非動画tier を再利用)">アクセスキー:</label>
+      <div><input type="text" id="setS3NvSpillAccessKey" placeholder="(空=非動画tier を再利用)" style="width:280px; padding:4px 8px;" autocomplete="off"></div>
+
+      <label for="setS3NvSpillSecretKey" title="画像退避先 シークレットキー (空 = 非動画tier を再利用)">シークレットキー:</label>
+      <div>
+        <input type="password" id="setS3NvSpillSecretKey" placeholder="" style="width:280px; padding:4px 8px;" autocomplete="off">
+        <button type="button" id="setS3NvSpillSecretToggle" class="pill" style="padding:2px 8px; font-size:.8em; margin-left:4px; background:#f5f5fa; border-color:#ccd; color:#555;" title="表示/非表示">👁</button>
+      </div>
+
+      <label for="setS3NvSpillRegion" title="リージョン名 (MinIO は任意)">リージョン:</label>
+      <div><input type="text" id="setS3NvSpillRegion" placeholder="us-east-1" style="width:160px; padding:4px 8px;"></div>
+
+      <div style="grid-column:1 / -1; margin-top:10px;">
+        <strong style="font-size:.9em; color:#556;">動画退避先</strong>
+        <span style="color:#888; font-size:.82em; margin-left:6px;">主 (動画) tier があふれた時の退避先。<b>エンドポイント空 = 退避OFF</b>。</span>
+      </div>
+
+      <label for="setS3SpillEndpoint" title="動画退避先 S3 互換エンドポイント (空 = 退避OFF)">エンドポイント:</label>
+      <div><input type="text" id="setS3SpillEndpoint" placeholder="例: http://192.168.50.8:9100 (空=OFF)" style="width:280px; padding:4px 8px;"></div>
+
+      <label for="setS3SpillBucket" title="動画退避先バケット (空 = 主バケットを再利用)">バケット:</label>
+      <div><input type="text" id="setS3SpillBucket" placeholder="(空=主バケットを再利用)" style="width:240px; padding:4px 8px;"></div>
+
+      <label for="setS3SpillAccessKey" title="動画退避先 アクセスキー ID (空 = 主tier を再利用)">アクセスキー:</label>
+      <div><input type="text" id="setS3SpillAccessKey" placeholder="(空=主tier を再利用)" style="width:280px; padding:4px 8px;" autocomplete="off"></div>
+
+      <label for="setS3SpillSecretKey" title="動画退避先 シークレットキー (空 = 主tier を再利用)">シークレットキー:</label>
+      <div>
+        <input type="password" id="setS3SpillSecretKey" placeholder="" style="width:280px; padding:4px 8px;" autocomplete="off">
+        <button type="button" id="setS3SpillSecretToggle" class="pill" style="padding:2px 8px; font-size:.8em; margin-left:4px; background:#f5f5fa; border-color:#ccd; color:#555;" title="表示/非表示">👁</button>
+      </div>
+
+      <label for="setS3SpillRegion" title="リージョン名 (MinIO は任意)">リージョン:</label>
+      <div><input type="text" id="setS3SpillRegion" placeholder="us-east-1" style="width:160px; padding:4px 8px;"></div>
+
       <div></div>
       <div style="display:flex; gap:8px; align-items:center; flex-wrap:wrap; margin-top:4px;">
         <button id="setSaveS3Btn" class="pill" style="background:#eef8ee; border-color:#7ab68a; color:#196b2c;"><iconify-icon icon="lucide:save"></iconify-icon> 接続設定を保存</button>
-        <button id="setS3TestBtn" class="pill" style="background:#e8f0ff; border-color:#6a8ec7; color:#2a4a8a;"><iconify-icon icon="lucide:plug"></iconify-icon> 接続テスト</button>
+        <button id="setS3TestBtn" class="pill" style="background:#e8f0ff; border-color:#6a8ec7; color:#2a4a8a;"><iconify-icon icon="lucide:plug"></iconify-icon> 主tier 接続テスト</button>
+        <button id="setS3NvTestBtn" class="pill" style="background:#e8f0ff; border-color:#6a8ec7; color:#2a4a8a;"><iconify-icon icon="lucide:plug"></iconify-icon> 非動画tier 接続テスト</button>
         <span id="setS3Status" style="font-size:.9em; margin-left:4px;"></span>
       </div>
     </div>

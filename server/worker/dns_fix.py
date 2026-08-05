@@ -41,7 +41,12 @@ import os
 log = logging.getLogger("paprika.worker.dns_fix")
 
 _RESOLV = "/etc/resolv.conf"
-_DEFAULT = ["1.1.1.1", "8.8.8.8"]
+# LAN gateway (Yamaha RTX1300) first: it caches every host the fleet crawls
+# and lives 1 LAN hop away, so it answers in <5ms with near-100 % hit rates.
+# Public resolvers stay as fallback for when the gateway is unreachable.
+# Keep the local DoH forwarder (doh_proxy.py) prepended by apply() below --
+# some video-CDN hosts are UNKNOWN to the LAN resolver and need DoH.
+_DEFAULT = ["10.10.50.1", "1.1.1.1"]
 _DISABLE = {"off", "0", "false", "no", "disable", "disabled"}
 
 

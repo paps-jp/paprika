@@ -242,6 +242,188 @@ async def _store_repromote_loop():
             log.warning("store re-promote loop error: %s", e)
 
 
+# --- Redis auto-reattach: heal a hub that booted while Redis was down --------
+# EVERY Redis consumer is wired ONCE, in lifespan, from
+# ``getattr(state.store, "_r", None)``. When Redis is mid-``LOADING`` at that
+# instant -- which is exactly what a fleet-wide restart produces, since Redis
+# and the 7 hubs come up together and a 1.5M-key RDB takes minutes -- that
+# value is None and STAYS None for the hub's whole life. Consequence: no
+# presence heartbeat (``/hubs`` -> ``count:1``), no worker mirror, so
+# ``/workers`` collapses to hub-local; behind nginx round-robin the admin
+# Workers count then flaps (11 <-> 20) depending on which hub answered.
+# Observed 2026-08-03 and again 2026-08-04 (5 of 7 hubs).
+#
+# The store already self-heals (_store_repromote_loop) but it only swaps
+# ``state.store`` -- which makes it WORSE to diagnose: jobs work, the UI
+# works, and the hub stays silently invisible to its peers. This loop closes
+# the gap for the rest of the wiring. Env: PAPRIKA_REDIS_REATTACH_DISABLE=1
+# off; PAPRIKA_REDIS_REATTACH_INTERVAL_S tune (default 30s).
+
+# Set by lifespan when it starts the cross-hub invalidation subscriber, so the
+# heal below can tell "already running" from "never started (store was on the
+# in-memory fallback at boot)" and start it late.
+_invalidate_task_ref = {"t": None}
+# Tasks spawned by the heal (cancelled on shutdown alongside lifespan's own).
+_healed_tasks: list[asyncio.Task] = []
+
+
+async def _redis_client_for_heal():
+    """A LIVE Redis client, or None if Redis still isn't answering.
+
+    Prefers the client the job store already holds (a store healed by
+    _store_repromote_loop builds a fresh one) so we don't add a second
+    connection pool per hub; otherwise builds its own, verifies it with a
+    PING, and lends it to the store too -- a dozen call sites
+    (_invalidate / _reaper / _spill / _storage_metrics / routes) read
+    ``getattr(state.store, "_r", None)`` and are just as stuck as the
+    registry is."""
+    r = getattr(state.store, "_r", None)
+    if r is not None:
+        return r
+    if not config.redis_url:
+        return None
+    from server.store import make_redis_client
+
+    client = make_redis_client(config.redis_url, decode_responses=True)
+    try:
+        await client.ping()
+    except Exception as e:
+        # Still down / still LOADING -- try again next tick.
+        log.debug("redis reattach: probe failed (%s)", e)
+        try:
+            await client.aclose()
+        except Exception:
+            pass
+        return None
+    # Only stores that actually have the slot (Redis / MariaDB) get it; the
+    # in-memory fallback has no ``_r`` attribute at all.
+    if hasattr(state.store, "_r"):
+        state.store._r = client
+        if getattr(state.store, "_pubsub_r", "absent") is None:
+            # Subscribe needs its own connection (a subscribed client can't
+            # serve normal commands).
+            state.store._pubsub_r = make_redis_client(
+                config.redis_url, decode_responses=True,
+            )
+    return client
+
+
+async def _rewire_redis_consumers(client) -> None:
+    """Point every Redis-backed consumer at *client*. Idempotent."""
+    # hub_id derivation ALSO needs Redis (CLIENT INFO) unless PAPRIKA_HOST_IP
+    # pins it, so a hub that booted Redis-less may still be carrying its
+    # random import-time id -- the orphan-hub failure. Re-derive here: nothing
+    # was ever written under the old id (there was no Redis), so the switch is
+    # safe, and it fixes the orphan in the same pass.
+    host_ip = await _host_lan_ip_via_redis(client)
+    if host_ip and not os.environ.get("HUB_ID"):
+        _derived = "hub-" + host_ip.rsplit(".", 1)[-1]
+        if _derived != config.hub_id:
+            log.warning(
+                "redis reattach: hub_id %s -> %s (re-derived from host LAN IP %s)",
+                config.hub_id, _derived, host_ip,
+            )
+            config.hub_id = _derived
+
+    # 1. Worker registry -- and re-publish the workers that connected during
+    #    the Redis-less window (register() is the only writer of the full row).
+    n_workers = 0
+    if state.registry is not None:
+        n_workers = await state.registry.rebind_redis(client, config.hub_id)
+
+    # 2. Session map (cross-hub session forwarding + restart survival).
+    try:
+        state.sessions.bind_redis(client, config.hub_id)
+    except Exception as e:
+        log.warning("redis reattach: session bind failed: %s", e)
+
+    # 3. Hub presence -- the ``/hubs count:1`` symptom, and what the nginx
+    #    reconciler reads.
+    try:
+        if state.hubs is None:
+            from server.hub._hubs import HubRegistry
+
+            state.hubs = HubRegistry(
+                redis_client=client,
+                hub_id=config.hub_id,
+                public_base=config.public_base_url or "",
+                version=os.environ.get("PAPRIKA_VERSION", "").strip(),
+            )
+        else:
+            state.hubs._r = client
+            state.hubs.hub_id = config.hub_id
+            state.hubs.update(hub_id=config.hub_id)
+        if host_ip:
+            state.hubs.update(ip=host_ip)
+        if not _ADMIN_MODE:
+            # No-op if the heartbeat task is somehow already running.
+            state.hubs.start()
+    except Exception as e:
+        log.warning("redis reattach: hub presence rebind failed: %s", e)
+
+    # 4. Two more consumers that lifespan gates on the BOOT-TIME store kind and
+    #    therefore skipped entirely on an in-memory boot: the WS-loop log
+    #    batcher and the cross-hub config-invalidation subscriber (without the
+    #    latter, settings/skills edits made on a peer never reach this hub).
+    try:
+        if (
+            state.log_batcher is None
+            and not _ADMIN_MODE
+            and state.store_kind in ("redis", "mariadb")
+        ):
+            from server.hub._log_batcher import LogBatcher
+
+            state.log_batcher = LogBatcher(state.store)
+    except Exception as e:
+        log.warning("redis reattach: log batcher init failed: %s", e)
+    try:
+        _inv = _invalidate_task_ref.get("t")
+        if _inv is None or _inv.done():
+            from server.hub._invalidate import run_invalidation_subscriber
+
+            _t = asyncio.create_task(run_invalidation_subscriber())
+            _invalidate_task_ref["t"] = _t
+            _healed_tasks.append(_t)
+    except Exception as e:
+        log.warning("redis reattach: invalidation subscriber start failed: %s", e)
+
+    log.warning(
+        "REDIS REATTACH: hub %s re-wired to Redis after a Redis-less boot "
+        "(presence heartbeat + %d connected worker(s) re-mirrored; "
+        "no restart needed)",
+        config.hub_id, n_workers,
+    )
+
+
+async def _redis_reattach_loop():
+    """Re-probe Redis while any consumer is unwired and rewire on success."""
+    if os.environ.get("PAPRIKA_REDIS_REATTACH_DISABLE"):
+        return
+    try:
+        interval = float(
+            os.environ.get("PAPRIKA_REDIS_REATTACH_INTERVAL_S") or 30.0)
+    except Exception:
+        interval = 30.0
+    while True:
+        try:
+            await asyncio.sleep(interval)
+            if not config.redis_url:
+                continue  # no shared Redis configured (dev / single host)
+            # The healthy path is one attribute read: the registry's client is
+            # the canonical "am I wired?" signal (it is what every peer-facing
+            # read depends on).
+            if getattr(state.registry, "_r", None) is not None:
+                continue
+            client = await _redis_client_for_heal()
+            if client is None:
+                continue
+            await _rewire_redis_consumers(client)
+        except asyncio.CancelledError:
+            break
+        except Exception as e:
+            log.warning("redis reattach loop error: %s", e)
+
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     # Bypass docker's flaky embedded DNS (127.0.0.11) BEFORE the SSRF guard,
@@ -580,7 +762,9 @@ async def lifespan(app: FastAPI):
     reaper_task = retire_task = dead_worker_task = job_lease_task = None
     preview_sub_task = cache_evict_task = stale_reconcile_task = None
     redrive_task = salvage_task = storage_metrics_task = None
-    nightly_review_task = retention_task = None
+    ct_scan_task = None
+    nightly_review_task = retention_task = spill_task = maintenance_task = None
+    review_retention_task = None
     if not _ADMIN_MODE:
         reaper_task = asyncio.create_task(_session_reaper_loop())
         retire_task = asyncio.create_task(_skill_convention_reaper_loop())
@@ -597,6 +781,18 @@ async def lifespan(app: FastAPI):
         from server.hub._salvage import _salvage_loop
 
         salvage_task = asyncio.create_task(_salvage_loop())
+
+        # Node-side worker health scan. Every OTHER check paprika makes runs
+        # inside the worker, so none of them survive the failure where the
+        # worker process itself is starved (hall CT133, 2026-08-03: memcg at
+        # 99% of its limit, PSI past the guard's own threshold, and anon down
+        # to 0.4MB because the python holding the guard was already gone).
+        # Reading /sys/fs/cgroup/lxc/<id>/ from the Proxmox node is the one
+        # vantage point that failure cannot take away. Inert until the
+        # proxmox_* settings are filled in. See server/hub/_ct_scan.py.
+        from server.hub._ct_scan import ct_scan_loop
+
+        ct_scan_task = asyncio.create_task(ct_scan_loop())
 
         # Durable backstop for orphaned-running + stuck-queued jobs that the
         # per-process nets (startup orphan-recovery, in-process queued-timeout
@@ -626,6 +822,15 @@ async def lifespan(app: FastAPI):
         from server.hub._reaper import _job_retention_loop
 
         retention_task = asyncio.create_task(_job_retention_loop())
+
+        # Review(課題)-specific expiry (opt-in via settings.review_retention_enabled,
+        # dry_run default ON): a SEPARATE shorter-horizon GC just for status=review,
+        # decoupled from the general oldest-first frontier so review is held at
+        # review_retention_days instead of the deep completed/failed backlog depth.
+        # See _reaper.py:_review_retention_loop.
+        from server.hub._reaper import _review_retention_loop
+
+        review_retention_task = asyncio.create_task(_review_retention_loop())
 
         # Success Audit: periodically sample completed video-download jobs +
         # ask a VisionAI whether the saved video is actually the page's main
@@ -664,6 +869,23 @@ async def lifespan(app: FastAPI):
 
         storage_metrics_task = asyncio.create_task(_storage_metrics_loop())
 
+        # RAM-disk spill-over sampler. Watches each RAM tier's free space and
+        # flips NEW asset writes to a durable spill store BEFORE the RAM disk
+        # fills (2026-07-20: it filled, the host stopped answering, and writes
+        # hung instead of failing -- so this must be threshold-driven, never
+        # error-driven). Inert unless asset_spill_enabled. See _spill.py.
+        from server.hub._spill import _spill_loop
+
+        spill_task = asyncio.create_task(_spill_loop())
+
+        # Scheduled-maintenance plugin ticker. Generic driver that invokes one
+        # operator-chosen plugin on a cadence (cross-hub locked). Used for the
+        # out-of-git, pipeline-coupled video-asset GC. Inert unless
+        # maintenance_plugin_enabled. See _maintenance.py.
+        from server.hub._maintenance import _maintenance_loop
+
+        maintenance_task = asyncio.create_task(_maintenance_loop())
+
         # Nightly per-host strategy digest. Runs once per day at the
         # configured UTC hour (default 16:00 UTC = 01:00 JST). Picks hosts
         # with notable failure/review activity in the last 24h and writes a
@@ -692,12 +914,22 @@ async def lifespan(app: FastAPI):
         from server.hub._invalidate import run_invalidation_subscriber
 
         invalidate_task = asyncio.create_task(run_invalidation_subscriber())
+    # Let the Redis auto-reattach heal start this late if we booted on the
+    # in-memory fallback and skipped it here.
+    _invalidate_task_ref["t"] = invalidate_task
 
     # Store auto-heal: if this hub started on the Redis/in-memory fallback
     # (MariaDB was down/restarting at boot), promote it back to MariaDB the
     # moment MariaDB is reachable -- no manual rolling restart. No-op once on
     # mariadb / when MariaDB isn't configured.
     repromote_task = asyncio.create_task(_store_repromote_loop())
+
+    # Redis auto-reattach: the store heals itself above, but the presence
+    # heartbeat / worker mirror / session map are wired once from the boot-time
+    # Redis client. If that was None (Redis mid-LOADING during a fleet-wide
+    # restart) this hub is invisible to its peers forever -- the flapping
+    # worker count. Re-wire in place as soon as Redis answers.
+    reattach_task = asyncio.create_task(_redis_reattach_loop())
 
     # Recover from previous hub crash / deploy: any job persisted as
     # `status=running` but no longer driven by a local task is an
@@ -747,10 +979,17 @@ async def lifespan(app: FastAPI):
     for _t in (reaper_task, retire_task, dead_worker_task, job_lease_task,
                invalidate_task, preview_sub_task, cache_evict_task,
                stale_reconcile_task, redrive_task, salvage_task,
+               ct_scan_task,
                storage_metrics_task, nightly_review_task, repromote_task,
-               retention_task):
+               reattach_task,
+               retention_task, review_retention_task, spill_task, maintenance_task):
         if _t is not None:
             _t.cancel()
+    # Tasks the Redis reattach heal started late (invalidation subscriber).
+    for _t in _healed_tasks:
+        _t.cancel()
+    _healed_tasks.clear()
+    _invalidate_task_ref["t"] = None
     # Stop hub heartbeat + drop the registry row so peers see us as
     # offline within ~1 minute instead of waiting for the 90s TTL.
     if state.hubs is not None:

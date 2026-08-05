@@ -691,7 +691,9 @@ async def _run_codegen_loop_job(request: Request, info: JobInfo) -> None:
         from server.hub.distiller_light import host_from_url, record_job_outcome
         _hk_host = host_from_url(info.url)
         if _hk_host:
-            record_job_outcome(
+            # os.fsync + history.jsonl write off the event loop (see workers.py).
+            await asyncio.to_thread(
+                record_job_outcome,
                 host=_hk_host,
                 success=(info.status == JobStatus.completed),
                 job_id=job_id,

@@ -31,6 +31,7 @@ model that ``codegen.py`` does, configured via the same env vars.
 
 from __future__ import annotations
 
+import asyncio
 import json
 import logging
 import re
@@ -63,78 +64,82 @@ class Verdict:
 
 _SYSTEM_PROMPT = """\
 You are a strict quality judge for an autonomous web-automation agent.
+You MUST follow the COMMIT-FIRST protocol below -- do NOT skip Step 1.
 
-The agent was given a goal in natural language. It then generated a
-Python script that drives a Chrome browser through the paprika fleet,
-ran the script, and produced an outcome (exit code, captured assets,
-stdout/stderr). You will see:
+# COMMIT-FIRST PROTOCOL (研究裏付け: arxiv 2607.05904)
+# reference-free judging that just says "yes/no" measures plausibility,
+# not correctness (false-positive rate 0.719). Forcing the judge to
+# commit an answer of its own FIRST -- specifically, to write down the
+# CRITERIA the goal implies before looking at what the agent did --
+# collapses the false-positive rate to 0.012 in the original paper.
+# We apply the same principle here.
 
-  * The GOAL the operator originally wrote.
-  * The SCRIPT the agent generated (real Python).
-  * The OUTCOME (exit code, assets, stdout/stderr).
-  * Sometimes a FINAL SCREENSHOT of the browser when the script
-    exited. Use it like a human reviewer would: if the visible page
-    is a 404 / age-gate / login wall / ad popup / blank tab, the
-    agent didn't actually reach the goal even if the script exit
-    code was 0. If the visible page LOOKS like the content the goal
-    asked for (search results, video list, target article body,
-    etc.) AND the asset count is non-zero, that's strong evidence
-    the agent succeeded.
+## Step 1: DECOMPOSE THE GOAL INTO OBJECTIVE CRITERIA (before looking at outcome)
+Read only the GOAL. Ignore the outcome for now. Write down 2-6 concrete,
+checkable success criteria the goal implies. Each criterion must have a
+"kind" and a "threshold" you can objectively verify against the OUTCOME
+block later. Common kinds:
 
-Your job has two parts:
+  * video_count       — "at least N video files saved"
+  * video_valid       — "each video has duration >= X sec AND resolution >= WxH"
+                        (thumbnails, previews, 8-second ads, and 728x90
+                        banners MUST fail this. This is the #1 false-
+                        positive class in paprika audit.)
+  * image_count       — "at least N image files"
+  * page_count        — "at least N pages crawled (progress markers)"
+  * page_reached      — "the final page shown is on the requested site
+                        AND is NOT 404 / login wall / age-gate / blank"
+  * content_match     — "the saved content actually contains what the
+                        goal asked for (topic, entity, page role)"
+  * no_error_flood    — "stderr is not a runaway loop of the same error"
 
-  1. Decide whether the OUTCOME actually achieves the GOAL.
-  2. If NG, point at the *specific line(s)* in SCRIPT that caused
-     the failure and propose a concrete fix.
+If the goal is genuinely under-specified (e.g. "just fetch it"), fall
+back to the DEFAULT set: page_reached=true AND (assets>0 OR
+progress_count>0).
 
-Verdict criteria:
-  * Did the script DO the requested work, or did it just complete
-    without crashing? "exit 0 with 0 assets when the goal asked for
-    downloads" is a FAILURE, not a success.
-  * If the goal specifies a quantity ("at least 3 videos", "20
-    pages") and the outcome falls clearly short (< half), that is
-    a FAILURE.
-  * Visible asset count, captured pages, downloaded files, and
-    successful progress markers in stdout count toward satisfaction.
-  * Stderr exceptions are NOT automatically failure -- the agent
-    might have recovered. But a stderr full of repeated errors with
-    no compensating progress markers is failure.
-  * Be honest. A borderline attempt should be flagged as NG so the
-    agent retries, NOT given the benefit of the doubt.
+## Step 2: CHECK EACH CRITERION AGAINST THE ACTUAL OUTCOME
+For each criterion, look at the OUTCOME block (asset breakdown, video
+probe results, screenshot, stdout progress markers, stderr) and record
+result: "pass" | "fail" | "unknown". "unknown" = you cannot tell from
+the evidence.
 
-Hint quality:
-  * READ THE SCRIPT. Don't generate a generic "try harder" hint.
-    Pinpoint the actual line / construct that broke.
-  * Common pitfalls to look for and call out by name when present:
-      - URL filters via "X in url" that match the domain itself
-        (e.g. `"video" in url` matches every page on a host whose
-        name itself contains "video"). Suggest a tighter pattern
-        (regex anchored to path segments like /v/, /watch/).
-      - Outline parsing via hand-rolled regex when pap.walk() would
-        do the same thing without the URL-filter pitfalls.
-      - Calling page.download_video() on a page that's not a video
-        page (= URL extraction picked menu / nav links).
-      - Missing page.close_popups() after agent-driven clicks that
-        open new tabs.
-      - Not refreshing the outline after navigation (= reading
-        stale state).
-  * Refer to specific identifiers from the script when possible:
-    "the loop at `for line in lines:` only collects URLs matching
-    'video' which also matches the domain name; switch to
-    `pap.walk(page, target_pages=20, same_domain=True)`".
+CRITICAL: use the VIDEO PROBES section when present. A file with a
+``.mp4`` extension that ffprobe reports as duration<3s OR width<200 OR
+no video stream IS NOT A VIDEO -- it is a thumbnail / preview / ad /
+mis-labelled image. Mark video_valid as FAIL.
 
+## Step 3: VERDICT
+``satisfied = true`` ONLY if ALL criteria are ``pass`` (unknowns count
+as fail for high-stakes categories: video_valid, page_reached,
+content_match). If ANY criterion is fail/unknown, satisfied = false.
+
+# HINT QUALITY (only on NG)
+Point at the specific line / construct in SCRIPT that caused the failed
+criterion, and propose a concrete fix. Common pitfalls:
+  - URL filters via "X in url" that match the domain itself
+    (e.g. `"video" in url` matches every page on a host whose name
+    contains "video"). Suggest an anchored pattern.
+  - Calling page.download_video() on a page that's not a video page.
+  - Missing page.close_popups() after agent-driven clicks.
+  - Not refreshing the outline after navigation.
+
+# OUTPUT
 Output strict JSON, no prose, no markdown fences:
 
   {
+    "criteria": [
+      {"kind": "<from list above>", "requirement": "<one line>", "result": "pass|fail|unknown", "evidence": "<why>"},
+      ...
+    ],
     "satisfied": <true|false>,
-    "reason": "<one-line, <= 160 chars, why you said yes/no>",
-    "hint": "<if satisfied=false: 1-2 sentences pinpointing the script line / construct that's wrong AND the concrete fix. Empty string if true.>"
+    "reason": "<one-line, <= 160 chars, WHICH criterion(a) drove the verdict>",
+    "hint": "<NG only: 1-2 sentences pinpointing the script line / construct that's wrong AND the concrete fix. Empty string on OK.>"
   }
 
-LANGUAGE: The natural-language fields ``reason`` and ``hint`` MUST be
+LANGUAGE: ``requirement`` / ``evidence`` / ``reason`` / ``hint`` MUST be
 written in JAPANESE (日本語). Keep code / selector references inline in
-English as written (e.g. ``await page.state()['url']``). The ``satisfied``
-boolean is unaffected.
+English as written (e.g. ``await page.state()['url']``). ``kind``,
+``result``, and the ``satisfied`` boolean stay as specified.
 """
 
 
@@ -151,6 +156,7 @@ def _format_outcome_summary(
     progress_count: int = 0,
     target_pages: int | None = None,
     blind: bool = False,
+    video_probes: list[dict] | None = None,
 ) -> str:
     """Render the attempt's outcome into a compact string the judge
     LLM can read. Trims long stdout/stderr to recent tails because
@@ -163,6 +169,12 @@ def _format_outcome_summary(
     judge from being persuaded by the maker's narrative — the
     "evaluator-optimizer" pattern requires the verifier to be
     blind to the maker's reasoning trace.
+
+    ``video_probes`` is a list of ffprobe results for video assets
+    (see judge_attempt). When present, embedded verbatim into the
+    OUTCOME block so the commit-first judge can objectively check
+    the ``video_valid`` criterion (duration + resolution + codec)
+    without being fooled by ``.mp4`` extension alone.
     """
     # Asset summary: count + group by extension. Keeps the judge's
     # prompt small (a profile with 200 cookies doesn't need every
@@ -176,6 +188,32 @@ def _format_outcome_summary(
             ext_counts = Counter((p.suffix.lower() or "(none)") for p in files)
             breakdown = ", ".join(f"{ext}: {n}" for ext, n in ext_counts.most_common(10))
             asset_line = f"assets: {len(files)} files ({breakdown})"
+
+    # VIDEO PROBES: for every ``.mp4`` / ``.webm`` / ``.mkv`` / ``.mov``
+    # / ``.m4v`` asset, embed ffprobe results (duration, width, height,
+    # codec) so the judge can rule on ``video_valid`` objectively. When
+    # video_probes is empty the block is omitted (judge sees "assets"
+    # only, same as before).
+    video_probe_line = ""
+    if video_probes:
+        rows = []
+        for p in video_probes:
+            name = (p.get("name") or "?")[:60]
+            if p.get("probe") is None:
+                rows.append(f"  - {name}: NO VIDEO STREAM (likely mis-labelled)")
+                continue
+            pr = p["probe"]
+            dur = pr.get("duration_s") or 0
+            w = pr.get("width") or 0
+            h = pr.get("height") or 0
+            codec = pr.get("codec") or "?"
+            flags = []
+            if dur < 3: flags.append("short<3s")
+            if w < 200 or h < 200: flags.append(f"tiny{w}x{h}")
+            if w and h and (w / max(1, h)) > 6: flags.append(f"banner-aspect{w}x{h}")
+            flag_str = f" [{'/'.join(flags)}]" if flags else ""
+            rows.append(f"  - {name}: {dur:.1f}s {w}x{h} {codec}{flag_str}")
+        video_probe_line = "video probes (ffprobe):\n" + "\n".join(rows)
 
     # Tail both streams. Stdout matters more for "what did the agent
     # accomplish"; stderr more for "what went wrong". Asymmetric
@@ -209,6 +247,8 @@ def _format_outcome_summary(
         + (f" (target hint: {target_pages})" if target_pages else ""),
         asset_line,
     ]
+    if video_probe_line:
+        parts += ["", video_probe_line]
     if not blind:
         parts += [
             "",
@@ -286,7 +326,7 @@ async def judge_attempt(
     screenshot_path: Path | None = None,
     progress_count: int = 0,
     target_pages: int | None = None,
-    max_tokens: int = 400,
+    max_tokens: int = 800,
     temperature: float = 0.0,
     target: LLMTarget | None = None,
     blind: bool = False,
@@ -303,6 +343,34 @@ async def judge_attempt(
     call surface so iterative_codegen.py uses the same pattern for
     both LLM round trips.
     """
+    # COMMIT-FIRST support: probe every video asset with ffprobe BEFORE
+    # composing the judge prompt, so the judge can objectively check
+    # ``video_valid`` (duration / resolution / codec) instead of trusting
+    # the ``.mp4`` extension. This closes the #1 false-positive class in
+    # the paprika audit (thumbnails / 8-sec previews / 728x90 banners).
+    video_probes: list[dict] = []
+    if assets_dir is not None and assets_dir.exists():
+        try:
+            _VIDEO_EXTS = {".mp4", ".webm", ".mkv", ".mov", ".m4v"}
+            vfiles = [p for p in assets_dir.rglob("*")
+                      if p.is_file() and p.suffix.lower() in _VIDEO_EXTS]
+            # Cap: never probe more than 8 videos (typical page has 1-3;
+            # a huge crawl has many but we only need a representative
+            # sample for the judge's video_valid decision).
+            vfiles = vfiles[:8]
+            if vfiles:
+                from server.hub._success_audit import _ffprobe_video
+                probes = await asyncio.gather(
+                    *[_ffprobe_video(p) for p in vfiles],
+                    return_exceptions=True,
+                )
+                for p, pr in zip(vfiles, probes):
+                    if isinstance(pr, Exception):
+                        pr = None
+                    video_probes.append({"name": p.name, "probe": pr})
+        except Exception as e:
+            log.debug("judge video probe crashed: %s", e)
+
     summary = _format_outcome_summary(
         goal=goal,
         script=script,
@@ -315,6 +383,7 @@ async def judge_attempt(
         progress_count=progress_count,
         target_pages=target_pages,
         blind=blind,
+        video_probes=video_probes,
     )
 
     # Compose the user message. If a screenshot is available and the
@@ -533,6 +602,215 @@ selectors, identifiers, and API method names stay in English. Your
 internal ``<think>...</think>`` reasoning may be in either language; the
 operator-visible verdict text must be Japanese.
 """
+
+
+# ---------------------------------------------------------------------------
+# P-B: Adversarial refuter (arxiv 2603.06594 / 2607.05904)
+#
+# The primary judge (judge_attempt above) uses commit-first prompting to
+# reduce false positives. But single-judge verdicts still leak "convincing
+# but wrong" satisfied=true answers, and the paper's mitigation is to
+# collect MULTIPLE independent judge-positive samples before trusting the
+# verdict. This module adds an adversarial refuter that tries HARD to
+# refute a claimed satisfied=true, run N times (see Setting
+# ``judge_adversarial_n``). If ≥majority refute, iterative_codegen.py
+# downgrades the verdict to satisfied=false.
+#
+# Only runs on satisfied=true verdicts (negative claims are self-verifying
+# -- the agent retries anyway). Cost: ~$0.001 per refute pass at V4-Flash
+# rates, called on ~10-20% of attempts.
+# ---------------------------------------------------------------------------
+
+_ADVERSARIAL_REFUTE_SYSTEM = """\
+You are an ADVERSARIAL REFUTER for an agent-verdict decision.
+
+CONTEXT: An autonomous web-automation agent tried to achieve a GOAL and
+its primary judge said "satisfied=true" (goal achieved). YOUR JOB is to
+try HARD to prove that judgment WRONG. Default to refuted=true when
+uncertain -- your bias is to catch false positives that the primary
+judge missed. If you cannot find any concrete failure evidence, only
+then say refuted=false.
+
+Look aggressively for these failure classes (all observed in real
+paprika audits):
+
+  * VIDEO_FAKE — a ``.mp4`` file that ffprobe says has duration<3s,
+    resolution<200x200, banner aspect ratio, or NO video stream. These
+    are thumbnails / previews / 728x90 ads mis-labelled as video.
+  * PAGE_WALL — screenshot shows 404 / login / age-gate / captcha /
+    blank / cookie-banner instead of the requested content. The agent
+    never reached the goal even if the script exited 0.
+  * COUNT_SHORT — goal asked for N items and outcome has < N/2. The
+    letter of the goal is missed.
+  * WRONG_CONTENT — assets exist but are from a wrong section (e.g.
+    "video list" goal but downloaded thumbnails of an ad carousel).
+  * SILENT_FAIL — stdout has "success" markers but stderr has repeated
+    tool errors that were not compensated for.
+
+Output strict JSON:
+
+  {
+    "refuted": <true|false>,
+    "evidence": "<concrete evidence in 1-2 sentences: WHICH failure class + WHICH file / line / count. Empty if refuted=false.>",
+    "confidence": <0.0-1.0>
+  }
+
+LANGUAGE: ``evidence`` MUST be written in JAPANESE (日本語). Keep file
+names, error strings, URLs in English as written.
+"""
+
+
+async def judge_adversarial_refute(
+    *,
+    goal: str,
+    exit_code: int,
+    elapsed_ms: int,
+    timed_out: bool,
+    stdout: str,
+    stderr: str,
+    assets_dir: Path | None = None,
+    screenshot_path: Path | None = None,
+    progress_count: int = 0,
+    target_pages: int | None = None,
+    max_tokens: int = 400,
+    temperature: float = 0.3,
+    target: LLMTarget | None = None,
+    blind: bool = False,
+    job_id: str | None = None,
+    lens_hint: str = "",
+) -> dict | None:
+    """One adversarial refutation pass. Returns
+    ``{refuted, evidence, confidence}`` or None on failure. Uses the same
+    outcome summary + ffprobe video probes as ``judge_attempt`` so both
+    judges rule on identical evidence. ``lens_hint`` optionally biases
+    the refuter toward one failure class (correctness / evidence /
+    reproducibility) so parallel refuters cover complementary angles."""
+    # Reuse the primary judge's video probes for consistency.
+    video_probes: list[dict] = []
+    if assets_dir is not None and assets_dir.exists():
+        try:
+            _VIDEO_EXTS = {".mp4", ".webm", ".mkv", ".mov", ".m4v"}
+            vfiles = [p for p in assets_dir.rglob("*")
+                      if p.is_file() and p.suffix.lower() in _VIDEO_EXTS][:8]
+            if vfiles:
+                from server.hub._success_audit import _ffprobe_video
+                probes = await asyncio.gather(
+                    *[_ffprobe_video(p) for p in vfiles],
+                    return_exceptions=True,
+                )
+                for p, pr in zip(vfiles, probes):
+                    if isinstance(pr, Exception):
+                        pr = None
+                    video_probes.append({"name": p.name, "probe": pr})
+        except Exception as e:
+            log.debug("refuter video probe crashed: %s", e)
+
+    summary = _format_outcome_summary(
+        goal=goal, exit_code=exit_code, elapsed_ms=elapsed_ms,
+        timed_out=timed_out, stdout=stdout, stderr=stderr,
+        assets_dir=assets_dir, progress_count=progress_count,
+        target_pages=target_pages, blind=blind, video_probes=video_probes,
+    )
+
+    lens_prefix = ""
+    if lens_hint:
+        lens_prefix = (
+            f"# REFUTATION LENS: {lens_hint}\n"
+            f"Focus your refutation attempts through this lens specifically.\n\n"
+        )
+
+    user_content: object = lens_prefix + summary
+    has_image = False
+    if screenshot_path is not None and screenshot_path.exists():
+        try:
+            import base64
+            img_bytes = screenshot_path.read_bytes()
+            b64 = base64.b64encode(img_bytes).decode("ascii")
+            mime = ("image/jpeg" if screenshot_path.suffix.lower() in (".jpg", ".jpeg")
+                    else "image/png")
+            user_content = [
+                {"type": "text", "text": lens_prefix + summary + "\n\n# FINAL SCREENSHOT\n"
+                    "Judge screenshot against goal -- 404 / login / age-gate / blank means fail."},
+                {"type": "image_url", "image_url": {"url": f"data:{mime};base64,{b64}"}},
+            ]
+            has_image = True
+        except Exception as e:
+            log.debug("refuter screenshot embed crashed: %s", e)
+
+    tgt = target or _env_default_target()
+    body = {
+        "model": tgt.model,
+        "messages": [
+            {"role": "system", "content": _ADVERSARIAL_REFUTE_SYSTEM},
+            {"role": "user", "content": user_content},
+        ],
+        "temperature": temperature,
+        "max_tokens": max_tokens,
+        "response_format": {"type": "json_object"},
+    }
+    body = adapt_chat_body(tgt, body)
+
+    t0 = time.time()
+    try:
+        from server.hub.codegen import (
+            check_engine_quota, check_engine_thermal, record_engine_usage,
+            EngineQuotaExceeded, EngineThermalThrottled,
+        )
+        try:
+            check_engine_quota(tgt)
+            await check_engine_thermal(tgt)
+        except (EngineQuotaExceeded, EngineThermalThrottled):
+            return None
+        from server.hub._ai_activity import track
+        async with httpx.AsyncClient(timeout=tgt.timeout) as client:
+            with track("judge_refute", slug=getattr(tgt, "engine_slug", "")):
+                r = await client.post(tgt.url, json=body, headers=tgt.headers)
+            if r.status_code >= 400:
+                return None
+            payload = r.json()
+            record_engine_usage(tgt, payload.get("usage") or {})
+    except Exception as e:
+        log.info(f"[judge_refute] call failed: {type(e).__name__}: {e}")
+        return None
+    elapsed = int((time.time() - t0) * 1000)
+    choices = payload.get("choices") or []
+    if not choices:
+        return None
+    raw = (choices[0].get("message") or {}).get("content") or ""
+
+    # Persist to ai_io_log for observability.
+    try:
+        from server.hub._ai_io_log import record_ai_io
+        _prompt_str = user_content if isinstance(user_content, str) else "(multimodal + " + lens_hint + ")"
+        _u = payload.get("usage") or {}
+        record_ai_io(purpose="judge_refute",
+                     engine_slug=getattr(tgt, "engine_slug", "") or tgt.model,
+                     job_id=job_id, prompt=str(_prompt_str)[:2000], response=raw,
+                     latency_ms=elapsed,
+                     tokens_in=_u.get("prompt_tokens"),
+                     tokens_out=_u.get("completion_tokens"),
+                     extra={"lens": lens_hint, "has_image": has_image})
+    except Exception:
+        pass
+
+    # Parse
+    d = None
+    try:
+        d = json.loads(raw.strip())
+    except Exception:
+        for m in _JSON_RX.finditer(raw):
+            try:
+                d = json.loads(m.group(0))
+                break
+            except Exception:
+                continue
+    if not isinstance(d, dict) or "refuted" not in d:
+        return None
+    return {
+        "refuted": bool(d.get("refuted")),
+        "evidence": str(d.get("evidence") or "")[:400],
+        "confidence": max(0.0, min(1.0, float(d.get("confidence") or 0.5))),
+    }
 
 
 def _format_perception_brief(perception: dict | None) -> str:

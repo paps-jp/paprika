@@ -91,6 +91,12 @@ async function loadSettingsPanel() {
       if (_jrEl) _jrEl.checked = !!hub.job_retention_enabled;
       const _jrdEl = document.getElementById('setJobRetentionDays');
       if (_jrdEl) _jrdEl.value = hub.job_retention_days ?? 10;
+      const _rrEl = document.getElementById('setReviewRetentionEnabled');
+      if (_rrEl) _rrEl.checked = !!hub.review_retention_enabled;
+      const _rrDryEl = document.getElementById('setReviewRetentionDryRun');
+      if (_rrDryEl) _rrDryEl.checked = hub.review_retention_dry_run ?? true;
+      const _rrdEl = document.getElementById('setReviewRetentionDays');
+      if (_rrdEl) _rrdEl.value = hub.review_retention_days ?? 7;
       document.getElementById('setSkillTopK').value               = hub.skill_retrieval_top_k ?? 3;
       document.getElementById('setMinAssetSize').value            = hub.min_asset_size_bytes ?? 0;
       // V: URL blacklist textarea
@@ -171,6 +177,40 @@ async function loadSettingsPanel() {
       _setVal('setS3Region', hub.s3_region || 'us-east-1');
       _setVal('setS3AccessKey', hub.s3_access_key);
       _setSecretPw('setS3SecretKey', !!_secretsSet.s3_secret_key);
+      // non-video hot tier (s3_nonvideo_*): images/HTML/HAR/json split to a
+      // separate MinIO; video stays on the primary above. Endpoint blank =
+      // split OFF. Secret redacted server-side -> placeholder via secrets_set.
+      _setVal('setS3NvEndpoint', hub.s3_nonvideo_endpoint);
+      _setVal('setS3NvBucket', hub.s3_nonvideo_bucket);
+      _setVal('setS3NvRegion', hub.s3_nonvideo_region || 'us-east-1');
+      _setVal('setS3NvAccessKey', hub.s3_nonvideo_access_key);
+      _setSecretPw('setS3NvSecretKey', !!_secretsSet.s3_nonvideo_secret_key);
+      // RAM-disk spill-over (asset_spill_* / s3_*_spill_*): when the normal
+      // tier fills past high_pct, new uploads go to the spill tier until it
+      // drops back under low_pct (hysteresis). Endpoint blank = spill OFF;
+      // blank bucket/credentials reuse the matching non-spill tier.
+      const _splEn = document.getElementById('setSpillEnabled');
+      if (_splEn) _splEn.checked = !!hub.asset_spill_enabled;
+      const _splHi = document.getElementById('setSpillHighPct');
+      if (_splHi) _splHi.value = hub.asset_spill_high_pct ?? 80;
+      const _splLo = document.getElementById('setSpillLowPct');
+      if (_splLo) _splLo.value = hub.asset_spill_low_pct ?? 60;
+      const _splIv = document.getElementById('setSpillInterval');
+      if (_splIv) _splIv.value = hub.asset_spill_sample_interval_s || 30;
+      const _splPt = document.getElementById('setSpillProbeTimeout');
+      if (_splPt) _splPt.value = hub.asset_spill_probe_timeout_s ?? 5;
+      const _splSa = document.getElementById('setSpillStaleAfter');
+      if (_splSa) _splSa.value = hub.asset_spill_stale_after_s || 180;
+      _setVal('setS3NvSpillEndpoint', hub.s3_nonvideo_spill_endpoint);
+      _setVal('setS3NvSpillBucket', hub.s3_nonvideo_spill_bucket);
+      _setVal('setS3NvSpillAccessKey', hub.s3_nonvideo_spill_access_key);
+      _setSecretPw('setS3NvSpillSecretKey', !!_secretsSet.s3_nonvideo_spill_secret_key);
+      _setVal('setS3NvSpillRegion', hub.s3_nonvideo_spill_region || 'us-east-1');
+      _setVal('setS3SpillEndpoint', hub.s3_spill_endpoint);
+      _setVal('setS3SpillBucket', hub.s3_spill_bucket);
+      _setVal('setS3SpillAccessKey', hub.s3_spill_access_key);
+      _setSecretPw('setS3SpillSecretKey', !!_secretsSet.s3_spill_secret_key);
+      _setVal('setS3SpillRegion', hub.s3_spill_region || 'us-east-1');
       _updateS3StatusBanner(d.s3_status || {});
 
       // ---- Worker salvage SSH ----
@@ -393,6 +433,9 @@ async function saveSettingsRetention() {
   const body = {
     job_retention_enabled: document.getElementById('setJobRetentionEnabled')?.checked ?? false,
     job_retention_days:    parseInt(document.getElementById('setJobRetentionDays')?.value, 10) || 10,
+    review_retention_enabled: document.getElementById('setReviewRetentionEnabled')?.checked ?? false,
+    review_retention_dry_run: document.getElementById('setReviewRetentionDryRun')?.checked ?? true,
+    review_retention_days:    parseInt(document.getElementById('setReviewRetentionDays')?.value, 10) || 7,
   };
   try {
     const r = await fetch(SETTINGS_URL, {
@@ -739,11 +782,41 @@ async function saveSettingsS3() {
     s3_prefix: (document.getElementById('setS3Prefix')?.value || 'jobs').trim(),
     s3_region: (document.getElementById('setS3Region')?.value || 'us-east-1').trim(),
     s3_access_key: (document.getElementById('setS3AccessKey')?.value || '').trim(),
+    // non-video hot tier. Endpoint blank = split OFF. Bucket blank = reuse
+    // s3_bucket (resolved server-side). Region defaults us-east-1.
+    s3_nonvideo_endpoint: (document.getElementById('setS3NvEndpoint')?.value || '').trim(),
+    s3_nonvideo_bucket: (document.getElementById('setS3NvBucket')?.value || '').trim(),
+    s3_nonvideo_region: (document.getElementById('setS3NvRegion')?.value || 'us-east-1').trim(),
+    s3_nonvideo_access_key: (document.getElementById('setS3NvAccessKey')?.value || '').trim(),
+    // RAM-disk spill-over. Thresholds are a hysteresis pair (high = switch to
+    // spill, low = switch back); the tier is pinned per job. Endpoint blank =
+    // spill OFF. Bucket/credentials blank = reuse the non-spill tier.
+    asset_spill_enabled: !!document.getElementById('setSpillEnabled')?.checked,
+    asset_spill_high_pct: parseFloat(document.getElementById('setSpillHighPct')?.value || '80'),
+    asset_spill_low_pct: parseFloat(document.getElementById('setSpillLowPct')?.value || '60'),
+    asset_spill_sample_interval_s: parseInt(document.getElementById('setSpillInterval')?.value || '30', 10),
+    asset_spill_probe_timeout_s: parseFloat(document.getElementById('setSpillProbeTimeout')?.value || '5'),
+    asset_spill_stale_after_s: parseInt(document.getElementById('setSpillStaleAfter')?.value || '180', 10),
+    s3_nonvideo_spill_endpoint: (document.getElementById('setS3NvSpillEndpoint')?.value || '').trim(),
+    s3_nonvideo_spill_bucket: (document.getElementById('setS3NvSpillBucket')?.value || '').trim(),
+    s3_nonvideo_spill_access_key: (document.getElementById('setS3NvSpillAccessKey')?.value || '').trim(),
+    s3_nonvideo_spill_region: (document.getElementById('setS3NvSpillRegion')?.value || 'us-east-1').trim(),
+    s3_spill_endpoint: (document.getElementById('setS3SpillEndpoint')?.value || '').trim(),
+    s3_spill_bucket: (document.getElementById('setS3SpillBucket')?.value || '').trim(),
+    s3_spill_access_key: (document.getElementById('setS3SpillAccessKey')?.value || '').trim(),
+    s3_spill_region: (document.getElementById('setS3SpillRegion')?.value || 'us-east-1').trim(),
   };
   // Blank secret field => keep the stored one (redacted from GET, never
-  // re-populated, so omit from the PUT).
+  // re-populated, so omit from the PUT). Same for the non-video secret.
   const _sk = document.getElementById('setS3SecretKey')?.value || '';
   if (_sk) body.s3_secret_key = _sk;
+  const _nvsk = document.getElementById('setS3NvSecretKey')?.value || '';
+  if (_nvsk) body.s3_nonvideo_secret_key = _nvsk;
+  // Spill-tier secrets follow the same blank = leave-unchanged rule.
+  const _nvspsk = document.getElementById('setS3NvSpillSecretKey')?.value || '';
+  if (_nvspsk) body.s3_nonvideo_spill_secret_key = _nvspsk;
+  const _spsk = document.getElementById('setS3SpillSecretKey')?.value || '';
+  if (_spsk) body.s3_spill_secret_key = _spsk;
   try {
     const r = await fetch(SETTINGS_URL, {
       method: 'PUT',
@@ -786,6 +859,43 @@ async function testS3Connection() {
       if (statusEl) { statusEl.style.color = '#196b2c'; statusEl.textContent = `✓ ${d.message}`; }
     } else {
       if (statusEl) { statusEl.style.color = '#a00'; statusEl.textContent = `✗ ${d.message}`; }
+    }
+  } catch (e) {
+    if (statusEl) { statusEl.style.color = '#a00'; statusEl.textContent = '接続失敗: ' + e.message; }
+  } finally {
+    if (btn) btn.innerHTML = origLabel;
+  }
+}
+
+// Test the non-video hot tier. Reuses POST /settings/s3/test with tier:
+// "nonvideo" so a blank endpoint/secret falls back to the SAVED s3_nonvideo_*
+// values (not the main tier's) -- see routes/settings.py:s3_test.
+async function testS3NonvideoConnection() {
+  const statusEl = document.getElementById('setS3Status');
+  const btn = document.getElementById('setS3NvTestBtn');
+  const origLabel = btn ? btn.innerHTML : '';
+  if (btn) btn.innerHTML = '<iconify-icon icon="lucide:loader-2" class="spin"></iconify-icon> テスト中…';
+  if (statusEl) { statusEl.style.color = '#888'; statusEl.textContent = ''; }
+  const body = {
+    tier: 'nonvideo',
+    endpoint: (document.getElementById('setS3NvEndpoint')?.value || '').trim(),
+    bucket: (document.getElementById('setS3NvBucket')?.value || '').trim(),
+    region: (document.getElementById('setS3NvRegion')?.value || 'us-east-1').trim(),
+    access_key: (document.getElementById('setS3NvAccessKey')?.value || '').trim(),
+    secret_key: document.getElementById('setS3NvSecretKey')?.value || '',
+  };
+  try {
+    const r = await fetch('/settings/s3/test', {
+      method: 'POST',
+      headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify(body),
+    });
+    let d;
+    try { d = await r.json(); } catch { d = { message: await r.text().catch(() => r.statusText) }; }
+    if (d.ok) {
+      if (statusEl) { statusEl.style.color = '#196b2c'; statusEl.textContent = `✓ 非動画: ${d.message}`; }
+    } else {
+      if (statusEl) { statusEl.style.color = '#a00'; statusEl.textContent = `✗ 非動画: ${d.message}`; }
     }
   } catch (e) {
     if (statusEl) { statusEl.style.color = '#a00'; statusEl.textContent = '接続失敗: ' + e.message; }
@@ -905,6 +1015,8 @@ async function mdbRefreshTableCounts() {
   if (saveS3) saveS3.addEventListener('click', saveSettingsS3);
   const testS3 = document.getElementById('setS3TestBtn');
   if (testS3) testS3.addEventListener('click', testS3Connection);
+  const testS3Nv = document.getElementById('setS3NvTestBtn');
+  if (testS3Nv) testS3Nv.addEventListener('click', testS3NonvideoConnection);
   // Worker salvage SSH (サルベージ用)
   const saveWSsh = document.getElementById('setSaveWorkerSshBtn');
   if (saveWSsh) saveWSsh.addEventListener('click', saveSettingsWorkerSsh);
@@ -919,6 +1031,21 @@ async function mdbRefreshTableCounts() {
   const s3SecToggle = document.getElementById('setS3SecretToggle');
   if (s3SecToggle) s3SecToggle.addEventListener('click', () => {
     const sk = document.getElementById('setS3SecretKey');
+    if (sk) sk.type = sk.type === 'password' ? 'text' : 'password';
+  });
+  const s3NvSecToggle = document.getElementById('setS3NvSecretToggle');
+  if (s3NvSecToggle) s3NvSecToggle.addEventListener('click', () => {
+    const sk = document.getElementById('setS3NvSecretKey');
+    if (sk) sk.type = sk.type === 'password' ? 'text' : 'password';
+  });
+  const s3NvSpillSecToggle = document.getElementById('setS3NvSpillSecretToggle');
+  if (s3NvSpillSecToggle) s3NvSpillSecToggle.addEventListener('click', () => {
+    const sk = document.getElementById('setS3NvSpillSecretKey');
+    if (sk) sk.type = sk.type === 'password' ? 'text' : 'password';
+  });
+  const s3SpillSecToggle = document.getElementById('setS3SpillSecretToggle');
+  if (s3SpillSecToggle) s3SpillSecToggle.addEventListener('click', () => {
+    const sk = document.getElementById('setS3SpillSecretKey');
     if (sk) sk.type = sk.type === 'password' ? 'text' : 'password';
   });
   // MariaDB Migration

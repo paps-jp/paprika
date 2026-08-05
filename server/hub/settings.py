@@ -56,6 +56,22 @@ _SCHEMA: dict[str, tuple[Any, str]] = {
     # (capped per tick). See server/hub/_reaper.py:_job_retention_loop.
     "job_retention_enabled": (False, "bool"),
     "job_retention_days": (10, "int"),
+    # Review(課題)-specific expiry -- a SEPARATE, shorter-horizon GC just for
+    # ``status=review`` jobs, decoupled from the general job_retention_days.
+    # WHY: the general retention loop deletes strictly OLDEST-FIRST across ALL
+    # terminal statuses, so review rows (a tiny 2% of the table) are only
+    # reached once the deletion frontier sweeps past them -- their effective
+    # TTL is pinned to the general frontier depth (~12d observed), NOT to any
+    # review target, and review is the status whose captured wall leaves the
+    # most downstream residue. This pass queries review-only with its own
+    # cutoff + budget so review is held at review_retention_days regardless of
+    # the general backlog. Same deletion (DB row + MinIO prefix + local cache),
+    # same safety valves. OFF by default; dry_run default ON so the first
+    # rollout only LOGS candidate counts. Env kill-switch
+    # PAPRIKA_REVIEW_RETENTION_DISABLE=1. See _reaper.py:_review_retention_loop.
+    "review_retention_enabled": (False, "bool"),
+    "review_retention_days": (7, "int"),
+    "review_retention_dry_run": (True, "bool"),
     # When ON, the reasoning distiller translates a newly-learned, replayable
     # barrier strategy (kind=click/sequence) into a per-host fetch_recipe so
     # plain mode=fetch jobs replay it and get past the barrier (age gate /
@@ -248,6 +264,19 @@ _SCHEMA: dict[str, tuple[Any, str]] = {
     # pattern and the 0xCodez 14-step "the gate must be objective —
     # never 'a second agent with an opinion'" principle.
     "judge_blind_mode": (True, "bool"),
+    # P-B (2026-07-15): adversarial refuter. When enabled, every
+    # satisfied=true primary verdict is challenged by N independent
+    # refutation passes (see judge_adversarial_n). If ≥majority refute,
+    # the verdict is DOWNGRADED to satisfied=false. Based on arxiv
+    # 2603.06594 / 2607.05904 which show that reference-free judging
+    # measures plausibility not correctness, and multi-sample refutation
+    # collapses false-positive rate. Only run on positive claims
+    # (negative claims are self-verifying via retry). Cost ~$0.001/pass
+    # at V4-Flash rates. Default OFF for safe rollout; flip to True to
+    # enable fleet-wide.
+    "judge_adversarial_verify_enabled": (False, "bool"),
+    "judge_adversarial_n": (2, "int"),
+    "judge_adversarial_downgrade_threshold": (0.5, "float"),  # ≥ this ratio of refuters -> downgrade
     # Objective gates short-circuit: when ON (default), unambiguous
     # objective evidence settles the verdict BEFORE the LLM judge is
     # called. Currently implemented (server/hub/iterative_codegen.py
@@ -343,11 +372,54 @@ _SCHEMA: dict[str, tuple[Any, str]] = {
     # s3_nonvideo_endpoint is set. Reads try the hot tier then fall back to
     # the primary (so pre-split / video objects still resolve). Bucket blank
     # -> reuse s3_bucket. See server/hub/objstore.py routing.
-    "s3_nonvideo_endpoint": ("", "str"),        # e.g. http://192.168.50.17:9000
+    "s3_nonvideo_endpoint": ("", "str"),        # e.g. http://192.168.50.47:9000
     "s3_nonvideo_bucket": ("", "str"),          # blank -> reuse s3_bucket
     "s3_nonvideo_access_key": ("", "str"),
     "s3_nonvideo_secret_key": ("", "str"),
     "s3_nonvideo_region": ("us-east-1", "str"),
+    # ---- RAM-disk spill-over (2026-07-21) -------------------------------
+    # Both tiers above are RAM-disk MinIO: small, and volatile (a reboot
+    # loses the contents). On 2026-07-20 the image RAM disk filled and the
+    # whole HOST went unresponsive -- writes hung rather than returning
+    # ENOSPC, so an error-driven fallback could never have fired. Instead we
+    # sample free space periodically and divert NEW assets to a large durable
+    # "spill" store BEFORE the RAM disk fills.
+    #
+    # Switch out at high_pct, come back only under low_pct (hysteresis: at a
+    # single threshold a job's assets would scatter across both stores and
+    # cost the consumer a lookup miss per asset). The decision is pinned per
+    # job, so one job never splits. A tier that cannot be sampled is treated
+    # as OVER threshold and spills -- an unresponsive host is exactly the
+    # failure this protects against. See server/hub/_spill.py.
+    "asset_spill_enabled": (False, "bool"),
+    "asset_spill_high_pct": (80.0, "float"),
+    "asset_spill_low_pct": (60.0, "float"),
+    "asset_spill_sample_interval_s": (30, "int"),
+    "asset_spill_probe_timeout_s": (5.0, "float"),
+    "asset_spill_stale_after_s": (180, "int"),
+    # Spill target for the primary/video tier (e.g. http://192.168.50.8:9100).
+    "s3_spill_endpoint": ("", "str"),
+    "s3_spill_bucket": ("", "str"),             # blank -> reuse s3_bucket
+    "s3_spill_access_key": ("", "str"),         # blank -> reuse s3_access_key
+    "s3_spill_secret_key": ("", "str"),
+    "s3_spill_region": ("us-east-1", "str"),
+    # Spill target for the non-video/image tier (e.g. http://192.168.50.17:9000).
+    "s3_nonvideo_spill_endpoint": ("", "str"),
+    "s3_nonvideo_spill_bucket": ("", "str"),    # blank -> reuse nonvideo bucket
+    "s3_nonvideo_spill_access_key": ("", "str"),  # blank -> reuse nonvideo key
+    "s3_nonvideo_spill_secret_key": ("", "str"),
+    "s3_nonvideo_spill_region": ("us-east-1", "str"),
+    # ---- scheduled-maintenance plugin ticker (2026-07-22) ---------------
+    # Generic driver (server/hub/_maintenance.py) that invokes ONE operator-
+    # chosen plugin on a cadence, cross-hub locked. Used to run pipeline-
+    # coupled maintenance (e.g. the out-of-git video-asset GC plugin) without
+    # baking that coupling into core. Off by default. params is an operator-
+    # editable JSON blob forwarded to the plugin (the ticker also injects
+    # Paprika's MariaDB/S3 config + an opaque cursor).
+    "maintenance_plugin_enabled": (False, "bool"),
+    "maintenance_plugin_name": ("", "str"),          # e.g. "video-gc"
+    "maintenance_plugin_interval_s": (300, "int"),
+    "maintenance_plugin_params": ("{}", "str"),      # JSON
     # ---- Windows portable: Chrome headless ------------------------------
     # When True, the bundled Chromium starts with ``--headless=new`` so
     # the operator's physical desktop isn't taken over by paprika's job
@@ -382,6 +454,37 @@ _SCHEMA: dict[str, tuple[Any, str]] = {
     # env. Lets the operator arm/disarm from the Settings UI with no hub restart
     # (re-evaluated every pass, cross-hub via settings).
     "salvage_enabled": (False, "bool"),
+    # ---- Proxmox stage: CT reboot (server/hub/_salvage.py) ---------------
+    # The last resort in the salvage ladder, used only after the HTTP,
+    # `docker restart` and `systemctl restart docker` stages have all failed:
+    # SSH the Proxmox node that owns the worker's container and `pct reboot`
+    # it. Host-side pct is the only lever that still works when the CT is too
+    # IO-starved to spawn a process (measured during the 2026-08-02 storm:
+    # `pct exec` returned nothing for 60s).
+    #
+    # These credentials reach the HYPERVISOR, which is a wider blast radius
+    # than anything else the hub holds -- deliberately a separate key from
+    # worker_ssh_key_pem, and OFF by default. Rate-limited to 1 reboot per
+    # worker per hour and PAPRIKA_SALVAGE_CT_REBOOT_MAX_PER_NODE_H (2) per
+    # node per hour, so a bad signal cannot walk a node down CT by CT.
+    #
+    # proxmox_nodes: "boiler=10.10.50.15,hall=10.10.50.11" (or bare addresses
+    # when the node names resolve). /etc/pve is the cluster filesystem, so any
+    # ONE reachable node resolves every CT; the list is also how a node NAME
+    # from /etc/pve/nodes/<name>/ maps back to something SSH can dial.
+    "proxmox_nodes": ("", "str"),
+    "proxmox_ssh_user": ("root", "str"),
+    "proxmox_ssh_port": (22, "int"),
+    "proxmox_ssh_key_path": ("", "str"),
+    "proxmox_ssh_key_pem": ("", "str"),
+    "ct_reboot_enabled": (False, "bool"),
+    # Node-side periodic worker health scan (server/hub/_ct_scan.py). ON by
+    # default because it is inert without the proxmox credentials above, and
+    # because DETECTING is harmless: a container that can still recycle itself
+    # is asked to, and one that cannot is only logged unless
+    # ct_reboot_enabled is also set. That split lets an operator watch what it
+    # would have done before arming the hypervisor stage.
+    "ct_scan_enabled": (True, "bool"),
     # ---- Storage capacity monitor (MinIO) -------------------------------
     # The background sampler in server/hub/_storage_metrics.py snapshots
     # MinIO's /minio/v2/metrics/cluster every `storage_sample_interval_s`
@@ -451,11 +554,34 @@ def _env_default(key: str, fallback: Any) -> Any:
         "s3_nonvideo_access_key": ("PAPRIKA_S3_NONVIDEO_ACCESS_KEY", "str"),
         "s3_nonvideo_secret_key": ("PAPRIKA_S3_NONVIDEO_SECRET_KEY", "str"),
         "s3_nonvideo_region": ("PAPRIKA_S3_NONVIDEO_REGION", "str"),
+        # RAM-disk spill-over: settings.json -> env vars -> static default.
+        "asset_spill_enabled": ("PAPRIKA_ASSET_SPILL_ENABLED", "bool"),
+        "asset_spill_high_pct": ("PAPRIKA_ASSET_SPILL_HIGH_PCT", "float"),
+        "asset_spill_low_pct": ("PAPRIKA_ASSET_SPILL_LOW_PCT", "float"),
+        "asset_spill_sample_interval_s": ("PAPRIKA_ASSET_SPILL_INTERVAL_S", "int"),
+        "asset_spill_probe_timeout_s": ("PAPRIKA_ASSET_SPILL_PROBE_TIMEOUT_S", "float"),
+        "asset_spill_stale_after_s": ("PAPRIKA_ASSET_SPILL_STALE_AFTER_S", "int"),
+        "s3_spill_endpoint": ("PAPRIKA_S3_SPILL_ENDPOINT", "str"),
+        "s3_spill_bucket": ("PAPRIKA_S3_SPILL_BUCKET", "str"),
+        "s3_spill_access_key": ("PAPRIKA_S3_SPILL_ACCESS_KEY", "str"),
+        "s3_spill_secret_key": ("PAPRIKA_S3_SPILL_SECRET_KEY", "str"),
+        "s3_spill_region": ("PAPRIKA_S3_SPILL_REGION", "str"),
+        "s3_nonvideo_spill_endpoint": ("PAPRIKA_S3_NONVIDEO_SPILL_ENDPOINT", "str"),
+        "s3_nonvideo_spill_bucket": ("PAPRIKA_S3_NONVIDEO_SPILL_BUCKET", "str"),
+        "s3_nonvideo_spill_access_key": ("PAPRIKA_S3_NONVIDEO_SPILL_ACCESS_KEY", "str"),
+        "s3_nonvideo_spill_secret_key": ("PAPRIKA_S3_NONVIDEO_SPILL_SECRET_KEY", "str"),
+        "s3_nonvideo_spill_region": ("PAPRIKA_S3_NONVIDEO_SPILL_REGION", "str"),
         # Worker salvage SSH: settings.json -> env vars -> static default.
         "worker_ssh_user": ("PAPRIKA_WORKER_SSH_USER", "str"),
         "worker_ssh_port": ("PAPRIKA_WORKER_SSH_PORT", "int"),
         "worker_ssh_key_path": ("PAPRIKA_WORKER_SSH_KEY", "str"),
         "salvage_enabled": ("PAPRIKA_SALVAGE_ENABLE", "bool"),
+        # Proxmox CT-reboot stage: same precedence chain.
+        "proxmox_nodes": ("PAPRIKA_PROXMOX_NODES", "str"),
+        "proxmox_ssh_user": ("PAPRIKA_PROXMOX_SSH_USER", "str"),
+        "proxmox_ssh_port": ("PAPRIKA_PROXMOX_SSH_PORT", "int"),
+        "proxmox_ssh_key_path": ("PAPRIKA_PROXMOX_SSH_KEY", "str"),
+        "ct_reboot_enabled": ("PAPRIKA_SALVAGE_CT_REBOOT", "bool"),
     }
     info = env_map.get(key)
     if not info:

@@ -158,12 +158,12 @@ async def take_job_screenshot(
             encoding="utf-8",
         )
         # Mirror the .meta sidecar to MinIO too (metadata durability).
-        await objstore.mirror_file(meta_dir / f"{name}.json")
+        await objstore.mirror_file(meta_dir / f"{name}.json", job_id=job_id)
     except Exception:
         pass
 
     # Mirror to shared object storage (dormant unless PAPRIKA_S3_ENABLED).
-    await objstore.mirror_file(target_path)
+    await objstore.mirror_file(target_path, job_id=job_id)
 
     return {
         "ok": True,
@@ -287,13 +287,13 @@ async def upload_asset(
                 encoding="utf-8",
             )
             # Mirror the .meta sidecar to MinIO too (metadata durability).
-            await objstore.mirror_file(meta_dir / f"{name}.json")
+            await objstore.mirror_file(meta_dir / f"{name}.json", job_id=job_id)
         except Exception:
             pass
 
     # Multi-hub foundation: mirror to shared object storage (no-op unless
     # PAPRIKA_S3_ENABLED). Local disk stays the source of truth.
-    await objstore.mirror_file(target)
+    await objstore.mirror_file(target, job_id=job_id)
 
     # str(target), not target.resolve(): the latter is a sync realpath (lstat
     # syscalls) on the event loop per asset upload; target is already absolute
@@ -413,7 +413,7 @@ async def complete_asset_upload(job_id: str, body: dict) -> dict:
 
         try:
             _sidecar = await asyncio.to_thread(_write_sidecar)
-            await objstore.mirror_file(_sidecar)
+            await objstore.mirror_file(_sidecar, job_id=job_id)
         except Exception:
             pass
     return {"ok": True, "name": name, "key": key, "size": size}
@@ -506,12 +506,12 @@ async def save_asset_from_url(job_id: str, body: dict) -> dict:
             encoding="utf-8",
         )
         # Mirror the .meta sidecar to MinIO too (metadata durability).
-        await objstore.mirror_file(meta_dir / f"{name}.json")
+        await objstore.mirror_file(meta_dir / f"{name}.json", job_id=job_id)
     except Exception:
         pass
 
     # Mirror to shared object storage (dormant unless PAPRIKA_S3_ENABLED).
-    await objstore.mirror_file(target)
+    await objstore.mirror_file(target, job_id=job_id)
 
     return {"status": "saved", "name": name, "size": len(content)}
 
@@ -543,7 +543,7 @@ async def upload_special(
             out.write(chunk)
             total += len(chunk)
     # Mirror to shared object storage (dormant unless PAPRIKA_S3_ENABLED).
-    await objstore.mirror_file(target)
+    await objstore.mirror_file(target, job_id=job_id)
     # str(target) not .resolve(): avoid the per-upload realpath on the loop.
     return {"saved": str(target), "size": total}
 

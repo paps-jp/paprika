@@ -33,7 +33,7 @@ from server.hub.codegen_preflight import (
     PreflightResult,
     run_preflight,
 )
-from server.hub.judge_llm import Verdict, judge_attempt
+from server.hub.judge_llm import Verdict, judge_attempt, judge_adversarial_refute
 from server.hub.planner_llm import Plan, plan_goal
 from server.hub.runner import ExecResult, execute_in_sandbox
 
@@ -1485,6 +1485,87 @@ async def run_iterative_codegen(
                     blind=_blind_judge,
                     job_id=job_id,
                 )
+
+                # P-B: adversarial verify. Only challenge satisfied=true
+                # verdicts (negative claims retry anyway). Run N refuters
+                # in parallel with distinct lenses; downgrade to
+                # satisfied=false if ≥threshold ratio refute.
+                if verdict is not None and verdict.satisfied:
+                    _adv_enabled = False
+                    _adv_n = 2
+                    _adv_thr = 0.5
+                    try:
+                        from server.hub._state import state as _adv_st
+                        if _adv_st.settings is not None:
+                            _adv_enabled = bool(_adv_st.settings.get("judge_adversarial_verify_enabled", False))
+                            _adv_n = max(1, int(_adv_st.settings.get("judge_adversarial_n", 2)))
+                            _adv_thr = max(0.0, min(1.0, float(_adv_st.settings.get("judge_adversarial_downgrade_threshold", 0.5))))
+                    except Exception:
+                        pass
+                    # NOTE (2026-07-15): previously we skipped refutation
+                    # when objective_pregate settled the verdict, under the
+                    # principle "an objective gate must not be overridden by
+                    # an LLM opinion". But the pregate is EXTENSION-ONLY
+                    # (counts ``.mp4`` files without ffprobe), so a job with
+                    # 14 thumbnail-fake mp4s gets pregate-True — exactly
+                    # the false_positive class the audit surfaced. Now we
+                    # ALWAYS run refuters on satisfied=true, including
+                    # pregate verdicts: the refuters have ffprobe evidence
+                    # (see judge_llm._format_outcome_summary video_probes)
+                    # so they are strictly better-informed than pregate.
+                    if _adv_enabled:
+                        # Distinct lenses so parallel refuters cover
+                        # complementary failure classes. Cycle through
+                        # the primary axes we've seen in real audits.
+                        _LENSES = [
+                            "video_valid (ffprobe duration/resolution/codec check)",
+                            "page_wall (screenshot: 404 / login / age-gate / blank)",
+                            "wrong_content (assets exist but don't match goal)",
+                        ]
+                        lenses = [_LENSES[i % len(_LENSES)] for i in range(_adv_n)]
+                        _log(f"  🛡️  adversarial verify: challenging satisfied=true with N={_adv_n} refuters {lenses}")
+                        refuter_tasks = [
+                            judge_adversarial_refute(
+                                goal=judge_goal,
+                                exit_code=result.exit_code,
+                                elapsed_ms=result.elapsed_ms,
+                                timed_out=result.timed_out,
+                                stdout=result.stdout or "",
+                                stderr=result.stderr or "",
+                                assets_dir=judge_assets,
+                                screenshot_path=screenshot_path,
+                                progress_count=progress,
+                                target_pages=target,
+                                target=llm_target,
+                                blind=_blind_judge,
+                                job_id=job_id,
+                                lens_hint=lens,
+                            )
+                            for lens in lenses
+                        ]
+                        try:
+                            refuter_results = await asyncio.gather(*refuter_tasks, return_exceptions=True)
+                        except Exception as _e:
+                            _log(f"  !! adversarial gather crashed: {type(_e).__name__}: {_e}")
+                            refuter_results = []
+                        valid = [r for r in refuter_results if isinstance(r, dict)]
+                        refuted = [r for r in valid if r.get("refuted")]
+                        ratio = (len(refuted) / len(valid)) if valid else 0.0
+                        _log(
+                            f"  🛡️  refuters: {len(refuted)}/{len(valid)} refuted "
+                            f"(ratio={ratio:.2f}, threshold={_adv_thr:.2f})"
+                        )
+                        if valid and ratio >= _adv_thr:
+                            evidence = refuted[0].get("evidence") if refuted else ""
+                            _log(f"  🛡️  DOWNGRADE: verdict satisfied=true -> false. evidence: {evidence[:200]}")
+                            verdict = Verdict(
+                                satisfied=False,
+                                reason=f"[adversarial-downgrade] {evidence[:250]}"[:300],
+                                hint="採用の判定は逆転(adversarial refuter で反証成立)。証拠: " + evidence[:200],
+                                model=(verdict.model or "?") + "+refuted",
+                                elapsed_ms=verdict.elapsed_ms,
+                                raw=verdict.raw,
+                            )
 
             # Reasoning judge (shadow / primary mode).
             # Settings → reasoning_judge_mode controls how the reasoning

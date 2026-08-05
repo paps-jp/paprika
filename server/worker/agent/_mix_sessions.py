@@ -74,6 +74,7 @@ from server.protocol import (
 )
 from server.scheduler import HEARTBEAT_INTERVAL
 from server.worker import browser_ops
+from server.worker import scratch_pool
 from server.worker.sessions import SessionState
 from server.worker._browser_helpers import (
     _LINKS_EXTRACT_JS,
@@ -156,7 +157,17 @@ class _SessionsMixin:
                             f"with lane default",
                         )
 
-            assets_dir = Path(tempfile.mkdtemp(prefix=f"paprika-ses-{sid}-"))
+            # Same opt-in as the per-job workdir (PAPRIKA_SCRATCH_JOB): the
+            # shared ramdisk pool when it is mounted and configured to take
+            # these, otherwise the CT disk exactly as before.
+            assets_dir = None
+            if scratch_pool.job_workdirs_enabled():
+                assets_dir = scratch_pool.acquire(
+                    f"paprika-ses-{sid}-", self.worker_id,
+                    scratch_pool.job_reserve_bytes(),
+                )
+            if assets_dir is None:
+                assets_dir = Path(tempfile.mkdtemp(prefix=f"paprika-ses-{sid}-"))
             (assets_dir / "assets").mkdir(parents=True, exist_ok=True)
 
             # Derive the parent job_id from the asset_upload_base URL

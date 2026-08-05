@@ -18,6 +18,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import logging
 import os
 import random
 import time
@@ -36,6 +37,8 @@ from server.protocol import (
     WorkerCapabilities,
     encode_msg,
 )
+
+log = logging.getLogger(__name__)
 
 # Heartbeat-related constants (seconds)
 WORKER_TTL = 120  # if no heartbeat for this long, worker is considered dead
@@ -273,6 +276,29 @@ class ConnectedWorker:
     disk_pct: float = 0.0
     disk_free_gb: float = 0.0
     load1: float = 0.0
+    # Cgroup-scoped memory from the heartbeat (2026-08-03). mem_pct above is
+    # only trustworthy when mem_scope == "cgroup"; on the docker-in-LXC fleet
+    # it is usually "host" (= the Proxmox node's memory, not this CT's), so
+    # the ABSOLUTE figures here are the ones to reason about. mem_psi_* is the
+    # refault-storm signal a percentage gauge structurally cannot show.
+    # All zero/"" for pre-2026-08-03 workers.
+    mem_scope: str = ""
+    mem_current_mb: float = 0.0
+    mem_anon_mb: float = 0.0
+    mem_psi_some_avg60: float = 0.0
+    mem_psi_full_avg60: float = 0.0
+    # Fault RATES (not cumulative counters -- see protocol.WorkerHeartbeat).
+    # mem_refault_per_s is the direct cache-thrash measure and reads 0.0 on a
+    # healthy worker, so it is the one to watch for a building storm.
+    mem_majfault_per_s: float = 0.0
+    mem_refault_per_s: float = 0.0
+    # Non-empty while the worker's own memory guard is draining it for a
+    # recycle; carries the reason. Read by the hub's memory-choke salvage
+    # escalation to tell "recovering itself" from "stuck and needs a push".
+    memguard: str = ""
+    #: Monotonic instant this hub first SAW memguard non-empty, so the
+    #: escalation can require it to persist rather than firing on one beat.
+    memguard_since: float = 0.0
     # Host CPU core count (os.cpu_count), heartbeat-reported. Lets the hub
     # normalise the host-level load1 into "load per core" (io_sat) for I/O-aware
     # dispatch -- essential for a fleet mixing Proxmox nodes and bare-metal boxes
@@ -350,6 +376,17 @@ class ConnectedWorker:
     # per-worker by ``_DOWNLOAD_CAP`` (off-lane downloads eat CPU/net/disk).
     # Discarded by :meth:`release` on complete/failed.
     downloading_jobs: set[str] = field(default_factory=set)
+
+    # ``active_downloads`` = download_ids this hub has dispatched to a
+    # DOWNLOADER-role worker (docs/ramdisk-video-tier.md) and not yet seen a
+    # WorkerVideoDownloadComplete for. Distinct from ``downloading_jobs``,
+    # which tracks yt-dlp running INSIDE a browse job on a browser-role
+    # worker. Used two ways:
+    #   * per-worker: keep one downloader from being handed everything
+    #   * per-POOL: several downloader workers can bind-mount the SAME host
+    #     tmpfs, so the real constraint is the sum across the pool -- the
+    #     shared ramdisk is what actually runs out, not any one worker.
+    active_downloads: set[str] = field(default_factory=set)
     # Monotonic deadline (``time.monotonic()`` epoch) for an auto-clearing
     # ``status="drain"``. The "no free lane in pool" recovery (Case C,
     # 2026-06-15) sets status="drain" + drain_until = now + 900s when a
@@ -661,6 +698,54 @@ class WorkerRegistry:
             await self._r.set(_k_owner(worker_id), self._hub_id, ex=WORKER_TTL)
         return worker
 
+    async def rebind_redis(self, redis_client, hub_id: str = "") -> int:
+        """Attach a Redis client to a registry that started WITHOUT one, and
+        re-publish every locally-connected worker. Returns the count.
+
+        A hub that boots while Redis is still ``LOADING`` wires ``_r=None`` for
+        its entire lifetime (the client is read once, in lifespan): its workers
+        are never mirrored, so every peer hub's /workers shows only its own
+        locals -- which nginx round-robin turns into the flapping worker count
+        (2026-08-03 / 2026-08-04). ``server/hub/app.py:_redis_reattach_loop``
+        calls this the moment Redis answers again.
+
+        The re-publish pass is the point: ``register()`` is the ONLY place the
+        full worker row is written -- the heartbeat path merely PATCHES a row
+        that already exists. Without it, the workers connected during the
+        Redis-less window would stay invisible to peers until each happened to
+        reconnect."""
+        self._r = redis_client
+        if hub_id:
+            self._hub_id = hub_id
+        if redis_client is None:
+            return 0
+        n = 0
+        now = time.time()
+        for worker_id, w in list(self.connections.items()):
+            row = {
+                "worker_id": worker_id,
+                "capabilities": w.capabilities.model_dump(),
+                "in_flight": w.in_flight,
+                "hub_id": self._hub_id,
+                "status": w.status,
+            }
+            addr = (w.client_address or "").strip()
+            if addr:
+                row["address"] = addr
+            try:
+                await redis_client.zadd(_k_index(), {worker_id: now})
+                await redis_client.set(_k_worker(worker_id), json.dumps(row))
+                await redis_client.set(_k_online(worker_id), "1", ex=WORKER_TTL)
+                await redis_client.set(
+                    _k_owner(worker_id), self._hub_id, ex=WORKER_TTL,
+                )
+                n += 1
+            except Exception as e:
+                log.warning(
+                    "rebind_redis: re-mirror of %s failed: %s", worker_id, e)
+                continue
+        return n
+
     async def persist_client_address(self, worker_id: str, address: str | None) -> None:
         """Write a worker's client_address into its Redis row right away, so a
         NON-OWNER hub serving /workers shows the IP immediately instead of
@@ -850,6 +935,14 @@ class WorkerRegistry:
         disk_free_gb: float = 0.0,
         load1: float = 0.0,
         nproc: int = 0,
+        mem_scope: str = "",
+        mem_current_mb: float = 0.0,
+        mem_anon_mb: float = 0.0,
+        mem_psi_some_avg60: float = 0.0,
+        mem_psi_full_avg60: float = 0.0,
+        mem_majfault_per_s: float = 0.0,
+        mem_refault_per_s: float = 0.0,
+        memguard: str = "",
     ) -> None:
         worker = self.connections.get(worker_id)
         if worker is None:
@@ -861,6 +954,24 @@ class WorkerRegistry:
         worker.disk_pct = disk_pct
         worker.disk_free_gb = disk_free_gb
         worker.load1 = load1
+        worker.mem_scope = mem_scope
+        worker.mem_current_mb = mem_current_mb
+        worker.mem_anon_mb = mem_anon_mb
+        worker.mem_psi_some_avg60 = mem_psi_some_avg60
+        worker.mem_psi_full_avg60 = mem_psi_full_avg60
+        worker.mem_majfault_per_s = mem_majfault_per_s
+        worker.mem_refault_per_s = mem_refault_per_s
+        # Stamp the FIRST beat that carried a memguard reason and hold it until
+        # the reason clears. The escalation needs "has been trying to recycle
+        # itself for N minutes", which a per-beat flag can't express -- and the
+        # worker's own drain deadline must be allowed to win before the hub
+        # reaches for a heavier hammer.
+        if memguard:
+            if not worker.memguard:
+                worker.memguard_since = time.monotonic()
+        else:
+            worker.memguard_since = 0.0
+        worker.memguard = memguard
         # nproc is static; a heartbeat may omit it (default 0) -- keep the last
         # known non-zero value so io_sat stays computable across such beats.
         if nproc:
@@ -973,6 +1084,35 @@ class WorkerRegistry:
                         if d.get("load1") != worker.load1:
                             d["load1"] = worker.load1
                             changed = True
+                        # Same reasoning for the cgroup-scoped memory fields.
+                        # Without them the Workers tab shows the memory column
+                        # for only the ~1/7 of the fleet that happens to be
+                        # owned by whichever hub nginx round-robined to -- the
+                        # recurring per-hub-view trap.
+                        #
+                        # Only the DISPLAY fields are mirrored. The
+                        # memguard-escalation timer stays owner-local on
+                        # purpose: the owning hub is the one holding the live
+                        # WS, so it is the right hub to decide a worker has
+                        # stopped recycling itself, and a mirrored monotonic
+                        # clock would be meaningless on a peer anyway.
+                        for _k, _v in (
+                            ("mem_scope", worker.mem_scope),
+                            ("mem_current_mb", round(worker.mem_current_mb, 1)),
+                            ("mem_anon_mb", round(worker.mem_anon_mb, 1)),
+                            ("mem_psi_some_avg60",
+                             round(worker.mem_psi_some_avg60, 2)),
+                            ("mem_psi_full_avg60",
+                             round(worker.mem_psi_full_avg60, 2)),
+                            ("mem_majfault_per_s",
+                             round(worker.mem_majfault_per_s, 1)),
+                            ("mem_refault_per_s",
+                             round(worker.mem_refault_per_s, 1)),
+                            ("memguard", worker.memguard),
+                        ):
+                            if d.get(_k) != _v:
+                                d[_k] = _v
+                                changed = True
                         if changed:
                             await self._r.set(
                                 _k_worker(worker_id), json.dumps(d),
@@ -999,6 +1139,88 @@ class WorkerRegistry:
     def alive_workers(self) -> list[ConnectedWorker]:
         cutoff = time.time() - WORKER_TTL
         return [w for w in self.connections.values() if w.last_heartbeat >= cutoff]
+
+    def downloader_workers(self) -> list[ConnectedWorker]:
+        """All alive, active downloader-role workers (video ramdisk tier)."""
+        return [
+            w
+            for w in self.alive_workers()
+            if w.status == "active"
+            and getattr(w.capabilities, "role", "browser") == "downloader"
+        ]
+
+    def _pool_key_of(self, w: ConnectedWorker) -> str:
+        """Shared-ramdisk pool identity. Falls back to the worker_id so a
+        downloader that forgot PAPRIKA_DOWNLOAD_POOL_KEY is treated as its own
+        private pool rather than silently sharing (and over-committing) another
+        node's tmpfs budget."""
+        return getattr(w.capabilities, "download_pool_key", None) or w.worker_id
+
+    def _pool_slots(self, pool_key: str) -> int:
+        """Concurrency budget for one shared tmpfs pool.
+
+        Workers on a node all bind-mount the same tmpfs and each advertise the
+        POOL's budget (not their own share), so the pool size is the MAX
+        advertised among them -- not the sum, which would multiply the budget
+        by the number of co-located workers and let them fill the ramdisk."""
+        slots = [
+            int(getattr(w.capabilities, "download_slots", 0) or 0)
+            for w in self.downloader_workers()
+            if self._pool_key_of(w) == pool_key
+        ]
+        return max(slots) if slots else 0
+
+    def _pool_in_flight(self, pool_key: str) -> int:
+        """Downloads currently in flight across every worker in the pool."""
+        return sum(
+            len(w.active_downloads)
+            for w in self.downloader_workers()
+            if self._pool_key_of(w) == pool_key
+        )
+
+    def pick_downloader(
+        self, reserve_download_id: str | None = None,
+    ) -> ConnectedWorker | None:
+        """Pick a downloader-role worker with a free slot in its ramdisk pool.
+
+        Returns None when no downloader is connected or every pool is at its
+        concurrency budget -- the caller MUST then fall back to the legacy
+        in-browser download path (the tier is additive, never a hard
+        dependency; see docs/ramdisk-video-tier.md §6).
+
+        Reserves the slot synchronously (same contract as ``pick_worker``'s
+        ``reserve_for_job``) so two concurrent handoffs can't both claim the
+        last slot across an await boundary. Callers that bail before sending
+        MUST call ``release_download``.
+        """
+        candidates: list[ConnectedWorker] = []
+        for w in self.downloader_workers():
+            pool = self._pool_key_of(w)
+            slots = self._pool_slots(pool)
+            if slots <= 0:
+                continue  # pool budget unset -> tier disabled for it
+            if self._pool_in_flight(pool) >= slots:
+                continue  # shared ramdisk is at capacity
+            if len(w.active_downloads) >= max(1, w.capabilities.max_concurrent):
+                continue  # this particular worker is saturated
+            candidates.append(w)
+        if not candidates:
+            return None
+        # Least-loaded first, random among ties (same rationale as pick_worker:
+        # avoids hammering the first-in-dict worker when the tier is idle).
+        best = min(len(w.active_downloads) for w in candidates)
+        tied = [w for w in candidates if len(w.active_downloads) == best]
+        winner = random.choice(tied)
+        if reserve_download_id:
+            winner.active_downloads.add(reserve_download_id)
+        return winner
+
+    def release_download(self, worker_id: str, download_id: str) -> None:
+        """Free a reserved/in-flight download slot. Idempotent -- safe to call
+        from both the completion handler and a bail-out path."""
+        w = self.connections.get(worker_id)
+        if w is not None:
+            w.active_downloads.discard(download_id)
 
     def pick_worker(
         self, reserve_for_job: str | None = None,
@@ -1116,6 +1338,13 @@ class WorkerRegistry:
             # worker_download_cap downloading jobs (their Chrome lanes are free,
             # but yt-dlp is eating its CPU/net/disk) so we don't pile more on.
             and len(w.downloading_jobs) < _dl_cap
+            # Downloader-tier workers run NO Chrome (docs/ramdisk-video-tier.md):
+            # they must NEVER receive a browse job. The Chrome-surface check
+            # below already excludes them in practice (no lanes, no novnc_url),
+            # but an explicit role gate is the guarantee -- a downloader CT that
+            # happens to inherit chrome_host/chrome_port from its args would
+            # otherwise slip through and fail every fetch with "no free lane".
+            and getattr(w.capabilities, "role", "browser") != "downloader"
             and (
                 len(w.capabilities.lane_novnc_urls or []) > 0
                 or bool(w.capabilities.novnc_url)
@@ -1222,6 +1451,27 @@ class WorkerRegistry:
                     "disk_free_gb": w.disk_free_gb,
                     "load1": w.load1,
                     "nproc": w.nproc,
+                    # Cgroup-scoped memory. mem_scope tells the UI whether
+                    # mem_pct above is a real percentage ("cgroup") or the
+                    # Proxmox node's ("host") -- render the latter as such
+                    # instead of implying it's this worker's.
+                    "mem_scope": w.mem_scope,
+                    "mem_current_mb": round(w.mem_current_mb, 1),
+                    "mem_anon_mb": round(w.mem_anon_mb, 1),
+                    "mem_psi_some_avg60": round(w.mem_psi_some_avg60, 2),
+                    "mem_psi_full_avg60": round(w.mem_psi_full_avg60, 2),
+                    "mem_majfault_per_s": round(w.mem_majfault_per_s, 1),
+                    "mem_refault_per_s": round(w.mem_refault_per_s, 1),
+                    "memguard": w.memguard,
+                    # Seconds this hub has seen the guard tripped without the
+                    # worker managing to recycle itself. The hub-side memory
+                    # escalation waits on THIS, not on the flag, so a worker
+                    # that is simply mid-drain is left to finish on its own.
+                    "memguard_s": (
+                        round(time.monotonic() - w.memguard_since, 1)
+                        if w.memguard_since
+                        else 0.0
+                    ),
                     # Host load per core (io_sat) -- the I/O-aware dispatch signal.
                     # None when nproc unknown (old worker) so the UI shows "—".
                     "io_sat": round(w.load1 / w.nproc, 2) if w.nproc else None,
@@ -1420,6 +1670,22 @@ class WorkerRegistry:
                 "disk_free_gb": float(data.get("disk_free_gb") or 0.0),
                 "load1": float(data.get("load1") or 0.0),
                 "nproc": int(data.get("nproc") or 0),
+                # Cgroup-scoped memory. This dict is an explicit WHITELIST, so
+                # mirroring a field into the Redis row (see heartbeat()) is only
+                # half the job -- without a line here the value is written every
+                # heartbeat and silently dropped on read, and the Workers tab
+                # shows the memory column for just the ~1/7 of the fleet owned
+                # by whichever hub nginx happened to route to.
+                # mem_scope defaults to "" (not "host") so a legacy row is
+                # rendered as "unknown scope", not as a claim we can't back.
+                "mem_scope": str(data.get("mem_scope") or ""),
+                "mem_current_mb": float(data.get("mem_current_mb") or 0.0),
+                "mem_anon_mb": float(data.get("mem_anon_mb") or 0.0),
+                "mem_psi_some_avg60": float(data.get("mem_psi_some_avg60") or 0.0),
+                "mem_psi_full_avg60": float(data.get("mem_psi_full_avg60") or 0.0),
+                "mem_majfault_per_s": float(data.get("mem_majfault_per_s") or 0.0),
+                "mem_refault_per_s": float(data.get("mem_refault_per_s") or 0.0),
+                "memguard": str(data.get("memguard") or ""),
             })
         return out
 

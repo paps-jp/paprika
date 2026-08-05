@@ -1249,16 +1249,25 @@ SAVE_MIME_PREFIXES = ("image/", "audio/")
 # Image.open() (UnidentifiedImageError). Tiny raster sprites are left to
 # the min_asset_size_bytes filter. This is the network-capture-side twin
 # of the in-page BAD regex used during DOM image discovery.
+#
+# 2026-07-17 (op): .gif も除外に追加。 .gif が MinIO の paprika bucket 容量の
+# ~46% (推計 865 GB) を占め、 特に Canva 製の巨大バナー広告 (43MB) が数十の
+# job で重複保存されて 07-16 に単日 ~890 GB spike → disk full → image-pull
+# が S3Error XMinioStorageFull で ~6h 停止。 pipeline 側で GIF はほぼ使わず
+# (image-hash-extract は cv2.imdecode で 1 frame decode するのみで UnidentifiedImageError
+# を吐く事も多い)、 saving 帯域と bucket 容量の完全な無駄。
 _DECORATIVE_ASSET_MIMES = {
     "image/svg+xml",
     "image/x-icon",
     "image/vnd.microsoft.icon",
     "image/ico",
+    "image/gif",
 }
 
 
 def _is_decorative_asset(mime: str, url: str) -> bool:
-    """True for SVG / favicon / .ico assets -- decoration, not photos."""
+    """True for SVG / favicon / .ico / .gif assets -- decoration or animation,
+    not usable photo content for the face-search pipeline."""
     m = (mime or "").split(";", 1)[0].strip().lower()
     if m in _DECORATIVE_ASSET_MIMES:
         return True
@@ -1267,7 +1276,7 @@ def _is_decorative_asset(mime: str, url: str) -> bool:
     except Exception:
         path = (url or "").lower()
     base = path.rsplit("/", 1)[-1]
-    if path.endswith((".svg", ".ico")):
+    if path.endswith((".svg", ".ico", ".gif")):
         return True
     if base.startswith("favicon"):
         return True

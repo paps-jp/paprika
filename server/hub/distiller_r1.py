@@ -360,23 +360,58 @@ def _build_brief(
 # ---------------------------------------------------------------------------
 
 
+# ---------------------------------------------------------------------------
+# 2026-07-15: distiller cooldown + per-host de-duplication.
+#
+# Measurement: 93% of reasoning_distill calls returned {"updates": []} while
+# each burned ~169s of qwen@.26 GPU time -- ~1780 calls/hour on hosts that
+# repeated the same failure over and over. Root cause: _should_run had
+# ``if not success: return True`` which fired unconditionally on every
+# failed job of every host, and there was no de-duplication vs. what the
+# distiller had already looked at for that host.
+#
+# Fix: two in-process gates before the LLM call.
+#   1. ``_HOST_COOLDOWN_S``: same host cannot re-distill within this window.
+#      In-memory (per-hub) is fine -- worst case each of the 7 hubs runs
+#      it once per window per host = still ~7x reduction. Cross-hub
+#      coordination via Redis is overkill for a fitness-only heuristic.
+#   2. Perception is REQUIRED for fail-case distillation too. A failed
+#      job with no perception has nothing new to teach ("no observation,
+#      nothing to learn" applies symmetrically to success and failure).
+# ---------------------------------------------------------------------------
+_HOST_COOLDOWN_S = 1800  # 30 min per host per hub
+_last_distilled_at: dict[str, float] = {}
+
+
 def _should_run(
     *,
     mode: str,
     success: bool,
     perception: dict | None,
     current_knowledge: dict,
+    host: str = "",
 ) -> bool:
     """Decide whether to spend an R1 call on this job."""
     if mode == "on":
         return True
     if mode != "new":
         return False  # off / unknown -- skip
+    # Per-host cooldown: skip if this host was distilled recently. Same
+    # host + same failure repeating = the previous distill already
+    # captured whatever new signal was there (93% empty-updates rate
+    # observed before this gate was added).
+    if host:
+        import time as _time
+        last = _last_distilled_at.get(host, 0.0)
+        if last and (_time.time() - last) < _HOST_COOLDOWN_S:
+            return False
     # mode == "new": run when there's likely new information to capture.
-    if not success:
-        return True  # failures are high-signal
     if not perception:
-        return False  # no observation, nothing to learn
+        return False  # no observation, nothing to learn (applies to both
+                      # success and failure -- fail-without-perception was
+                      # the top empty-updates class)
+    if not success:
+        return True  # failures WITH perception are high-signal
     barriers_seen = (perception.get("barriers") or [])
     known_barriers = set(((current_knowledge.get("per_page") or {}).get("barriers") or {}).keys())
     for b in barriers_seen:
@@ -384,6 +419,14 @@ def _should_run(
         if kind and kind not in known_barriers:
             return True  # new barrier kind observed
     return False  # routine successful job, knowledge already accurate
+
+
+def _mark_distilled(host: str) -> None:
+    """Record that ``host`` was just distilled, for _HOST_COOLDOWN_S dedup."""
+    if not host:
+        return
+    import time as _time
+    _last_distilled_at[host] = _time.time()
 
 
 # ---------------------------------------------------------------------------
@@ -470,8 +513,13 @@ async def distill_for_job(
         success=success,
         perception=perception,
         current_knowledge=current,
+        host=host,
     ):
         return None
+    # Mark BEFORE the LLM call so concurrent invocations for the same
+    # host (e.g. two jobs finishing back-to-back) don't both slip past
+    # the cooldown gate and double-spend the 169s call.
+    _mark_distilled(host)
 
     # Resolve R1 engine.
     try:

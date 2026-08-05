@@ -39,7 +39,13 @@ import os
 log = logging.getLogger("paprika.hub.dns_fix")
 
 _RESOLV = "/etc/resolv.conf"
-_DEFAULT = ["1.1.1.1", "8.8.8.8"]
+# LAN gateway (Yamaha RTX1300) first: it caches everything the fleet queries
+# and has zero DPI on the LAN hop, so it answers cold lookups in <5ms with
+# warm-cache hit rates near 100% -- versus racing public UDP/53 upstreams
+# that intermittently fell silent (30-40 % on cold hosts under submit-burst
+# load, root cause of the 2026-07-13 "dead-domain misjudgement" incident).
+# Public resolvers stay as fallback for the moment the gateway is unreachable.
+_DEFAULT = ["10.10.50.1", "1.1.1.1"]
 _DISABLE = {"off", "0", "false", "no", "disable", "disabled"}
 
 
