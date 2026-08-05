@@ -98,6 +98,12 @@ from ._mix_profile import _ProfileExtMixin
 from ._mix_maintenance import _MaintenanceMixin
 from ._mix_preview import _PreviewMixin
 from ._mix_uploads import _UploadsMixin
+from ._mix_videodl import (
+    _VideoDownloadMixin,
+    download_pool_key_from_env,
+    download_slots_from_env,
+    role_from_env,
+)
 
 
 class WorkerAgent(
@@ -109,6 +115,7 @@ class WorkerAgent(
     _MaintenanceMixin,
     _PreviewMixin,
     _UploadsMixin,
+    _VideoDownloadMixin,
 ):
     PAPRIKA_AGENT_ID = "gmhfgiloilioklcofcinlemifjjaeppe"
 
@@ -122,6 +129,53 @@ class WorkerAgent(
         "paprika-profile-",
         "paprika-vid-",
         "paprika-",                  # legacy / job tmpdirs (paprika-<jobid>-<rand>)
+    )
+
+    # Chrome's own scratch in the system temp dir. Unlike the paprika-*
+    # entries above these are NOT ours to name, carry no job/session id to
+    # key a keep-set off, and come as BOTH files and directories -- so they
+    # get their own list and their own (longer, mtime-only) age guard.
+    #
+    # Chrome never cleans these up when its parent SIGKILLs it, which in
+    # this pipeline is every lane swap, every Xvfb restart and every
+    # container SIGTERM. Nothing else in the worker owns them, so they grow
+    # without bound: measured 2026-08-05 across 11 fleet CTs, the six
+    # without the CT-side daily timer held 6.6-10.9 GB of container /tmp
+    # (173-269 scoped_dir, 1034-1346 shm files) at 0-1d uptime, against
+    # 0.46-1.8 GB on the five that had it. That timer
+    # (scripts/worker-housekeep.sh) was the only thing pruning them, and it
+    # is installed per-CT by hand -- which is why it was missing on more
+    # than half the fleet. Sweeping here instead makes the cleanup travel
+    # with the worker source and caps the footprint at one age window.
+    #
+    # Shapes, counted on a prod worker's /tmp 2026-08-05. The leading dot is
+    # NOT cosmetic -- it separates two different families, and matching only
+    # the dotted one (as scripts/worker-housekeep.sh does) misses the
+    # numerous half entirely:
+    #
+    #   com.google.Chrome.XXXXXX   6704  DIRECTORY, singleton socket dir
+    #                                    (SingletonSocket + SingletonCookie),
+    #                                    one per Chrome launch, ~4K
+    #   .com.google.Chrome.XXXXXX  1427  FILE, shm segment, up to 9.9 MB --
+    #                                    on disk at all only because of
+    #                                    --disable-dev-shm-usage (lanes.py)
+    #   scoped_dir*                ~240  DIRECTORY, base::ScopedTempDir,
+    #                                    ~53 MB each = most of the bytes
+    #
+    # So the dirs dominate the entry count and scoped_dir dominates the
+    # space. Both matter: 6704 stale entries make every /tmp lookup slower,
+    # 240 x 53 MB is ~12 GB.
+    #
+    # CAUTION: the socket dir of a LIVE Chrome is in here too, and its mtime
+    # is its creation time -- observed a day old on a running browser -- so
+    # age alone would delete it. _sweep_tmp_orphans resolves the live ones
+    # through lanes.chrome_live_socket_dirs() instead of guessing.
+    _TMP_SWEEP_CHROME_PREFIXES = (
+        "scoped_dir",
+        "com.google.Chrome.",
+        ".com.google.Chrome.",
+        "org.chromium.",
+        ".org.chromium.",
     )
 
 
@@ -169,6 +223,21 @@ class WorkerAgent(
         # SE_DRAIN_AFTER_SESSION_COUNT does. 0 disables.
         self._jobs_done = 0
         self._draining = False
+        # --- memory guard (server/worker/cgroup_mem.py) --------------------
+        # Set by the memory-guard THREAD when it trips: the human-readable
+        # reason (reported to the hub in the heartbeat so the operator sees
+        # WHY a worker recycled), the wall-clock instant it tripped, and the
+        # monotonic instant we started draining -- the last one arms the
+        # forced-exit deadline for the case a thrashing worker's in-flight
+        # jobs never drain. Empty reason == guard has not tripped.
+        self._memguard_reason: str = ""
+        self._memguard_at: float = 0.0
+        self._memguard_drain_m: float = 0.0
+        #: (majfault/s, refault/s) from the guard's last pair of samples.
+        #: Rates need two samples, so only the guard thread can compute them;
+        #: the heartbeat reports them so a building storm is visible in the
+        #: Workers tab BEFORE it is bad enough to trip the guard.
+        self._memguard_rates: tuple[float, float] = (0.0, 0.0)
         # Rolling self-update state (set when we detect a hub-advertised
         # version mismatch and start draining for an update). Replaces
         # the old "immediately fetch + exit(42)" thundering-herd flow.
@@ -410,5 +479,11 @@ class WorkerAgent(
             novnc_url=self.novnc_url,
             lane_novnc_urls=lane_urls,
             supports_preview_push=True,
+            # Downloader tier (docs/ramdisk-video-tier.md). Browser-role
+            # workers advertise role='browser' + no pool, so the hub's
+            # routing is unchanged for the existing fleet.
+            role=role_from_env(),
+            download_pool_key=download_pool_key_from_env(),
+            download_slots=download_slots_from_env(),
         )
 

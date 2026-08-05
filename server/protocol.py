@@ -501,6 +501,33 @@ class WorkerCapabilities(BaseModel):
         "HubPreviewSubscribe to workers that advertise this; older "
         "workers keep the legacy pull path. Set by new worker builds.",
     )
+    role: str = Field(
+        "browser",
+        description="Worker role. 'browser' (default) runs the lane/Chrome "
+        "pool and serves fetch/session/codegen jobs. 'downloader' "
+        "runs NO Chrome -- it only serves HubAssignVideoDownload "
+        "handoffs, writing to a shared host-tmpfs ramdisk and "
+        "uploading straight to the parent job's assets. Set via "
+        "PAPRIKA_WORKER_ROLE on the CT. Unknown values are treated "
+        "as 'browser' by the hub for forward-compat.",
+    )
+    download_pool_key: str | None = Field(
+        None,
+        description="downloader-role only: identity of the shared tmpfs pool "
+        "this worker writes to (typically the Proxmox node name, so "
+        "all downloader workers on one node that bind-mount the same "
+        "/ram/pvid report the same key). The hub caps concurrent "
+        "downloads PER pool_key so the shared ramdisk can't be "
+        "exhausted by co-located workers.",
+    )
+    download_slots: int = Field(
+        0,
+        description="downloader-role only: max concurrent downloads the shared "
+        "pool (download_pool_key) permits, = floor(tmpfs_size / "
+        "(max_video * merge_factor)). The hub uses the MAX advertised "
+        "value across workers sharing a pool_key as that pool's "
+        "semaphore size.",
+    )
 
 
 # --- Worker → Hub ----------------------------------------------------------
@@ -548,15 +575,53 @@ class WorkerHeartbeat(BaseModel):
     # (default 0.0) so an older worker that doesn't send them still
     # deserialises -- the admin UI just shows "—" for that row.
     # cpu_pct + load1 reflect the LXC HOST (Proxmox node), since the CT
-    # shares its kernel and /proc/stat. mem_pct + disk_* reflect the CT
-    # itself (cgroup-limited mem + overlayfs root). The split is what an
-    # operator needs to distinguish "this CT is full" from "the underlying
-    # node is overloaded across all its CTs".
+    # shares its kernel and /proc/stat. disk_* reflect the CT itself
+    # (overlayfs root). The split is what an operator needs to distinguish
+    # "this CT is full" from "the underlying node is overloaded across all
+    # its CTs".
     cpu_pct: float = 0.0
+    #: SCOPE-DEPENDENT -- read ``mem_scope`` before trusting this. It was
+    #: documented as CT-local until 2026-08-03 but is derived from
+    #: /proc/meminfo, which inside a docker-in-LXC worker reports the PROXMOX
+    #: NODE (measured: 377GB on an 8GB CT). Only meaningful when
+    #: ``mem_scope == "cgroup"``.
     mem_pct: float = 0.0
     disk_pct: float = 0.0
     disk_free_gb: float = 0.0
     load1: float = 0.0
+    # --- cgroup-scoped memory (2026-08-03) -------------------------------
+    # Absolute figures read from this container's own cgroup v2 controller,
+    # which -- unlike /proc/meminfo -- is correctly scoped. These are what the
+    # hub's memory-choke detection and the admin Workers tab should use.
+    # Absolute rather than percentages because the 8GB cap lives on the parent
+    # (CT) cgroup, which a cgroup namespace hides from the container.
+    #: "cgroup" = mem_pct is a real percentage of a real limit;
+    #: "host" = no limit discoverable, mem_pct is node-wide (label it as such);
+    #: "" = older worker, or no cgroup v2 memory controller.
+    mem_scope: str = ""
+    mem_current_mb: float = 0.0
+    #: Anonymous memory. The RSS-leak signal
+    #: ([[worker-python-rss-leak-refault-storm]]); healthy fleet baseline is
+    #: 1.6-2.1 GB.
+    mem_anon_mb: float = 0.0
+    #: PSI: percent of wall-clock time tasks spent stalled on memory. Healthy
+    #: baseline is 0.00; this is the direct measure of the refault storm that
+    #: percentage-of-limit gauges cannot see (page cache reads as "available"
+    #: while the box thrashes on it).
+    mem_psi_some_avg60: float = 0.0
+    mem_psi_full_avg60: float = 0.0
+    #: Fault RATES from the memory guard's last sample pair (cumulative
+    #: counters are useless -- a healthy host shows millions since boot at
+    #: 0.3/s). ``mem_refault_per_s`` is the direct thrash measure: pages
+    #: evicted then immediately read back. Measured 0.0/s on every healthy CT
+    #: (boiler + garage, 2026-08-03), so anything non-trivial here is real.
+    #: Reported so a building storm is visible BEFORE the guard trips.
+    mem_majfault_per_s: float = 0.0
+    mem_refault_per_s: float = 0.0
+    #: Non-empty when the worker's memory guard has tripped and it is draining
+    #: for a recycle -- carries the human-readable reason so the operator sees
+    #: WHY in the Workers tab instead of an unexplained restart.
+    memguard: str = ""
     # Host CPU core count (os.cpu_count). Lets the hub normalise the host-level
     # load1 into "load per core" for I/O-aware dispatch across a fleet mixing
     # Proxmox nodes and bare-metal boxes of different sizes. 0 = older worker.
@@ -867,11 +932,54 @@ class WorkerVideoProbe(BaseModel):
     tls: str = ""
 
 
+class WorkerVideoHandoff(BaseModel):
+    """browse worker -> hub: 'I detected a downloadable video for parent_job_id
+    and I'm handing it off to the download tier'. Emitted right before the
+    browse worker tears down its Chrome session (lane freed immediately).
+
+    The payload is browser-independent: cookies are normally re-fetched by the
+    downloader from /hosts/{host}/cookies.txt, so cookies_snapshot is only
+    populated for ``gated`` streams whose delivery is tied to the live session's
+    token (best-effort -- must be spent before the token expires; no keepalive).
+    """
+
+    type: Literal["video_handoff"] = "video_handoff"
+    parent_job_id: str
+    url: str
+    referer_chain: list[str] = Field(
+        default_factory=list,
+        description="referer candidates in priority order (frame referer, "
+        "top page url, ''). Mirrors _download_stream's chain.",
+    )
+    user_agent: str | None = None
+    host: str = ""
+    min_asset_size: int = 0
+    is_live: bool = False
+    verdict: str = ""  # probe(E): decouplable | tokened | gated | drm
+    cookies_snapshot: list[dict[str, Any]] | None = None
+
+
+class WorkerVideoDownloadComplete(BaseModel):
+    """downloader worker -> hub: terminal result of one HubAssignVideoDownload.
+    ok=False means the download failed on the tier (token expired / gated /
+    tier error) -> the hub may re-drive it through the legacy in-browser path."""
+
+    type: Literal["video_download_complete"] = "video_download_complete"
+    download_id: str
+    parent_job_id: str
+    ok: bool = False
+    n_files: int = 0
+    bytes_total: int = 0
+    message: str = ""
+
+
 WorkerToHubMsg = Annotated[
     Union[
         WorkerRegister,
         WorkerEngineUsage,
         WorkerVideoProbe,
+        WorkerVideoHandoff,
+        WorkerVideoDownloadComplete,
         WorkerHeartbeat,
         WorkerJobAccepted,
         WorkerJobProgress,
@@ -1386,9 +1494,57 @@ class HubSessionInteraction(BaseModel):
     ts: float
 
 
+class HubAssignVideoDownload(BaseModel):
+    """hub -> downloader worker: download ONE video to the shared ramdisk and
+    upload it straight to the parent job's assets. No Chrome, no lane.
+
+    Reuses the browse worker's existing download core: the downloader points
+    ``_make_video_downloader`` at its tmpfs assets_dir with an on_saved that
+    POSTs to ``asset_upload_base``. cookies_url lets the downloader rebuild the
+    per-host cookies.txt itself (the normal path); ``cookies`` carries a live
+    snapshot only for gated streams handed off with WorkerVideoHandoff."""
+
+    type: Literal["assign_video_download"] = "assign_video_download"
+    download_id: str
+    parent_job_id: str
+    url: str
+    referer_chain: list[str] = Field(default_factory=list)
+    user_agent: str | None = None
+    host: str = ""
+    min_asset_size: int = 0
+    is_live: bool = False
+    asset_upload_base: str = Field(
+        ...,
+        description="Base URL to POST the downloaded video to "
+        "(e.g. http://hub:8000/jobs/{parent_job_id}/assets), "
+        "same contract as HubAssignJob.asset_upload_base.",
+    )
+    cookies_url: str | None = Field(
+        None,
+        description="{hub}/hosts/{host}/cookies.txt -- the downloader GETs this "
+        "to build the yt-dlp cookies.txt itself (browser-independent).",
+    )
+    cookies: list[dict[str, Any]] | None = Field(
+        None,
+        description="Live cookie snapshot forwarded from WorkerVideoHandoff for "
+        "gated streams; None for decouplable/tokened (use cookies_url).",
+    )
+
+    @property
+    def job_id(self) -> str:
+        """Alias for parent_job_id.
+
+        The worker's upload helpers (``_upload_asset`` / ``_upload_asset_direct``)
+        read exactly two attributes off the assignment -- ``job_id`` and
+        ``asset_upload_base`` -- so exposing this alias lets the downloader tier
+        reuse them verbatim instead of forking an upload path."""
+        return self.parent_job_id
+
+
 HubToWorkerMsg = Annotated[
     Union[
         HubAssignJob,
+        HubAssignVideoDownload,
         HubCancelJob,
         HubForceCompleteJob,
         HubPing,

@@ -74,6 +74,7 @@ from server.protocol import (
 )
 from server.scheduler import HEARTBEAT_INTERVAL
 from server.worker import browser_ops
+from server.worker import scratch_pool
 from server.worker.sessions import SessionState
 from server.worker._browser_helpers import (
     _LINKS_EXTRACT_JS,
@@ -172,13 +173,23 @@ class _MaintenanceMixin:
 
     async def _disk_cleanup_loop(self) -> None:
         """Periodically prune stale /tmp/paprika-* dirs left behind by
-        crashes / ungraceful teardown. Idempotent; safe to run while
+        crashes / ungraceful teardown, plus Chrome's own abandoned scratch
+        (see _TMP_SWEEP_CHROME_PREFIXES). Idempotent; safe to run while
         new sessions are starting (age threshold + active-session check)."""
         interval = float(
             os.environ.get("PAPRIKA_TMP_SWEEP_INTERVAL_S") or 1800.0,  # 30 min
         )
         min_age = float(
             os.environ.get("PAPRIKA_TMP_SWEEP_MIN_AGE_S") or 1800.0,  # 30 min
+        )
+        # Chrome's leftovers get a longer window than ours: we can prove a
+        # paprika-* dir is dead from the live session/job sets, but Chrome's
+        # entries carry no id to match on, so age is the ONLY evidence. 60
+        # min is what the CT-side timer (scripts/worker-housekeep.sh) has
+        # been using in production, so this inherits a proven threshold
+        # rather than inventing one. 0 disables the Chrome half entirely.
+        chrome_min_age = float(
+            os.environ.get("PAPRIKA_TMP_SWEEP_CHROME_MIN_AGE_S") or 3600.0,
         )
         # One pass immediately on startup so a worker that just came up
         # from a previous crash starts clean. Subsequent passes are spaced
@@ -191,13 +202,14 @@ class _MaintenanceMixin:
                 else:
                     await asyncio.sleep(interval)
                 try:
-                    n, bytes_freed = await asyncio.to_thread(
-                        self._sweep_tmp_orphans, min_age,
+                    n, bytes_freed, n_chrome = await asyncio.to_thread(
+                        self._sweep_tmp_orphans, min_age, chrome_min_age,
                     )
                     if n:
                         _logger.info(
                             f"[worker {self.worker_id}] tmp sweep: "
-                            f"removed {n} orphan dir(s), "
+                            f"removed {n} orphan entr(ies) "
+                            f"({n_chrome} chrome), "
                             f"~{bytes_freed // (1024*1024)} MiB freed",
                         )
                 except Exception as e:
@@ -208,14 +220,47 @@ class _MaintenanceMixin:
         except asyncio.CancelledError:
             return
 
-    def _sweep_tmp_orphans(self, min_age_s: float) -> tuple[int, int]:
+    def _tmp_sweep_roots(self) -> list[Path]:
+        """Directories the sweep walks.
+
+        The system temp dir always: it holds our own mkdtemp() scratch, and
+        Chrome's leftovers too whenever its TMPDIR is NOT redirected (no
+        ramdisk, or a lane that failed to prepare one). Plus every lane
+        TMPDIR on the ramdisk, because that is where Chrome's scratch goes
+        once it IS redirected -- and leaving those unswept would trade a
+        bounded disk leak for an unbounded RAM one on a mount shared by the
+        whole node. ``PAPRIKA_TMP_SWEEP_ROOT`` overrides the system dir so a
+        test can sweep a sandbox.
+        """
+        roots = [Path(os.environ.get("PAPRIKA_TMP_SWEEP_ROOT") or "/tmp")]
+        try:
+            from server.worker.lanes import chrome_lane_tmp_roots
+
+            roots += chrome_lane_tmp_roots()
+        except Exception:
+            # Older worker source / import trouble: sweeping the system tmp
+            # alone is the pre-existing behaviour, never a reason to abort.
+            pass
+        out: list[Path] = []
+        for r in roots:
+            try:
+                if r.exists() and r not in out:
+                    out.append(r)
+            except OSError:
+                continue
+        return out
+
+    def _sweep_tmp_orphans(
+        self, min_age_s: float, chrome_min_age_s: float = 3600.0,
+    ) -> tuple[int, int, int]:
         """One sweep pass. Synchronous (run in a thread because rmtree of
-        multi-GB dirs is blocking). Returns ``(removed_count, bytes_freed)``."""
+        multi-GB dirs is blocking). Returns
+        ``(removed_count, bytes_freed, chrome_removed_count)``."""
         import time as _t
 
-        tmp = Path("/tmp")
-        if not tmp.exists():
-            return (0, 0)
+        roots = self._tmp_sweep_roots()
+        if not roots:
+            return (0, 0, 0)
         # Snapshot of live session IDs so we don't race a session_end
         # that fires mid-sweep. Slight race risk on a session that just
         # started but hasn't populated self._sessions yet -- the
@@ -235,27 +280,62 @@ class _MaintenanceMixin:
         # Combined keep-set: any tmpdir whose name contains one of
         # these strings is preserved this pass.
         keep_tokens: set[str] = {x for x in (live_sids | live_jobs) if x}
+        # Chrome's entries carry no id to match on, so the keep-set above
+        # cannot speak for them -- but one shape MUST be spared: the
+        # singleton socket dir of a running browser. Its mtime is its
+        # creation time (seen a day stale on a live Chrome), so the age
+        # guard would not save it. Resolve the live ones exactly, via the
+        # symlink each lane profile keeps pointing at its own.
+        chrome_keep: set[str] = set()
+        try:
+            from server.worker.lanes import chrome_live_socket_dirs
+
+            chrome_keep = chrome_live_socket_dirs()
+        except Exception:
+            # Without that evidence we cannot tell a live socket dir from a
+            # leaked one, and guessing wrong costs a lane. Sit the Chrome
+            # half out this pass; the next one will have it.
+            chrome_min_age_s = 0.0
         now = _t.time()
         removed = 0
         freed = 0
-        try:
-            entries = list(tmp.iterdir())
-        except Exception:
-            return (0, 0)
+        chrome_removed = 0
+        entries: list[Path] = []
+        for root in roots:
+            try:
+                entries += list(root.iterdir())
+            except Exception:
+                continue
         for entry in entries:
             name = entry.name
             if name in self._TMP_SWEEP_PROTECTED:
                 continue
-            if not any(name.startswith(p) for p in self._TMP_SWEEP_PREFIXES):
+            is_chrome = chrome_min_age_s > 0 and any(
+                name.startswith(p) for p in self._TMP_SWEEP_CHROME_PREFIXES
+            )
+            if not is_chrome and not any(
+                name.startswith(p) for p in self._TMP_SWEEP_PREFIXES
+            ):
                 continue
             try:
-                if not entry.is_dir():
+                # Ours are always directories. Chrome's are a mix:
+                # scoped_dir*/.org.chromium.* are dirs, the shm segments
+                # (.com.google.Chrome.*) are plain files -- which is why
+                # they survived every previous version of this sweep.
+                is_dir = entry.is_dir()
+                if not is_dir and not is_chrome:
                     continue
                 age = now - entry.stat().st_mtime
             except OSError:
                 continue
-            if age < min_age_s:
+            if age < (chrome_min_age_s if is_chrome else min_age_s):
                 continue
+            if is_chrome and chrome_keep:
+                try:
+                    if os.path.realpath(str(entry)) in chrome_keep:
+                        continue
+                except OSError:
+                    continue
             # If the dir name embeds a live session id OR an in-flight
             # background-download job id, keep it. Names follow
             # paprika-ses-<sid>-<rand> / paprika-profile-<key>-<rand> /
@@ -263,27 +343,51 @@ class _MaintenanceMixin:
             # substring match is loose but safe-direction: false
             # positives only KEEP a stale dir an extra cycle; the
             # protection NEVER deletes a live dir.
-            if any(tok in name for tok in keep_tokens):
+            #
+            # Chrome's entries are exempt because they carry no id to match
+            # -- age is their only evidence, hence the longer window above.
+            if not is_chrome and any(tok in name for tok in keep_tokens):
                 continue
             try:
-                # Best-effort directory size for the log line, capped so
-                # we don't os.walk a huge tree just for telemetry.
-                size = 0
-                for root, _, files in os.walk(entry):
-                    for f in files:
-                        try:
-                            size += os.path.getsize(os.path.join(root, f))
-                        except OSError:
-                            pass
-                        if size > 100 * 1024 * 1024 * 1024:  # cap at 100 GiB
-                            break
-                shutil.rmtree(entry, ignore_errors=True)
+                if is_dir:
+                    # Best-effort directory size for the log line, capped so
+                    # we don't os.walk a huge tree just for telemetry.
+                    size = 0
+                    for root, _, files in os.walk(entry):
+                        for f in files:
+                            try:
+                                size += os.path.getsize(os.path.join(root, f))
+                            except OSError:
+                                pass
+                            if size > 100 * 1024 * 1024 * 1024:  # cap 100 GiB
+                                break
+                    shutil.rmtree(entry, ignore_errors=True)
+                else:
+                    size = entry.stat().st_size
+                    entry.unlink()
                 removed += 1
                 freed += size
+                if is_chrome:
+                    chrome_removed += 1
             except Exception:
                 # Best-effort: skip and try again next sweep.
                 continue
-        return (removed, freed)
+        # Shared ramdisk pool (server/worker/scratch_pool.py): same contract,
+        # but STRICTLY owner-scoped -- the other CTs on this node write into
+        # the same tmpfs and are invisible from in here, so a name-only sweep
+        # would delete a neighbour's live download. Also refresh our own
+        # claims, otherwise a 2h download's reservation ages out and the node
+        # over-admits while we are still writing.
+        try:
+            scratch_pool.touch_own(self.worker_id)
+            _pr, _pf = scratch_pool.sweep_own(
+                self.worker_id, keep_tokens, min_age_s,
+            )
+            removed += _pr
+            freed += _pf
+        except Exception:
+            pass
+        return (removed, freed, chrome_removed)
 
     async def _fetch_cookies_txt_for(self, target_url, state, log=None):
         """Fetch a Netscape cookies.txt for ``target_url``'s host from

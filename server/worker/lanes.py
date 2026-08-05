@@ -43,6 +43,253 @@ def _log(lane_idx: int, msg: str) -> None:
     log.info("[lane %d] %s", lane_idx, msg)
 
 
+# --------------------------------------------------------------------------
+# Chrome lane root
+# --------------------------------------------------------------------------
+# Chrome's user-data-dir is the worker's dominant *disk* writer. Measured on
+# loft 2026-08-04: with browsing active the node's 20 CTs pushed 47 MB/s at
+# the LVM-thin pool; with 42 yt-dlp downloads still running but browsing idle,
+# 0.6 MB/s. The video downloads were already on the node tmpfs
+# (server/worker/scratch_pool.py) -- what was left was essentially all Chrome.
+#
+# PAPRIKA_CHROME_LANE_ROOT points the lane dirs at a second node tmpfs
+# bind-mounted into the CT, so those bytes are charged to host RAM instead of
+# the thin pool. Unset (or not a real tmpfs) keeps the historical /tmp
+# behaviour, so this is inert until the infrastructure exists.
+# See docs/ramdisk-chrome-lane.md.
+#
+# OWNER SCOPING: the mount is ONE tmpfs shared by every worker CT on the node,
+# exactly like the download pool, and each worker owns
+# ``<mount>/<worker_id>/``. It is deliberately NOT a per-CT mount at
+# ``/ram/chrome/<CTID>``: PVE refuses to clone a CT that has a bind mountpoint
+# at all (API2/LXC.pm: "unable to clone mountpoint (type bind)"), so a path
+# carrying the CTID could never be produced by cloning -- while a path that is
+# byte-identical on every CT is copied around freely and stays correct.
+# worker_id is derived from the CT's LAN IP ("w50150"), so a cloned CT lands
+# on a fresh directory with no coordination.
+#
+# INVARIANT: a lane dir and its ``.lane-default`` backup MUST live under the
+# same mount. use_profile() renames one onto the other; a cross-device rename
+# degrades into a ~160MB copytree on every profile swap, which would make this
+# change a pessimisation rather than an optimisation. Both come from the
+# helpers below for exactly that reason -- never rebuild these paths by hand.
+
+_DEFAULT_CHROME_LANE_ROOT = Path("/tmp")
+
+#: Resolved once per process (the mount can't appear mid-run: docker binds are
+#: rprivate, so a host-side mount after container start never reaches us).
+_chrome_lane_root: Path | None = None
+_chrome_lane_owner: str | None = None
+
+
+def _env_int(name: str, default: int) -> int:
+    try:
+        return int((os.environ.get(name) or "").strip() or default)
+    except ValueError:
+        return default
+
+
+def _owner_id() -> str:
+    if _chrome_lane_owner:
+        return _chrome_lane_owner
+    # Defensive only: __main__ calls init_chrome_lane_root() before any lane
+    # spawns. Imported lazily because agent imports this module.
+    try:
+        from server.worker.agent import default_worker_id
+
+        return default_worker_id()
+    except Exception:
+        return ""
+
+
+def _resolve_chrome_lane_root() -> Path:
+    from server.worker import scratch_pool as _sp
+
+    raw = (os.environ.get("PAPRIKA_CHROME_LANE_ROOT") or "").strip()
+    if not raw or raw == str(_DEFAULT_CHROME_LANE_ROOT):
+        return _DEFAULT_CHROME_LANE_ROOT
+    mount = Path(raw)
+    # Strict tmpfs check, same rationale as scratch_pool: when the mp isn't
+    # set up docker silently creates a plain directory on the CT rootfs, and
+    # we would write Chrome's profile churn to the exact device this exists
+    # to spare while the logs claim success.
+    if not _sp._is_tmpfs(mount):
+        # INFO, not WARNING: this is the expected state on every node that has
+        # not been through scripts/setup-chrome-ramdisk.sh yet, and the default
+        # points at the mount so a node self-activates once the mp lands. The
+        # genuinely unexpected failures below stay at WARNING.
+        log.info(
+            "[pool] chrome lane root %s is not a tmpfs -- using %s "
+            "(chrome profiles stay on the CT disk)",
+            mount, _DEFAULT_CHROME_LANE_ROOT,
+        )
+        return _DEFAULT_CHROME_LANE_ROOT
+    owner = _owner_id()
+    if not owner:
+        log.warning(
+            "[pool] chrome lane root %s: no worker id to scope by -- falling "
+            "back to %s (an unscoped dir would collide with the other CTs "
+            "sharing this ramdisk)",
+            mount, _DEFAULT_CHROME_LANE_ROOT,
+        )
+        return _DEFAULT_CHROME_LANE_ROOT
+    root = mount / owner
+    try:
+        root.mkdir(parents=True, exist_ok=True)
+    except OSError as e:
+        log.warning(
+            "[pool] chrome lane root %s not usable (%s) -- falling back to %s",
+            root, e, _DEFAULT_CHROME_LANE_ROOT,
+        )
+        return _DEFAULT_CHROME_LANE_ROOT
+    # Local _env_int, not scratch_pool's: that one maps 0 back to the default,
+    # so the guard could never be switched off. 0 here means "no guard", which
+    # is a legitimate choice on a small ramdisk where 256MB is a big slice.
+    min_free_mb = _env_int("PAPRIKA_CHROME_ROOT_MIN_FREE_MB", 256)
+    try:
+        st = os.statvfs(str(root))
+        free_mb = (st.f_bavail * st.f_frsize) // (1024 * 1024)
+    except Exception:
+        free_mb = 0
+    if free_mb < min_free_mb:
+        # Chrome cannot degrade gracefully on a full filesystem the way the
+        # download path can (scratch_pool just returns None and uses disk) --
+        # it dies and takes the lane with it. Refuse up front instead.
+        log.warning(
+            "[pool] chrome lane root %s has %d MB free (< %d) -- falling back to %s",
+            root, free_mb, min_free_mb, _DEFAULT_CHROME_LANE_ROOT,
+        )
+        return _DEFAULT_CHROME_LANE_ROOT
+    return root
+
+
+def init_chrome_lane_root(worker_id: str) -> Path:
+    """Bind the lane root to this worker's owner directory.
+
+    Called from ``server/__main__.py`` once worker_id is known and before any
+    lane spawns, so the decision (and the reason for any fallback) lands in
+    the startup log rather than being inferred from a lane minutes later.
+    """
+    global _chrome_lane_root, _chrome_lane_owner
+    _chrome_lane_owner = (worker_id or "").strip() or None
+    _chrome_lane_root = None
+    return chrome_lane_root()
+
+
+def chrome_lane_root() -> Path:
+    """Root directory holding every lane's Chrome user-data-dir."""
+    global _chrome_lane_root
+    if _chrome_lane_root is None:
+        _chrome_lane_root = _resolve_chrome_lane_root()
+    return _chrome_lane_root
+
+
+def chrome_on_ramdisk() -> bool:
+    """True when the lane dirs live on the node tmpfs rather than /tmp."""
+    return chrome_lane_root() != _DEFAULT_CHROME_LANE_ROOT
+
+
+def lane_user_data_dir(lane_idx: int) -> Path:
+    """This lane's Chrome user-data-dir."""
+    return chrome_lane_root() / f"chrome-lane-{lane_idx}"
+
+
+def lane_backup_dir(lane_idx: int) -> Path:
+    """Where use_profile() parks the lane's own profile during a swap."""
+    return chrome_lane_root() / f"chrome-lane-{lane_idx}.lane-default"
+
+
+def lane_tmp_dir(lane_idx: int) -> Path:
+    """This lane's TMPDIR -- where Chrome puts its *scratch*, as opposed to
+    its profile.
+
+    Separate from the user-data-dir on purpose: this one is disposable and
+    gets wiped on every spawn, while the profile carries login state.
+    """
+    return chrome_lane_root() / f"chrome-lane-{lane_idx}.tmp"
+
+
+def chrome_lane_tmp_roots() -> list[Path]:
+    """Every lane TMPDIR this worker owns, for the periodic sweeper.
+
+    Empty unless the lane root is a real ramdisk, because that is the only
+    case where Chrome's TMPDIR gets redirected at all. The sweeper needs
+    these because wiping at spawn only bounds the leak per Chrome lifetime,
+    and a lane that runs for days without a respawn would otherwise
+    accumulate on the ramdisk -- where it is *worse* than on disk: the mount
+    is shared by every CT on the node, has no per-directory quota, and a
+    full mount takes out every lane on it at once.
+    """
+    if not chrome_on_ramdisk():
+        return []
+    try:
+        return [
+            p for p in chrome_lane_root().glob("chrome-lane-*.tmp")
+            if p.is_dir()
+        ]
+    except OSError:
+        return []
+
+
+def chrome_live_socket_dirs() -> set[str]:
+    """Temp directories a LIVE Chrome is currently using, as realpaths.
+
+    Chrome puts its singleton socket in a temp dir of its own
+    (``com.google.Chrome.XXXXXX/`` holding ``SingletonSocket`` +
+    ``SingletonCookie``) and symlinks the profile's ``SingletonSocket`` at
+    it. That symlink is the only reliable way to tell a live one from the
+    thousands of leaked ones: the directory's mtime is its *creation* time,
+    observed a full day stale on a running browser, so an age heuristic
+    would happily delete the socket dir out from under a working lane.
+
+    Scoped to this worker by construction -- chrome_lane_root() already ends
+    in our worker_id, and the neighbouring CTs' lane dirs (visible on the
+    shared ramdisk) point at *their* container's /tmp, which does not exist
+    in ours.
+
+    Realpaths rather than Paths so callers can compare against a realpath of
+    their own: readlink alone returns whatever spelling the link carries.
+    """
+    out: set[str] = set()
+    try:
+        lane_dirs = list(chrome_lane_root().glob("chrome-lane-*"))
+    except OSError:
+        return out
+    for d in lane_dirs:
+        # SingletonSocket is the only one of the three that points at a
+        # path; SingletonLock is "<host>-<pid>" and SingletonCookie is a
+        # bare number.
+        p = d / "SingletonSocket"
+        try:
+            if not p.is_symlink():
+                continue
+            target = os.path.dirname(os.path.realpath(str(p)))
+        except OSError:
+            continue
+        if target and target != os.sep:
+            out.add(target)
+    return out
+
+
+def chrome_lane_status_line() -> str:
+    """One-line human summary for the startup log (mirrors scratch_pool)."""
+    root = chrome_lane_root()
+    if root == _DEFAULT_CHROME_LANE_ROOT:
+        return (
+            "chrome lane root: /tmp (no ramdisk) -- chrome profiles stay on "
+            "the CT disk"
+        )
+    try:
+        st = os.statvfs(str(root))
+        total_mb = (st.f_blocks * st.f_frsize) // (1024 * 1024)
+        free_mb = (st.f_bavail * st.f_frsize) // (1024 * 1024)
+    except Exception:
+        total_mb = free_mb = 0
+    return (
+        f"chrome lane root: {root} tmpfs {total_mb} MB ({free_mb} MB free)"
+    )
+
+
 def _migrate_user_data_dirs(n_lanes: int) -> None:
     """One-time rename of chrome-slot-{i} -> chrome-lane-{i}.
 
@@ -51,9 +298,14 @@ def _migrate_user_data_dirs(n_lanes: int) -> None:
     worker boot -- a no-op once the rename has happened. Drop this helper
     one release after the rename ships.
     """
+    # Legacy dirs only ever existed in /tmp. On a tmpfs root there is nothing
+    # to migrate (and renaming across the two would be a cross-device copy of
+    # a profile nobody has used since the Slot->Lane rename shipped).
+    if chrome_lane_root() != _DEFAULT_CHROME_LANE_ROOT:
+        return
     for i in range(n_lanes):
         old = Path(f"/tmp/chrome-slot-{i}")
-        new = Path(f"/tmp/chrome-lane-{i}")
+        new = lane_user_data_dir(i)
         if old.exists() and not new.exists():
             try:
                 old.rename(new)
@@ -260,6 +512,76 @@ class Lane:
         self._watchdog_task = asyncio.create_task(self._chrome_watchdog())
         _log(self.lane_idx, f"READY  chrome=:{self.chrome_port}  noVNC={self.novnc_url}")
 
+    def _prepare_lane_tmpdir(self) -> None:
+        """Point Chrome's TMPDIR at a lane-private dir on the ramdisk and
+        empty it. Called from _spawn_chrome, i.e. always while this lane's
+        Chrome is dead.
+
+        Chrome's scratch -- ScopedTempDirs (``scoped_dir*``) and, because of
+        --disable-dev-shm-usage below, its shm segments
+        (``.com.google.Chrome.*``) -- goes to TMPDIR. Left at the default
+        that is the container's /tmp on the CT's LVM-thin rootfs: exactly
+        the write path docs/ramdisk-chrome-lane.md moved the profiles off,
+        with the scratch left behind.
+
+        It also never gets cleaned up, because Chrome only tidies these on a
+        graceful exit and in this pipeline the parent SIGKILLs it on every
+        lane swap, Xvfb restart and container SIGTERM. Measured across 11
+        fleet CTs on 2026-08-05: 6.6-10.9 GB of container /tmp at 0-1d
+        uptime on the six without the (hand-installed, daily) CT-side timer.
+
+        A lane-private TMPDIR fixes both halves. The writes land on the node
+        tmpfs, and ownership stops being ambiguous: the global /tmp mixes
+        live and dead scratch from every lane with no way to tell them
+        apart, whereas here Chrome is dead at this instant, so the whole
+        directory is garbage by construction and can go without an age
+        heuristic. That bound is what makes it safe to put on RAM at all.
+
+        Inert unless the lane root is a real ramdisk -- on the default /tmp
+        this would change behaviour for no gain, and the periodic sweep
+        (_TMP_SWEEP_CHROME_PREFIXES) already covers that case.
+        """
+        if not chrome_on_ramdisk():
+            return
+        # Free-space gate, re-evaluated on every spawn. The root check in
+        # _resolve_chrome_lane_root() runs once at startup and cannot see a
+        # mount that filled up hours later -- and unlike the profile, this
+        # scratch has a graceful fallback available (the CT disk), so there
+        # is no reason to gamble the lane on it. This restores for Chrome
+        # the property /ram/pdl has by design and /ram/chrome lacks: when
+        # the pool is full, degrade to disk instead of dying. Matters most
+        # right after deployment, when the mount is still sized for
+        # profiles alone (1G/CT) and the operator has not re-capped it.
+        min_free_mb = _env_int("PAPRIKA_CHROME_TMP_MIN_FREE_MB", 1024)
+        if min_free_mb > 0:
+            try:
+                st = os.statvfs(str(chrome_lane_root()))
+                free_mb = (st.f_bavail * st.f_frsize) // (1024 * 1024)
+            except Exception:
+                # Same breadth as _resolve_chrome_lane_root's probe: if we
+                # cannot measure the mount we must not claim space on it.
+                free_mb = 0
+            if free_mb < min_free_mb:
+                _log(
+                    self.lane_idx,
+                    f"lane tmpdir skipped: ramdisk has {free_mb} MB free "
+                    f"(< {min_free_mb}); chrome scratch stays on the CT disk",
+                )
+                self._env.pop("TMPDIR", None)
+                return
+        tmpdir = lane_tmp_dir(self.lane_idx)
+        try:
+            shutil.rmtree(tmpdir, ignore_errors=True)
+            tmpdir.mkdir(parents=True, exist_ok=True)
+        except OSError as e:
+            # Never fatal: falling back to the inherited TMPDIR is the
+            # pre-existing behaviour, and a lane that cannot start is a much
+            # worse outcome than a lane that writes its scratch to disk.
+            _log(self.lane_idx, f"lane tmpdir unavailable ({e}); using default TMPDIR")
+            self._env.pop("TMPDIR", None)
+            return
+        self._env["TMPDIR"] = str(tmpdir)
+
     async def _spawn_chrome(self) -> None:
         """Start (or restart) Chrome on this lane's display."""
         # Suppress the "Chrome didn't shut down correctly -- restore tabs?"
@@ -268,6 +590,8 @@ class Lane:
         # exit_type == "Crashed" triggers the prompt. Flip it back to
         # "Normal" before launching so the new instance starts clean.
         self._mark_prefs_clean()
+        self._clear_foreign_singleton_lock()
+        self._prepare_lane_tmpdir()
         _log(self.lane_idx, f"starting Chrome remote-debugging :{self.chrome_port}")
         chrome_args = [
             "google-chrome",
@@ -286,10 +610,18 @@ class Lane:
             "--restore-last-session=false",
             f"--remote-debugging-port={self.chrome_port}",
             "--remote-allow-origins=*",
-            f"--user-data-dir=/tmp/chrome-lane-{self.lane_idx}",
+            f"--user-data-dir={lane_user_data_dir(self.lane_idx)}",
             "--window-size=1920,1080",
             "--start-maximized",
         ]
+        if chrome_on_ramdisk():
+            # Chrome sizes its HTTP cache from the FREE SPACE it sees, so a
+            # multi-GB ramdisk invites a multi-GB cache. On the CT disk that
+            # was self-limiting (small rootfs); on a shared node ramdisk one
+            # lane could crowd out every other CT's browser. Pin it -- there
+            # is no per-directory quota on a tmpfs to fall back on.
+            cache_mb = max(16, _env_int("PAPRIKA_CHROME_DISK_CACHE_MB", 128))
+            chrome_args.append(f"--disk-cache-size={cache_mb * 1024 * 1024}")
         # Worker egress proxy (target-site plane). When PAPRIKA_WORKER_PROXY
         # is set, this lane's Chrome routes all its outbound traffic through
         # that proxy so sites see the proxy box's IP (e.g. a per-拠点 box) --
@@ -395,7 +727,7 @@ class Lane:
         1) Profile-local extensions discovered under the lane's
            user-data-dir at::
 
-               /tmp/chrome-lane-N/Default/Extensions/<id>/<version>/
+               <chrome-lane-root>/chrome-lane-N/Default/Extensions/<id>/<version>/
 
            For each ``<id>`` we pick the lexicographically-highest
            ``<version>`` subdir that contains a parseable
@@ -420,7 +752,7 @@ class Lane:
         # Chrome 148 ignores --load-extension for unpacked extensions, so
         # we load the agent over CDP (Extensions.loadUnpacked) after
         # Chrome starts instead -- see _load_agent_extension().
-        ext_root = Path(f"/tmp/chrome-lane-{self.lane_idx}/Default/Extensions")
+        ext_root = lane_user_data_dir(self.lane_idx) / "Default" / "Extensions"
         if ext_root.exists():
             for ext_id_dir in sorted(ext_root.iterdir()):
                 if not ext_id_dir.is_dir() or ext_id_dir.name == "Temp":
@@ -448,8 +780,55 @@ class Lane:
                 paths.append(p)
         return paths
 
+    def _clear_foreign_singleton_lock(self) -> None:
+        """Drop a ``SingletonLock`` left by a DIFFERENT container.
+
+        Chrome refuses to open a profile whose ``SingletonLock`` symlink names
+        a host other than the current one -- "The profile appears to be in use
+        by another Google Chrome process (N) on another computer (HOST)" -- and
+        it never expires. On the CT disk that could not happen: the lane dir
+        died with the container that wrote it. On the node-shared ramdisk the
+        dir OUTLIVES the container, and a container's hostname is its docker id,
+        so **every ``docker compose up -d`` (recreate) leaves a lock Chrome will
+        reject forever**. That wedged 9 workers on 2026-08-05 even after their
+        ids were fixed, at ~40s per crash-restart cycle.
+
+        Safe because we are the dir's owner: worker_id is derived from this
+        CT's LAN IP (server/worker/agent/workerid.py), so no other live
+        container shares this path. We only clear a FOREIGN host's lock -- our
+        own (a crashed previous process in this same container) is left for
+        Chrome, which handles that case itself.
+        """
+        lane_dir = lane_user_data_dir(self.lane_idx)
+        try:
+            host = socket.gethostname()
+        except Exception:
+            return
+        for name in ("SingletonLock", "SingletonCookie", "SingletonSocket"):
+            p = lane_dir / name
+            try:
+                if not p.is_symlink():
+                    continue
+                target = os.readlink(str(p))
+            except OSError:
+                continue
+            # Format: "<hostname>-<pid>" (Socket points at a /tmp path).
+            owner = target.rsplit("-", 1)[0] if name == "SingletonLock" else ""
+            if name == "SingletonLock" and (not owner or owner == host):
+                return  # ours (or unparseable) -- let Chrome decide
+            try:
+                p.unlink()
+                if name == "SingletonLock":
+                    _log(
+                        self.lane_idx,
+                        f"cleared stale Chrome profile lock from a previous "
+                        f"container ({target}; we are {host})",
+                    )
+            except OSError:
+                pass
+
     def _mark_prefs_clean(self) -> None:
-        prefs = Path(f"/tmp/chrome-lane-{self.lane_idx}/Default/Preferences")
+        prefs = lane_user_data_dir(self.lane_idx) / "Default" / "Preferences"
         try:
             if prefs.exists():
                 data = json.loads(prefs.read_text())
@@ -560,7 +939,7 @@ class Lane:
     # When a job sets ``options.use_profile``, the worker downloads the
     # uploaded tarball, extracts it to a temp dir, and calls
     # ``use_profile()`` on the lane. The lane stops its Chrome, moves
-    # its current ``/tmp/chrome-lane-N`` aside, swaps the extracted
+    # its current ``chrome-lane-N`` dir aside, swaps the extracted
     # profile in, restarts Chrome on the same port. The original lane
     # profile is restored on ``restore_default_profile()`` (called from
     # the job's finally block + on session end).
@@ -578,8 +957,8 @@ class Lane:
         """
         if self._profile_swap_active:
             return
-        lane_dir = Path(f"/tmp/chrome-lane-{self.lane_idx}")
-        backup_dir = Path(f"/tmp/chrome-lane-{self.lane_idx}.lane-default")
+        lane_dir = lane_user_data_dir(self.lane_idx)
+        backup_dir = lane_backup_dir(self.lane_idx)
         _log(self.lane_idx, f"profile swap: installing {profile_dir} into {lane_dir}")
         # Pause the watchdog so it doesn't fight us during the swap.
         if self._watchdog_task is not None:
@@ -665,7 +1044,7 @@ class Lane:
         # Idempotent: same name already installed -> no-op.
         if self._ambient_profile_name == profile_name:
             return True
-        lane_dir = Path(f"/tmp/chrome-lane-{self.lane_idx}")
+        lane_dir = lane_user_data_dir(self.lane_idx)
         _log(self.lane_idx, f"ambient profile install: {profile_name!r} -> {lane_dir}")
         if self._watchdog_task is not None:
             self._watchdog_task.cancel()
@@ -719,7 +1098,7 @@ class Lane:
             return False
         if self._ambient_profile_name is None:
             return True
-        lane_dir = Path(f"/tmp/chrome-lane-{self.lane_idx}")
+        lane_dir = lane_user_data_dir(self.lane_idx)
         _log(self.lane_idx, "ambient profile clear: reverting to lane stock")
         if self._watchdog_task is not None:
             self._watchdog_task.cancel()
@@ -757,8 +1136,8 @@ class Lane:
         """
         if not self._profile_swap_active:
             return
-        lane_dir = Path(f"/tmp/chrome-lane-{self.lane_idx}")
-        backup_dir = Path(f"/tmp/chrome-lane-{self.lane_idx}.lane-default")
+        lane_dir = lane_user_data_dir(self.lane_idx)
+        backup_dir = lane_backup_dir(self.lane_idx)
         _log(self.lane_idx, "profile swap: restoring lane default")
         # Pause watchdog + stop Chrome (same dance as use_profile).
         if self._watchdog_task is not None:
