@@ -93,6 +93,7 @@ from .profile import _normalise_extracted_profile, parse_attach
 from .recipe import _apply_fetch_recipe, _looks_suspect
 from .selfupdate import _auto_exit_on_version_mismatch, _auto_fetch_source, _check_github_release_once, _fetch_and_apply_source_from_hub, _fetch_worker_plugins_from_hub, _print_version_mismatch_banner, _versions_meaningfully_differ, default_worker_version
 from .translate import _looks_non_english, _translate_to_english
+from server.worker import scratch_pool
 from .video import _make_video_downloader, _parse_dl_progress, detect_yt_dlp
 from .workerid import WORKER_ID_FILE, _WorkerIdReassigned, hub_http_base
 
@@ -103,6 +104,23 @@ from .workerid import WORKER_ID_FILE, _WorkerIdReassigned, hub_http_base
 # also filters at this threshold in pick_worker, so dispatches only slip
 # through during the heartbeat lag window (≤10s).
 _DISK_PRESSURE_FAIL_PCT = 90.0
+
+
+def _looks_like_enospc(msg: object) -> bool:
+    """True when a yt-dlp failure message reads as "the filesystem is full".
+
+    Only consulted for downloads placed on the shared ramdisk pool, where a
+    neighbouring CT can legitimately fill the tmpfs between our admission
+    check and our writes -- that case is worth one local-disk retry, unlike
+    an ordinary download failure.
+    """
+    s = str(msg or "").lower()
+    return (
+        "no space left" in s
+        or "enospc" in s
+        or "errno 28" in s
+        or "disk quota exceeded" in s
+    )
 
 
 def _emergency_disk_cleanup() -> None:
@@ -120,6 +138,14 @@ def _emergency_disk_cleanup() -> None:
     """
     import glob as _glob
 
+    from server.worker.lanes import chrome_lane_root
+
+    # Lane dirs are only in /tmp when PAPRIKA_CHROME_LANE_ROOT is unset; on a
+    # node-tmpfs deployment they live there instead (docs/ramdisk-chrome-lane.md).
+    # Globbing the wrong root here would silently stop reclaiming Chrome's
+    # caches -- which is precisely what this disk-pressure path exists for.
+    _lanes = str(chrome_lane_root()).rstrip("/")
+
     cleaned = 0
     # (pattern, kind) — kind is "dir" or "file".
     targets: list[tuple[str, str]] = [
@@ -128,12 +154,12 @@ def _emergency_disk_cleanup() -> None:
         # Chrome on-disk caches: GPU + shader + Code Cache + HTTP cache.
         # Safe to nuke (Chrome rebuilds on next launch; worst-case is a
         # warm-up pause on the first hit). Cookies / Preferences untouched.
-        ("/tmp/chrome-lane-*/Default/Cache", "dir"),
-        ("/tmp/chrome-lane-*/Default/Code Cache", "dir"),
-        ("/tmp/chrome-lane-*/Default/GPUCache", "dir"),
-        ("/tmp/chrome-lane-*/Default/Service Worker/CacheStorage", "dir"),
-        ("/tmp/chrome-lane-*/ShaderCache", "dir"),
-        ("/tmp/chrome-lane-*/GraphiteDawnCache", "dir"),
+        (f"{_lanes}/chrome-lane-*/Default/Cache", "dir"),
+        (f"{_lanes}/chrome-lane-*/Default/Code Cache", "dir"),
+        (f"{_lanes}/chrome-lane-*/Default/GPUCache", "dir"),
+        (f"{_lanes}/chrome-lane-*/Default/Service Worker/CacheStorage", "dir"),
+        (f"{_lanes}/chrome-lane-*/ShaderCache", "dir"),
+        (f"{_lanes}/chrome-lane-*/GraphiteDawnCache", "dir"),
         # Chrome's own /tmp leak — single biggest hog seen in the wild
         # (2026-06-06: 24k stale files / ~9G per CT across the fleet after
         # 5 days of jobs). Chrome spills two patterns into the system /tmp
@@ -302,8 +328,20 @@ class _JobExecMixin:
                                 f"continuing with lane default",
                             )
 
-                # Local tempdir for assets + page.html + log.txt
-                workdir = Path(tempfile.mkdtemp(prefix=f"paprika-{job_id}-"))
+                # Local tempdir for assets + page.html + log.txt. Optionally
+                # on the shared ramdisk pool -- default OFF, because on a
+                # small pool the video reserve is the whole budget and this
+                # dir can itself receive an inline video download. Any of the
+                # existing rmtree(workdir) paths stay correct: a pool claim
+                # whose dir is gone is self-healing (scratch_pool).
+                workdir = None
+                if scratch_pool.job_workdirs_enabled():
+                    workdir = scratch_pool.acquire(
+                        f"paprika-{job_id}-", self.worker_id,
+                        scratch_pool.job_reserve_bytes(),
+                    )
+                if workdir is None:
+                    workdir = Path(tempfile.mkdtemp(prefix=f"paprika-{job_id}-"))
                 assets_dir = workdir / "assets"
                 assets_dir.mkdir(parents=True, exist_ok=True)
                 log_path = workdir / "log.txt"
@@ -1000,17 +1038,39 @@ class _JobExecMixin:
         OWN temp dir (not the job workdir, which the caller rmtree's) and
         a generous per-download timeout so big VODs aren't killed
         mid-stream (the old inline path capped at 600s and died ~50%).
+
+        That temp dir is taken from the shared node-tmpfs pool when one is
+        mounted (server/worker/scratch_pool.py) -- this is the write that
+        fills the CT's thin-pool -- and falls back to local disk when the
+        pool is absent or full.
         """
         import os as _os
-        import shutil as _shutil
         import tempfile as _tempfile
+
+        from server.worker import scratch_pool as _pool
 
         job_id = assign.job_id
 
         async def _run() -> None:
             from core.fetcher import run_ytdlp
 
-            tmp = Path(_tempfile.mkdtemp(prefix=f"paprika-vid-{job_id}-"))
+            # Prefer the shared node-tmpfs pool: this task is THE writer that
+            # fills the CT's thin-pool (1-2GB per video, up to 2h resident).
+            # acquire() returns None when the pool isn't mounted or can't
+            # take another download, and we fall back to the CT disk exactly
+            # as before. See server/worker/scratch_pool.py.
+            _prefix = f"paprika-vid-{job_id}-"
+            tmp = _pool.acquire(_prefix, self.worker_id, _pool.video_reserve_bytes())
+            _on_pool = tmp is not None
+            if tmp is None:
+                tmp = Path(_tempfile.mkdtemp(prefix=_prefix))
+            # Every directory that may hold output. Normally just one; an
+            # ENOSPC fallback appends a second (local-disk) dir mid-flight.
+            _dl_dirs: list[Path] = [tmp]
+            _logger.info(
+                "[%s] video scratch: %s (%s)", job_id, tmp,
+                "shared ramdisk pool" if _on_pool else "local disk",
+            )
             dl_timeout = int(
                 _os.environ.get("PAPRIKA_VIDEO_DOWNLOAD_TIMEOUT_S", "7200")
             )
@@ -1089,9 +1149,28 @@ class _JobExecMixin:
                     )[:64]
                     _cur_last[0] = 0.0  # let this target's first marker emit now
                     ok, msg = await asyncio.to_thread(
-                        run_ytdlp, u, tmp,
+                        run_ytdlp, u, _dl_dirs[-1],
                         referer=ref, timeout=dl_timeout, log=_dl_log,
                     )
+                    if not ok and _on_pool and _looks_like_enospc(msg):
+                        # A neighbouring CT won the race between our
+                        # admission check and its own writes. Losing a
+                        # multi-minute download to the shared pool being
+                        # full is worse than one redundant re-download, so
+                        # retry this target once on local disk.
+                        _fb = Path(_tempfile.mkdtemp(prefix=_prefix))
+                        _dl_dirs.append(_fb)
+                        _on_pool = False
+                        await self._send(WorkerJobLog(
+                            job_id=job_id,
+                            line="  [downloading] ramdisk pool full -- "
+                                 "retrying on local disk",
+                        ))
+                        _cur_last[0] = 0.0
+                        ok, msg = await asyncio.to_thread(
+                            run_ytdlp, u, _fb,
+                            referer=ref, timeout=dl_timeout, log=_dl_log,
+                        )
                     # Resolve this target's progress bar (success or fail)
                     # so it doesn't stick at the last %.
                     try:
@@ -1109,7 +1188,7 @@ class _JobExecMixin:
                         ))
                 # Upload every completed file (skip in-progress parts).
                 _video_ext = {".mp4", ".webm", ".mkv", ".mov", ".m4v", ".ts"}
-                for p in sorted(tmp.iterdir()):
+                for p in sorted(_f for _d in _dl_dirs for _f in _d.iterdir()):
                     if not p.is_file():
                         continue
                     low = p.name.lower()
@@ -1158,10 +1237,14 @@ class _JobExecMixin:
                         ))
                     except Exception:
                         pass
-                    try:
-                        _salvaged = await self._salvage_partial_downloads(tmp)
-                    except Exception:
-                        _salvaged = []
+                    _salvaged = []
+                    for _d in _dl_dirs:
+                        try:
+                            _salvaged.extend(
+                                await self._salvage_partial_downloads(_d)
+                            )
+                        except Exception:
+                            pass
                     for _p in _salvaged:
                         try:
                             await self._upload_asset(
@@ -1189,7 +1272,10 @@ class _JobExecMixin:
                                 ))
                             except Exception:
                                 pass
-                _shutil.rmtree(tmp, ignore_errors=True)
+                # release() drops the pool claim too, so the node's admission
+                # accounting frees up the instant the bytes do.
+                for _d in _dl_dirs:
+                    _pool.release(_d)
                 # ALWAYS finish the job so it can never hang in
                 # "downloading" -- include whatever video assets landed.
                 try:
