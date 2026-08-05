@@ -31,6 +31,7 @@ from core.fetcher import (
 from server.protocol import (
     AssetInfo,
     HubAssignJob,
+    HubAssignVideoDownload,
     HubExpectedVersion,
     HubForceCompleteJob,
     HubProfileDelete,
@@ -132,6 +133,20 @@ _DISK_CLEANUP_MIN_INTERVAL_S = float(
 _NPROC = os.cpu_count() or 0
 
 
+def _num_env(name: str, default: float) -> float:
+    """Numeric env override. Unset / unparseable -> the caller's default, so a
+    typo in a compose file degrades to the shipped behaviour instead of
+    disabling a guard silently. A deliberate 0 IS honoured (turns a threshold
+    off), which is why this doesn't use the ``or default`` idiom."""
+    raw = os.environ.get(name)
+    if raw is None or not raw.strip():
+        return default
+    try:
+        return float(raw)
+    except (TypeError, ValueError):
+        return default
+
+
 def _sample_resources() -> tuple[float, float, float, float, float]:
     """Return (cpu_pct, mem_pct, disk_pct, disk_free_gb, load1) for this CT.
 
@@ -141,10 +156,20 @@ def _sample_resources() -> tuple[float, float, float, float, float]:
     the heartbeat thread (~10s cadence) so the CPU% delta window matches.
 
     cpu_pct + load1 are LXC-host (Proxmox node) signals because the CT
-    shares /proc/stat + getloadavg with its host. mem_pct + disk_* are
-    CT-local (cgroup memory + overlayfs root). The split matches what an
-    operator needs to triage "this CT is full" vs "this whole node is
-    overloaded across all CTs sharing it".
+    shares /proc/stat + getloadavg with its host. disk_* are CT-local
+    (overlayfs root). The split matches what an operator needs to triage
+    "this CT is full" vs "this whole node is overloaded across all CTs
+    sharing it".
+
+    The mem_pct returned here is HOST-scoped and only a fallback -- see
+    ``_sample_memory``. This used to be documented as "CT-local (cgroup
+    memory)", which was wrong: the workers are a docker container inside an
+    LXC CT, and while lxcfs virtualises /proc/meminfo for the CT, the
+    container mounts a fresh procfs showing the bare kernel's numbers. Read
+    inside paprika-worker-1 on boiler CT382 (an 8GB CT): MemTotal
+    395,718,540 kB = the 377GB Proxmox node. Every worker on a node
+    therefore reported that node's memory, identically -- which is why the
+    2026-08-02 refault storm was invisible in the admin Workers tab.
     """
     global _cpu_last_sample
     cpu_pct = 0.0
@@ -195,6 +220,38 @@ def _sample_resources() -> tuple[float, float, float, float, float]:
         pass
 
     return cpu_pct, mem_pct, disk_pct, disk_free_gb, load1
+
+
+def _sample_memory() -> tuple[str, float, "Any"]:
+    """Return ``(scope, pct, sample)`` for THIS container's memory cgroup.
+
+    ``scope`` is the honest label for what ``pct`` measures:
+
+    ``"cgroup"``  the cgroup has a real limit, so pct is a percentage of it;
+    ``"host"``    no discoverable limit -- pct is meaningless here and the
+                  caller should keep its /proc/meminfo (node-wide) number,
+                  clearly labelled as such;
+    ``""``        no cgroup v2 memory controller at all.
+
+    On the production fleet the usual answer is ``"host"``: the docker
+    container has no limit of its own (``memory.max`` = ``max``) because the
+    8GB cap lives on the parent CT cgroup, which a cgroup namespace hides.
+    An operator who wants a real percentage in the Workers tab can declare it
+    with ``PAPRIKA_WORKER_MEM_LIMIT_MB``. This is presentation only -- the
+    memory guard's thresholds are absolute precisely so they don't depend on
+    a limit nobody can read.
+    """
+    try:
+        from server.worker import cgroup_mem
+        s = cgroup_mem.sample()
+    except Exception:
+        return ("", 0.0, None)
+    if not s.ok:
+        return ("", 0.0, None)
+    pct = s.limit_pct
+    if pct is None:
+        return ("host", 0.0, s)
+    return ("cgroup", pct, s)
 
 
 class _RunMixin:
@@ -261,6 +318,13 @@ class _RunMixin:
         # restarts us clean. Daemon thread, so it answers even while the asyncio
         # loop is idle/ghosted; a fully-wedged box won't answer -> hub SSH fallback.
         self._start_selfrestart_server()
+        # Memory guard: recycle ourselves before the CT's memory cgroup goes
+        # into a refault storm. Also a daemon thread, and for the same reason
+        # the watchdog is one -- the failure it exists to catch is exactly the
+        # one that stops the asyncio loop from getting scheduled. Reading
+        # sysfs + os._exit need NO disk IO, which is what makes this survivable
+        # when the node's SSD is saturated and `docker restart` would block.
+        self._start_memory_guard(asyncio.get_running_loop())
         async with make_async_client(timeout=60.0) as http:
             self._http = http
             while True:
@@ -650,6 +714,20 @@ class _RunMixin:
                     self._last_resources = (
                         cpu_pct, mem_pct, disk_pct, disk_free_gb, load1,
                     )
+                    # Real, cgroup-scoped memory for the admin UI + the hub's
+                    # memory-choke salvage trigger. mem_scope tells the hub
+                    # whether mem_pct means anything (see _sample_memory);
+                    # the absolute figures below always do.
+                    mem_scope, _cg_pct, _cg = _sample_memory()
+                    mem_current_mb = mem_anon_mb = 0.0
+                    mem_psi_some_avg60 = mem_psi_full_avg60 = 0.0
+                    if _cg is not None:
+                        mem_current_mb = _cg.current / 1048576.0
+                        mem_anon_mb = _cg.anon / 1048576.0
+                        mem_psi_some_avg60 = _cg.psi_some_avg60
+                        mem_psi_full_avg60 = _cg.psi_full_avg60
+                    if mem_scope == "cgroup":
+                        mem_pct = _cg_pct
                     # Proactive disk self-heal for an IDLE, disk-pressured
                     # worker. Without this a CT that crosses the 90%
                     # dispatch-exclusion line stops receiving jobs and so
@@ -692,6 +770,14 @@ class _RunMixin:
                             disk_free_gb=disk_free_gb,
                             load1=load1,
                             nproc=_NPROC,
+                            mem_scope=mem_scope,
+                            mem_current_mb=mem_current_mb,
+                            mem_anon_mb=mem_anon_mb,
+                            mem_psi_some_avg60=mem_psi_some_avg60,
+                            mem_psi_full_avg60=mem_psi_full_avg60,
+                            mem_majfault_per_s=self._memguard_rates[0],
+                            mem_refault_per_s=self._memguard_rates[1],
+                            memguard=self._memguard_reason,
                         )
                     )
                     # A successful heartbeat == the hub link is alive.
@@ -959,6 +1045,217 @@ class _RunMixin:
             f"(auth={'secret' if secret else 'lan-open'})"
         )
 
+    # --- memory guard -----------------------------------------------------
+    # Defaults are set from measurements taken on boiler (10.10.50.15) worker
+    # CTs 356/365/382 on 2026-08-03, all healthy and running jobs:
+    #   anon           1.6-2.1 GB   (climbing 78-215 MB per 31s under load)
+    #   pgmajfault     41-75 /s
+    #   PSI some avg60 0.00
+    # and against the 2026-08-02 incident, where CT356 had accumulated 18.4
+    # MILLION major faults and the node did 24k read IOPS of 2KB random IO.
+    # Every threshold below therefore sits an order of magnitude above healthy
+    # and an order of magnitude below the incident.
+    _MEMGUARD_ANON_MB = 5500        # ~69% of the fleet's 8GB CT cap
+    _MEMGUARD_MAJFAULT_PER_S = 1000.0
+    _MEMGUARD_PSI_PCT = 20.0
+    # Page-cache refaults/s: pages evicted and immediately read back. THE
+    # direct measure of the thrash -- a major fault can be a legitimate first
+    # read, a refault cannot. Measured 0.0/s on every healthy CT sampled
+    # (boiler 2026-08-03, garage 17 CTs 2026-08-03), so the headroom below is
+    # enormous and false positives are structurally unlikely. Sized from the
+    # boiler incident: ~48MB/s of 2KB random reads over ~11 CTs is on the
+    # order of 1000 pages/s per CT, so 500 trips before it is that bad.
+    _MEMGUARD_REFAULT_PER_S = 500.0
+    _MEMGUARD_SUSTAIN_S = 300.0     # must hold this long -- no spike recycles
+    _MEMGUARD_INTERVAL_S = 30.0
+    _MEMGUARD_DRAIN_DEADLINE_S = 900.0
+    _MEMGUARD_JITTER_S = 120.0
+
+    def _start_memory_guard(self, loop: "asyncio.AbstractEventLoop") -> None:
+        """Arm the memory-guard daemon thread. Kill switch:
+        ``PAPRIKA_MEMGUARD_DISABLE=1``."""
+        if os.environ.get("PAPRIKA_MEMGUARD_DISABLE") == "1":
+            _logger.info(
+                f"[worker {self.worker_id}] memory guard DISABLED "
+                f"(PAPRIKA_MEMGUARD_DISABLE=1)"
+            )
+            return
+        from server.worker import cgroup_mem
+        if not cgroup_mem.available():
+            # cgroup v1 host, or /sys/fs/cgroup not mounted. Stay inert rather
+            # than fall back to /proc/meminfo -- on this fleet that file
+            # reports the Proxmox NODE's memory, so a guess built on it would
+            # recycle workers for a neighbour's memory pressure.
+            _logger.info(
+                f"[worker {self.worker_id}] memory guard inert "
+                f"(no cgroup v2 memory controller)"
+            )
+            return
+        import threading
+        _logger.info(
+            f"[worker {self.worker_id}] memory guard armed -- "
+            f"{cgroup_mem.status_line(cgroup_mem.sample())}"
+        )
+        threading.Thread(
+            target=self._memory_guard_loop,
+            args=(loop,),
+            name=f"memguard-{self.worker_id}",
+            daemon=True,
+        ).start()
+
+    def _memguard_breaches(self, prev, cur, dt_s: float) -> list[str]:
+        """Which thresholds this sample crosses. Empty list == healthy.
+
+        Four independent signals because each catches something the others
+        cannot: ``anon`` sees the slow RSS leak long before any stall shows up;
+        the refault rate sees cache thrash directly and earliest; the
+        major-fault rate sees it even if reclaim ran in a parent cgroup we
+        can't read; PSI sees the stall in the unit that actually matters
+        (wall-clock time lost). Any one of them is enough to act on --
+        requiring agreement would just delay recovery.
+
+        NOT a signal, deliberately: ``memory.current`` near the limit. A memcg
+        fills with clean page cache up to its limit by design, so "current is
+        high" is the normal state of a busy worker, not a symptom. Measured on
+        garage 2026-08-03: CT351 sat at 6174MB of an 8192MB limit with refault
+        0.0/s and PSI 0.02 -- perfectly healthy. A ``current > 80%`` trigger
+        (proposed after that day's crashes) would have recycled it, and most
+        of the fleet with it. What distinguishes the storm from a full cache
+        is whether the cache is being RE-READ, which is what refault measures.
+        """
+        from server.worker import cgroup_mem
+        out: list[str] = []
+        anon_mb = _num_env("PAPRIKA_MEMGUARD_ANON_MB", self._MEMGUARD_ANON_MB)
+        if anon_mb > 0 and cur.anon >= anon_mb * 1024 * 1024:
+            out.append(f"anon {cur.anon // (1024 * 1024)}MB >= {anon_mb:.0f}MB")
+        mf_limit = _num_env(
+            "PAPRIKA_MEMGUARD_MAJFAULT_PER_S", self._MEMGUARD_MAJFAULT_PER_S
+        )
+        rf_limit = _num_env(
+            "PAPRIKA_MEMGUARD_REFAULT_PER_S", self._MEMGUARD_REFAULT_PER_S
+        )
+        if prev is not None:
+            mf_rate = cgroup_mem.majfault_rate(prev, cur, dt_s)
+            rf_rate = cgroup_mem.refault_rate(prev, cur, dt_s)
+            # Stash for the heartbeat: rates need two samples, so the guard
+            # thread is the only place that can compute them, and without
+            # reporting them the storm stays invisible until it is fatal.
+            self._memguard_rates = (mf_rate, rf_rate)
+            if mf_limit > 0 and mf_rate >= mf_limit:
+                out.append(f"majfault {mf_rate:.0f}/s >= {mf_limit:.0f}/s")
+            if rf_limit > 0 and rf_rate >= rf_limit:
+                out.append(f"refault {rf_rate:.0f}/s >= {rf_limit:.0f}/s")
+        psi_limit = _num_env("PAPRIKA_MEMGUARD_PSI_PCT", self._MEMGUARD_PSI_PCT)
+        if psi_limit > 0 and cur.psi_some_avg60 >= psi_limit:
+            out.append(
+                f"PSI some avg60 {cur.psi_some_avg60:.1f} >= {psi_limit:.1f}"
+            )
+        return out
+
+    def _memory_guard_loop(self, loop: "asyncio.AbstractEventLoop") -> None:
+        """Daemon thread: trip into drain-and-recycle on sustained memory
+        distress, and force-exit if the drain can't complete.
+
+        Two-stage on purpose. The graceful stage sets ``_draining``, which the
+        heartbeat loop already turns into "report full, then exit(0) once
+        in-flight hits 0" -- the same recycle path the fd-budget gate and the
+        drain-after-N counter use, so in-flight jobs are never killed. But a
+        worker deep in a refault storm may never finish those jobs (that is the
+        whole failure mode), so a deadline force-exits afterwards. Losing the
+        in-flight jobs of a thrashing worker is strictly better than the hub
+        waiting on a box that has stopped making progress -- the jobs are
+        requeued by the redrive path either way.
+        """
+        from server.worker import cgroup_mem
+
+        interval = _num_env(
+            "PAPRIKA_MEMGUARD_INTERVAL_S", self._MEMGUARD_INTERVAL_S
+        )
+        sustain_s = _num_env(
+            "PAPRIKA_MEMGUARD_SUSTAIN_S", self._MEMGUARD_SUSTAIN_S
+        )
+        deadline_s = _num_env(
+            "PAPRIKA_MEMGUARD_DRAIN_DEADLINE_S", self._MEMGUARD_DRAIN_DEADLINE_S
+        )
+        # Stagger: a node-wide event (a neighbour VM ballooning, a host OOM)
+        # can breach every CT on that node within the same minute. Without a
+        # random offset all of them would drain together and take the node's
+        # whole share of the fleet offline at once.
+        jitter_s = random.uniform(
+            0.0, max(0.0, _num_env("PAPRIKA_MEMGUARD_JITTER_S", self._MEMGUARD_JITTER_S))
+        )
+
+        prev = None
+        prev_m = 0.0
+        breach_since = 0.0
+        while True:
+            time.sleep(interval)
+            try:
+                cur = cgroup_mem.sample()
+                if not cur.ok:
+                    continue
+                now_m = time.monotonic()
+                dt = now_m - prev_m if prev is not None else 0.0
+                reasons = self._memguard_breaches(prev, cur, dt)
+                prev, prev_m = cur, now_m
+
+                if not reasons:
+                    if breach_since:
+                        _logger.info(
+                            f"[worker {self.worker_id}] memory guard: "
+                            f"pressure cleared before the "
+                            f"{sustain_s:.0f}s window elapsed -- standing down"
+                        )
+                    breach_since = 0.0
+                    continue
+
+                if not breach_since:
+                    breach_since = now_m
+                    _logger.warning(
+                        f"[worker {self.worker_id}] memory guard: "
+                        f"{'; '.join(reasons)} -- watching for "
+                        f"{sustain_s:.0f}s before draining "
+                        f"({cgroup_mem.status_line(cur)})"
+                    )
+                    continue
+                if now_m - breach_since < sustain_s + jitter_s:
+                    continue
+
+                # Sustained. Trip -- unless something else already drained us
+                # (a rolling self-update): stealing that drain would let our
+                # deadline force-exit a worker mid-update.
+                if not self._draining:
+                    self._memguard_reason = "; ".join(reasons)
+                    self._memguard_at = time.time()
+                    self._memguard_drain_m = now_m
+                    self._draining = True
+                    _logger.critical(
+                        f"[worker {self.worker_id}] memory guard TRIPPED "
+                        f"({self._memguard_reason}) -- draining for recycle; "
+                        f"force-exit in {deadline_s:.0f}s if in-flight work "
+                        f"does not finish. {cgroup_mem.status_line(cur)}"
+                    )
+                    # Tell the hub NOW rather than up to a heartbeat later, so
+                    # it stops dispatching to a worker we've already given up on.
+                    try:
+                        loop.call_soon_threadsafe(self._heartbeat_kick.set)
+                    except Exception:
+                        pass
+                if (
+                    deadline_s > 0
+                    and self._memguard_drain_m
+                    and now_m - self._memguard_drain_m >= deadline_s
+                ):
+                    _logger.critical(
+                        f"[worker {self.worker_id}] memory guard: drain did not "
+                        f"complete within {deadline_s:.0f}s ({self._in_flight} "
+                        f"in-flight) -- force-exiting now (docker will restart)"
+                    )
+                    os._exit(0)
+            except Exception:
+                # A guard that crashes is worse than one that misses a cycle.
+                _logger.debug("memory guard iteration failed", exc_info=True)
+
     def _watchdog_loop(self, loop: "asyncio.AbstractEventLoop") -> None:
         """Daemon thread: detect a wedged event loop and force-exit so the
         supervisor (docker ``restart: unless-stopped``) relaunches us clean.
@@ -1043,6 +1340,14 @@ class _RunMixin:
     async def _handle_hub_message(self, msg) -> None:
         if isinstance(msg, HubAssignJob):
             t = asyncio.create_task(self._run_assigned_job(msg))
+            t.add_done_callback(self._on_job_task_done)
+            return
+        if isinstance(msg, HubAssignVideoDownload):
+            # Downloader tier (docs/ramdisk-video-tier.md): no lane, no Chrome
+            # -- download to the shared ramdisk and upload to the parent job.
+            # Counted through the same in-flight bookkeeping as jobs so the
+            # heartbeat/capacity view stays honest.
+            t = asyncio.create_task(self._handle_assign_video_download(msg))
             t.add_done_callback(self._on_job_task_done)
             return
         if isinstance(msg, HubForceCompleteJob):

@@ -41,12 +41,15 @@ disk or logged here.
 from __future__ import annotations
 
 import asyncio
+import logging
 import os
 import threading
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
 from server.hub._state import get_storage_dir, state
+
+log = logging.getLogger("paprika.objstore")
 
 
 # --- dedicated S3/MinIO IO thread pool --------------------------------------
@@ -136,18 +139,41 @@ def _prefix() -> str:
 
 
 def reset_client() -> None:
-    """Drop the cached boto3 client so the next call rebuilds it from the
+    """Drop the cached boto3 clients so the next call rebuilds them from the
     current Settings/env config. Called after the operator saves S3
-    settings so endpoint / credential changes take effect immediately."""
-    global _client, _nv_client
+    settings so endpoint / credential changes take effect immediately.
+
+    The old clients are CLOSED, not just dereferenced. Each owns a urllib3
+    pool holding up to ``max_pool_connections`` sockets; dropping the last
+    reference leaves them to the GC, and the fds outlive the TCP connection
+    (they stop showing up in ``ss`` entirely -- on 2026-07-24 hub .40 held 967
+    socket fds with only 255 sockets left in any TCP state, and died of
+    EMFILE). This runs on EVERY settings invalidation, cross-hub, so an
+    un-closed client here leaks 4 pools per settings change per hub.
+
+    Closed outside the lock: teardown does IO, and holding ``_client_lock``
+    across it would block every S3 caller in the process."""
+    global _client, _nv_client, _spill_cli, _nv_spill_cli
     with _client_lock:
+        stale = [_client, _nv_client, _spill_cli, _nv_spill_cli]
         _client = None
         _nv_client = None
+        _spill_cli = None
+        _nv_spill_cli = None
+    for c in stale:
+        if c is None:
+            continue
+        try:
+            c.close()
+        except Exception:
+            pass
 
 
 # --- lazy boto3 client (created once, on first use) -------------------------
 _client = None
 _nv_client = None
+_spill_cli = None
+_nv_spill_cli = None
 _client_lock = threading.Lock()
 
 
@@ -269,44 +295,301 @@ def _get_nv_client():
         return _nv_client
 
 
+# --- RAM-disk spill targets (2026-07-21) ------------------------------------
+# Both tiers above are RAM-disk MinIO instances (small, and volatile -- a
+# reboot loses everything). When one crosses a free-space threshold, NEW
+# assets are written to its large durable "spill" store instead. The decision
+# is made in _spill.py from a periodic capacity sample -- pre-emptively, on a
+# threshold, NOT by catching write errors: during the 2026-07-20 incident the
+# RAM host stopped answering entirely, so writes hung instead of failing and
+# an error-driven fallback would never have fired.
+#
+# Reads/lists/deletes union the spill stores too, so spilled objects stay
+# visible to the hub with no migration.
+
+
+def _spill_endpoint() -> str:
+    return _s3cfg("s3_spill_endpoint", "PAPRIKA_S3_SPILL_ENDPOINT", "")
+
+
+def _spill_bucket() -> str:
+    return _s3cfg("s3_spill_bucket", "PAPRIKA_S3_SPILL_BUCKET", "") or _bucket()
+
+
+def _nv_spill_endpoint() -> str:
+    return _s3cfg("s3_nonvideo_spill_endpoint", "PAPRIKA_S3_NONVIDEO_SPILL_ENDPOINT", "")
+
+
+def _nv_spill_bucket() -> str:
+    return (
+        _s3cfg("s3_nonvideo_spill_bucket", "PAPRIKA_S3_NONVIDEO_SPILL_BUCKET", "")
+        or _nonvideo_bucket()
+    )
+
+
+def _spill_feature_on() -> bool:
+    """Master switch (Settings ``asset_spill_enabled``). Off => the whole
+    spill mechanism is inert and routing is exactly as it was before."""
+    try:
+        from server.hub import _spill
+
+        return _spill.spill_enabled()
+    except Exception:
+        return False
+
+
+def _spill_enabled() -> bool:
+    """Primary(video) tier has somewhere to spill to."""
+    return enabled() and _spill_feature_on() and bool(_spill_endpoint())
+
+
+def _nv_spill_enabled() -> bool:
+    """Non-video(image) hot tier has somewhere to spill to."""
+    return (
+        _nonvideo_enabled() and _spill_feature_on() and bool(_nv_spill_endpoint())
+    )
+
+
+def _build_s3_client(endpoint: str, ak: str, sk: str, region: str):
+    """Build one MinIO-flavoured boto3 client, or None on any failure."""
+    try:
+        import boto3
+        from botocore.config import Config as _BotoConfig
+
+        return boto3.client(
+            "s3",
+            endpoint_url=endpoint or None,
+            aws_access_key_id=ak or None,
+            aws_secret_access_key=sk or None,
+            region_name=region or "us-east-1",
+            config=_BotoConfig(
+                signature_version="s3v4",
+                s3={"addressing_style": "path"},
+                retries={"max_attempts": 2, "mode": "standard"},
+                max_pool_connections=int(
+                    os.environ.get("PAPRIKA_S3_MAX_POOL_CONNECTIONS") or 50
+                ),
+            ),
+        )
+    except Exception:
+        return None
+
+
+def _get_spill_client():
+    global _spill_cli
+    if _spill_cli is not None:
+        return _spill_cli
+    with _client_lock:
+        if _spill_cli is not None:
+            return _spill_cli
+        ep = _spill_endpoint()
+        if not ep:
+            return None
+        _spill_cli = _build_s3_client(
+            ep,
+            _s3cfg("s3_spill_access_key", "PAPRIKA_S3_SPILL_ACCESS_KEY")
+            or _s3cfg("s3_access_key", "PAPRIKA_S3_ACCESS_KEY"),
+            _s3cfg("s3_spill_secret_key", "PAPRIKA_S3_SPILL_SECRET_KEY")
+            or _s3cfg("s3_secret_key", "PAPRIKA_S3_SECRET_KEY"),
+            _s3cfg("s3_spill_region", "PAPRIKA_S3_SPILL_REGION", "us-east-1"),
+        )
+        return _spill_cli
+
+
+def _get_nv_spill_client():
+    global _nv_spill_cli
+    if _nv_spill_cli is not None:
+        return _nv_spill_cli
+    with _client_lock:
+        if _nv_spill_cli is not None:
+            return _nv_spill_cli
+        ep = _nv_spill_endpoint()
+        if not ep:
+            return None
+        _nv_spill_cli = _build_s3_client(
+            ep,
+            _s3cfg(
+                "s3_nonvideo_spill_access_key", "PAPRIKA_S3_NONVIDEO_SPILL_ACCESS_KEY"
+            )
+            or _s3cfg("s3_nonvideo_access_key", "PAPRIKA_S3_NONVIDEO_ACCESS_KEY"),
+            _s3cfg(
+                "s3_nonvideo_spill_secret_key", "PAPRIKA_S3_NONVIDEO_SPILL_SECRET_KEY"
+            )
+            or _s3cfg("s3_nonvideo_secret_key", "PAPRIKA_S3_NONVIDEO_SECRET_KEY"),
+            _s3cfg(
+                "s3_nonvideo_spill_region",
+                "PAPRIKA_S3_NONVIDEO_SPILL_REGION",
+                "us-east-1",
+            ),
+        )
+        return _nv_spill_cli
+
+
+# --- bucket existence / persistence (2026-07-21) ----------------------------
+# The RAM-disk MinIO tiers (.47 images, .48 video) lose ALL state on reboot --
+# including the ``paprika`` bucket itself, not just the objects. A missing
+# bucket makes every write fail with NoSuchBucket, and the spill switch is
+# threshold-driven (not error-driven) so it would NOT catch that. So the hub
+# idempotently (re)creates the bucket on each write endpoint, driven by the
+# spill sampler's periodic pass -- practical "persistence" for a volatile
+# store. When the bucket is missing AND cannot be recreated (endpoint wedged),
+# the sampler treats the tier as un-writable and spills to the durable store.
+
+
+def ensure_bucket(client, bucket: str) -> bool:
+    """Idempotently make sure ``bucket`` exists on ``client``.
+
+    SYNCHRONOUS + blocking; only ever called from inside the S3 IO executor.
+    Returns True if the bucket exists or was just created, False if it could
+    not be ensured (endpoint unreachable / create denied) -- which the caller
+    reads as 'not writable right now -> spill'. Never raises.
+    """
+    if client is None or not bucket:
+        return False
+    try:
+        client.head_bucket(Bucket=bucket)
+        return True
+    except Exception:
+        pass  # missing, or a transient head failure -- try to (re)create
+    try:
+        client.create_bucket(Bucket=bucket)
+        log.info("objstore: (re)created bucket %r on a write endpoint", bucket)
+        return True
+    except Exception as exc:
+        tag = type(exc).__name__ + " " + str(exc)
+        # A peer hub raced us to create it, or head was just flaky: it exists.
+        if "BucketAlreadyOwnedByYou" in tag or "BucketAlreadyExists" in tag:
+            return True
+        log.warning("objstore: could not ensure bucket %r: %s", bucket, type(exc).__name__)
+        return False
+
+
+def _ram_client_bucket(tier: str):
+    """(client, bucket) of the RAM store backing ``tier`` (not its spill)."""
+    if tier == "nonvideo":
+        return _get_nv_client(), _nonvideo_bucket()
+    return _get_client(), _bucket()
+
+
+async def ensure_ram_bucket(tier: str) -> bool:
+    """Ensure the RAM tier's bucket exists; see :func:`ensure_bucket`. Called
+    by the spill sampler each pass so a rebooted RAM MinIO self-heals within
+    one interval. Returns False when the bucket is missing and unrecoverable
+    (-> the tier is spilled)."""
+    def _do() -> bool:
+        c, b = _ram_client_bucket(tier)
+        return ensure_bucket(c, b)
+
+    try:
+        return await _run_io(_do)
+    except Exception:
+        return False
+
+
+async def ensure_spill_buckets() -> None:
+    """Best-effort ensure the spill-TARGET buckets exist too. They're durable
+    stores so this is defensive, but a missing target bucket would break the
+    fallback. Non-fatal; never raises."""
+    def _do() -> None:
+        if _spill_enabled():
+            ensure_bucket(_get_spill_client(), _spill_bucket())
+        if _nv_spill_enabled():
+            ensure_bucket(_get_nv_spill_client(), _nv_spill_bucket())
+
+    try:
+        await _run_io(_do)
+    except Exception:
+        pass
+
+
+def job_id_from_key(key: str) -> str | None:
+    """``{prefix}/{job_id}/...`` -> job_id. None for non-job keys (profiles/...).
+
+    Lets the synchronous write path recover the job a key belongs to without
+    threading job context through every caller signature -- which is what
+    keeps one job's assets pinned to a single store.
+    """
+    k = (key or "").strip("/")
+    p = _prefix()
+    if p and k.startswith(p + "/"):
+        k = k[len(p) + 1 :]
+    seg = k.split("/", 1)[0].strip()
+    return seg or None
+
+
+def _spilling(tier: str, key: str) -> bool:
+    try:
+        from server.hub import _spill
+
+        return _spill.is_spilling(tier, job_id_from_key(key))
+    except Exception:
+        return False
+
+
 def _write_cb(key: str):
     """(client, bucket) to WRITE ``key`` to: non-video -> hot tier when
-    configured, else primary; video -> primary. (None, bucket) when no client."""
+    configured, else primary; video -> primary. Each tier diverts to its
+    spill store while that tier is over its free-space threshold (per-job
+    pinned, so one job never splits). (None, bucket) when no client."""
     if not _is_video_key(key) and _nonvideo_enabled():
+        if _nv_spill_enabled() and _spilling("nonvideo", key):
+            c = _get_nv_spill_client()
+            if c is not None:
+                return c, _nv_spill_bucket()
         c = _get_nv_client()
         if c is not None:
             return c, _nonvideo_bucket()
+    if _spill_enabled() and _spilling("primary", key):
+        c = _get_spill_client()
+        if c is not None:
+            return c, _spill_bucket()
     return _get_client(), _bucket()
+
+
+def _dedup_cbs(cbs: list) -> list:
+    """Drop duplicate (client, bucket) pairs -- a spill target may be
+    configured to the same endpoint as another tier, and LIST/DELETE must not
+    visit it twice."""
+    out: list = []
+    seen: set = set()
+    for c, b in cbs:
+        if c is None:
+            continue
+        sig = (id(c), b)
+        if sig in seen:
+            continue
+        seen.add(sig)
+        out.append((c, b))
+    return out
 
 
 def _read_cbs(key: str) -> list:
     """[(client, bucket), ...] to try IN ORDER when READING ``key``. Non-video:
-    hot tier first, then primary (fallback for pre-split objects). Video:
-    primary only. Empty when no client is available."""
+    hot tier first, then its spill, then primary (fallback for pre-split
+    objects) and the primary's spill. Empty when no client is available."""
     out: list = []
     if not _is_video_key(key) and _nonvideo_enabled():
-        c = _get_nv_client()
-        if c is not None:
-            out.append((c, _nonvideo_bucket()))
-    pc = _get_client()
-    if pc is not None:
-        out.append((pc, _bucket()))
-    return out
+        out.append((_get_nv_client(), _nonvideo_bucket()))
+        if _nv_spill_enabled():
+            out.append((_get_nv_spill_client(), _nv_spill_bucket()))
+    out.append((_get_client(), _bucket()))
+    if _spill_enabled():
+        out.append((_get_spill_client(), _spill_bucket()))
+    return _dedup_cbs(out)
 
 
 def _all_cbs() -> list:
     """All configured (client, bucket) tiers -- for prefix LIST / DELETE, which
-    must union both because a job's assets are split video(primary) /
-    non-video(hot)."""
-    out: list = []
-    pc = _get_client()
-    if pc is not None:
-        out.append((pc, _bucket()))
+    must union every tier because a job's assets are split video(primary) /
+    non-video(hot), and either may additionally have spilled."""
+    out: list = [(_get_client(), _bucket())]
+    if _spill_enabled():
+        out.append((_get_spill_client(), _spill_bucket()))
     if _nonvideo_enabled():
-        c = _get_nv_client()
-        if c is not None:
-            out.append((c, _nonvideo_bucket()))
-    return out
+        out.append((_get_nv_client(), _nonvideo_bucket()))
+        if _nv_spill_enabled():
+            out.append((_get_nv_spill_client(), _nv_spill_bucket()))
+    return _dedup_cbs(out)
 
 
 def _key_for(local_path: Path) -> str | None:
@@ -329,15 +612,37 @@ def _key_for(local_path: Path) -> str | None:
 # --- public async API -------------------------------------------------------
 
 
-async def mirror_file(local_path: Path | str) -> None:
+async def warm_pin(job_id: str | None) -> None:
+    """Resolve this job's store decision BEFORE dispatching a write into the
+    executor thread.
+
+    ``_write_cb`` runs inside the thread pool and so cannot await Redis; it
+    reads a process-local cache instead. This warms that cache. Callers that
+    know their job_id should call it -- without a pin the write falls back to
+    the live threshold decision, which could split a job across two stores if
+    the threshold happens to flip mid-job. Never raises."""
+    if not job_id:
+        return
+    try:
+        from server.hub import _spill
+
+        await _spill.ensure_pin(job_id)
+    except Exception:
+        pass
+
+
+async def mirror_file(local_path: Path | str, job_id: str | None = None) -> None:
     """Best-effort upload of a freshly-written local file to the bucket.
 
     No-op when disabled. Never raises: a mirror failure must not fail
     the upload that produced the file (local disk is the source of
     truth). Runs the blocking boto3 call in a worker thread.
+
+    ``job_id`` is optional and only pins the spill decision (see warm_pin).
     """
     if not enabled():
         return
+    await warm_pin(job_id)
     path = Path(local_path)
 
     def _put() -> None:
@@ -379,6 +684,8 @@ async def mirror_dir(local_dir: Path | str) -> int:
     if not enabled():
         return 0
     root = Path(local_dir)
+    # Job dirs are {storage_root}/{job_id}; .name avoids a resolve() here.
+    await warm_pin(root.name)
 
     def _put_all() -> int:
         n = 0
@@ -477,6 +784,7 @@ async def put_object(key: str, local_path: Path | str) -> bool:
     no-op→False when disabled / boto3 missing / file absent. Never raises."""
     if not enabled():
         return False
+    await warm_pin(job_id_from_key(key))
     path = Path(local_path)
 
     def _put() -> bool:
@@ -514,6 +822,9 @@ async def presign_put(key: str, expires_in: int = 7200) -> str | None:
     disabled / no client. Never raises."""
     if not enabled():
         return None
+    # Must pin BEFORE signing: the URL bakes in one endpoint, so the worker's
+    # direct PUT lands wherever this decision points.
+    await warm_pin(job_id_from_key(key))
 
     def _sign() -> str | None:
         client, bucket = _write_cb(key)
@@ -851,6 +1162,14 @@ async def reachable() -> tuple[bool, str]:
             from botocore.config import Config as _BotoConfig
         except Exception:
             return (False, "boto3 unavailable")
+        # This client is PER-CALL (unlike the cached transfer clients), so it
+        # must be closed: a boto3 client owns a urllib3 pool, and dropping the
+        # reference leaves its sockets to the GC -- they linger as CLOSE-WAIT
+        # once MinIO times the keep-alive out. /settings calls this on every
+        # load, so an admin tab left polling slowly ate the hub's fd budget
+        # (2026-07-24 EMFILE outage). ``client`` is bound before the try so
+        # ``finally`` can close it even if construction's follow-up call raises.
+        client = None
         try:
             client = boto3.client(
                 "s3",
@@ -870,6 +1189,12 @@ async def reachable() -> tuple[bool, str]:
             return (True, "")
         except Exception as e:
             return (False, type(e).__name__)
+        finally:
+            if client is not None:
+                try:
+                    client.close()
+                except Exception:
+                    pass
 
     try:
         return await _run_io(_check)

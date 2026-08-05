@@ -14,6 +14,10 @@ stanzas + _apply_route_tags() now.
   ``state.local_tasks`` map is by definition an orchestrator killed
   by a hub restart -- mark them failed so the admin UI shows a
   terminal state instead of an eternal yellow "running" badge.
+  Fires off ``_recover_orphan_running_jobs_scan`` as a background task
+  (the scan is a full-table walk and must never block the lifespan),
+  and that scan refuses to run at all while any peer hub answers
+  ``/health`` -- in a shared store the "orphans" would be theirs.
 
 close_session is imported via app.py's re-export chain (originally
 from routes/sessions.py) to dodge the routes <-> hub circular at
@@ -53,7 +57,103 @@ async def close_session(session_id: str):
 _REAPER_INTERVAL_S = 5
 
 
+def _peer_health_url(hub_id: str) -> str:
+    """Internal /health URL of a sibling hub.
+
+    Deliberately duplicates routes/sessions/_base.py ``_hub_internal_url``
+    (same env knobs, same ``hub-NN`` -> LAN IP scheme) instead of importing it:
+    this runs at lifespan-start, when the route package is still mid-import,
+    and pulling it in here reintroduces the routes<->hub circular the rest of
+    this module goes out of its way to dodge. Keep the two in sync.
+    """
+    fmt = os.environ.get("PAPRIKA_HUB_INTERNAL_FMT")
+    if fmt:
+        return f"{fmt.format(hub=hub_id).rstrip('/')}/health"
+    m = re.match(r"^hub-(\d{1,3})$", hub_id or "")
+    if m:
+        subnet = os.environ.get("PAPRIKA_HUB_SUBNET", "10.10.50")
+        port = os.environ.get("PAPRIKA_HUB_INTERNAL_PORT", "8100")
+        return f"http://{subnet}.{m.group(1)}:{port}/health"
+    return f"http://{hub_id}:8000/health"
+
+
+async def _any_peer_hub_alive() -> bool:
+    """True if ANY sibling hub is actually serving right now.
+
+    Redis presence alone is NOT trustworthy for this question. A hub that
+    booted while Redis was unavailable (e.g. mid-``LOADING``) keeps running
+    with ``redis_client=None`` forever: it serves traffic and owns jobs, but
+    never writes ``paprika:hubs:{id}``. Judging liveness by presence then
+    concludes "I am alone" while six healthy peers are working -- which is
+    exactly how 2026-08-03 blanket-failed 10 running jobs owned by peers.
+
+    So: presence is only a *candidate source*. Membership is decided by a real
+    ``/health`` probe, the same call the nginx reconciler switched to in
+    commit 74b760e for the identical reason.
+    """
+    if state.hubs is None:
+        return False
+    try:
+        rows = await state.hubs.list_all()
+    except Exception:
+        # Can't enumerate peers -> we cannot prove we're alone. Assume we are
+        # NOT (fail safe: skipping recovery is recoverable, blanket-failing
+        # a live fleet's jobs is not).
+        return True
+    candidates: list[str] = []
+    for h in rows:
+        hid = str(h.get("hub_id") or "")
+        if not hid or h.get("local") or hid == config.hub_id:
+            continue
+        if h.get("alive"):
+            # Presence row is live -> peer is definitely up, no probe needed.
+            return True
+        candidates.append(hid)
+    if not candidates:
+        return False
+
+    async def _probe(hid: str) -> bool:
+        try:
+            import httpx
+
+            async with httpx.AsyncClient(timeout=4.0) as client:
+                r = await client.get(_peer_health_url(hid))
+            return r.status_code == 200
+        except Exception:
+            return False
+
+    results = await asyncio.gather(
+        *[_probe(h) for h in candidates], return_exceptions=True
+    )
+    for hid, ok in zip(candidates, results):
+        if ok is True:
+            log.info(
+                "recovery: peer hub %s answers /health despite no Redis "
+                "presence -> treating cluster as LIVE", hid,
+            )
+            return True
+    return False
+
+
 async def _recover_orphan_running_jobs() -> int:
+    """Schedule the orphan-running-job recovery scan in the background.
+
+    Returns 0 immediately. The scan walks EVERY job in the store
+    (``list_job_ids`` + a ``get_job_info`` round-trip each); against the
+    production MariaDB (~860k rows) that takes minutes. It used to be
+    awaited inline in the lifespan, so uvicorn never reached
+    "Application startup complete" and never bound the port -- the hub
+    logged happily from its background loops while ``/health`` refused
+    connections, which read exactly like a crash and failed the deploy
+    script's health gate (2026-08-03).
+
+    Startup must not depend on a full-table walk, so it runs as a task.
+    """
+    asyncio.create_task(_recover_orphan_running_jobs_scan())
+    return 0
+
+
+async def _recover_orphan_running_jobs_scan() -> int:
     """Scan the job store at hub startup and mark any job persisted as
     ``status=running`` but no longer driven by a local task as failed.
 
@@ -77,30 +177,30 @@ async def _recover_orphan_running_jobs() -> int:
             return 0
     except Exception:
         pass
-    # Multi-hub safety (clone-safe): if ANY other hub is alive in the shared
-    # presence registry, this process is joining a LIVE cluster (e.g. a freshly
-    # cloned VM, or a peer hub starting up). The in-store "running" jobs then
-    # belong to live peers, NOT to a dead local orchestrator -- blanket-failing
-    # them would nuke the whole fleet's work. Skip; genuine dead-hub orphans are
-    # handled by the lease reaper (when leasing is on).
+    # Multi-hub safety (clone-safe): if ANY other hub is alive, this process is
+    # joining a LIVE cluster (e.g. a freshly cloned VM, or a peer hub starting
+    # up). The in-store "running" jobs then belong to live peers, NOT to a dead
+    # local orchestrator -- blanket-failing them would nuke the whole fleet's
+    # work. Skip; genuine dead-hub orphans are handled by the lease reaper
+    # (when leasing is on) and by _stale_job_reconciler_loop.
+    #
+    # Liveness is decided by a real /health probe, NOT by Redis presence --
+    # see _any_peer_hub_alive for why presence silently lies.
     try:
-        if state.hubs is not None:
-            peers = [
-                h for h in await state.hubs.list_all()
-                if h.get("alive")
-                and not h.get("local")
-                and str(h.get("hub_id")) != config.hub_id
-            ]
-            if peers:
-                log.info(
-                    "recovery: %d live peer hub(s) present (%s) -> skipping "
-                    "blanket orphan recovery (multi-hub safety)",
-                    len(peers),
-                    ", ".join(str(h.get("hub_id")) for h in peers),
-                )
-                return 0
+        if await _any_peer_hub_alive():
+            log.info(
+                "recovery: live peer hub(s) detected -> skipping blanket "
+                "orphan recovery (multi-hub safety)",
+            )
+            return 0
     except Exception:
-        log.debug("recovery: peer-presence check failed", exc_info=True)
+        # Never let a failed liveness check fall through into the blanket
+        # scan: unknown cluster state must mean "do nothing".
+        log.warning(
+            "recovery: peer-liveness check errored -> skipping blanket "
+            "orphan recovery (fail safe)", exc_info=True,
+        )
+        return 0
     # state.local_tasks is empty at this point (fresh process), so any
     # in-store "running" job is by definition an orphan.
     try:
@@ -136,6 +236,12 @@ async def _recover_orphan_running_jobs() -> int:
             n += 1
         except Exception:
             pass
+    # The caller (lifespan) no longer awaits this, so report here or the
+    # blast radius of a bad run is invisible.
+    log.info(
+        "recovery: orphan scan finished -- walked %d job(s), marked %d "
+        "orphan running job(s) failed", len(job_ids), n,
+    )
     return n
 
 
@@ -1153,13 +1259,23 @@ async def _fail_orphan_job(info, reason: str) -> None:
 # tick (delete is idempotent, but this avoids 7x MinIO churn). Kill-switch env
 # PAPRIKA_JOB_RETENTION_DISABLE=1.
 _RETENTION_INTERVAL_S = float(
-    os.environ.get("PAPRIKA_JOB_RETENTION_INTERVAL_S", "3600") or 3600
+    os.environ.get("PAPRIKA_JOB_RETENTION_INTERVAL_S", "1200") or 1200
 )
 _RETENTION_BATCH = int(os.environ.get("PAPRIKA_JOB_RETENTION_BATCH", "500") or 500)
 # Cap per tick so a huge first-run backlog drains GRADUALLY instead of one
 # multi-hour delete storm hammering MariaDB + MinIO.
 _RETENTION_MAX_PER_TICK = int(
     os.environ.get("PAPRIKA_JOB_RETENTION_MAX_PER_TICK", "5000") or 5000
+)
+# Per-job deletes (MinIO purge + DB row + local rmtree) run BOUNDED-PARALLEL
+# within a batch instead of strictly sequential -- the MinIO delete_prefix RTT
+# was the pass's wall-clock bottleneck, so one slow object tier throttled the
+# whole drain to ~inflow rate and the backlog never shrank. Concurrency is
+# capped so a drain can't storm MariaDB/MinIO (same reasoning as the per-tick
+# cap). All three underlying deletes are already async / to_thread, so this
+# just overlaps their waits; it does NOT add loop-blocking work.
+_RETENTION_DELETE_CONCURRENCY = max(
+    1, int(os.environ.get("PAPRIKA_JOB_RETENTION_DELETE_CONCURRENCY", "10") or 10)
 )
 _RETENTION_STATUSES = ["completed", "failed", "cancelled", "review"]
 # Per-job MinIO purge timeout. A hung delete (slow / unreachable object tier)
@@ -1174,6 +1290,46 @@ _RETENTION_LOCK_KEY = "paprika:retention:lock"
 
 _last_retention_run_at: datetime | None = None
 _last_retention_deleted = 0
+
+
+async def _purge_job(store, jid: str, sem, minio_timeout: float) -> bool:
+    """Purge one job everywhere: MinIO/S3 prefix + DB row (+CASCADE) + local
+    cache dir. Returns True on a successful DB-row delete. A MinIO / FS hiccup
+    is logged but never fails the row delete (a stray object is reclaimable by
+    a later pass). CancelledError propagates so shutdown tears the pass down.
+
+    Shared by the general job-retention pass and the review-specific expiry
+    pass so both delete identically (one code path = one behaviour to reason
+    about). ``sem`` bounds how many purges run at once."""
+    from server.hub import objstore
+    from server.hub._state import get_storage_dir
+    import shutil as _shutil
+
+    async with sem:
+        try:
+            if objstore.enabled():
+                try:
+                    await asyncio.wait_for(
+                        objstore.delete_prefix(jid), timeout=minio_timeout
+                    )
+                except asyncio.CancelledError:
+                    raise
+                except Exception:
+                    # Includes TimeoutError: a hung tier can't stall the pass.
+                    log.debug("retention: MinIO purge %s failed", jid, exc_info=True)
+            await store.delete_job(jid)
+            try:
+                d = get_storage_dir() / jid
+                if d.exists():
+                    await asyncio.to_thread(_shutil.rmtree, d, True)
+            except Exception:
+                pass
+            return True
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            log.debug("retention: delete %s failed", jid, exc_info=True)
+            return False
 
 
 async def _job_retention_loop() -> None:
@@ -1226,12 +1382,16 @@ async def _run_job_retention_once() -> int:
         except Exception:
             pass
     from datetime import timedelta as _td
-    from server.hub import objstore
-    from server.hub._state import get_storage_dir
-    import shutil as _shutil
 
     cutoff = datetime.utcnow() - _td(days=days)
     deleted = 0
+
+    # Bound how many job purges run at once (see _RETENTION_DELETE_CONCURRENCY).
+    _sem = asyncio.Semaphore(_RETENTION_DELETE_CONCURRENCY)
+
+    async def _del_one(jid: str) -> bool:
+        return await _purge_job(store, jid, _sem, _RETENTION_MINIO_TIMEOUT_S)
+
     while deleted < _RETENTION_MAX_PER_TICK:
         try:
             ids = await store.list_deletable_job_ids(
@@ -1242,29 +1402,13 @@ async def _run_job_retention_once() -> int:
             break
         if not ids:
             break
-        for jid in ids:
-            try:
-                if objstore.enabled():
-                    try:
-                        await asyncio.wait_for(
-                            objstore.delete_prefix(jid),
-                            timeout=_RETENTION_MINIO_TIMEOUT_S,
-                        )
-                    except Exception:
-                        # Includes TimeoutError: a hung tier can't stall the pass.
-                        log.debug(
-                            "job-retention: MinIO purge %s failed", jid, exc_info=True
-                        )
-                await store.delete_job(jid)
-                try:
-                    d = get_storage_dir() / jid
-                    if d.exists():
-                        await asyncio.to_thread(_shutil.rmtree, d, True)
-                except Exception:
-                    pass
-                deleted += 1
-            except Exception:
-                log.debug("job-retention: delete %s failed", jid, exc_info=True)
+        # Delete the batch BOUNDED-PARALLEL (was strictly sequential -- the
+        # per-job MinIO delete_prefix RTT made a full pass slower than the job
+        # inflow, so the backlog never actually shrank). gather never raises
+        # here: _del_one swallows per-job errors -> False; CancelledError still
+        # propagates out for a clean shutdown.
+        results = await asyncio.gather(*(_del_one(j) for j in ids))
+        deleted += sum(1 for ok in results if ok)
         # Yield between batches so we never monopolise the DB pool / loop.
         try:
             await asyncio.sleep(0.5)
@@ -1280,3 +1424,160 @@ async def _run_job_retention_once() -> int:
             deleted, days,
         )
     return deleted
+
+
+# --------------------------------------------------------------------------- #
+# Review(課題)-specific expiry
+# --------------------------------------------------------------------------- #
+# A SEPARATE GC just for status=review, decoupled from the general
+# job_retention_days. The general pass deletes oldest-first across ALL terminal
+# statuses, so review rows (~2% of the table) are only reached once the deletion
+# frontier sweeps past them -- their effective TTL is pinned to the general
+# frontier depth, not to any review target. This pass queries review-ONLY with
+# its own (shorter) cutoff + budget, so review is bounded at review_retention_days
+# regardless of the general completed/failed backlog. Same purge path
+# (_purge_job: DB row + MinIO prefix + local cache). OFF by default; dry_run
+# default ON (first rollout only LOGS candidate counts). Kill-switch env
+# PAPRIKA_REVIEW_RETENTION_DISABLE=1.
+_REVIEW_RETENTION_INTERVAL_S = float(
+    os.environ.get("PAPRIKA_REVIEW_RETENTION_INTERVAL_S", "1200") or 1200
+)
+_REVIEW_RETENTION_BATCH = int(
+    os.environ.get("PAPRIKA_REVIEW_RETENTION_BATCH", "500") or 500
+)
+_REVIEW_RETENTION_MAX_PER_TICK = int(
+    os.environ.get("PAPRIKA_REVIEW_RETENTION_MAX_PER_TICK", "5000") or 5000
+)
+_REVIEW_RETENTION_MINIO_TIMEOUT_S = float(
+    os.environ.get("PAPRIKA_REVIEW_RETENTION_MINIO_TIMEOUT_S", "30") or 30
+)
+_REVIEW_RETENTION_LOCK_KEY = "paprika:review_retention:lock"
+
+_last_review_retention_run_at: datetime | None = None
+_last_review_retention_deleted = 0
+
+
+async def _review_retention_loop() -> None:
+    """Background review(課題) expiry GC. Idempotent; safe to run on every hub
+    (a redis lock elects one hub per tick). Inert unless review_retention_enabled."""
+    if os.environ.get("PAPRIKA_REVIEW_RETENTION_DISABLE") == "1":
+        return
+    first = True
+    while True:
+        try:
+            await asyncio.sleep(300 if first else _REVIEW_RETENTION_INTERVAL_S)
+        except asyncio.CancelledError:
+            return
+        first = False
+        try:
+            await _run_review_retention_once()
+        except Exception:
+            # WARNING not debug: a silent failure is what let the general
+            # retention loop stall invisibly (2026-07-11); mirror that lesson.
+            log.warning("review-retention pass failed", exc_info=True)
+
+
+async def _run_review_retention_once() -> dict:
+    """One review-expiry pass. Returns a small stats dict.
+
+    ``{"enabled", "dry_run", "days", "candidates", "deleted"}``. In dry_run the
+    candidate count is probed (single indexed query, capped at MAX_PER_TICK) and
+    NOTHING is deleted -- the operator reads the log to size the impact before
+    flipping dry_run off. Extracted for on-demand / test invocation."""
+    global _last_review_retention_run_at, _last_review_retention_deleted
+    out = {"enabled": False, "dry_run": True, "days": 0, "candidates": 0, "deleted": 0}
+    store = state.store
+    if store is None or not hasattr(store, "list_deletable_job_ids"):
+        return out
+    if state.settings is None or not bool(
+        state.settings.get("review_retention_enabled", False)
+    ):
+        return out
+    out["enabled"] = True
+    # NB: do NOT use ``or 7`` here -- that would coerce an explicit 0 back to
+    # the default and delete at 7d. Respect an explicit 0/negative as "inert"
+    # so the operator can zero the days to PAUSE the pass without unchecking.
+    try:
+        days = int(state.settings.get("review_retention_days", 7))
+    except (TypeError, ValueError):
+        days = 7
+    if days <= 0:
+        return out
+    out["days"] = days
+    dry = bool(state.settings.get("review_retention_dry_run", True))
+    out["dry_run"] = dry
+
+    # Elect ONE hub per tick (delete is idempotent; the lock just avoids 7x
+    # MinIO churn). Best-effort -- proceed if redis absent.
+    r = getattr(store, "_r", None)
+    if r is not None:
+        try:
+            got = await r.set(
+                _REVIEW_RETENTION_LOCK_KEY, config.hub_id or "1",
+                nx=True, ex=max(60, int(_REVIEW_RETENTION_INTERVAL_S * 0.9)),
+            )
+            if not got:
+                return out
+        except Exception:
+            pass
+
+    from datetime import timedelta as _td
+
+    cutoff = datetime.utcnow() - _td(days=days)
+
+    # DRY-RUN: probe candidate volume without touching anything. One indexed
+    # query (capped) -- if it returns the cap, report ">=cap".
+    if dry:
+        try:
+            ids = await store.list_deletable_job_ids(
+                cutoff, ["review"], _REVIEW_RETENTION_MAX_PER_TICK
+            )
+        except Exception:
+            log.warning("review-retention: dry-run candidate query failed", exc_info=True)
+            return out
+        out["candidates"] = len(ids)
+        _last_review_retention_run_at = datetime.utcnow()
+        _last_review_retention_deleted = 0
+        log.info(
+            "review-retention[dry-run]: %s%d review job(s) older than %d days "
+            "would be purged (DB + MinIO + cache). Set review_retention_dry_run=false "
+            "to enact.",
+            (">=" if len(ids) >= _REVIEW_RETENTION_MAX_PER_TICK else ""),
+            len(ids), days,
+        )
+        return out
+
+    # ENACT: delete review-only, oldest-first, bounded-parallel + per-tick cap.
+    _sem = asyncio.Semaphore(_RETENTION_DELETE_CONCURRENCY)
+    deleted = 0
+    while deleted < _REVIEW_RETENTION_MAX_PER_TICK:
+        try:
+            ids = await store.list_deletable_job_ids(
+                cutoff, ["review"], _REVIEW_RETENTION_BATCH
+            )
+        except Exception:
+            log.warning("review-retention: candidate query failed", exc_info=True)
+            break
+        if not ids:
+            break
+        results = await asyncio.gather(
+            *(_purge_job(store, j, _sem, _REVIEW_RETENTION_MINIO_TIMEOUT_S) for j in ids)
+        )
+        deleted += sum(1 for ok in results if ok)
+        try:
+            await asyncio.sleep(0.5)
+        except asyncio.CancelledError:
+            raise
+        if len(ids) < _REVIEW_RETENTION_BATCH:
+            break
+    out["candidates"] = deleted
+    out["deleted"] = deleted
+    _last_review_retention_run_at = datetime.utcnow()
+    _last_review_retention_deleted = deleted
+    if deleted:
+        log.info(
+            "review-retention: deleted %d review(課題) jobs older than %d days "
+            "(DB + MinIO + cache)",
+            deleted, days,
+        )
+    return out

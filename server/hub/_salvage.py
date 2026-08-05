@@ -171,10 +171,17 @@ async def _http_self_restart(ip: str, secret: str, port: int) -> bool:
     url = f"http://{ip}:{port}/self-restart"
     headers = {"X-Worker-Secret": secret} if secret else {}
     try:
-        async with make_async_client(timeout=8.0) as http:
+        async with make_async_client(timeout=15.0) as http:
             r = await http.post(url, headers=headers)
-            return getattr(r, "status_code", 0) == 200
-    except Exception:
+            code = getattr(r, "status_code", 0)
+            if code != 200:
+                log.info("salvage[http] %s: HTTP %s from :%s", ip, code, port)
+            return code == 200
+    except Exception as e:
+        # Expected when the worker process is gone (port closed) -- info, not
+        # a warning. Logged anyway so the ledger's "all methods failed" can be
+        # traced to a stage instead of being a dead end.
+        log.info("salvage[http] %s:%s unreachable (%s)", ip, port, type(e).__name__)
         return False
 
 
@@ -187,28 +194,436 @@ async def _ssh_restart(ip: str, user: str, port: str, key: str) -> bool:
     # salvage works without a Dockerfile rebuild.
     if not await _ensure_ssh_client():
         return False
+    return await _ssh_run(
+        ip, user, port, key, "docker restart -t 8 paprika-worker-1",
+        what="docker-restart",
+    )
+
+
+#: SSH timeouts for the salvage path. Deliberately far more generous than a
+#: normal SSH call: the population salvage acts on is BY DEFINITION the boxes
+#: that are struggling, so the moment a node is loaded enough to need salvage
+#: is exactly the moment a tight timeout starts failing. Measured on garage
+#: 2026-08-03: the node ran at load 104 / IO PSI 52 right after a crash-reboot,
+#: which is when a salvage attempt was recorded as "all methods failed" while
+#: the key, the route and the wrapper were all provably fine minutes later.
+_SSH_CONNECT_TIMEOUT_S = _int("PAPRIKA_SALVAGE_SSH_CONNECT_TIMEOUT_S", 20)
+_SSH_CMD_TIMEOUT_S = _int("PAPRIKA_SALVAGE_SSH_CMD_TIMEOUT_S", 60)
+
+
+async def _ssh_run(
+    host: str, user: str, port: str, key: str, remote_cmd: str, *,
+    timeout: float | None = None, what: str = "ssh",
+) -> bool:
+    """Run one command over SSH. True iff rc 0. No key -> no-op False.
+
+    Logs WHY it failed. The previous version collapsed every failure mode --
+    no key, no ssh binary, auth rejection, connect timeout, non-zero rc --
+    into a bare False, so the ledger's "all salvage methods failed" was the
+    only artefact and diagnosing one required going to the worker and reading
+    its sshd/wrapper logs. A recovery system that cannot say why it failed
+    cannot be tuned.
+    """
+    if not key:
+        log.info("salvage[%s] %s: no SSH key configured -- stage skipped", what, host)
+        return False
+    if not await _ensure_ssh_client():
+        log.warning("salvage[%s] %s: no ssh client available", what, host)
+        return False
+    timeout = timeout if timeout is not None else float(_SSH_CMD_TIMEOUT_S)
     cmd = [
         "ssh", "-i", key, "-p", str(port),
         "-o", "StrictHostKeyChecking=no", "-o", "BatchMode=yes",
-        "-o", "ConnectTimeout=8",
-        f"{user}@{ip}", "docker restart -t 8 paprika-worker-1",
+        "-o", f"ConnectTimeout={_SSH_CONNECT_TIMEOUT_S}",
+        f"{user}@{host}", remote_cmd,
+    ]
+    proc = None
+    started = time.time()
+    try:
+        proc = await asyncio.create_subprocess_exec(
+            *cmd,
+            stdout=asyncio.subprocess.DEVNULL,
+            stderr=asyncio.subprocess.PIPE,
+        )
+        _out, err = await asyncio.wait_for(proc.communicate(), timeout=timeout)
+        rc = proc.returncode
+        if rc == 0:
+            return True
+        detail = (err or b"").decode(errors="replace").strip().splitlines()
+        log.info(
+            "salvage[%s] %s: rc=%s after %.1fs -- %s", what, host, rc,
+            time.time() - started, detail[-1] if detail else "(no stderr)",
+        )
+        return False
+    except asyncio.TimeoutError:
+        log.warning(
+            "salvage[%s] %s: TIMED OUT after %.0fs (node too loaded to answer?)",
+            what, host, timeout,
+        )
+        return False
+    except Exception as e:
+        log.warning("salvage[%s] %s: %s: %s", what, host, type(e).__name__, e)
+        return False
+    finally:
+        if proc is not None and proc.returncode is None:
+            try:
+                proc.kill()
+            except Exception:
+                pass
+
+
+async def _ssh_capture(
+    host: str, user: str, port: str, key: str, remote_cmd: str, *,
+    timeout: float = 30.0,
+) -> str:
+    """Run one command over SSH and return its stdout ('' on any failure)."""
+    if not key or not await _ensure_ssh_client():
+        return ""
+    cmd = [
+        "ssh", "-i", key, "-p", str(port),
+        "-o", "StrictHostKeyChecking=no", "-o", "BatchMode=yes",
+        "-o", f"ConnectTimeout={_SSH_CONNECT_TIMEOUT_S}",
+        f"{user}@{host}", remote_cmd,
     ]
     proc = None
     try:
         proc = await asyncio.create_subprocess_exec(
             *cmd,
-            stdout=asyncio.subprocess.DEVNULL,
+            stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.DEVNULL,
         )
-        rc = await asyncio.wait_for(proc.wait(), timeout=30.0)
-        return rc == 0
+        out, _ = await asyncio.wait_for(proc.communicate(), timeout=timeout)
+        return (out or b"").decode(errors="replace").strip()
     except Exception:
         if proc is not None:
             try:
                 proc.kill()
             except Exception:
                 pass
+        return ""
+
+
+async def _ssh_restart_dockerd(ip: str, user: str, port: str, key: str) -> bool:
+    """Restart the CT's docker DAEMON, then bring the worker container back.
+
+    The stage between "restart the container" and "reboot the CT". It exists
+    because ``docker restart`` has a failure mode of its own: when a CT is
+    rebooted or thrashed with containers running, dockerd can come back with
+    the container wedged ``Dead`` / "marked for removal", holding the
+    ``paprika-worker-1`` name so nothing can recreate it -- observed on 100%
+    of the CTs in the 2026-08-02 scratch-pool rollout that skipped a clean
+    ``compose down`` (docs/ramdisk-scratch-pool.md).  ``docker restart`` cannot
+    fix that; restarting dockerd and force-removing the corpse can.
+
+    The recipe mirrors the manual repair from that post-mortem: bounce dockerd,
+    try a plain start, and only if that fails force-remove the stale name and
+    recreate from compose. ``|| true`` on the tail so a box where /opt/paprika
+    has no compose file still reports the dockerd bounce as done.
+    """
+    script = (
+        "systemctl restart docker && sleep 5 && "
+        "(docker start paprika-worker-1 || "
+        " (docker rm -f paprika-worker-1; "
+        "  cd /opt/paprika && "
+        "  docker compose -f docker-compose-worker.yml up -d worker)) || true"
+    )
+    return await _ssh_run(
+        ip, user, port, key, script, timeout=180.0, what="dockerd-restart",
+    )
+
+
+# --- Proxmox stage (CT reboot) --------------------------------------------
+# The heaviest stage, and the only one that reaches OUTSIDE the worker box: it
+# SSHes a Proxmox node and reboots the container. That is a genuinely new trust
+# boundary for the hub -- a hub compromise now reaches the hypervisor -- so it
+# is OFF by default, needs its own credentials (never reuses the worker key),
+# and is rate-limited per worker AND per node so a bad signal can't walk a node
+# down one CT at a time.
+
+_PROXMOX_KEY_PATH = "/tmp/paprika-proxmox-ssh-key"
+
+#: ip -> (node_address, ctid, resolved_at). /etc/pve is the cluster filesystem,
+#: so ANY reachable node answers for every CT in the cluster; the mapping only
+#: changes when a CT is migrated or re-addressed, hence the long TTL.
+_ct_cache: dict[str, tuple[str, str, float]] = {}
+_CT_CACHE_TTL_S = 3600.0
+
+
+def _proxmox_nodes() -> list[tuple[str, str]]:
+    """[(node_name, ssh_address)] from the ``proxmox_nodes`` setting.
+
+    Accepts ``boiler=10.10.50.15,hall=10.10.50.11`` or bare addresses. The
+    names matter because ``/etc/pve/nodes/<name>/lxc/<id>.conf`` identifies
+    which node actually RUNS a container -- resolution can happen anywhere,
+    but ``pct reboot`` only works on the owning node.
+    """
+    raw = ""
+    if state.settings is not None:
+        try:
+            raw = str(state.settings.get("proxmox_nodes") or "")
+        except Exception:
+            raw = ""
+    raw = raw or os.environ.get("PAPRIKA_PROXMOX_NODES", "")
+    out: list[tuple[str, str]] = []
+    for tok in raw.replace(";", ",").split(","):
+        tok = tok.strip()
+        if not tok:
+            continue
+        name, _, addr = tok.partition("=")
+        name = name.strip()
+        addr = addr.strip() or name
+        if name:
+            out.append((name, addr))
+    return out
+
+
+def _proxmox_ssh() -> tuple[str, str, str]:
+    """(user, port, key_path) for the Proxmox nodes. Separate from the worker
+    SSH config on purpose: these credentials reach the hypervisor."""
+    def g(skey: str, env: str, dflt: str) -> str:
+        v = None
+        if state.settings is not None:
+            try:
+                v = state.settings.get(skey)
+            except Exception:
+                v = None
+        return str(v or os.environ.get(env) or dflt)
+    user = g("proxmox_ssh_user", "PAPRIKA_PROXMOX_SSH_USER", "root")
+    port = g("proxmox_ssh_port", "PAPRIKA_PROXMOX_SSH_PORT", "22")
+    key_path = g("proxmox_ssh_key_path", "PAPRIKA_PROXMOX_SSH_KEY", "")
+    if not key_path and state.settings is not None:
+        try:
+            pem = state.settings.get("proxmox_ssh_key_pem") or ""
+        except Exception:
+            pem = ""
+        if pem:
+            if not pem.endswith("\n"):
+                pem = pem + "\n"
+            try:
+                try:
+                    with open(_PROXMOX_KEY_PATH, "r", encoding="utf-8") as f:
+                        if f.read() == pem:
+                            return (user, port, _PROXMOX_KEY_PATH)
+                except FileNotFoundError:
+                    pass
+                with open(_PROXMOX_KEY_PATH, "w", encoding="utf-8") as f:
+                    f.write(pem)
+                os.chmod(_PROXMOX_KEY_PATH, 0o600)
+                key_path = _PROXMOX_KEY_PATH
+            except Exception:
+                log.warning("salvage: failed to materialize proxmox key", exc_info=True)
+    return (user, port, key_path)
+
+
+def _parse_ct_conf_path(path: str) -> tuple[str, str] | None:
+    """``/etc/pve/nodes/boiler/lxc/382.conf`` -> ``("boiler", "382")``.
+
+    Requires the ``lxc`` segment. Proxmox numbers VMs and containers from the
+    same id space, and the sibling ``qemu-server/`` directory holds VM configs
+    -- accepting one of those would hand ``pct reboot`` a VM's id, which either
+    fails or, if a container happens to share the number, reboots the wrong
+    guest entirely.
+    """
+    parts = [p for p in path.strip().split("/") if p]
+    try:
+        i = parts.index("nodes")
+        node = parts[i + 1]
+        kind = parts[i + 2]
+        ctid = parts[-1]
+    except (ValueError, IndexError):
+        return None
+    if kind != "lxc" or not ctid.endswith(".conf"):
+        return None
+    ctid = ctid[: -len(".conf")]
+    if not (node and ctid.isdigit()):
+        return None
+    return (node, ctid)
+
+
+async def _resolve_ct(ip: str) -> tuple[str, str] | None:
+    """Map a worker IP to ``(owning_node_ssh_address, ctid)``, or None.
+
+    Matches on the container's declared address in its Proxmox config rather
+    than on any naming convention, so a renamed or re-numbered CT still
+    resolves. ``grep -F`` with the trailing ``/`` of the CIDR keeps
+    ``10.10.51.16`` from matching ``10.10.51.161``.
+    """
+    now = time.time()
+    hit = _ct_cache.get(ip)
+    if hit and now - hit[2] < _CT_CACHE_TTL_S:
+        return (hit[0], hit[1])
+    nodes = _proxmox_nodes()
+    if not nodes:
+        return None
+    user, port, key = _proxmox_ssh()
+    if not key:
+        return None
+    by_name = {n: a for n, a in nodes}
+    # A VERB, not a shell command. The node-side key is pinned to
+    # scripts/paprika-ct-reboot.sh, which does the /etc/pve scan itself and
+    # only ever accepts "resolve <ip>" / "reboot <ctid>" / "ping". Sending a
+    # pipeline here instead would force that wrapper to parse an IP back out
+    # of a shell string -- fragile, and it would have to keep working as this
+    # string changed. See docs/worker-memory-guard.md §5.
+    remote = f"resolve {ip}"
+    for _name, addr in nodes:
+        out = await _ssh_capture(addr, user, port, key, remote, timeout=20.0)
+        if not out:
+            continue  # node unreachable, or the CT genuinely isn't here
+        parsed = _parse_ct_conf_path(out.splitlines()[0])
+        if parsed is None:
+            continue
+        owner_name, ctid = parsed
+        # The OWNING node is what pct must run on; fall back to using the node
+        # name as a hostname when the operator didn't list it explicitly.
+        owner_addr = by_name.get(owner_name, owner_name)
+        _ct_cache[ip] = (owner_addr, ctid, now)
+        log.info(
+            "salvage: resolved %s -> CT %s on node %s (%s)",
+            ip, ctid, owner_name, owner_addr,
+        )
+        return (owner_addr, ctid)
+    return None
+
+
+async def _ct_reboot_allowed(r, wid: str, node: str) -> bool:
+    """Rate limits for the hypervisor stage: at most one reboot per worker per
+    hour, and at most N per node per hour. Without the per-node cap a wrong
+    signal (a stale fleet view, a bad threshold) could reboot every CT on a
+    node in sequence -- exactly the 2026-07-09 failure mode that already forced
+    the alive-collapse guard, but with reboots instead of restarts."""
+    if r is None:
+        return True
+    per_node = _int("PAPRIKA_SALVAGE_CT_REBOOT_MAX_PER_NODE_H", 2)
+    try:
+        ok = await r.set(f"paprika:salvage:ctreboot:{wid}", "1", nx=True, ex=3600)
+        if not ok:
+            log.info("salvage: %s CT reboot suppressed (per-worker 1/h)", wid)
+            return False
+        nkey = f"paprika:salvage:ctreboot:node:{node}"
+        n = await r.incr(nkey)
+        await r.expire(nkey, 3600)
+        if n > per_node:
+            log.warning(
+                "salvage: node %s hit the CT-reboot budget (%d/h) -- refusing "
+                "to reboot %s. If this is a real node-wide event it needs an "
+                "operator, not more reboots.", node, per_node, wid,
+            )
+            return False
+    except Exception:
+        return True
+    return True
+
+
+def _proxmox_armed() -> bool:
+    """True when the hypervisor stage is armed AND has credentials."""
+    armed = False
+    if state.settings is not None:
+        try:
+            armed = bool(state.settings.get("ct_reboot_enabled"))
+        except Exception:
+            armed = False
+    if not armed and not _flag("PAPRIKA_SALVAGE_CT_REBOOT", False):
         return False
+    return bool(_proxmox_ssh()[2]) and bool(_proxmox_nodes())
+
+
+async def _node_verb(ip: str, verb: str, *, timeout: float = 60.0) -> str | None:
+    """Run one wrapper verb against the node that owns *ip*'s container.
+
+    Returns the wrapper's stdout, or None when the CT can't be resolved / the
+    node can't be reached. Shared by diagnose and netfix so both go through the
+    same resolution + credential path as the reboot stage.
+    """
+    resolved = await _resolve_ct(ip)
+    if resolved is None:
+        return None
+    node_addr, ctid = resolved
+    user, port, key = _proxmox_ssh()
+    out = await _ssh_capture(
+        node_addr, user, port, key, f"{verb} {ctid}", timeout=timeout,
+    )
+    return out or None
+
+
+async def _diagnose_ct(ip: str) -> str:
+    """Ask the owning node WHY this worker is unreachable. Read-only.
+
+    The whole point: from the hub, "host is dead", "CT is wedged" and "CT's
+    networking is dead" are indistinguishable -- every stage fails identically
+    and the ledger records the same useless line for all three. The evidence
+    only exists host-side, so go get it and put it in the ledger.
+    """
+    try:
+        out = await _node_verb(ip, "diagnose", timeout=45.0)
+    except Exception as e:
+        return f"diagnose failed: {type(e).__name__}"
+    if not out:
+        # Nothing answered on the NODE either -- that itself is the finding.
+        return "node unreachable (host down?)"
+    return out.strip().splitlines()[0][:300]
+
+
+async def _netfix_ct(wid: str, ip: str) -> bool:
+    """Repair the CT's networking without rebooting it.
+
+    Sits between the SSH stages and ``pct reboot`` because it is the only
+    repair that keeps in-flight jobs: a CT whose networking died is otherwise
+    healthy, and rebooting it to fix an interface throws away up to two hours
+    of video download. The node-side wrapper does the actual work (interface
+    bounce -> host veth bounce -> NIC re-apply) and stops at whatever succeeds.
+    """
+    if not _proxmox_armed():
+        return False
+    try:
+        out = await _node_verb(ip, "netfix", timeout=120.0)
+    except Exception as e:
+        log.info("salvage[netfix] %s: %s", ip, type(e).__name__)
+        return False
+    if not out:
+        return False
+    log.warning("salvage[netfix] %s (%s): %s", wid, ip, out.strip())
+    return "netfix:" in out and "failed" not in out
+
+
+async def _pct_reboot(wid: str, ip: str, r) -> bool:
+    """Last resort: reboot the worker's CT from its Proxmox node.
+
+    Host-side ``pct`` is the only lever that still works when the CT is so IO-
+    starved that spawning a process inside it blocks (the operator measured
+    ``pct exec`` returning nothing for 60s during the 2026-08-02 storm), which
+    is precisely when every SSH-into-the-CT stage above has already failed.
+
+    ``pct reboot --timeout`` asks for a clean shutdown first; a CT too wedged
+    to honour that falls through to stop+start, which the hypervisor can always
+    force.
+    """
+    if not _proxmox_armed():
+        return False
+    resolved = await _resolve_ct(ip)
+    if resolved is None:
+        log.info("salvage: %s (%s) -- could not resolve a CT to reboot", wid, ip)
+        return False
+    node_addr, ctid = resolved
+    if not await _ct_reboot_allowed(r, wid, node_addr):
+        return False
+    user, port, key = _proxmox_ssh()
+    timeout_s = _int("PAPRIKA_SALVAGE_CT_REBOOT_TIMEOUT_S", 60)
+    # Again a verb. The wrapper on the node owns the actual pct invocation
+    # (reboot --timeout, falling back to stop+start) AND the safety checks the
+    # hub cannot make from here: that the id is a container on that node, that
+    # its hostname is a paprika worker, and that it is not on the node's
+    # operator-maintained deny list. A hub that asked for "pct <anything>"
+    # would be trusting itself with the hypervisor; this way the node decides.
+    script = f"reboot {ctid}"
+    log.warning(
+        "salvage: ESCALATING to CT reboot -- worker %s (%s) = CT %s on %s. "
+        "Every container-level stage failed.", wid, ip, ctid, node_addr,
+    )
+    return await _ssh_run(
+        node_addr, user, port, key, script, timeout=float(timeout_s + 120),
+        what="ct-reboot",
+    )
 
 
 async def _salvage_one(wid: str, ip: str) -> str:
@@ -234,13 +649,59 @@ async def _salvage_one(wid: str, ip: str) -> str:
             pass
     secret = config.worker_secret or ""
     port = _int("PAPRIKA_WORKER_SELFRESTART_PORT", 9099)
+    # Escalation ladder, cheapest and least disruptive first. Each stage can
+    # recover a failure the one before it cannot:
+    #   http     in-process exit -- needs NO disk IO, so it still works on a
+    #            box whose SSD is saturated (where `docker restart` blocks).
+    #   ssh      the container is stuck but dockerd is fine.
+    #   dockerd  dockerd itself is wedged / the container is Dead.
+    #   ct       the CT can't even run a process (host-side pct is the only
+    #            lever left). Gated + rate-limited; see _pct_reboot.
     method = None
+    diagnosis = ""
     if await _http_self_restart(ip, secret, port):
         method = "http"
     else:
         user, sshport, key = _ssh_conf()
         if await _ssh_restart(ip, user, sshport, key):
             method = "ssh"
+        elif await _ssh_restart_dockerd(ip, user, sshport, key):
+            method = "dockerd"
+    if method is None:
+        # Only reach for the hypervisor once the box has already proved it
+        # can't recover itself -- both on this pass (every stage above failed)
+        # and across passes (it has re-ghosted after previous restarts).
+        fails = 0
+        if r is not None:
+            try:
+                f = await r.get(f"paprika:salvage:fails:{wid}")
+                fails = int(f) if f else 0
+            except Exception:
+                fails = 0
+        # Ask the node what is actually wrong before reaching for anything
+        # heavier. Cheap, read-only, and it is what turns a "failed" ledger row
+        # from a dead end into a finding.
+        # Gated on CREDENTIALS, not on ct_reboot_enabled. Diagnosing is
+        # read-only, and the operator who has not armed automatic reboots is
+        # exactly the one who needs to know WHY a box failed -- observed
+        # 2026-08-03, when three balcony workers logged "all salvage methods
+        # failed" with no reason attached while the node could have said
+        # "exec=hang" for every one of them.
+        if _proxmox_nodes() and _proxmox_ssh()[2]:
+            diagnosis = await _diagnose_ct(ip)
+            log.warning(
+                "salvage %s (%s): every IP-based stage failed -- node says: %s",
+                wid, ip, diagnosis,
+            )
+            # A CT that is running and whose init still answers is NOT a dead
+            # box: it is reachable over the hypervisor channel, so repair its
+            # networking instead of rebooting it. Keeps in-flight jobs.
+            if "status=running" in diagnosis and "exec=ok" in diagnosis:
+                if await _netfix_ct(wid, ip):
+                    method = "netfix"
+        if method is None and fails >= _int("PAPRIKA_SALVAGE_CT_REBOOT_AFTER", 2):
+            if await _pct_reboot(wid, ip, r):
+                method = "ct-reboot"
     if method:
         # Stage a pending re-register check (resolved next pass). Carry the
         # restart timestamp so _resolve_pending can declare failure if the
@@ -255,13 +716,30 @@ async def _salvage_one(wid: str, ip: str) -> str:
             except Exception:
                 pass
         return method
-    # Both methods failed -> VM likely truly dead; record + leave alone.
-    try:
-        await state.store.record_recovery_event(
-            wid, hub_id=hub_id, ip=ip, method="http+ssh",
-            result="failed", detail="all salvage methods failed")
-    except Exception:
-        pass
+    # Every stage failed -> box likely truly dead; record + leave alone.
+    # Throttle the RECORD, not just the attempt: a permanently-dead box was
+    # otherwise re-tried by all 7 hubs every ~80s forever, and recovery_events
+    # filled with identical "failed" rows (observed 2026-08-03: w51161/163/167
+    # were the only content of the ledger). Attempts stay cheap and frequent --
+    # the box may come back -- but the ledger only gets one row per interval.
+    quiet = _int("PAPRIKA_SALVAGE_FAILED_LOG_INTERVAL_S", 3600)
+    should_record = True
+    if r is not None and quiet > 0:
+        try:
+            should_record = bool(
+                await r.set(f"paprika:salvage:failedlog:{wid}", "1", nx=True, ex=quiet)
+            )
+        except Exception:
+            should_record = True
+    if should_record:
+        try:
+            await state.store.record_recovery_event(
+                wid, hub_id=hub_id, ip=ip, method="http+ssh+dockerd",
+                result="failed",
+                detail=(f"all salvage methods failed -- {diagnosis}"
+                        if diagnosis else "all salvage methods failed"))
+        except Exception:
+            pass
     return "failed"
 
 
@@ -359,6 +837,54 @@ async def _resolve_pending(r, alive: set) -> None:
             pass
 
 
+async def _memguard_pass(payload: dict, meta: dict) -> int:
+    """Escalate workers whose OWN memory guard has failed to recycle them.
+
+    The worker-side guard (server/worker/cgroup_mem.py + agent/_mix_run.py)
+    already drains and exits on sustained memory distress, and that handles the
+    ordinary case without the hub involved. This pass exists only for the case
+    the guard cannot handle: it set ``memguard``, we kept seeing that flag beat
+    after beat, and the worker is STILL here well past its own force-exit
+    deadline. That means the exit didn't happen or docker didn't bring it back
+    -- i.e. the container/daemon layer is itself stuck, which is exactly what
+    the dockerd and CT stages are for.
+
+    Waiting on the elapsed time rather than the flag is what keeps this from
+    fighting the worker: a healthy guard trip clears in minutes.
+    """
+    grace = _int("PAPRIKA_SALVAGE_MEMGUARD_GRACE_S", 1200)
+    if grace <= 0:
+        return 0
+    stuck: list[tuple[str, str, float, str]] = []
+    for w in payload.get("workers", []):
+        if not w.get("alive"):
+            continue  # already a ghost -> the normal ghost pass owns it
+        reason = w.get("memguard") or ""
+        if not reason:
+            continue
+        held = float(w.get("memguard_s") or 0.0)
+        if held < grace:
+            continue
+        wid = w.get("worker_id") or ""
+        # Prefer the MariaDB ledger's IP, same as the ghost path: behind nginx
+        # the live connection's client_address can be the proxy's, and SSHing
+        # the proxy would be both useless and alarming.
+        ip = (meta.get(wid, {}) or {}).get("ledger_ip") or w.get("address") or ""
+        if wid and ip:
+            stuck.append((wid, ip, held, reason))
+    n = 0
+    for wid, ip, held, reason in stuck[: _int("PAPRIKA_SALVAGE_MAX_PER_PASS", 3)]:
+        log.warning(
+            "salvage: %s (%s) has been memory-guard draining for %.0fs "
+            "(%s) without recycling -- escalating", wid, ip, held, reason,
+        )
+        res = await _salvage_one(wid, ip)
+        if res in ("http", "ssh", "dockerd", "netfix", "ct-reboot"):
+            log.info("salvage: memory escalation for %s issued via %s", wid, res)
+            n += 1
+    return n
+
+
 async def _salvage_pass() -> int:
     if state.store is None or state.registry is None:
         return 0
@@ -406,6 +932,13 @@ async def _salvage_pass() -> int:
             await _resolve_pending(r, alive)
         except Exception:
             log.warning("salvage: resolve_pending failed", exc_info=True)
+    # Memory-choke escalation. Runs under the same collapse guard as the ghost
+    # pass above, and against workers that are ALIVE -- so it is a strictly
+    # separate population from the ghosts collected below.
+    try:
+        await _memguard_pass(payload, meta)
+    except Exception:
+        log.warning("salvage: memguard pass failed", exc_info=True)
     now = time.time()
     min_age = _int("PAPRIKA_SALVAGE_GHOST_MIN_AGE_S", 300)
     # 24h default (was 1h): a ghost whose VM is still alive (answers HTTP/SSH)
