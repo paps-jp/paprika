@@ -8,7 +8,7 @@ to a Jinja2/StaticFiles template in a later round).
 """
 from __future__ import annotations
 
-from fastapi import APIRouter, HTTPException
+from fastapi import APIRouter, HTTPException, Request
 from fastapi.responses import HTMLResponse, PlainTextResponse, RedirectResponse, Response
 
 from server.hub._state import config, state
@@ -138,8 +138,31 @@ async def info_text() -> str:
     )
 
 
+def caller_ip(request: Request | None) -> str:
+    """The caller's REAL address as this hub observes it.
+
+    Behind the multi-hub nginx front ``request.client.host`` is the proxy for
+    every caller, so read the forwarded headers first (same precedence the
+    worker-WS handshake uses to pin a worker's IP-derived id).
+
+    This is the fleet's answer to "what is my LAN IP?": a worker container is
+    on a docker bridge, so from the inside every route to the hub has source
+    ``172.18.0.2`` -- the CT's real ``10.10.5x.y`` is visible only from out
+    here, after the CT's NAT. See ``server/worker/agent/workerid.py``.
+    """
+    if request is None:
+        return ""
+    ip = (
+        request.headers.get("x-real-ip")
+        or (request.headers.get("x-forwarded-for") or "").split(",")[0]
+    ).strip()
+    if not ip and request.client:
+        ip = (request.client.host or "").strip()
+    return ip
+
+
 @router.get("/health")
-async def health() -> dict:
+async def health(request: Request = None) -> dict:  # noqa: B008 - FastAPI injects
     """The probe every operational sidecar reads.
 
     Returns hub version + connected-worker count, plus a
@@ -148,6 +171,12 @@ async def health() -> dict:
     one worker is on an old build). Previously operators had to GET
     /workers and post-process to see the mismatch — which is exactly
     what got missed in the 2026-05-27 and 2026-05-31 self-update loops.
+
+    Also echoes ``client_ip`` -- the caller's address as the hub sees it.
+    A worker reads this at startup to learn its own CT LAN IP (it cannot
+    determine it from inside its bridge-networked container) and derive a
+    UNIQUE worker_id from it. /health is the endpoint every worker can
+    always reach, at the earliest point of init, on any hub.
     """
     nstats = state.registry.stats() if state.registry else {"count": 0, "workers": []}
     hub_v = _hub_version()
@@ -166,6 +195,18 @@ async def health() -> dict:
         vision_inference = get_vision_inference_stats()
     except Exception:
         vision_inference = None
+
+    # RAM-disk spill-over (2026-07-21): which store NEW assets are going to
+    # right now, per tier, plus the usage % that decision came from. This is
+    # the signal that was missing on 2026-07-20 -- /info and /jobs/completes
+    # are MariaDB-backed so they kept answering normally while the asset path
+    # was dead, which is what made the outage so hard to pin down.
+    asset_spill: dict | None = None
+    try:
+        from server.hub._spill import snapshot as _spill_snapshot
+        asset_spill = _spill_snapshot()
+    except Exception:
+        asset_spill = None
 
     # GPU gate (P): codegen-loop concurrency status.
     # codegen_loop_running / codegen_loop_limit を見て、operator が現在の
@@ -258,6 +299,14 @@ async def health() -> dict:
         # which engine slug PAPRIKA_R1_DISTILLER_ENGINE currently points at
         # (could be deepseek-r1 / chatgpt51 / claude / etc.) plus the modes.
         "reasoning_engine": reasoning_engine,
+        # RAM-disk spill-over: per tier {"spill": bool, "pct": float,
+        # "age_s": float, "stale": bool}. spill=true means NEW assets for that
+        # tier are going to the durable spill store instead of the RAM disk.
+        "asset_spill": asset_spill,
+        # The caller's address as this hub sees it (post-NAT). Workers read
+        # this at startup to derive their IP-pinned worker_id -- see
+        # caller_ip() above and server/worker/agent/workerid.py.
+        "client_ip": caller_ip(request),
     }
 
 
