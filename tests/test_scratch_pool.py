@@ -240,6 +240,106 @@ def test_smaller_reserve_admits_more(pool, monkeypatch):
     assert all(g is not None for g in got)   # 8 x 800MB fits; 8 x 2600MB never would
 
 
+# --- 5. cgroup axis (loft 2026-08-06) --------------------------------------
+#
+# The pool's free space says the NODE can take the bytes. It says nothing about
+# whether the calling CT's memory cgroup can -- and tmpfs pages ARE charged to
+# the CT that writes them, which is what crushed loft's page cache to 0.6MB and
+# turned a write problem into a 270MB/s read storm. Both axes must pass.
+
+
+def _cgroup(monkeypatch, *, current_mb, limit_mb=None, ok=True):
+    """Declare a cgroup state: what we've spent, and the cap someone told us."""
+    monkeypatch.delenv("PAPRIKA_WORKER_MEM_LIMIT_MB", raising=False)
+    monkeypatch.delenv("PAPRIKA_SCRATCH_CGROUP_RESERVE_MB", raising=False)
+    monkeypatch.setattr(
+        scratch_pool.cgroup_mem, "sample",
+        lambda: scratch_pool.cgroup_mem.MemSample(ok=ok, current=current_mb * MB),
+    )
+    if limit_mb is not None:
+        (scratch_pool.configured_dir() / ".cgroup_limit_mb").write_text(str(limit_mb))
+
+
+def test_cgroup_axis_is_inert_without_a_declared_limit(pool, monkeypatch):
+    """No limit declared => the axis has no opinion and the old behaviour
+    stands. This is what lets the source ship before any node is configured."""
+    _free(monkeypatch, 10_000 * MB)
+    _cgroup(monkeypatch, current_mb=7_500)          # would be way over any cap
+    assert scratch_pool.cgroup_headroom_bytes(pool, "w1") is None
+    assert scratch_pool.acquire("paprika-vid-j1-", "w1", 2600 * MB) is not None
+
+
+def test_cgroup_axis_is_inert_when_the_controller_is_unreadable(pool, monkeypatch):
+    """cgroup v1 host, or no controller: ok=False must mean 'no signal', never
+    'no headroom'. Guessing here would push every download onto the disk."""
+    _free(monkeypatch, 10_000 * MB)
+    _cgroup(monkeypatch, current_mb=0, limit_mb=8192, ok=False)
+    assert scratch_pool.cgroup_headroom_bytes(pool, "w1") is None
+    assert scratch_pool.acquire("paprika-vid-j1-", "w1", 2600 * MB) is not None
+
+
+def test_cgroup_axis_rejects_when_the_ct_budget_is_full(pool, monkeypatch):
+    """The loft case: pool has plenty of room, the CT does not."""
+    _free(monkeypatch, 60_000 * MB)                 # node is fine
+    _cgroup(monkeypatch, current_mb=6_000, limit_mb=8192)
+    # 8192 - 6000 - 1536 reserve = 656MB of headroom
+    assert scratch_pool.cgroup_headroom_bytes(pool, "w1") == 656 * MB
+    assert scratch_pool.acquire("paprika-vid-j1-", "w1", 2600 * MB) is None
+
+
+def test_cgroup_axis_admits_when_the_ct_has_room(pool, monkeypatch):
+    """Same node, same download, cap raised 8G -> 12G: now it fits. The knob
+    has to be continuous like this, not a cliff."""
+    _free(monkeypatch, 60_000 * MB)
+    _cgroup(monkeypatch, current_mb=3_000, limit_mb=12288)
+    assert scratch_pool.acquire("paprika-vid-j1-", "w1", 2600 * MB) is not None
+
+
+def test_cgroup_axis_keeps_a_page_cache_floor(pool, monkeypatch):
+    """Without the reserve the CT would be admitted right up to its cap, which
+    is precisely the state that leaves 0.6MB of active_file."""
+    _free(monkeypatch, 60_000 * MB)
+    _cgroup(monkeypatch, current_mb=4_000, limit_mb=8192)
+    # 4192MB nominally free, but 1536 is reserved -> 2656 usable
+    assert scratch_pool.cgroup_headroom_bytes(pool, "w1") == 2656 * MB
+    assert scratch_pool.acquire("paprika-vid-j1-", "w1", 3000 * MB) is None
+    assert scratch_pool.acquire("paprika-vid-j2-", "w1", 2000 * MB) is not None
+
+
+def test_cgroup_axis_ignores_a_neighbours_claim(pool, monkeypatch):
+    """A neighbour's promised bytes land in the NEIGHBOUR's cgroup. Counting
+    them against us would be the pool axis over again, and would starve a CT
+    that has room purely because its node-mates are busy."""
+    _free(monkeypatch, 60_000 * MB)
+    _cgroup(monkeypatch, current_mb=1_000, limit_mb=12288)
+    neighbour = scratch_pool.acquire("paprika-vid-j9-", "w2", 5000 * MB)
+    assert neighbour is not None
+    assert scratch_pool.cgroup_headroom_bytes(pool, "w1") == (12288 - 1000 - 1536) * MB
+    assert scratch_pool.acquire("paprika-vid-j1-", "w1", 2600 * MB) is not None
+
+
+def test_cgroup_axis_counts_our_own_outstanding_claim(pool, monkeypatch):
+    """Two downloads starting back-to-back on ONE worker: the first has written
+    nothing yet, so memory.current cannot see it. Without subtracting our own
+    claim the same headroom is handed out twice and both land in the cgroup."""
+    _free(monkeypatch, 60_000 * MB)
+    _cgroup(monkeypatch, current_mb=1_000, limit_mb=8192)
+    # headroom 5656MB: one 3000MB download fits, two do not
+    assert scratch_pool.acquire("paprika-vid-j1-", "w1", 3000 * MB) is not None
+    assert scratch_pool.acquire("paprika-vid-j2-", "w1", 3000 * MB) is None
+
+
+def test_cgroup_limit_pool_file_beats_env(pool, monkeypatch):
+    """Same precedence as the other two knobs: env is baked into the container
+    at create time, the pool file is one echo away."""
+    _free(monkeypatch, 60_000 * MB)
+    _cgroup(monkeypatch, current_mb=1_000, limit_mb=12288)
+    monkeypatch.setenv("PAPRIKA_WORKER_MEM_LIMIT_MB", "8192")
+    assert scratch_pool.cgroup_limit_bytes() == 12288 * MB
+    (scratch_pool.configured_dir() / ".cgroup_limit_mb").unlink()
+    assert scratch_pool.cgroup_limit_bytes() == 8192 * MB
+
+
 # --- ENOSPC classifier (the local-disk retry trigger) ----------------------
 
 

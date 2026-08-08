@@ -14,13 +14,31 @@ This module moves those writes onto a **tmpfs that lives on the Proxmox node
 and is bind-mounted into every worker CT** (``mp0: /ram/pdl,mp=/var/paprika/dl``).
 Two properties make the shared-pool shape the right one:
 
-  * tmpfs pages are charged to the HOST, not to the CT's 8GB memory cgroup, so
-    a worker's own RAM budget -- and its OOM exposure, the CTs run ``swap: 0``
-    -- is untouched;
   * the pool is shared by every CT on the node, so a single 1.8GB download can
     use space the other, idle CTs aren't using.  A per-CT private ramdisk of
     the same total size cannot: sized 1GB it holds neither the median (270MB
     with the x1.3 merge headroom) reliably nor the p90 (1.8GB) at all.
+
+The memory the pool costs, and who pays it
+------------------------------------------
+This module was written believing that a host-mounted tmpfs is charged to the
+host, leaving the CT's memory cgroup untouched.  **That is false**, and loft
+proved it on 2026-08-06: cgroup v2 charges a shmem page to the cgroup that
+first faults it in, and the process doing the faulting is yt-dlp inside the CT.
+So a 5.8GB download lands 5.8GB against that CT's 8GB ``memory.max``.
+
+The CTs run ``swap: 0``, so shmem cannot be reclaimed.  The only reclaimable
+thing left is page cache, which was duly crushed from 6GB to 0.6MB -- after
+which every executable and shared library the container touched had to be read
+back off the disk on every access.  The node did 270MB/s of reads against
+1.2MB/s of writes, ``io.pressure`` sat at 99% and load hit 397: a module that
+exists to spare the disk had turned a write problem into a 15x larger read
+problem.
+
+Hence the second admission axis below.  The pool's own free space says whether
+the NODE can take the bytes; it says nothing about whether the calling CT's
+memory budget can.  Both must be true, or the download goes to disk -- which
+costs one video's worth of writes and is unambiguously the cheaper failure.
 
 Sharing is also the hazard.  The CTs are mutually invisible -- no lock server,
 no hub involvement -- so this module NEVER deletes or accounts away another
@@ -63,6 +81,18 @@ re-creation::
     echo 800 > /ram/pdl/.reserve_mb      # per-video claim
     echo 512 > /ram/pdl/.min_free_mb     # headroom
 
+The cgroup axis is configured the same way.  It is INERT until the limit is
+supplied, because the container cannot discover it: ``memory.max`` inside the
+container reads ``max`` (the CT's cap lives on a parent cgroup that the cgroup
+namespace hides), while ``/proc/meminfo`` shows the whole Proxmox node.  Only
+``memory.current`` is real and correctly scoped.  The cap is uniform across a
+node's worker CTs, so it is node policy like the two knobs above::
+
+    echo 12288 > /ram/pdl/.cgroup_limit_mb    # = pct set <id> -memory
+    echo 1536  > /ram/pdl/.cgroup_reserve_mb  # page cache floor + CT overhead
+
+``PAPRIKA_WORKER_MEM_LIMIT_MB`` is honoured as a fallback for the limit.
+
 Pool file wins over env, which wins over the default.
 ``PAPRIKA_SCRATCH_JOB``            1 = also pool per-job workdirs (default 0)
 ``PAPRIKA_SCRATCH_JOB_RESERVE_MB`` per-job-workdir claim (default 256)
@@ -77,6 +107,8 @@ import shutil
 import tempfile
 import time
 from pathlib import Path
+
+from . import cgroup_mem
 
 log = logging.getLogger("paprika.worker.scratch")
 
@@ -147,6 +179,67 @@ def video_reserve_bytes() -> int:
     if mb is None:
         mb = _env_int("PAPRIKA_SCRATCH_VIDEO_RESERVE_MB", 2600)
     return mb * _MB
+
+
+def cgroup_limit_bytes() -> int:
+    """This CT's ``memory.max``, or 0 when nobody has told us.
+
+    Not discoverable from inside the container -- see the module docstring --
+    so it must be declared.  0 means "no signal", and every caller must treat
+    that as "do not gate", never as "no headroom": an undeclared limit is the
+    default state of a node that has not been configured yet, and gating on a
+    guess would silently push every download onto the disk this module exists
+    to protect.
+    """
+    mb = _pool_override_mb(".cgroup_limit_mb")
+    if mb is None:
+        mb = _env_int("PAPRIKA_WORKER_MEM_LIMIT_MB", 0)
+    return max(0, mb) * _MB
+
+
+def cgroup_reserve_bytes() -> int:
+    """Bytes that must stay unspent inside the cgroup after a download lands.
+
+    Two things have to fit in it:
+
+    * a **page cache floor**.  The whole failure this axis prevents is page
+      cache being reclaimed to zero, so the budget has to keep some.  Healthy
+      CTs across the fleet hold 700-820MB of ``active_file``; 1GB covers that.
+    * **CT-level overhead the container cannot see**.  ``memory.current`` here
+      is the docker container's cgroup, but the cap is on the CT, which also
+      carries systemd, dockerd and the lane processes -- a few hundred MB that
+      would otherwise be double-spent.
+
+    Default 1536MB = 1GB floor + 512MB overhead.
+    """
+    mb = _pool_override_mb(".cgroup_reserve_mb")
+    if mb is None:
+        mb = _env_int("PAPRIKA_SCRATCH_CGROUP_RESERVE_MB", 1536)
+    return mb * _MB
+
+
+def cgroup_headroom_bytes(pool: Path, worker_id: str) -> int | None:
+    """Bytes this CT can still absorb as shmem, or None when the axis is inert.
+
+    None (no declared limit, or no readable cgroup v2 controller) means "this
+    axis has no opinion" and admission falls back to the pool check alone --
+    exactly the behaviour that shipped before this axis existed.
+
+    Our own outstanding claims are subtracted because they are bytes we have
+    promised to write but have not written yet: they are not in
+    ``memory.current`` and would otherwise be handed out twice by two
+    concurrent downloads on the same worker.  Neighbours' claims are NOT
+    subtracted -- they are charged to their own cgroups, not ours.  That
+    asymmetry is the whole point of having two axes.
+    """
+    limit = cgroup_limit_bytes()
+    if limit <= 0:
+        return None
+    s = cgroup_mem.sample()
+    if not s.ok:
+        return None
+    spent = s.current + outstanding_bytes(pool, owner=worker_id)
+    return max(0, limit - spent - cgroup_reserve_bytes())
 
 
 def job_reserve_bytes() -> int:
@@ -263,8 +356,12 @@ def _dir_used_bytes(d: Path) -> int:
     return total
 
 
-def outstanding_bytes(pool: Path) -> int:
+def outstanding_bytes(pool: Path, owner: str | None = None) -> int:
     """Bytes other workers (and we) have claimed but not yet written.
+
+    With *owner* set, only that worker's claims are counted -- used by the
+    cgroup axis, where a neighbour's promise is irrelevant because it will be
+    charged to the neighbour's cgroup, not ours.
 
     ``free`` alone is not a safe admission signal on a shared pool: a
     neighbouring CT may be 30 seconds into a 1.8GB download, so most of what
@@ -285,8 +382,11 @@ def outstanding_bytes(pool: Path) -> int:
         entries = list(claims.iterdir())
     except OSError:
         return 0
+    token = _owner_token(owner) if owner else None
     for c in entries:
         if c.suffix != ".claim":
+            continue
+        if token is not None and token not in c.stem:
             continue
         d = pool / c.stem
         try:
@@ -333,6 +433,19 @@ def acquire(prefix: str, worker_id: str, need_bytes: int) -> Path | None:
 
     floor = min_free_bytes()
     if free_bytes(pool) - outstanding_bytes(pool) - floor < need:
+        return None
+
+    # Second axis: can OUR cgroup absorb these bytes as shmem? The pool check
+    # above only established that the node can. Skipped entirely when the axis
+    # is inert (no declared limit) -- see cgroup_headroom_bytes.
+    headroom = cgroup_headroom_bytes(pool, worker_id)
+    if headroom is not None and headroom < need:
+        log.info(
+            "scratch pool: %s needs %d MB but cgroup headroom is %d MB "
+            "(limit %d MB, reserve %d MB); using local disk",
+            prefix, need // _MB, headroom // _MB,
+            cgroup_limit_bytes() // _MB, cgroup_reserve_bytes() // _MB,
+        )
         return None
 
     try:
