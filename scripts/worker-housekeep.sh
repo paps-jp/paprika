@@ -30,6 +30,27 @@ set -euo pipefail
 LOG_PREFIX="[paprika-housekeep]"
 log() { echo "$LOG_PREFIX $*"; }
 
+# Refuse to pretend on a read-only rootfs. When the thin pool fills, ext4 flips
+# the CT to emergency_ro and every delete below fails silently -- fstrim then
+# reports GiB "trimmed" while the pool does not move, because there is nothing
+# to release. On foyer 2026-08-11 the fleet guard ran this every 15 minutes for
+# three hours against ten read-only CTs and logged 0% reclaimed each time,
+# which read as "there is nothing to clean" instead of "I cannot clean".
+#
+# The flag is the tell, and it is easy to misread: ext4 LEAVES rw at the front
+# and appends emergency_ro, so `grep ^rw` says the volume is healthy. Match the
+# suffix. Testing an actual write also catches ro remounts that predate us.
+root_opts=$(awk '$2=="/" {print $4; exit}' /proc/mounts 2>/dev/null)
+case "$root_opts" in
+    *emergency_ro*|ro,*|*,ro)
+        log "CRITICAL: rootfs is READ-ONLY ($root_opts) -- refusing to run."
+        log "CRITICAL: nothing can be deleted and fstrim will free nothing until"
+        log "CRITICAL: the CT is stopped and e2fsck'd from the node. See"
+        log "CRITICAL: internal/ops/thinpool-guard.sh for the runbook."
+        exit 1
+        ;;
+esac
+
 before_used=$(df --output=pcent / | tail -1 | tr -dc '0-9')
 before_free=$(df -h --output=avail / | tail -1 | tr -d ' ')
 log "before: disk ${before_used}% used, ${before_free} free"
@@ -50,31 +71,80 @@ find /var/lib/docker/containers -name '*-json.log' -size +100M 2>/dev/null | whi
     : > "$f"
 done
 
-# In-container Chrome /tmp leak cleanup. The bulk of long-term CT bloat
-# (2026-06-06 measurement: ~9G per worker after 5 days of jobs) is NOT
-# host-side -- it's Chrome's own /tmp scratch leaking inside the docker
-# container's overlay. Two patterns dominate:
-#   .com.google.Chrome.*  ~9.7M each, one per crashed renderer
-#   scoped_dir*           ~52M each, one per killed lane reload
-# Chrome doesn't clean these on exit when a parent SIGKILLs it (= every
-# lane swap / Xvfb restart / container SIGTERM in our pipeline). They
-# accumulate indefinitely with no owner. Match outside-mtime-60-min so we
-# never race with active Chrome holding an fd on the current entry.
+# In-container /tmp scratch cleanup. The bulk of long-term CT bloat is NOT
+# host-side -- it's scratch leaking inside the docker container's overlay,
+# left behind whenever a parent SIGKILLs its child (= every lane swap / Xvfb
+# restart / container SIGTERM in our pipeline). Nothing owns it afterwards.
+#
+# The patterns are workload-specific and they go stale. The original three were
+# raw-Chrome era; by the time foyer was measured on 2026-08-11 the fleet had
+# moved to undetected-chromedriver plus paprika's own profile management, and
+# `scoped_dir*` matched ZERO entries across all twenty CTs while the guard
+# reported 0% reclaimed and everyone read that as "clean". Measured occupancy
+# that day, per CT:
+#
+#   paprika-profile-*  80M each x 66..181   <- dominant by far
+#   paprika-vid-*      up to 2.4G           <- present on a quarter of the fleet
+#   uc_*               12k..14.8k entries   <- only ~50M, but murder on inodes
+#   scoped_dir*        0                    <- the one pattern we were matching
+#
+# Re-measure before trusting this list again. `du -sh $T/* | sort -hr | head`
+# inside the upper layer is the whole method.
+#
+# Two names in that namespace are NOT scratch and must never be swept:
+# paprika-profile-cache is the shared profile every worker seeds from, and
+# paprika-extensions lives in a committed image layer -- deleting it corrupts
+# the image. This is why the globs stay explicit and nobody widens them to
+# `paprika-*`.
+#
+# -mmin +60 keeps us from racing live Chrome holding an fd on a current entry.
+TMP_SCRATCH_GLOBS=(
+    '.com.google.Chrome.*'
+    'com.google.Chrome.*'
+    'scoped_dir*'
+    'paprika-profile-*'
+    'paprika-vid-*'
+    'uc_*'
+)
+KEEP_GLOBS=( 'paprika-profile-cache' 'paprika-extensions' )
+
+# Build the shared find(1) fragments once so the docker-exec and containerd
+# fallback paths cannot drift apart -- they did before, and the fallback was
+# the one that mattered during an outage.
+#
+# The parens are backslash-escaped because this string is consumed by `eval`
+# and by `sh -c` inside the container -- a bare ( is a shell syntax error in
+# both, and the failure is invisible on the containerd path where stderr goes
+# to /dev/null. Caught in a fixture before deploy; do not "clean up" the
+# backslashes.
+_name_expr() {
+    local first=1 g
+    printf '\\('
+    for g in "${TMP_SCRATCH_GLOBS[@]}"; do
+        [ "$first" = 1 ] || printf ' -o'
+        printf ' -name "%s"' "$g"
+        first=0
+    done
+    printf ' \\)'
+    for g in "${KEEP_GLOBS[@]}"; do printf ' ! -name "%s"' "$g"; done
+}
+NAME_EXPR="$(_name_expr)"
+
+# rm via xargs, not `-exec rm -rf {} +`. The + form batches every path into a
+# single rm that runs LAST, so a timeout kills the whole thing and deletes
+# nothing while -print still reports thousands "found" (2026-08-10: "removed=188"
+# with zero bytes actually freed). Chunked xargs frees incrementally instead.
 if docker ps --format '{{.Names}}' 2>/dev/null | grep -q '^paprika-worker-1$'; then
-    nfiles=$(docker exec paprika-worker-1 sh -c \
-        'find /tmp -maxdepth 1 -name ".com.google.Chrome.*" -type f -mmin +60 -delete -print 2>/dev/null | wc -l' \
-        2>/dev/null || echo 0)
-    ndirs=$(docker exec paprika-worker-1 sh -c \
-        'find /tmp -maxdepth 1 -name "scoped_dir*" -type d -mmin +60 -exec rm -rf {} + -print 2>/dev/null | wc -l' \
-        2>/dev/null || echo 0)
-    # Chrome also leaves NON-dotted com.google.Chrome.XXXXXX *directories* (the
-    # SingletonCookie/SingletonSocket holders). Individually tiny -- 31M total on
-    # a CT carrying 3G of leak -- but neither pattern above ever matched them, so
-    # they were the one class that survived every housekeep run.
-    ncdirs=$(docker exec paprika-worker-1 sh -c \
-        'find /tmp -maxdepth 1 -name "com.google.Chrome.*" -type d -mmin +60 -exec rm -rf {} + -print 2>/dev/null | wc -l' \
-        2>/dev/null || echo 0)
-    log "container /tmp Chrome leak: removed $nfiles file(s) + $ndirs scoped_dir(s) + $ncdirs chrome dir(s)"
+    # Count first, then delete. Counting the deletion stream in-flight needs
+    # process substitution that /bin/sh inside the container does not have, and
+    # the entries are stale by construction (>60 min) so nothing appears between
+    # the two passes that we would want to keep.
+    n=$(docker exec paprika-worker-1 sh -c \
+        "find /tmp -maxdepth 1 -mmin +60 $NAME_EXPR 2>/dev/null | wc -l" 2>/dev/null || echo 0)
+    docker exec paprika-worker-1 sh -c \
+        "find /tmp -maxdepth 1 -mmin +60 $NAME_EXPR -print0 2>/dev/null \
+         | xargs -0 -r -n 40 rm -rf 2>/dev/null" >/dev/null 2>&1 || true
+    log "container /tmp scratch: removed $n entr(ies)"
 else
     # The docker-exec path above silently no-ops whenever dockerd is unreachable
     # -- which is exactly what happens once the CT rootfs has gone emergency_ro,
@@ -85,9 +155,9 @@ else
     # moby namespace regardless of dockerd, so reach into the writable layer
     # directly. Same 60-min guard so we never race live Chrome.
     SNAPS=/var/lib/containerd/io.containerd.snapshotter.v1.overlayfs/snapshots
-    nfb=$(find "$SNAPS" -maxdepth 4 -path '*/fs/tmp/*' -mmin +60 \
-            \( -name 'scoped_dir*' -o -name 'com.google.Chrome.*' -o -name '.com.google.Chrome.*' \) \
-            -prune -exec rm -rf {} + -print 2>/dev/null | wc -l)
+    FIND_ARGS="-mindepth 4 -maxdepth 4 -path '*/fs/tmp/*' -mmin +60 $NAME_EXPR"
+    nfb=$(eval "find '$SNAPS' $FIND_ARGS" 2>/dev/null | wc -l)
+    eval "find '$SNAPS' $FIND_ARGS -print0" 2>/dev/null | xargs -0 -r -n 40 rm -rf 2>/dev/null || true
     log "container /tmp cleanup via containerd upper layer (docker unreachable): removed $nfb entr(ies)"
 fi
 
