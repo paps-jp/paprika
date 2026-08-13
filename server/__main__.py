@@ -340,6 +340,41 @@ def _run_worker(args) -> int:
     except Exception as e:
         log.warning("startup scratch-pool purge failed (continuing): %s", e)
 
+    # Core dumps off, for this process and everything it spawns.
+    #
+    # The nodes run the kernel default core_pattern ("core" = the crashing
+    # process's CWD, i.e. /app) and the container's RLIMIT_CORE is unlimited,
+    # so every Chrome crash writes a 0.2-8 GB core file onto the CT rootfs --
+    # which is the node's LVM thin pool. Chrome crashes 10-20x/day/worker
+    # here, so this is a steady leak, not an incident: foyer accumulated
+    # ~105 GB across 22 CTs in five days (2026-08-13), taking pve/data from
+    # 41% to 100% and dropping seven CTs into ext4 emergency read-only --
+    # which cannot be cleared from inside the CT.
+    #
+    # The SOFT limit is what the kernel checks, and children inherit it across
+    # fork+exec, so setting it once here covers Chrome, Xvfb, x11vnc and
+    # yt-dlp without touching how any of them are launched. The hard limit is
+    # left alone so a debugging session can raise it back.
+    # PAPRIKA_ALLOW_CORE_DUMPS=1 opts out; the periodic sweep in
+    # agent/_mix_maintenance.py (_sweep_core_dumps) then still bounds them.
+    try:
+        if (os.environ.get("PAPRIKA_ALLOW_CORE_DUMPS") or "").lower() not in (
+            "1", "true", "yes",
+        ):
+            import resource as _resource
+
+            _soft, _hard = _resource.getrlimit(_resource.RLIMIT_CORE)
+            if _soft != 0:
+                _resource.setrlimit(_resource.RLIMIT_CORE, (0, _hard))
+                log.info(
+                    "startup: core dumps disabled for this worker and its "
+                    "children (RLIMIT_CORE soft %s -> 0)", _soft,
+                )
+    except Exception as e:
+        # Non-POSIX (dev on Windows) or a hardened kernel: the sweep is the
+        # fallback, never a reason to fail startup.
+        log.warning("startup: could not disable core dumps (continuing): %s", e)
+
     # Second node tmpfs, same idea applied to Chrome's user-data-dirs -- the
     # dominant remaining writer to the CT's thin pool once video downloads are
     # on the pool above. Owner-scoped by worker_id for the same reason the

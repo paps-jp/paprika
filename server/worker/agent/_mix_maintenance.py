@@ -191,6 +191,13 @@ class _MaintenanceMixin:
         chrome_min_age = float(
             os.environ.get("PAPRIKA_TMP_SWEEP_CHROME_MIN_AGE_S") or 3600.0,
         )
+        # Core dumps (see _sweep_core_dumps). Short window on purpose: these
+        # are 0.2-8 GB each on the CT rootfs = the node's thin pool, so the
+        # cost of holding one an extra half hour is far higher than for a
+        # /tmp entry. 0 disables the core half.
+        core_min_age = float(
+            os.environ.get("PAPRIKA_CORE_SWEEP_MIN_AGE_S") or 120.0,
+        )
         # One pass immediately on startup so a worker that just came up
         # from a previous crash starts clean. Subsequent passes are spaced
         # by ``interval``.
@@ -217,6 +224,24 @@ class _MaintenanceMixin:
                         f"[worker {self.worker_id}] tmp sweep failed: "
                         f"{type(e).__name__}: {e}",
                     )
+                # Separate try: a failure sweeping /tmp must not skip the
+                # half that keeps the thin pool alive.
+                if core_min_age > 0:
+                    try:
+                        n_core, core_freed = await asyncio.to_thread(
+                            self._sweep_core_dumps, core_min_age,
+                        )
+                        if n_core:
+                            _logger.info(
+                                f"[worker {self.worker_id}] core sweep: "
+                                f"removed {n_core} core dump(s), "
+                                f"~{core_freed // (1024*1024)} MiB freed",
+                            )
+                    except Exception as e:
+                        _logger.info(
+                            f"[worker {self.worker_id}] core sweep failed: "
+                            f"{type(e).__name__}: {e}",
+                        )
         except asyncio.CancelledError:
             return
 
@@ -388,6 +413,75 @@ class _MaintenanceMixin:
         except Exception:
             pass
         return (removed, freed, chrome_removed)
+
+    # Core dumps do NOT land in any tmp root, so the sweep above cannot see
+    # them: the node's kernel.core_pattern is the default "core", which means
+    # the CRASHING PROCESS'S CWD -- /app for everything the worker spawns --
+    # and that is the CT's rootfs, i.e. the node's LVM thin pool.
+    #
+    # Measured on foyer 2026-08-13: 51-101 files / 3.8-8.0 GB per CT, ~105 GB
+    # across 22 CTs in five days (~1 GB/CT/day, Chrome crashing 10-20x/day per
+    # worker). pve/data went 41% -> 100% and seven CTs dropped into ext4
+    # emergency read-only, which is NOT recoverable from inside the CT.
+    #
+    # server/__main__.py drops RLIMIT_CORE to 0 at worker startup, which stops
+    # new dumps at the source. This sweep is the second layer: it clears what
+    # earlier versions already wrote, and it still bounds the footprint if the
+    # rlimit is opted out of (PAPRIKA_ALLOW_CORE_DUMPS=1) or a child resets it.
+    #
+    # ``core`` with no suffix is a legitimate name for the dump too (the
+    # pattern has no %p unless kernel.core_uses_pid is set), and /app/core is
+    # ALSO the paprika ``core/`` package directory -- so this must never delete
+    # a directory. is_file() below is load-bearing, not defensive noise.
+    _CORE_DUMP_RE = _re.compile(r"^core(\.\d+)?$")
+
+    def _core_dump_roots(self) -> list[Path]:
+        """Where dumps land: the worker's CWD (/app in the container).
+
+        ``PAPRIKA_CORE_SWEEP_ROOT`` overrides it (tests, or a node whose
+        core_pattern points somewhere else).
+        """
+        raw = os.environ.get("PAPRIKA_CORE_SWEEP_ROOT")
+        try:
+            root = Path(raw) if raw else Path.cwd()
+            return [root] if root.is_dir() else []
+        except OSError:
+            return []
+
+    def _sweep_core_dumps(self, min_age_s: float) -> tuple[int, int]:
+        """Delete stale core dumps. Returns ``(removed_count, bytes_freed)``.
+
+        The age guard keeps us off a dump the kernel is still writing: a
+        multi-GB core takes seconds to land, and unlinking it mid-write only
+        wastes the crash evidence (the kernel holds the fd, so no space is
+        reclaimed until it finishes anyway).
+        """
+        import time as _t
+
+        now = _t.time()
+        removed = 0
+        freed = 0
+        for root in self._core_dump_roots():
+            try:
+                entries = list(root.iterdir())
+            except OSError:
+                continue
+            for entry in entries:
+                if not self._CORE_DUMP_RE.match(entry.name):
+                    continue
+                try:
+                    if not entry.is_file():   # /app/core is the source package
+                        continue
+                    st = entry.stat()
+                    if (now - st.st_mtime) < min_age_s:
+                        continue
+                    size = st.st_size
+                    entry.unlink()
+                except OSError:
+                    continue
+                removed += 1
+                freed += size
+        return (removed, freed)
 
     async def _fetch_cookies_txt_for(self, target_url, state, log=None):
         """Fetch a Netscape cookies.txt for ``target_url``'s host from
