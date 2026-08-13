@@ -1084,6 +1084,18 @@ class WorkerRegistry:
                         if d.get("load1") != worker.load1:
                             d["load1"] = worker.load1
                             changed = True
+                        # nproc travels WITH load1 or the pair is useless: load1
+                        # is host-scoped (an LXC CT reports its Proxmox node's
+                        # getloadavg), so every consumer has to divide by nproc
+                        # to get load-per-core. Mirroring load1 alone left the
+                        # ~6/7 of the fleet a hub doesn't own with nproc=0 --
+                        # io_sat None, and /workers/capacity's health formula
+                        # comparing a 128-thread node's load1 against a flat
+                        # ref. That pinned 42% of the fleet at the 0.3 health
+                        # floor while it sat at 18% CPU (2026-08-09).
+                        if d.get("nproc") != worker.nproc:
+                            d["nproc"] = worker.nproc
+                            changed = True
                         # Same reasoning for the cgroup-scoped memory fields.
                         # Without them the Workers tab shows the memory column
                         # for only the ~1/7 of the fleet that happens to be

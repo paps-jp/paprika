@@ -190,15 +190,24 @@ _SCHEMA: dict[str, tuple[Any, str]] = {
     # fetch_load_factor: global headroom multiplier on healthy_lanes.
     #   0.7 = recommend 70% of healthy capacity (was a fixed 0.8 in the
     #   old single-input formula).
-    # fetch_load_ref: load1 above which a worker contributes less than its
-    #   full capacity. LXC host load1 propagates into the container per
-    #   [[paprika-fleet-lxc-on-proxmox]]; ~24 is a typical 2-lane-on-busy-host
-    #   threshold. health = clamp(1 - (load1 - REF)/REF, 0.3, 1.0).
+    # fetch_load_core_ref: load-PER-CORE above which a worker contributes less
+    #   than its full capacity -- the primary load axis.
+    #   health = clamp(1 - (load1/nproc - REF)/REF, 0.3, 1.0).
+    #   load1 is a HOST number (an LXC CT shares its Proxmox node's
+    #   getloadavg per [[paprika-fleet-lxc-on-proxmox]]), so it only carries
+    #   meaning divided by that host's core count -- same normalisation the
+    #   dispatcher ranks on (scheduler.py:_io_sat). 1.0 = one runnable task
+    #   per core; the 0.3 floor is reached at 2.0/core.
+    # fetch_load_ref: FALLBACK absolute load1 threshold, used only for a
+    #   worker that reports no nproc. Comparing a raw host load1 to a flat
+    #   number is what pinned 42% of the fleet at the health floor while it
+    #   idled at 18% CPU (2026-08-09) -- don't promote this back to primary.
     # fetch_mem_ref: mem_pct above which a worker contributes less. 75 keeps
     #   safe margin before Chrome/yt-dlp OOM territory (~85+).
-    "fetch_load_factor": (0.7, "float"),
-    "fetch_load_ref":    (24.0, "float"),
-    "fetch_mem_ref":     (75.0, "float"),
+    "fetch_load_factor":  (0.7, "float"),
+    "fetch_load_core_ref": (1.0, "float"),
+    "fetch_load_ref":     (24.0, "float"),
+    "fetch_mem_ref":      (75.0, "float"),
     # fetch_downloading_weight: how much a background video-download (yt-dlp;
     #   its Chrome lane is ALREADY released, but it keeps burning worker
     #   CPU/disk/net for minutes) counts toward accept-capacity. Occupancy =
@@ -522,6 +531,7 @@ def _env_default(key: str, fallback: Any) -> Any:
         "fetch_load_factor": ("PAPRIKA_FETCH_LOAD_FACTOR", "float"),
         "fetch_downloading_weight": ("PAPRIKA_FETCH_DOWNLOADING_WEIGHT", "float"),
         "worker_download_cap": ("PAPRIKA_WORKER_DOWNLOAD_CAP", "int"),
+        "fetch_load_core_ref": ("PAPRIKA_FETCH_LOAD_CORE_REF", "float"),
         "fetch_load_ref":    ("PAPRIKA_FETCH_LOAD_REF",    "float"),
         "fetch_mem_ref":     ("PAPRIKA_FETCH_MEM_REF",     "float"),
         # Reasoning judge: settings.json -> env vars -> static default.

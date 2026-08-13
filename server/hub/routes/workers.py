@@ -150,9 +150,12 @@ async def _compute_capacity() -> dict:
     # Settings tab and every hub picks the new value on its next
     # /workers/capacity call (no restart).
     #
-    # fetch_load_factor : global headroom on healthy_lanes (0.7 default)
-    # fetch_load_ref    : load1 threshold a worker is judged "saturated" at
-    # fetch_mem_ref     : mem_pct threshold a worker is judged "tight" at
+    # fetch_load_factor   : global headroom on healthy_lanes (0.7 default)
+    # fetch_load_core_ref : load-PER-CORE a worker is judged "saturated" at.
+    #                       The primary load axis; see _health() below.
+    # fetch_load_ref      : absolute load1 threshold, fallback for a worker
+    #                       that doesn't report nproc (pre-2026-07 agent)
+    # fetch_mem_ref       : mem_pct threshold a worker is judged "tight" at
     #
     # load_factor stays clamped [0.05, 1.0] so a bad value in settings can
     # never accidentally take the fleet to 0% or push it above the hard cap.
@@ -168,6 +171,7 @@ async def _compute_capacity() -> dict:
 
     load_factor = max(0.05, min(_setting_f("fetch_load_factor", 0.7), 1.0))
     load_ref = max(1.0, _setting_f("fetch_load_ref", 24.0))
+    load_core_ref = max(0.1, _setting_f("fetch_load_core_ref", 1.0))
     mem_ref = max(1.0, min(_setting_f("fetch_mem_ref", 75.0), 99.0))
     MIN_HEALTH = 0.3  # floor so a sweltering fleet still recommends *something*
 
@@ -176,7 +180,8 @@ async def _compute_capacity() -> dict:
             "max_concurrent": 0, "recommended_concurrency": 0, "available": 0,
             "running": 0, "utilization_pct": 0,
             "load_factor": load_factor,
-            "load_ref": load_ref, "mem_ref": mem_ref,
+            "load_ref": load_ref, "load_core_ref": load_core_ref,
+            "mem_ref": mem_ref,
             "healthy_lanes": 0, "queue_health": 1.0,
             "lanes": {"total": 0, "busy": 0, "free": 0},
             "workers": {"eligible": 0, "active": 0, "alive": 0},
@@ -210,12 +215,31 @@ async def _compute_capacity() -> dict:
     # the container per [[paprika-fleet-lxc-on-proxmox]], so a host carrying
     # too many busy CTs makes ALL its workers contribute less. Worker missing
     # a metric (None) is treated as healthy for that axis (idle assumption).
+    #
+    # The load axis normalises by ``nproc`` -- load1 is a HOST number, so it
+    # only means anything divided by that host's core count. This is the same
+    # ``io_sat = load1 / nproc`` the dispatcher already ranks on
+    # (scheduler.py:_io_sat); capacity was the one consumer still comparing
+    # the raw value against a flat threshold. On the 128-thread nodes that
+    # read load1 ~70 (= 0.55/core, 18% CPU, zero PSI) the flat ref=24 pinned
+    # 64 of 151 workers -- 88 lanes, 42% of the fleet -- at MIN_HEALTH, so
+    # admission answered accept_new=false with 120-190 lanes actually idle
+    # and the whole crawl pipeline throttled to ~250 jobs/min (2026-08-09).
+    #
+    # ``fetch_load_ref`` survives as the fallback for a worker that reports
+    # no nproc; it is NOT a second gate on top of the per-core one, or an
+    # old agent mid-rolling-update would get judged twice.
     def _health(w) -> float:
         load1 = w.get("load1")
+        nproc = w.get("nproc")
         mem_pct = w.get("mem_pct")
         load_h = 1.0
         if isinstance(load1, (int, float)) and load1 > 0:
-            load_h = 1.0 - max(0.0, float(load1) - load_ref) / load_ref
+            if isinstance(nproc, (int, float)) and nproc and nproc > 0:
+                sat = float(load1) / float(nproc)
+                load_h = 1.0 - max(0.0, sat - load_core_ref) / load_core_ref
+            else:
+                load_h = 1.0 - max(0.0, float(load1) - load_ref) / load_ref
         mem_h = 1.0
         if isinstance(mem_pct, (int, float)) and mem_pct > 0:
             mem_h = 1.0 - max(0.0, float(mem_pct) - mem_ref) / max(1.0, 100.0 - mem_ref)
@@ -275,6 +299,15 @@ async def _compute_capacity() -> dict:
         "accept_new": accept_new,
         "load_factor": load_factor,
         "load_ref": load_ref,
+        "load_core_ref": load_core_ref,
+        # How many eligible workers took the per-core path vs the legacy
+        # absolute-load1 fallback. A non-zero fallback count on a fully
+        # updated fleet means nproc stopped arriving (heartbeat field or its
+        # Redis mirror) and the load axis is silently back to the flat ref.
+        "load_axis": {
+            "per_core": sum(1 for w in eligible if (w.get("nproc") or 0) > 0),
+            "fallback_abs": sum(1 for w in eligible if not (w.get("nproc") or 0)),
+        },
         "mem_ref": mem_ref,
         "healthy_lanes": round(healthy_lanes, 1),
         "queue_health": round(queue_health, 2),
