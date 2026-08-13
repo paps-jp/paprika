@@ -42,6 +42,54 @@ _STREAM_INF_RE = re.compile(r"^#EXT-X-STREAM-INF:[^\n]*\n([^\s#][^\n]*)", re.M)
 _KEY_RE = re.compile(r"^#EXT-X-KEY:([^\n]*)", re.M)
 _ENDLIST_RE = re.compile(r"^#EXT-X-ENDLIST", re.M)
 
+#: Hard ceiling on how much of a "manifest" we will ever hold in memory.
+#: An .m3u8 with thousands of segments is ~100-200KB, so this is generous.
+_MAX_MANIFEST_BYTES = 512 * 1024
+
+
+async def _get_bounded(client, url, *, headers, timeout_s, max_bytes):
+    """GET *url*, never materialising more than *max_bytes* of the body.
+
+    ``max_bytes=0`` means status-only: the connection is opened and closed
+    without reading the body at all.
+
+    Why this exists (2026-08-14, garage): every fetch here used a plain
+    ``client.get()``, which reads the WHOLE response into memory, and the
+    manifest path then called ``r.text`` on top -- so a single response was
+    held twice, once as bytes and once as a decoded str. The module's
+    assumption is that these URLs are small text manifests, but
+    ``spawn_probes`` feeds it whatever stream-ish URLs a page yielded, and a
+    direct .mp4 among them is a 25MB response. Measured with the memtrace
+    leak profiler on two workers mid-burst::
+
+        +149.5MB (blocks +6)  httpx/_models.py:649  <- video_probe.py:120
+        +39.5MB  (blocks +3)  httpx/_models.py:979  <- video_probe.py:118
+
+    i.e. ~25MB per response, and the two workers where video_probe appeared
+    at all were exactly the two growing at 53 and 150 MB/min, against 11-18MB
+    per 90s on workers where it did not. Probes are fire-and-forget
+    (one task per target), so several of those overlap.
+
+    The ``Range: bytes=0-1`` on the segment fetch was already the right idea,
+    but a server is free to ignore Range and answer 200 with the whole file --
+    the ceiling has to be enforced on our side, not requested politely.
+    """
+    async with client.stream(
+        "GET", url, headers=headers, timeout=timeout_s
+    ) as r:
+        status = int(getattr(r, "status_code", 0) or 0)
+        if max_bytes <= 0:
+            # Leaving the context aborts the transfer; we never wanted the body.
+            return status, ""
+        buf = bytearray()
+        async for chunk in r.aiter_bytes():
+            buf.extend(chunk)
+            if len(buf) >= max_bytes:
+                break
+        # m3u8 is UTF-8 by spec; "replace" keeps a truncated multi-byte tail
+        # (or a binary body that was never a manifest) from raising.
+        return status, bytes(buf[:max_bytes]).decode("utf-8", "replace")
+
 # Fire-and-forget probe tasks, held until done so the loop doesn't GC them
 # mid-flight (and emit "Task was destroyed but it is pending" warnings).
 _inflight: set = set()
@@ -105,8 +153,10 @@ async def classify_stream(
         # DASH: skip the per-segment HLS parse; manifest reachability is the
         # signal (a minority of targets; keeps the probe simple + cheap).
         if base.endswith(".mpd"):
-            r = await client.get(manifest_url, headers=hdrs, timeout=timeout_s)
-            sc = int(getattr(r, "status_code", 0) or 0)
+            # Status only -- the DASH path never parses the body.
+            sc, _ = await _get_bounded(
+                client, manifest_url, headers=hdrs, timeout_s=timeout_s, max_bytes=0,
+            )
             out["manifest_status"] = sc
             out["verdict"] = (
                 "decouplable" if 200 <= sc < 300
@@ -115,9 +165,10 @@ async def classify_stream(
             )
             return out
 
-        r = await client.get(manifest_url, headers=hdrs, timeout=timeout_s)
-        out["manifest_status"] = int(getattr(r, "status_code", 0) or 0)
-        body = r.text or ""
+        out["manifest_status"], body = await _get_bounded(
+            client, manifest_url, headers=hdrs, timeout_s=timeout_s,
+            max_bytes=_MAX_MANIFEST_BYTES,
+        )
         if not (200 <= out["manifest_status"] < 300) or not body:
             out["verdict"] = (
                 "gated" if out["manifest_status"] in (401, 403) else "error"
@@ -130,9 +181,12 @@ async def classify_stream(
         mv = _STREAM_INF_RE.search(body)
         if mv:
             variant = urljoin(manifest_url, mv.group(1).strip())
-            rv = await client.get(variant, headers=hdrs, timeout=timeout_s)
-            if 200 <= int(getattr(rv, "status_code", 0) or 0) < 300 and (rv.text or ""):
-                media_url, media_body = variant, rv.text
+            sc_v, body_v = await _get_bounded(
+                client, variant, headers=hdrs, timeout_s=timeout_s,
+                max_bytes=_MAX_MANIFEST_BYTES,
+            )
+            if 200 <= sc_v < 300 and body_v:
+                media_url, media_body = variant, body_v
                 out["is_live"] = _ENDLIST_RE.search(media_body) is None
                 if _TOKEN_HINT_RE.search(variant):
                     out["token_hint"] = True
@@ -161,18 +215,18 @@ async def classify_stream(
         # the status code, not the bytes, so a Range keeps it feather-light.
         if key_uri:
             try:
-                rk = await client.get(
-                    urljoin(media_url, key_uri), headers=hdrs, timeout=timeout_s,
+                out["key_status"], _ = await _get_bounded(
+                    client, urljoin(media_url, key_uri), headers=hdrs,
+                    timeout_s=timeout_s, max_bytes=0,
                 )
-                out["key_status"] = int(getattr(rk, "status_code", 0) or 0)
             except Exception:
                 out["key_status"] = 0
         if seg:
             try:
-                rs = await client.get(
-                    seg, headers={**hdrs, "Range": "bytes=0-1"}, timeout=timeout_s,
+                out["segment_status"], _ = await _get_bounded(
+                    client, seg, headers={**hdrs, "Range": "bytes=0-1"},
+                    timeout_s=timeout_s, max_bytes=0,
                 )
-                out["segment_status"] = int(getattr(rs, "status_code", 0) or 0)
             except Exception:
                 out["segment_status"] = 0
 
