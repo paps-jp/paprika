@@ -208,7 +208,7 @@ async def install_last_response_tracker(
     tab,
     on_response_captured,
     log: LogFn | None = None,
-) -> None:
+) -> "Callable[[], None] | None":
     """Passive tracker that keeps ``state.last_response`` current.
 
     Hooks Network.requestWillBeSent + Network.responseReceived for the
@@ -229,12 +229,27 @@ async def install_last_response_tracker(
         dict each time a new top-level document response is observed.
         The agent wires this to ``state.last_response = info``.
       log: optional logger for diagnostics.
+
+    Returns:
+      A callable that removes this tracker's handlers, or None when the
+      tab exposes no handler surface. Calling it is optional -- installing
+      again on the same tab removes the previous tracker first -- but an
+      explicit teardown at session end drops the pinned SessionState
+      immediately instead of at the next session's install.
     """
     # Mirrors _capture_nav_response's logic but runs unconditionally
     # for the session's lifetime. The first request after install
     # might not be a navigation -- a page already has resources in
     # flight at install time -- so we don't seed an initial value.
+    #
+    # Bounded: an entry is dropped only when the matching
+    # responseReceived arrives, and a document request can simply never
+    # get one -- an aborted navigation, a tab closed mid-load, a request
+    # the network layer blocked. Those entries would otherwise sit here
+    # for the whole session. Only the newest ones can still be matched,
+    # so evicting the oldest costs nothing.
     pending_docs: dict[str, str] = {}   # request_id -> request url
+    _PENDING_CAP = 256
 
     def _request_url(event) -> str:
         req = getattr(event, "request", None)
@@ -256,6 +271,8 @@ async def install_last_response_tracker(
             if not _is_doc(event):
                 return
             pending_docs[str(event.request_id)] = _request_url(event)
+            while len(pending_docs) > _PENDING_CAP:
+                pending_docs.pop(next(iter(pending_docs)), None)
         except Exception:
             pass
 
@@ -298,11 +315,48 @@ async def install_last_response_tracker(
     if handlers is None:
         if log:
             log("  [last-response] tab has no .handlers; tracker disabled")
-        return
+        return None
+
+    def _uninstall() -> None:
+        for evt, fn in (
+            (cdp.network.RequestWillBeSent, _on_request),
+            (cdp.network.ResponseReceived, _on_response),
+        ):
+            try:
+                handlers.get(evt, []).remove(fn)
+            except (ValueError, AttributeError):
+                pass
+
+    # Replace, don't stack. A session takes its lane's EXISTING tab
+    # (``chrome.get(..., new_tab=False)`` in _mix_sessions), so the tab --
+    # and its handler lists -- outlive every session that ran on that lane.
+    # Appending unconditionally meant session N left N-1 dead trackers behind,
+    # each one still called for every network event and each one pinning its
+    # own pending_docs plus, through on_response_captured, the whole
+    # SessionState of a session that ended long ago.
+    #
+    # Self-healing rather than caller-enforced: the previous tracker is removed
+    # here, so a caller that forgets to invoke the returned uninstall (or that
+    # dies before it can) still cannot stack a second one.
+    prev = getattr(tab, "_paprika_last_response_uninstall", None)
+    if callable(prev):
+        try:
+            prev()
+        except Exception:
+            pass
     handlers.setdefault(cdp.network.RequestWillBeSent, []).append(_on_request)
     handlers.setdefault(cdp.network.ResponseReceived, []).append(_on_response)
+    try:
+        tab._paprika_last_response_uninstall = _uninstall
+    except Exception:
+        pass  # exotic tab object -- the replace is best-effort, the hook still works
     if log:
-        log("  [last-response] tracker installed")
+        log(
+            f"  [last-response] tracker installed "
+            f"(listeners now req={len(handlers.get(cdp.network.RequestWillBeSent, []))} "
+            f"resp={len(handlers.get(cdp.network.ResponseReceived, []))})"
+        )
+    return _uninstall
 
 
 async def execute_nav_with_response(
