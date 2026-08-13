@@ -7,6 +7,7 @@ from __future__ import annotations
 import asyncio
 import functools
 import json
+import math
 import os
 import random
 import shutil
@@ -16,6 +17,7 @@ import string
 import sys
 import tempfile
 import time
+from collections import deque
 from pathlib import Path
 from typing import Any, Optional
 from urllib.parse import urlsplit, urlunsplit
@@ -1067,6 +1069,12 @@ class _RunMixin:
     # order of 1000 pages/s per CT, so 500 trips before it is that bad.
     _MEMGUARD_REFAULT_PER_S = 500.0
     _MEMGUARD_SUSTAIN_S = 300.0     # must hold this long -- no spike recycles
+    # Fraction of the sustain window that must be breaching to trip. Below 1.0
+    # deliberately: see the sliding-window note in _memory_guard_loop. 0.6 of a
+    # 10-14 sample window is 6-9 breaching samples, so a lone spike (1-2) still
+    # cannot recycle a worker, but the dips that made the old unbroken-run rule
+    # unsatisfiable no longer throw the window away.
+    _MEMGUARD_WINDOW_FRAC = 0.6
     _MEMGUARD_INTERVAL_S = 30.0
     _MEMGUARD_DRAIN_DEADLINE_S = 900.0
     _MEMGUARD_JITTER_S = 120.0
@@ -1165,6 +1173,10 @@ class _RunMixin:
         in-flight jobs of a thrashing worker is strictly better than the hub
         waiting on a box that has stopped making progress -- the jobs are
         requeued by the redrive path either way.
+
+        "Sustained" is measured as *most of* a fixed window rather than *all
+        of* an unbroken run -- see the window_n/need_n note below for the
+        measurement that forced that change.
         """
         from server.worker import cgroup_mem
 
@@ -1185,9 +1197,37 @@ class _RunMixin:
             0.0, max(0.0, _num_env("PAPRIKA_MEMGUARD_JITTER_S", self._MEMGUARD_JITTER_S))
         )
 
+        # Sliding-window hysteresis. The rule used to be an UNBROKEN run of
+        # breaching samples for sustain_s+jitter_s, with the clock reset by any
+        # single clear sample. Measured on garage (10.10.50.46) 2026-08-13,
+        # across that node's 39 worker CTs: 109 breaches logged (anon median
+        # 6194MB, max 9938MB), 109 stand-downs, only 10 trips -- while the
+        # kernel OOM-killed those same CTs 86 times in the same window. anon
+        # oscillates around the threshold as Chrome lanes recycle and
+        # yt-dlp/ffmpeg children come and go, so one dip anywhere in the 10-14
+        # sample run threw the whole window away; several stand-downs landed
+        # 30-60s after the warning that started them. Counting breaches over a
+        # FIXED-LENGTH window survives those dips while still ignoring a lone
+        # spike -- the same shape as the fix for the worker self-check flap.
+        window_n = max(2, math.ceil((sustain_s + jitter_s) / max(interval, 1.0)))
+        need_n = max(
+            1,
+            min(
+                window_n,
+                math.ceil(
+                    window_n
+                    * _num_env(
+                        "PAPRIKA_MEMGUARD_WINDOW_FRAC", self._MEMGUARD_WINDOW_FRAC
+                    )
+                ),
+            ),
+        )
+        window: deque[bool] = deque(maxlen=window_n)
+
         prev = None
         prev_m = 0.0
-        breach_since = 0.0
+        warned = False
+        last_reasons: list[str] = []
         while True:
             time.sleep(interval)
             try:
@@ -1198,34 +1238,56 @@ class _RunMixin:
                 dt = now_m - prev_m if prev is not None else 0.0
                 reasons = self._memguard_breaches(prev, cur, dt)
                 prev, prev_m = cur, now_m
+                window.append(bool(reasons))
+                if reasons:
+                    last_reasons = reasons
+                hits = sum(window)
 
-                if not reasons:
-                    if breach_since:
-                        _logger.info(
-                            f"[worker {self.worker_id}] memory guard: "
-                            f"pressure cleared before the "
-                            f"{sustain_s:.0f}s window elapsed -- standing down"
-                        )
-                    breach_since = 0.0
-                    continue
+                # Force-exit deadline, evaluated on EVERY iteration once we have
+                # tripped. The old code reached this check only while the breach
+                # was still live, so a single clear sample after the trip
+                # disarmed the deadline and a drain that never completes could
+                # hang indefinitely -- the exact case the deadline exists for.
+                if (
+                    deadline_s > 0
+                    and self._memguard_drain_m
+                    and now_m - self._memguard_drain_m >= deadline_s
+                ):
+                    _logger.critical(
+                        f"[worker {self.worker_id}] memory guard: drain did not "
+                        f"complete within {deadline_s:.0f}s ({self._in_flight} "
+                        f"in-flight) -- force-exiting now (docker will restart)"
+                    )
+                    os._exit(0)
 
-                if not breach_since:
-                    breach_since = now_m
+                if reasons and not warned:
+                    warned = True
                     _logger.warning(
                         f"[worker {self.worker_id}] memory guard: "
-                        f"{'; '.join(reasons)} -- watching for "
-                        f"{sustain_s:.0f}s before draining "
+                        f"{'; '.join(reasons)} -- breaching {hits} of the last "
+                        f"{window_n} samples, drains at {need_n}/{window_n} "
                         f"({cgroup_mem.status_line(cur)})"
                     )
-                    continue
-                if now_m - breach_since < sustain_s + jitter_s:
+                elif warned and hits == 0:
+                    warned = False
+                    _logger.info(
+                        f"[worker {self.worker_id}] memory guard: pressure "
+                        f"cleared (no breach in the last {window_n} samples) "
+                        f"-- standing down"
+                    )
+
+                if hits < need_n:
                     continue
 
                 # Sustained. Trip -- unless something else already drained us
                 # (a rolling self-update): stealing that drain would let our
                 # deadline force-exit a worker mid-update.
                 if not self._draining:
-                    self._memguard_reason = "; ".join(reasons)
+                    # last_reasons, not reasons: the window can reach need_n on
+                    # an iteration whose own sample happens to be a dip, and an
+                    # empty reason string would strip the WHY out of both the
+                    # log line and the heartbeat the operator reads.
+                    self._memguard_reason = "; ".join(last_reasons)
                     self._memguard_at = time.time()
                     self._memguard_drain_m = now_m
                     self._draining = True
@@ -1241,17 +1303,6 @@ class _RunMixin:
                         loop.call_soon_threadsafe(self._heartbeat_kick.set)
                     except Exception:
                         pass
-                if (
-                    deadline_s > 0
-                    and self._memguard_drain_m
-                    and now_m - self._memguard_drain_m >= deadline_s
-                ):
-                    _logger.critical(
-                        f"[worker {self.worker_id}] memory guard: drain did not "
-                        f"complete within {deadline_s:.0f}s ({self._in_flight} "
-                        f"in-flight) -- force-exiting now (docker will restart)"
-                    )
-                    os._exit(0)
             except Exception:
                 # A guard that crashes is worse than one that misses a cycle.
                 _logger.debug("memory guard iteration failed", exc_info=True)
