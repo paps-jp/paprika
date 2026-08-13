@@ -1178,7 +1178,7 @@ class _RunMixin:
         of* an unbroken run -- see the window_n/need_n note below for the
         measurement that forced that change.
         """
-        from server.worker import cgroup_mem
+        from server.worker import cgroup_mem, memtrace
 
         interval = _num_env(
             "PAPRIKA_MEMGUARD_INTERVAL_S", self._MEMGUARD_INTERVAL_S
@@ -1260,6 +1260,17 @@ class _RunMixin:
                     )
                     os._exit(0)
 
+                # Leak attribution. The first breach is the cheapest moment to
+                # start tracing that is still early enough to be useful: the
+                # leak grows continuously (35-80MB/min measured), so a bounded
+                # window from here attributes far more than the noise floor,
+                # and a worker that never breaches never pays the cost. Armed
+                # only when the operator has asked for it -- see memtrace.
+                if reasons:
+                    memtrace.arm(self.worker_id)
+                if memtrace.due():
+                    memtrace.report(self.worker_id)
+
                 if reasons and not warned:
                     warned = True
                     _logger.warning(
@@ -1303,6 +1314,10 @@ class _RunMixin:
                         loop.call_soon_threadsafe(self._heartbeat_kick.set)
                     except Exception:
                         pass
+                    # Flush the leak report before the drain exits the process:
+                    # a fast leaker (380MB/min was measured) trips well inside
+                    # the trace window, and an unflushed trace is a wasted run.
+                    memtrace.report(self.worker_id)
             except Exception:
                 # A guard that crashes is worse than one that misses a cycle.
                 _logger.debug("memory guard iteration failed", exc_info=True)
