@@ -64,6 +64,50 @@ def _truthy(v: str | None) -> bool:
     return (v or "").strip().lower() in ("1", "true", "yes", "on")
 
 
+def _knob_text() -> str | None:
+    """Contents of the knob file, or None when it is absent/unreadable.
+
+    None means "not armed via the file" -- distinct from "" (armed, defaults),
+    which is what ``touch`` produces.
+    """
+    try:
+        from server.worker import scratch_pool
+        pool = scratch_pool.pool_dir()
+        if pool is None:
+            return None
+        return (pool / KNOB_NAME).read_text(encoding="utf-8")
+    except OSError:
+        return None
+    except Exception:
+        return None
+
+
+def _knob(key: str) -> str | None:
+    """One ``key=value`` setting from the knob file.
+
+    The file is whitespace-separated ``key=value`` tokens, so the first round of
+    tracing is ``touch .memtrace`` and the follow-up that needs call chains is::
+
+        echo 'frames=5 window=90' > /ram/pdl/.memtrace
+
+    Retuning has to work without a restart for the same reason arming does: the
+    env vars are baked into the container at create time, and the first report
+    is exactly what tells you the second run needs deeper frames. Restarting to
+    change that would reset the very anon growth being measured.
+
+    Unparseable tokens are ignored rather than fatal -- a typo in a knob must
+    degrade to the default, never crash the guard thread that reads it.
+    """
+    raw = _knob_text()
+    if not raw:
+        return None
+    for tok in raw.split():
+        k, sep, v = tok.partition("=")
+        if sep and k.strip() == key:
+            return v.strip()
+    return None
+
+
 def enabled() -> bool:
     """True when the operator has armed leak tracing.
 
@@ -73,33 +117,43 @@ def enabled() -> bool:
     """
     if _truthy(os.environ.get("PAPRIKA_MEMTRACE")):
         return True
-    try:
-        from server.worker import scratch_pool
-        pool = scratch_pool.pool_dir()
-        if pool is None:
-            return False
-        return (pool / KNOB_NAME).exists()
-    except Exception:
-        return False
+    return _knob_text() is not None
+
+
+def _tunable(knob_key: str, env_key: str, default: float, lo: float, hi: float) -> float:
+    """Knob file > env > default, clamped. Never raises."""
+    for raw in (_knob(knob_key), os.environ.get(env_key)):
+        if raw is None or not str(raw).strip():
+            continue
+        try:
+            return max(lo, min(hi, float(raw)))
+        except (TypeError, ValueError):
+            continue
+    return default
 
 
 def window_s() -> float:
     """How long to trace before reporting and stopping. Bounded on purpose:
-    the trace table itself costs memory in a CT that is already short of it."""
-    try:
-        return max(30.0, float(os.environ.get("PAPRIKA_MEMTRACE_WINDOW_S") or 120.0))
-    except (TypeError, ValueError):
-        return 120.0
+    the trace table itself costs memory in a CT that is already short of it.
+
+    Worth shortening when the leak bursts: a worker that goes from the 5500MB
+    arm point to its 12GB cap in ~6 minutes can be killed -- by the kernel OOM
+    killer or by the self-check's ``os._exit`` -- before a long window reports,
+    and a report that never prints is a wasted run.
+    """
+    return _tunable("window", "PAPRIKA_MEMTRACE_WINDOW_S", 120.0, 30.0, 900.0)
 
 
 def _nframes() -> int:
-    """Frames kept per allocation. 1 by default -- the file:line of the
-    allocation is what identifies the leak, and each extra frame multiplies the
-    trace table's own footprint."""
-    try:
-        return max(1, min(10, int(os.environ.get("PAPRIKA_MEMTRACE_FRAMES") or 1)))
-    except (TypeError, ValueError):
-        return 1
+    """Frames kept per allocation.
+
+    1 by default: the file:line of the allocation is the cheapest useful answer
+    and each extra frame multiplies the trace table's own footprint. Raise it
+    when the top growers are generic sites (``json/decoder.py``,
+    ``httpx/_models.py``) that say WHERE bytes were allocated but not WHO keeps
+    them alive -- the call chain is what names the retainer.
+    """
+    return int(_tunable("frames", "PAPRIKA_MEMTRACE_FRAMES", 1.0, 1.0, 10.0))
 
 
 def arm(worker_id: str) -> bool:
@@ -147,18 +201,41 @@ def report(worker_id: str, limit: int = 20) -> None:
         return
     elapsed = time.monotonic() - _armed_at
     try:
+        # "traceback" groups by the whole call chain, "lineno" by the allocation
+        # site alone. With one frame they are the same thing; with more, only
+        # the former separates "json.loads called from the CDP reader" from
+        # "json.loads called from the asset uploader" -- which is the entire
+        # reason for asking for more frames.
+        key = "traceback" if _nframes() > 1 else "lineno"
         snap = tracemalloc.take_snapshot()
-        stats = snap.compare_to(_baseline, "lineno") if _baseline else snap.statistics("lineno")
+        stats = snap.compare_to(_baseline, key) if _baseline else snap.statistics(key)
         grew = [s for s in stats if getattr(s, "size_diff", s.size) > 0][:limit]
         total = sum(getattr(s, "size_diff", s.size) for s in stats)
-        lines = [
-            f"  {getattr(s, 'size_diff', s.size) / _MB:+9.1f}MB  "
-            f"(blocks {getattr(s, 'count_diff', s.count):+8d})  {s.traceback[0]}"
-            for s in grew
-        ]
+        lines = []
+        for s in grew:
+            # tracemalloc sorts a Traceback OLDEST-first since 3.7, so the
+            # allocation site is traceback[-1] and traceback[0] is the outermost
+            # frame (usually the event loop, identical for everything and
+            # useless). Verified on 3.13.7. With nframes=1 only the most recent
+            # frame is kept, which is why a one-frame report reads correctly off
+            # traceback[0] and a deep one silently reads INVERTED -- print the
+            # site explicitly rather than relying on the single-frame accident.
+            tb = s.traceback
+            head = (
+                f"  {getattr(s, 'size_diff', s.size) / _MB:+9.1f}MB  "
+                f"(blocks {getattr(s, 'count_diff', s.count):+8d})  {tb[-1]}"
+            )
+            # Callers, innermost first, indented under the allocation site. The
+            # retainer is usually 2-3 frames up: the site is a library, the
+            # keeper is ours.
+            callers = [
+                f"                                  <- {f}" for f in reversed(tb[:-1])
+            ]
+            lines.append("\n".join([head, *callers]))
         log.warning(
-            "[memtrace] %s window %.0fs: %+.1fMB traced growth, top %d growers:\n%s",
-            worker_id, elapsed, total / _MB, len(lines), "\n".join(lines),
+            "[memtrace] %s window %.0fs (%d frame(s)): %+.1fMB traced growth, "
+            "top %d growers:\n%s",
+            worker_id, elapsed, _nframes(), total / _MB, len(lines), "\n".join(lines),
         )
     except Exception:
         log.debug("[memtrace] report failed", exc_info=True)
