@@ -465,6 +465,7 @@ class MariaDBJobStore:
         status: list[str] | None = None,
         mode: list[str] | None = None,
         url_substr: str | None = None,
+        url_exact: str | None = None,
         owner_id: str | None = None,
     ) -> tuple[list[Any], int]:
         """Return (infos, total_matching) in a single hydration query.
@@ -487,7 +488,18 @@ class MariaDBJobStore:
             placeholders = ",".join(["%s"] * len(mode))
             clauses.append(f"mode IN ({placeholders})")
             params.extend(m.lower() for m in mode)
-        if url_substr:
+        if url_exact:
+            # Equality, so ``idx_url_prefix`` can serve it as a point lookup.
+            # Callers that want "is THIS url already active" must use this and
+            # not url_substr: passing a whole URL to a leading-wildcard LIKE
+            # forces a scan and only differs by also matching rows that
+            # CONTAIN the url -- which such callers then filter out anyway.
+            # Measured on prod (1.63M rows, 2026-08-15):
+            #   LIKE  -> type=range key=idx_status_created rows≈35,747
+            #   =     -> type=ref   key=idx_url_prefix     rows=1
+            clauses.append("url = %s")
+            params.append(url_exact)
+        elif url_substr:
             clauses.append("url LIKE %s")
             params.append(f"%{url_substr}%")
         if owner_id:
