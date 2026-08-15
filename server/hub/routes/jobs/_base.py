@@ -814,12 +814,94 @@ def _spawn_queued_timeout_guard(job_id: str) -> None:
         pass  # no running loop (shouldn't happen in request context)
 
 
+# Stale-while-revalidate cache for the peer-capacity lookup below.
+# ``None`` means "never computed" (cold start); otherwise (expires_at, peer).
+_PEER_CAP_TTL_S = float(os.environ.get("PAPRIKA_PEER_CAPACITY_TTL_S") or 2.0)
+_peer_cap_cache: tuple[float, str | None] | None = None
+_peer_cap_lock = asyncio.Lock()
+_peer_cap_refresh: "asyncio.Task | None" = None
+
+
+def _spawn_peer_cap_refresh() -> None:
+    """Kick off a background refresh unless one is already running."""
+    global _peer_cap_refresh
+    t = _peer_cap_refresh
+    if t is not None and not t.done():
+        return
+    try:
+        _peer_cap_refresh = asyncio.create_task(_refresh_peer_cap())
+    except RuntimeError:
+        pass  # no running loop
+
+
+async def _refresh_peer_cap() -> None:
+    global _peer_cap_cache
+    try:
+        out = await _compute_peer_hub_with_spare_capacity()
+    except Exception:
+        # Keep serving the last good answer, but push the expiry out so a
+        # persistently failing aggregation doesn't respawn on every submit.
+        if _peer_cap_cache is not None:
+            _peer_cap_cache = (
+                time.monotonic() + _PEER_CAP_TTL_S, _peer_cap_cache[1]
+            )
+        return
+    _peer_cap_cache = (time.monotonic() + _PEER_CAP_TTL_S, out)
+
+
 async def _peer_hub_with_spare_capacity() -> str | None:
     """P1 cross-hub dispatch: return the peer hub_id (not us) with the MOST
     spare active-worker lane capacity per the shared cross-hub worker view,
     or None if no peer has a free lane. Job dispatch is otherwise per-hub, so
     a hub whose LOCAL workers are full 503s even while peers sit idle; this
-    lets it forward the job to an idle peer instead."""
+    lets it forward the job to an idle peer instead.
+
+    Cached, because the underlying ``stats_async()`` is a cross-hub Redis
+    aggregation costing ~1.5s (p50, measured) and a locally-full hub calls
+    this TWICE per submit: once in ``_fleet_has_spare_capacity`` (the
+    admission gate) and again in ``_forward_to_peer_hub`` (the dispatch).
+    That was ~3s of a 3.58s p50 -- 79% of all measured POST /jobs time on
+    2026-08-14 -- to compute the same answer twice.
+
+    STALE-WHILE-REVALIDATE, not a plain TTL. The first attempt used a 1s TTL
+    with a single-flight lock and only got ``capacity`` from 1504ms to
+    1309ms, because a TTL SHORTER than the 1.5s computation leaves no window
+    where the entry is actually fresh: every caller either ran the
+    aggregation or blocked on the lock waiting for someone else's. Converting
+    "N parallel 1.5s calls" into "N callers waiting 1.5s" does not shorten
+    any single request. (The second call in the same request did halve --
+    1874ms to 900ms -- which is exactly the signature of that bug.)
+
+    So: serve whatever we have IMMEDIATELY, even if stale, and refresh
+    behind the response. Only a genuinely cold cache blocks a caller.
+
+    Staleness is fine for what this returns: a coarse routing hint ("which
+    peer has a lane"), at most ~TTL + one aggregation old. If the chosen peer
+    filled up meanwhile it simply 503s and the caller falls back to local
+    dispatch -- the same path a stale-by-milliseconds answer would take.
+
+    Negative results are cached too: when the whole fleet is full, that is
+    exactly when we least want every submit re-running the aggregation.
+    """
+    global _peer_cap_cache
+    cached = _peer_cap_cache
+    if cached is not None:
+        expires, value = cached
+        if time.monotonic() >= expires:
+            _spawn_peer_cap_refresh()   # refresh behind the response
+        return value
+    # Cold start only: nothing to serve, so this caller waits. The lock keeps
+    # the concurrent submits behind it from each starting their own run.
+    async with _peer_cap_lock:
+        if _peer_cap_cache is not None:
+            return _peer_cap_cache[1]
+        out = await _compute_peer_hub_with_spare_capacity()
+        _peer_cap_cache = (time.monotonic() + _PEER_CAP_TTL_S, out)
+        return out
+
+
+async def _compute_peer_hub_with_spare_capacity() -> str | None:
+    """Uncached form -- the cross-hub aggregation itself."""
     if state.registry is None or state.hubs is None:
         return None
     me = state.hubs.hub_id or ""
