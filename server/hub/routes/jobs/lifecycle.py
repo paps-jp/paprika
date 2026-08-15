@@ -735,6 +735,14 @@ async def cancel_job(job_id: str, request: Request) -> dict:
 
     Idempotent: cancelling an already-finished job is a no-op
     returning ``{cancelled: false}``."""
+    # Drop the id from the pull list if it is still waiting there. Without
+    # this a worker pops a job that no longer exists, the claim 404s, and the
+    # lane bounces for nothing.
+    try:
+        await _pull_queue.remove(job_id)
+    except Exception:
+        pass
+
     info = await _require_owned_job_info(job_id, request)
     if info.status not in IN_FLIGHT_STATUSES:
         return {
@@ -921,6 +929,14 @@ async def delete_job(job_id: str, request: Request) -> dict:
     t = state.local_tasks.pop(job_id, None)
     if t and not t.done():
         t.cancel()
+    # Drop the id from the pull list if it is still waiting there. Without
+    # this a worker pops a job that no longer exists, the claim 404s, and the
+    # lane bounces for nothing.
+    try:
+        await _pull_queue.remove(job_id)
+    except Exception:
+        pass
+
     # Purge the durable MinIO/S3 prefix BEFORE dropping the row. The local
     # dir + jobs row are caches over the bucket; without this the row vanished
     # but the bucket kept the bytes (orphan). POST /jobs/cleanup and

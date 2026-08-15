@@ -296,6 +296,28 @@ async def _redrive_dispatch_one(info) -> bool:
     mode = (info.options.mode if info.options else None) or "fetch"
     if mode in ("codegen-loop", "rerun"):
         return False  # hub-orchestrated -> redispatch_orphan_job's domain
+
+    # Under pull dispatch this hub does not choose a worker -- it puts the id
+    # back on the list for whichever worker has a lane free. That covers the
+    # one window pull adds: BLPOP is a hard pop, so a worker that dies between
+    # popping and claiming takes the id with it while the row stays queued.
+    # This loop is what notices.
+    #
+    # remove-then-push keeps it idempotent: a job that is still sitting in the
+    # list (queued but simply not popped yet) must not accumulate a copy every
+    # pass, or one worker death would leave the same URL crawled twice.
+    from server.hub import _pull_queue
+    if _pull_queue.ENABLED:
+        try:
+            await _pull_queue.remove(info.job_id)
+            if await _pull_queue.push(info.job_id):
+                log.info("redrive: re-queued %s onto the pull list", info.job_id)
+                return True
+        except Exception:
+            log.warning(
+                "redrive: pull re-queue failed for %s; falling back to inline "
+                "dispatch", info.job_id, exc_info=True,
+            )
     # Reserve a pending_assigns slot at pick time so a concurrent picker
     # during the await store.claim_queued_job DB round-trip below sees the
     # worker as full. EVERY non-assign exit path must release_pending_assign.
