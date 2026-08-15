@@ -1942,6 +1942,31 @@ async def worker_link(ws: WebSocket, worker_id: str):
                 ]
             except Exception:
                 orphan_job_ids = []
+        # The session registry is this hub's own memory, so it only lists jobs
+        # THIS hub dispatched. Ask the store as well -- it is authoritative and
+        # hub-independent, and it catches two cases the registry misses:
+        #
+        #   * a job whose eager session registration failed (the dispatch path
+        #     swallows that error and carries on with fetch_sid=None), and
+        #   * pull dispatch, where the hub that hands a worker its job is
+        #     whichever one answers the claim, NOT the hub holding its WS.
+        #     Without this the sweep finds nothing and recovery falls back to
+        #     the 300s _STALE_RUNNING_GRACE_S path instead of being immediate.
+        if state.store is not None:
+            try:
+                _rows, _ = await state.store.list_job_infos(
+                    status=[s.value for s in IN_FLIGHT_STATUSES], limit=500,
+                )
+                orphan_job_ids.extend(
+                    j.job_id for j in _rows
+                    if getattr(j, "worker_id", None) == worker_id and j.job_id
+                )
+            except Exception:
+                log.info(
+                    "worker %s disconnect: store lookup for in-flight jobs "
+                    "failed; falling back to the session registry only",
+                    worker_id, exc_info=True,
+                )
             dropped = state.sessions.drop_by_worker(worker_id)
             if dropped:
                 log.info(
