@@ -12,6 +12,7 @@ from fastapi import APIRouter, File, Form, HTTPException, Request, UploadFile
 from fastapi.responses import FileResponse, HTMLResponse, StreamingResponse
 from server.hub._state import config, get_storage_dir, state
 from server.hub import objstore
+from server.hub import _pull_queue
 from server.hub._helpers import _safe_job_file
 from server.hub.routes.novnc import _proxy_session_dict
 from server.hub.routes.sessions import (
@@ -1198,8 +1199,182 @@ async def _fleet_has_spare_capacity() -> bool:
     return False
 
 
+# --- POST /jobs stage timing (2026-08-14 throughput investigation) ---------
+# The crawl submitter saturates its 48 parallel POST slots at ~4.2 jobs/s while
+# the fleet sits at ~48% lane utilisation with zero queued jobs, so intake is
+# gated by how long POST /jobs takes. Sampling from outside kept pointing at the
+# wrong stage (the per-host role lookup, then the Cloudflare pre-flight -- both
+# real costs, neither the dominant one), and the per-request variance (13.2 /
+# 2.4 / 4.0 / 1.8s for identical work) says it isn't a fixed per-host cost at
+# all. So: measure the stages from the inside instead of inferring them.
+#
+# Cost when armed is a monotonic() read per stage (~50ns); when disarmed the
+# stopwatch is None and every probe is an `if _sw` on a null. Only requests
+# slower than the threshold log, so the steady state at ~220 jobs/min is quiet.
+#   PAPRIKA_JOB_TIMING=0        off
+#   PAPRIKA_JOB_TIMING_MIN_MS   log threshold, default 2000
+_JOB_TIMING = (os.environ.get("PAPRIKA_JOB_TIMING", "1") or "1").strip().lower() not in (
+    "0", "false", "no", "off",
+)
+_JOB_TIMING_MIN_S = float(os.environ.get("PAPRIKA_JOB_TIMING_MIN_MS") or 2000) / 1000.0
+
+
+async def _forward_to_peer_hub(request: Request, job_id: str, *, fetch_sid):
+    """Forward this POST /jobs to a peer hub with spare lanes, or None.
+
+    Returns the peer's response on success (the caller must return it
+    unchanged), or None when there is no peer with capacity / the hop
+    failed -- in which case the caller carries on dispatching locally.
+
+    Orphan handling is the important part. By the time dispatch runs we have
+    already persisted a `queued` row for ``job_id`` (save_job_info, well
+    above) and the peer issues its OWN job_id, so a forward that just
+    returned would leave our row queued forever. That row is not harmless:
+    the redrive reclaims stale queued rows and would re-dispatch it, giving
+    the same URL a second crawl while the peer is already doing the first.
+    So drop it before handing the work over. delete_job is row-level only
+    (jobs row + its log file); nothing has been written to MinIO yet because
+    the job never ran.
+
+    ``_FWD_MARK`` keeps this to one hop -- a forwarded request dispatches
+    locally on the peer or 503s, it never bounces onward.
+    """
+    if state.hubs is None or request.headers.get(_FWD_MARK_HDR()):
+        return None
+    try:
+        _peer = await _peer_hub_with_spare_capacity()
+    except Exception:
+        return None
+    if not _peer:
+        return None
+    from server.hub.routes.sessions import _proxy_request_to_hub
+    try:
+        _resp = await _proxy_request_to_hub(_peer, request, 60.0)
+    except Exception:
+        _resp = None
+    # 503 = peer also full. 409 = the peer deduped against a row it should have
+    # skipped (our own placeholder); never pass that back as if the job were
+    # placed, or we delete a perfectly good row and the caller drops the URL.
+    # Belt-and-braces: the peer skips dedup on forwarded requests, so a 409
+    # here should now be impossible -- if it happens, fall back to local
+    # dispatch rather than losing the work.
+    if _resp is None or getattr(_resp, "status_code", 503) in (409, 503):
+        return None  # peer full / unreachable / bounced -> keep trying locally
+    # The peer owns the work now; our placeholder row must not survive.
+    if fetch_sid and state.sessions is not None:
+        try:
+            state.sessions.remove(fetch_sid)
+        except Exception:
+            pass
+    try:
+        assert state.store is not None
+        await state.store.delete_job(job_id)
+    except Exception:
+        log.warning(
+            f"[hub] job {job_id}: forwarded to {_peer} but could not drop the "
+            f"local placeholder row; redrive may re-dispatch it",
+            exc_info=True,
+        )
+    log.info(
+        f"[hub] job {job_id}: no free local worker -> forwarded to "
+        f"peer hub {_peer} (cross-hub dispatch)"
+    )
+    return _resp
+
+
+def _FWD_MARK_HDR() -> str:
+    from server.hub.routes.sessions import _FWD_MARK
+    return _FWD_MARK
+
+
+_JOB_LOG_FLUSH_TASKS: set = set()
+
+
+async def _flush_dispatch_log(job_id: str, lines: list[str]) -> None:
+    """Write the dispatch-time operator log lines, off the request path.
+
+    Batches the append into ONE store call when the store offers it (the
+    MariaDB store's ``append_log_lines`` coalesces to a single write()), and
+    falls back to the per-line API for stores that don't. The pubsub relay
+    stays per-line because that's the only shape ``publish_log`` has.
+    """
+    if state.store is None or not lines:
+        return
+    try:
+        batch = getattr(state.store, "append_log_lines", None)
+        if batch is not None:
+            await batch(job_id, lines)
+        else:
+            for ln in lines:
+                await state.store.append_log_line(job_id, ln)
+    except Exception:
+        return  # operator visibility only -- never surface as a job failure
+    for ln in lines:
+        try:
+            await state.store.publish_log(job_id, ln)
+        except Exception:
+            pass
+
+
+def _spawn_dispatch_log_flush(job_id: str, lines: list[str]) -> None:
+    """Fire-and-forget the dispatch log write.
+
+    2026-08-14: this used to be an inline ``await append_log_line`` +
+    ``await publish_log`` PER LINE, right in the middle of POST /jobs. Stage
+    timing across 135 slow submits put it at 45.8% of all time spent -- the
+    single largest cost in job creation, p50 2.17s, p90 3.32s -- because each
+    line took a per-job lock and its own ``asyncio.to_thread`` hop into a
+    filesystem append, and that thread pool is shared with (and starved by)
+    S3 asset uploads. The comment at the call site already promised these
+    writes "never block job dispatch"; now they actually don't.
+
+    Nothing downstream reads these lines synchronously -- they exist so an
+    operator can see what HostKnowledge/pre-flight did for the job -- so the
+    write is safe to detach. The task is parked in a module-level set so the
+    GC can't collect it mid-flight.
+    """
+    if not lines:
+        return
+    try:
+        t = asyncio.create_task(_flush_dispatch_log(job_id, list(lines)))
+        _JOB_LOG_FLUSH_TASKS.add(t)
+        t.add_done_callback(_JOB_LOG_FLUSH_TASKS.discard)
+    except RuntimeError:
+        pass  # no running loop (shouldn't happen in request context)
+
+
+class _StageTimer:
+    """Records elapsed time between ``mark()`` calls. Never raises."""
+
+    __slots__ = ("t0", "_last", "_marks")
+
+    def __init__(self) -> None:
+        self.t0 = self._last = time.monotonic()
+        self._marks: list[tuple[str, float]] = []
+
+    def mark(self, name: str) -> None:
+        now = time.monotonic()
+        self._marks.append((name, now - self._last))
+        self._last = now
+
+    def report(self, job_id: str, url: str) -> None:
+        """Emit one line iff the request was slow. Stages under 1ms are
+        dropped so the line shows only what actually cost something."""
+        total = time.monotonic() - self.t0
+        if total < _JOB_TIMING_MIN_S:
+            return
+        parts = " ".join(
+            f"{n}={d * 1000:.0f}" for n, d in self._marks if d >= 0.001
+        )
+        log.info(
+            "[job-timing] %s total=%.0fms %s url=%s",
+            job_id or "-", total * 1000, parts, (url or "")[:120],
+        )
+
+
 @router.post("/jobs", response_model=JobInfo)
 async def create_job(req: JobRequest, request: Request) -> JobInfo:
+    _sw = _StageTimer() if _JOB_TIMING else None
     if not req.url:
         raise HTTPException(400, "url is required")
     # SSRF guard: refuse loopback / RFC1918 / link-local (incl. cloud
@@ -1213,6 +1388,7 @@ async def create_job(req: JobRequest, request: Request) -> JobInfo:
     # is the worker-side iptables egress firewall.
     from server.hub.url_safety import assert_public_url_async
     await assert_public_url_async(req.url)  # off-loop: getaddrinfo mustn't stall the loop
+    if _sw: _sw.mark("ssrf")
     assert state.store is not None and state.registry is not None
 
     # Same-URL dedup (operator policy 2026-06-06): if the EXACT same URL is
@@ -1223,10 +1399,35 @@ async def create_job(req: JobRequest, request: Request) -> JobInfo:
     # 0-2 candidate rows; the exact `j.url == req.url` filter is the real test.
     # Scope: fetch only (codegen-loop/rerun differ by goal/script even on the
     # same URL; attach_to_job is intentionally tied to another job).
-    if (req.options.mode or "fetch") == "fetch" and not req.options.attach_to_job:
+    # A FORWARDED request must skip this check (2026-08-15). The forwarding hub
+    # has already persisted a `queued` row for this URL and already ran the
+    # dedup itself -- so the only thing the peer can find is the origin's own
+    # placeholder, and it 409s every single forward. Measured: hub-37 forwarded
+    # 1,611 requests in 30 minutes and nginx returned 1,751 409s over the same
+    # window. Worse than wasted slots: the submitter treats 409 as "paprika
+    # already has it", marks the crawl row done, and the URL is dropped for
+    # good -- silent data loss, not just lost throughput.
+    _is_forwarded = bool(request.headers.get(_FWD_MARK_HDR()))
+    if (
+        (req.options.mode or "fetch") == "fetch"
+        and not req.options.attach_to_job
+        and not _is_forwarded
+    ):
         try:
+            # url_exact, NOT url_substr (2026-08-15). Passing the whole URL to
+            # url_substr became ``url LIKE '%<url>%'``, which cannot use the
+            # url index -- the optimizer fell back to ranging over
+            # idx_status_created (~35,747 rows estimated) and filtering each
+            # row with the LIKE. Fine while the pages were hot; once they
+            # weren't, this ONE query became 98.2% of POST /jobs (p50 24.2s,
+            # from 38-69ms earlier the same day) and dragged crawl intake from
+            # 279 to 120 jobs/min with the fleet 84% idle.
+            #
+            # The exact form is a point lookup on idx_url_prefix (rows=1) and
+            # means the same thing here: the substring result was being
+            # filtered down to ``j.url == req.url`` on the next line anyway.
             _active, _ = await state.store.list_job_infos(
-                status=["queued", "running", "downloading"], url_substr=req.url, limit=100
+                status=["queued", "running", "downloading"], url_exact=req.url, limit=100
             )
         except Exception:
             _active = []
@@ -1258,14 +1459,22 @@ async def create_job(req: JobRequest, request: Request) -> JobInfo:
     #   * codegen-loop / rerun -- hub-orchestrated (GPU-gated, no worker lane);
     #   * attach_to_job (pinned) -- targets one specific worker regardless of
     #     its in_flight, so the fleet-wide capacity check doesn't apply.
+    if _sw: _sw.mark("dedup")
     if (
         (req.options.mode or "fetch") not in ("codegen-loop", "rerun")
         and not req.options.attach_to_job
-        and not await _fleet_has_spare_capacity()
+        # Under pull the backlog is the signal, and LLEN answers in O(1) at any
+        # fleet size -- the aggregation below costs 1.5s at 152 workers and
+        # grows from there. Falls back to the aggregation when pull is off.
+        and (
+            await _pull_queue.is_full() if _pull_queue.ENABLED
+            else not await _fleet_has_spare_capacity()
+        )
     ):
         raise HTTPException(
             503, "fleet at capacity (all lanes busy); retry with backoff"
         )
+    if _sw: _sw.mark("capacity")
 
     # download_video resolution (operator design 2026-06-10, refined 2026-07-06):
     # an explicit opts value (True/False) wins; the default None falls back to
@@ -1356,7 +1565,9 @@ async def create_job(req: JobRequest, request: Request) -> JobInfo:
     # barrier strategies and content-extraction tool selection.
     # The consultation log goes into the job log so operators can see
     # what knowledge was applied.
+    if _sw: _sw.mark("role")
     _hk_consultation = _consult_host_knowledge(req.url, req.options)
+    if _sw: _sw.mark("hostknow")
 
     # Phase 2b: a scoped (enforce, non-admin) caller may only launch a job with
     # a Chrome profile they own or that is shared. Fail fast with 403 BEFORE
@@ -1393,6 +1604,7 @@ async def create_job(req: JobRequest, request: Request) -> JobInfo:
         owner_id=owner_of(request),
     )
     await state.store.save_job_info(info)
+    if _sw: _sw.mark("save1")
 
     # state-model v1.1: queued-timeout guard. Dispatch is normally
     # immediate (codegen/rerun create_task; fetch dispatches inline), so
@@ -1402,26 +1614,19 @@ async def create_job(req: JobRequest, request: Request) -> JobInfo:
     # stuck queued. Fires once; harmless once the status moved on.
     _spawn_queued_timeout_guard(job_id)
 
-    # Persist the consultation summary to the job log for operator
-    # visibility. ``append_log_line`` rpushes to the Redis list (and the
-    # subscribe stream relays via the pubsub channel). Best-effort;
-    # never blocks job dispatch.
-    if _hk_consultation:
-        try:
-            for ln in _hk_consultation:
-                await state.store.append_log_line(job_id, ln)
-                try:
-                    await state.store.publish_log(job_id, ln)
-                except Exception:
-                    pass
-        except Exception:
-            pass
+    # Collect the consultation summary for the job log (operator visibility).
+    # NOT written yet: the pre-flight step below appends its own lines, and
+    # both flush together in one detached task -- one store round-trip
+    # instead of 2N, and no interleaving (two independent tasks would have
+    # no ordering guarantee between them).
+    _dispatch_log: list[str] = list(_hk_consultation or ())
 
     # v2 Phase 7c: pre-flight plugin auto-invocation.
     # If HostKnowledge declared a suggested_tool for a present barrier
     # (e.g. paprika-flare for cloudflare_challenge), run it now and
     # merge cookies into HostRecord BEFORE the worker dispatch reads
     # rec.cookies below. Best-effort: failures are logged, never raise.
+    if _sw: _sw.mark("hklog")
     try:
         _preflight_lines = await _preflight_cf_plugin(req.url, job_id)
     except Exception as e:
@@ -1430,18 +1635,13 @@ async def create_job(req: JobRequest, request: Request) -> JobInfo:
             f"({type(e).__name__}: {str(e)[:200]}); continuing without"
         ]
     if _preflight_lines:
-        try:
-            for ln in _preflight_lines:
-                await state.store.append_log_line(job_id, ln)
-                try:
-                    await state.store.publish_log(job_id, ln)
-                except Exception:
-                    pass
-        except Exception:
-            pass
+        _dispatch_log.extend(_preflight_lines)
+    _spawn_dispatch_log_flush(job_id, _dispatch_log)
 
+    if _sw: _sw.mark("preflight")
     (get_storage_dir() / job_id).mkdir(parents=True, exist_ok=True)
     (get_storage_dir() / job_id / "assets").mkdir(parents=True, exist_ok=True)
+    if _sw: _sw.mark("mkdir")
 
     # NOTE: the v1 "vision-agent" mode (CogAgent-driven pixel-space
     # action loop) was removed in the v2 cleanup. Pydantic now rejects
@@ -1749,6 +1949,32 @@ async def create_job(req: JobRequest, request: Request) -> JobInfo:
     # (job d435107ed59b hit exactly this). Pinned jobs (attach_to_job)
     # skip the grace loop -- they need one specific worker and the
     # assign below queues onto it regardless of its in_flight count.
+    if _sw: _sw.mark("prep")
+
+    # ---- pull dispatch (phase 1: built, off by default) ----------------
+    # When enabled, submit stops choosing a worker: it appends the job id to
+    # the shared list and returns. A worker with a free lane pops it and calls
+    # POST /jobs/{id}/claim on ITS OWN hub -- the one holding its WebSocket --
+    # which runs exactly the dispatch below with that worker pre-selected.
+    # Nothing about how a job is assembled or delivered changes; only who
+    # decides. See server/hub/_pull_queue.py for why.
+    #
+    # Pinned jobs (attach_to_job) keep dispatching inline: they name one
+    # specific worker, so there is nothing to decide and nothing to queue.
+    if _pull_queue.ENABLED and pinned_worker is None:
+        if await _pull_queue.push(job_id):
+            if _sw:
+                _sw.mark("pull_push")
+                _sw.report(job_id, req.url)
+            return _proxy_info(info, request)
+        # Push failed (Redis down / not configured). Fall through to the
+        # existing dispatch rather than stranding the job -- during migration
+        # Redis must not be a single point of failure for dispatch.
+        log.warning(
+            "[pull] job %s: queue push failed; dispatching inline instead",
+            job_id,
+        )
+
     worker = pinned_worker
     if worker is None:
         # Reserve a pending_assigns slot at pick time so a concurrent picker
@@ -1758,6 +1984,32 @@ async def create_job(req: JobRequest, request: Request) -> JobInfo:
         # release_pending_assign. assign() itself idempotently re-adds the
         # same job_id (set semantics).
         worker = state.registry.pick_worker(reserve_for_job=job_id)
+        if worker is None:
+            # Locally full. Hand the job to a peer that has room BEFORE
+            # sitting in the grace loop (2026-08-14 stage timing).
+            #
+            # nginx round-robins submits evenly across the 7 hubs, but
+            # workers pin to a hub by consistent hash, so the per-hub lane
+            # split is very uneven -- measured 10 workers / 20 lanes / 0 free
+            # on hub-40 while the fleet as a whole had 146 lanes idle. The
+            # fleet-wide capacity gate above therefore says "yes" and then
+            # pick_worker() finds nothing local, so every submit routed to
+            # that hub burned the full grace window. That made this the
+            # single biggest cost in POST /jobs: 73.9% of measured time,
+            # p50 4.05s, p90 6.69s -- waiting for a local lane while a peer
+            # sat idle one hop away.
+            #
+            # The grace loop still exists for the case it was written for --
+            # the moments after a hub restart when the WS registry is
+            # momentarily empty and NO peer has capacity either. That is a
+            # transient at startup, not a steady state, so it must not be
+            # the first thing a full hub does.
+            _fwd = await _forward_to_peer_hub(request, job_id, fetch_sid=None)
+            if _fwd is not None:
+                if _sw:
+                    _sw.mark("pick")
+                    _sw.report(job_id, req.url)
+                return _fwd
         if worker is None and JOB_DISPATCH_GRACE_S > 0:
             _grace_deadline = time.monotonic() + JOB_DISPATCH_GRACE_S
             _waited = False
@@ -1771,11 +2023,16 @@ async def create_job(req: JobRequest, request: Request) -> JobInfo:
                     f"during dispatch grace window "
                     f"({worker.worker_id})",
                 )
+    # Declared out here (not inside the dispatch block) because the
+    # fall-through paths below -- cross-hub forward, 503 -- read it, and they
+    # are reached precisely when the dispatch block did NOT run.
+    fetch_sid: str | None = None
     if worker is not None:
         # Prefer the URL the worker actually dialled when it connected to
         # us (recorded on the WS handshake). Falls back to the operator
         # config / incoming HTTP request only when the worker connected
         # without a Host header.
+        if _sw: _sw.mark("pick")
         base = worker.public_base_url or _hub_base_url(request)
 
         # Allocate a session_id for this fetch so the admin UI can
@@ -1787,7 +2044,6 @@ async def create_job(req: JobRequest, request: Request) -> JobInfo:
         # SessionInfo is removed here in the hub on WorkerJobComplete
         # / WorkerJobFailed; the id stays on JobInfo as a historical
         # reference but stops resolving once removed.
-        fetch_sid: str | None = None
         if (req.options.mode or "fetch") == "fetch" and state.sessions is not None:
             fetch_sid = new_session_id()
             try:
@@ -1835,6 +2091,7 @@ async def create_job(req: JobRequest, request: Request) -> JobInfo:
         # Reject explicit names that don't exist with a synchronous
         # 400; a missing default is silent (the job just runs with
         # the lane's stock profile, same as before defaults existed).
+        if _sw: _sw.mark("session")
         _profile_url: str | None = None
         _profile_etag: str | None = None
         _profile_name = (req.options.use_profile or "").strip() or None
@@ -1928,6 +2185,7 @@ async def create_job(req: JobRequest, request: Request) -> JobInfo:
         #   the same job. The CAS here pins ownership at the DB layer, so a
         #   concurrent redrive sees worker_id NOT NULL (or status running)
         #   and skips. _MIN_AGE_S can now be lowered safely.
+        if _sw: _sw.mark("profile")
         _started_at = datetime.utcnow()
         try:
             _claim_ok = await state.store.claim_queued_job(
@@ -1967,7 +2225,9 @@ async def create_job(req: JobRequest, request: Request) -> JobInfo:
             except Exception:
                 pass
             return _proxy_info(info, request)
+        if _sw: _sw.mark("claim")
         ok = await state.registry.assign(worker, assign)
+        if _sw: _sw.mark("assign")
         if ok:
             # Record which worker + (if known) the noVNC URL so clients can
             # watch the job live. Status was already flipped to running by
@@ -2018,6 +2278,9 @@ async def create_job(req: JobRequest, request: Request) -> JobInfo:
                 f"{worker.capabilities.max_concurrent})  "
                 f"novnc={info.novnc_url or '(none)'}",
             )
+            if _sw:
+                _sw.mark("save2")
+                _sw.report(job_id, req.url)
             return _proxy_info(info, request)
         # If send failed, fall through to the 503 path below. Roll back
         # the SessionInfo we eagerly registered so it doesn't stick
@@ -2056,21 +2319,14 @@ async def create_job(req: JobRequest, request: Request) -> JobInfo:
     # while peers sit idle. ``info`` is not persisted until the 503 / success
     # paths below, so there's no orphan to clean up. _FWD_MARK makes the
     # forwarded hop dispatch locally only (one hop, no inter-hub bounce loop).
-    from server.hub.routes.sessions import _FWD_MARK, _proxy_request_to_hub
-    if not request.headers.get(_FWD_MARK) and state.hubs is not None:
-        _peer = await _peer_hub_with_spare_capacity()
-        if _peer:
-            try:
-                _resp = await _proxy_request_to_hub(_peer, request, 60.0)
-            except Exception:
-                _resp = None
-            if _resp is not None and getattr(_resp, "status_code", 503) != 503:
-                log.info(
-                    f"[hub] job {job_id}: no free local worker -> forwarded to "
-                    f"peer hub {_peer} (cross-hub dispatch)"
-                )
-                return _resp
-            # peer also full / unreachable -> fall through to the local 503.
+    # Same helper as the pre-grace attempt above, so both forward paths drop
+    # the local placeholder row identically. (The old inline version left it
+    # queued -- rare then because this only ran after the grace loop failed,
+    # but the row still fed the redrive a duplicate crawl.)
+    _fwd = await _forward_to_peer_hub(request, job_id, fetch_sid=fetch_sid)
+    if _fwd is not None:
+        return _fwd
+    # peer also full / unreachable -> fall through to the local 503.
 
     # 2) No worker available -- reject with 503. The hub used to run an
     # in-process nodriver fallback here, but the hub container has no
