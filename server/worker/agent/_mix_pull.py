@@ -77,6 +77,13 @@ class _PullMixin:
         # means abandoning it at exit.
         if getattr(self, "_pending_update_to", None):
             return False
+        # No WebSocket, no claim: the assignment comes back over it, so a
+        # disconnected worker can only pop an id and throw it away. Observed on
+        # 2026-08-15 -- w5110 sat with alive=False and kept draining the queue,
+        # every claim answered "not connected to this hub" while the popped
+        # rows waited out the redrive.
+        if getattr(self, "_ws", None) is None:
+            return False
         return self._pull_free_lanes() > 0
 
     async def _pull_claim(self, job_id: str) -> bool:
@@ -86,20 +93,34 @@ class _PullMixin:
         left ``queued`` while the id sat in the list. A 404 means the job was
         cancelled or deleted between submit and pop. Neither is an error worth
         retrying -- drop it and pop the next one.
+
+        The path carries OUR id, not the job's, because ``hub_http_url`` is the
+        nginx front and nginx routes on the path alone. Addressed as
+        ``/jobs/{id}/claim`` the claim round-robined across all seven hubs and
+        only the one holding our WebSocket could answer it: 6 in 7 came back
+        409 and pull dispatch delivered zero jobs while looking healthy, since
+        the redrive re-dispatched every one of them the old way.
         """
         import httpx
-        url = f"{self.hub_http_url.rstrip('/')}/jobs/{job_id}/claim"
+        url = f"{self.hub_http_url.rstrip('/')}/workers/{self.worker_id}/claim"
         try:
             async with httpx.AsyncClient(timeout=30.0) as client:
-                resp = await client.post(url, json={"worker_id": self.worker_id})
+                resp = await client.post(url, json={"job_id": job_id})
         except Exception as e:
             log.info("[pull] claim %s failed to send: %s", job_id, e)
             return False
         if resp.status_code == 200:
+            log.info("[pull] claim %s -> ok", job_id)
             return True
         if resp.status_code in (404, 409):
-            log.info("[pull] claim %s -> %s (someone else has it)",
-                     job_id, resp.status_code)
+            # The reason is the diagnostic that matters: "not connected to
+            # this hub" means routing is broken, "already running" means we
+            # merely lost a race. They demand opposite responses.
+            try:
+                _why = resp.text[:120]
+            except Exception:
+                _why = ""
+            log.info("[pull] claim %s -> %s %s", job_id, resp.status_code, _why)
             return False
         log.warning("[pull] claim %s -> HTTP %s", job_id, resp.status_code)
         return False

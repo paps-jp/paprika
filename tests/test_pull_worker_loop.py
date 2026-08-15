@@ -36,10 +36,14 @@ class _Pool:
 
 
 class _Agent(_PullMixin):
-    def __init__(self, pool=None, draining=False, updating=None):
+    def __init__(self, pool=None, draining=False, updating=None, ws=object()):
         self.lane_pool = pool
         self._draining = draining
         self._pending_update_to = updating
+        # The assignment comes back over the WS, so a worker without one can
+        # only pop an id and discard it. Default to connected; the disconnected
+        # case has its own test below.
+        self._ws = ws
 
 
 def test_disabled_by_default():
@@ -129,3 +133,10 @@ def test_claim_treats_404_and_409_as_ordinary():
     pop. Neither is worth retrying -- drop it and pop the next id."""
     src = inspect.getsource(_PullMixin._pull_claim)
     assert "(404, 409)" in src
+
+
+def test_disconnected_worker_does_not_ask():
+    """A pop by a worker whose WS is down is pure loss: the id leaves Redis,
+    the claim is refused ("not connected to this hub"), and the row waits out
+    the redrive. w5110 did this for its whole disconnection on 2026-08-15."""
+    assert _Agent(_Pool(False), ws=None)._pull_should_ask() is False

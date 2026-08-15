@@ -1854,6 +1854,98 @@ async def claim_job(job_id: str, body: dict, request: Request) -> JobInfo:
     return placed
 
 
+#: worker_id -> hub_id, from the cross-hub snapshot. Short TTL because the
+#: mapping only changes when a worker reconnects, and a misrouted claim must
+#: not pay for a fleet-wide aggregation (1.5s at 152 workers).
+_WORKER_HUB_TTL_S = 5.0
+_worker_hub_cache: tuple[float, dict[str, str]] | None = None
+_worker_hub_lock = asyncio.Lock()
+
+
+async def _hub_holding_worker(worker_id: str) -> str | None:
+    """Which hub holds this worker's WebSocket right now, or None.
+
+    Not derivable from the worker_id: nginx pins WS connections with a
+    consistent hash, but that decides where a NEW connection goes, not where
+    an existing one lives. A worker that reconnected while its hub was
+    restarting lands on the failover hub and stays there, so hash and reality
+    diverge -- measured 2026-08-15, w5111's claims routed to its WS owner
+    19/20 before a rolling restart and 0/20 after. The snapshot is the only
+    authority.
+    """
+    global _worker_hub_cache
+    if state.registry is None:
+        return None
+    now = time.monotonic()
+    c = _worker_hub_cache
+    if c is None or c[0] <= now:
+        async with _worker_hub_lock:
+            c = _worker_hub_cache
+            if c is None or c[0] <= now:
+                try:
+                    snap = await state.registry.stats_async()
+                except Exception:
+                    # Serve the stale map rather than nothing: a 5s-old hub
+                    # id is right far more often than giving up is.
+                    return c[1].get(worker_id) or None if c else None
+                _worker_hub_cache = c = (
+                    now + _WORKER_HUB_TTL_S,
+                    {
+                        str(w.get("worker_id")): str(w.get("hub_id") or "")
+                        for w in snap.get("workers", [])
+                        if w.get("worker_id")
+                    },
+                )
+    return c[1].get(worker_id) or None
+
+
+@router.post("/workers/{worker_id}/claim", response_model=JobInfo)
+async def claim_job_as_worker(
+    worker_id: str, body: dict, request: Request,
+) -> JobInfo:
+    """The claim, addressed to the WORKER instead of the job.
+
+    Same handler, same CAS, same dispatch -- the only thing that changes is
+    which identifier sits in the path, and that is the whole point: nginx
+    picks a hub from the path alone. ``/jobs/{id}/claim`` carries worker_id in
+    the body, where nginx cannot see it, so it fell through to ``location /``
+    and round-robined across all seven hubs. Only the hub holding this
+    worker's WebSocket can answer, so 6 in 7 claims returned 409 "not
+    connected to this hub" and pull dispatch delivered exactly zero jobs for
+    its whole first run (the redrive quietly re-dispatched everything the old
+    way, so throughput never moved and nothing looked wrong).
+
+    With worker_id in the path, nginx routes this through the same
+    ``hash $worker_id consistent`` upstream that already carries the worker's
+    WebSocket -- so the claim provably lands on the hub that can serve it.
+    Requires the matching ``location ~ ^/workers/(?<worker_id>[^/]+)/claim``
+    block in deploy/nginx.conf; nginx.conf is not auto-deployed.
+
+    ``/jobs/{job_id}/claim`` stays for direct-to-hub callers.
+    """
+    job_id = str((body or {}).get("job_id") or "").strip()
+    if not job_id:
+        raise HTTPException(400, "job_id is required")
+    # nginx gets us to the right hub most of the time; the snapshot closes the
+    # gap when the hash and the live WS disagree. Without this a misroute is a
+    # 409 the worker cannot act on -- it drops the popped id, the row waits out
+    # the redrive, and pull dispatch looks like it is working while the old
+    # path quietly does the job.
+    if (
+        state.registry is not None
+        and state.registry.connections.get(worker_id) is None
+        and not request.headers.get(_FWD_MARK_HDR())
+    ):
+        _owner = await _hub_holding_worker(worker_id)
+        _me = state.hubs.hub_id if state.hubs is not None else ""
+        if _owner and _owner != _me:
+            from server.hub.routes.sessions import _proxy_request_to_hub
+            # One hop only: _proxy_request_to_hub stamps the forward marker,
+            # so the owner hub handles it locally or 409s. It never bounces on.
+            return await _proxy_request_to_hub(_owner, request, 30.0)
+    return await claim_job(job_id, {"worker_id": worker_id}, request)
+
+
 @router.post("/jobs", response_model=JobInfo)
 async def create_job(req: JobRequest, request: Request) -> JobInfo:
     _sw = _StageTimer() if _JOB_TIMING else None
