@@ -42,10 +42,25 @@ def _sweep_source() -> str:
     return src[start:end]
 
 
-def test_sweep_queries_the_store_for_in_flight_rows():
+def test_sweep_queries_the_store_for_queued_rows():
     body = _sweep_source()
     assert "list_job_infos" in body, "the sweep must ask the authoritative store"
-    assert "IN_FLIGHT_STATUSES" in body
+
+
+def test_store_query_is_queued_only():
+    """THE regression. Pulling every in-flight status fed `running` rows to
+    the sweep, which settles them as FAILED immediately -- skipping the 300s
+    grace the stale-job reconciler exists to give a worker that dropped for a
+    self-update and comes back with the same id. Every rolling update then
+    failed that worker's whole in-flight set, taking the hourly success rate
+    from 97.3% to 74.7% (2,813 failures/hour).
+
+    `queued` is the safe half: the worker provably never started those, so
+    there is no partial work and nothing to wait for."""
+    body = _sweep_source()
+    q = body[body.index("list_job_infos"):body.index("list_job_infos") + 260]
+    assert "JobStatus.queued.value" in q
+    assert "IN_FLIGHT_STATUSES" not in q
 
 
 def test_sweep_filters_store_rows_to_the_disconnecting_worker():
@@ -71,13 +86,13 @@ def test_store_failure_does_not_break_disconnect_handling():
     assert "except Exception" in store_call
 
 
-def test_in_flight_statuses_cover_the_states_a_dead_worker_can_hold():
-    """queued (claimed but not started), running, and downloading. If a new
-    in-flight state appears, the sweep picks it up automatically -- this test
-    exists so that stays true."""
+def test_running_and_downloading_stay_with_the_reconciler():
+    """They are in-flight but must NOT be swept on disconnect -- see above."""
     assert {s.value for s in IN_FLIGHT_STATUSES} == {
         "queued", "running", "downloading",
     }
+    body = _sweep_source()
+    assert "_STALE_RUNNING_GRACE_S" in body, "the reason must stay written down"
 
 
 @pytest.mark.parametrize("marker", ["pull", "claim", "_STALE_RUNNING_GRACE_S"])

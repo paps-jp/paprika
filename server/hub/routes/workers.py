@@ -1952,15 +1952,30 @@ async def worker_link(ws: WebSocket, worker_id: str):
         #     whichever one answers the claim, NOT the hub holding its WS.
         #     Without this the sweep finds nothing and recovery falls back to
         #     the 300s _STALE_RUNNING_GRACE_S path instead of being immediate.
+        # NOTE the narrow status filter. An earlier version of this pulled
+        # every IN_FLIGHT status and fed it to the sweep below, which settles
+        # anything still `running` as FAILED. That skipped the 300s
+        # _STALE_RUNNING_GRACE_S window the stale-job reconciler exists to
+        # provide -- the window where a worker that dropped for a self-update
+        # comes back with the SAME id and re-adopts its jobs. Every rolling
+        # update then failed that worker's whole in-flight set: the hourly
+        # success rate fell from 97.3% to 74.7% (2,813 failures/hour).
+        #
+        # `queued` is the safe half and the half worth having: the worker
+        # provably never started those (status would be running), so there is
+        # no partial work and no reason to wait -- re-queue them now. Anything
+        # already running stays with the reconciler and its grace window.
+        _queued_only: set[str] = set()
         if state.store is not None:
             try:
                 _rows, _ = await state.store.list_job_infos(
-                    status=[s.value for s in IN_FLIGHT_STATUSES], limit=500,
+                    status=[JobStatus.queued.value], limit=500,
                 )
-                orphan_job_ids.extend(
+                _queued_only = {
                     j.job_id for j in _rows
                     if getattr(j, "worker_id", None) == worker_id and j.job_id
-                )
+                }
+                orphan_job_ids.extend(_queued_only)
             except Exception:
                 log.info(
                     "worker %s disconnect: store lookup for in-flight jobs "
