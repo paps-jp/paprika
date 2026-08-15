@@ -98,6 +98,7 @@ from ._mix_profile import _ProfileExtMixin
 from ._mix_maintenance import _MaintenanceMixin
 from ._mix_preview import _PreviewMixin
 from ._mix_uploads import _UploadsMixin
+from ._mix_pull import _PullMixin
 from ._mix_videodl import (
     _VideoDownloadMixin,
     download_pool_key_from_env,
@@ -116,6 +117,7 @@ class WorkerAgent(
     _PreviewMixin,
     _UploadsMixin,
     _VideoDownloadMixin,
+    _PullMixin,
 ):
     PAPRIKA_AGENT_ID = "gmhfgiloilioklcofcinlemifjjaeppe"
 
@@ -238,6 +240,16 @@ class WorkerAgent(
         #: the heartbeat reports them so a building storm is visible in the
         #: Workers tab BEFORE it is bad enough to trip the guard.
         self._memguard_rates: tuple[float, float] = (0.0, 0.0)
+        #: anon growth in MB/min from the guard's last pair of samples. Its own
+        #: attribute rather than a third slot in _memguard_rates so the
+        #: heartbeat's positional use of that tuple keeps working untouched.
+        self._memguard_anon_rate_mb_min: float = 0.0
+        #: Monotonic instant the guard's CURRENT run of breaching samples
+        #: started, 0.0 when the last sample was clean. Read by the self-check
+        #: loop, which stands down while this is live so the guard's graceful
+        #: drain wins the race against self-check's abrupt os._exit -- see
+        #: _memguard_owns_recycle().
+        self._memguard_breach_since: float = 0.0
         # Rolling self-update state (set when we detect a hub-advertised
         # version mismatch and start draining for an update). Replaces
         # the old "immediately fetch + exit(42)" thundering-herd flow.

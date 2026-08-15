@@ -1372,6 +1372,472 @@ class _StageTimer:
         )
 
 
+async def _dispatch_to_worker(
+    *,
+    req: JobRequest,
+    info: JobInfo,
+    worker,
+    request: Request,
+    job_id: str,
+    auto_host: str | None,
+    auto_cookies: list[dict] | None,
+    auto_popup_policy: str,
+    lane_hint: int | None,
+    _is_codegen_loop: bool,
+    _sw=None,
+) -> JobInfo | None:
+    """Hand a queued job to one already-chosen worker.
+
+    Lifted verbatim out of ``create_job`` so pull dispatch can reuse it: a
+    worker that pops a job id claims it on the hub holding its own WebSocket,
+    and that hub runs exactly this. Keeping ONE copy is the point -- a second
+    assembly path is how the two dedup checks came to disagree and cost
+    246,166 URLs on 2026-08-14.
+
+    Returns the response JobInfo once the assign is on the wire, or None when
+    the send failed -- the caller then falls through to the peer forward / 503
+    path, with the row already released back to queued.
+    """
+    # Prefer the URL the worker actually dialled when it connected to
+    # us (recorded on the WS handshake). Falls back to the operator
+    # config / incoming HTTP request only when the worker connected
+    # without a Host header.
+    if _sw: _sw.mark("pick")
+    base = worker.public_base_url or _hub_base_url(request)
+
+    # Allocate a session_id for this fetch so the admin UI can
+    # inspect the running browser via /sessions/{sid}/* while the
+    # fetch is in flight. The worker registers a read-only
+    # SessionState under this id when the browser is attached and
+    # tears it down right before browser.stop() (see fetch()'s
+    # on_browser_ready / on_browser_closing callbacks). The
+    # SessionInfo is removed here in the hub on WorkerJobComplete
+    # / WorkerJobFailed; the id stays on JobInfo as a historical
+    # reference but stops resolving once removed.
+    if (req.options.mode or "fetch") == "fetch" and state.sessions is not None:
+        fetch_sid = new_session_id()
+        try:
+            # keep_session: operator stays attached via noVNC and
+            # the API. The noVNC proxy taps client-side RFB events
+            # (mouse / key / clipboard) and touches the session's
+            # last_active_at so the 60-second idle window is
+            # genuinely "no operator activity for 60 s" rather
+            # than "no API call". 60 s default chosen so a
+            # forgotten / abandoned session doesn't hog a lane;
+            # operator can override per-detach via
+            # ``await sess.detach(idle_ttl_s=...)`` if they want
+            # a longer leash. 24h absolute is the hard backstop.
+            #
+            # State machine after crawl ends:
+            #   keepalive --(RFB activity)--> running
+            #   running --(QUIET_S no RFB)--> keepalive
+            #   keepalive --(idle_ttl_s no RFB)--> IDLE (= reaped)
+            keep_session_req = bool(getattr(req.options, "keep_session", False))
+            _idle_ttl_s = 60 if keep_session_req else 600
+            _abs_ttl_s = 24 * 3600 if keep_session_req else 3600
+            sinfo = SessionInfo(
+                session_id=fetch_sid,
+                worker_id=worker.worker_id,
+                initial_url=req.url,
+                idle_ttl_s=_idle_ttl_s,
+                absolute_ttl_s=_abs_ttl_s,
+                job_id=job_id,
+            )
+            sinfo.state = "fetch_running"
+            state.sessions.add(sinfo)
+            info.session_id = fetch_sid
+        except Exception as e:
+            log.info(
+                f"[hub] job {job_id}: could not register fetch "
+                f"session: {type(e).__name__}: {e}",
+            )
+            fetch_sid = None
+
+    # Resolve ``options.use_profile`` (or fall back to the
+    # operator-set default profile) to a profile_url the worker
+    # can GET. We pass the URL (not just the name) so the worker
+    # doesn't need to know hub-side path conventions and so the
+    # tarball can in principle live on a different host later.
+    # Reject explicit names that don't exist with a synchronous
+    # 400; a missing default is silent (the job just runs with
+    # the lane's stock profile, same as before defaults existed).
+    if _sw: _sw.mark("session")
+    _profile_url: str | None = None
+    _profile_etag: str | None = None
+    _profile_name = (req.options.use_profile or "").strip() or None
+    _explicit = _profile_name is not None
+    # Profiles are shared across hubs (MariaDB metadata + MinIO bytes), so
+    # resolve the default + existence/etag from the shared view -- any hub
+    # can dispatch a job using a profile uploaded on any other hub. The
+    # worker fetches the tarball from THIS hub's /profiles/{name}, which
+    # serves it from local disk or pulls it from MinIO on a cache miss.
+    from server.hub.routes.profiles import _shared_default, _shared_meta
+    if _profile_name is None:
+        _profile_name = await _shared_default()
+    if _profile_name:
+        _pmeta = await _shared_meta(_profile_name)
+        if _pmeta is None:
+            if _explicit:
+                raise HTTPException(
+                    400,
+                    f"use_profile: profile '{_profile_name}' not "
+                    "found. Upload it first via POST /profiles/{name} "
+                    "(paprika-client upload-profile).",
+                )
+            # default went stale between read + recheck -- treat as
+            # "no default" rather than failing the dispatch.
+            _profile_name = None
+        else:
+            # Phase 2b: tenant isolation on the dispatch path. Inject the
+            # profile only when the job's owner may use it (shared, or
+            # same tenant). The explicit-profile case is already 403'd up
+            # front; this is the belt-and-suspenders for the AMBIENT
+            # default-profile fallback — a private default never rides onto
+            # another tenant's job. No-op under off/optional (owner_can_use
+            # returns True), so ambient behaviour is unchanged.
+            from server.hub.auth import owner_can_use
+            if owner_can_use(
+                _pmeta.get("owner_id"),
+                job_owner=info.owner_id,
+                shared=bool(_pmeta.get("shared", True)),
+            ):
+                _profile_url = f"{base}/profiles/{_profile_name}"
+                # Etag lets the worker skip the download when its cache
+                # already has this exact version (typical after sync).
+                _profile_etag = _pmeta.get("etag") or None
+            else:
+                _profile_name = None  # run with the lane's stock profile
+
+    # Asset URL blacklist (V): pull operator-managed list from Settings
+    # and stamp onto every assignment so an admin UI edit takes effect
+    # on the next dispatched job. Stored as newline-separated string;
+    # split + trim + drop blanks here so the worker just iterates.
+    _bl_raw = ""
+    if state.settings is not None:
+        try:
+            _bl_raw = (state.settings.get("asset_url_blacklist", "") or "").strip()
+        except Exception:
+            _bl_raw = ""
+    _asset_url_blacklist = [
+        line.strip()
+        for line in _bl_raw.splitlines()
+        if line.strip() and not line.strip().startswith("#")
+    ]
+    assign = HubAssignJob(
+        job_id=job_id,
+        url=req.url,
+        options=req.options,
+        asset_upload_base=_asset_upload_url(base, job_id),
+        lane_hint=lane_hint,
+        cookies=auto_cookies,
+        save_cookies_host=auto_host if req.options.mode == "fetch" else None,
+        session_id=fetch_sid,
+        popup_policy=auto_popup_policy,
+        profile_url=_profile_url,
+        profile_name=_profile_name,
+        profile_etag=_profile_etag,
+        asset_url_blacklist=_asset_url_blacklist,
+    )
+    # Bump the registry's last_used_at so the Hosts tab reflects
+    # that the cookies actually rode along on a real job.
+    if auto_cookies and auto_host and state.hosts is not None:
+        try:
+            state.hosts.touch_used(auto_host)
+        except Exception:
+            pass
+    # CAS-claim the row from queued -> running BEFORE sending the WS
+    # assign. This makes POST symmetric with redrive (which already uses
+    # claim_queued_job) and closes the race that forced redrive's
+    # _MIN_AGE_S to 90s:
+    #   POST sends WS, then blindly upserts queued+worker_id; if redrive
+    #   had simultaneously CAS'd to running+W2, POST's blind save would
+    #   overwrite running+W2 back to queued+W1 -- both workers then run
+    #   the same job. The CAS here pins ownership at the DB layer, so a
+    #   concurrent redrive sees worker_id NOT NULL (or status running)
+    #   and skips. _MIN_AGE_S can now be lowered safely.
+    if _sw: _sw.mark("profile")
+    _started_at = datetime.utcnow()
+    try:
+        _claim_ok = await state.store.claim_queued_job(
+            job_id, worker.worker_id, _started_at,
+        )
+    except Exception:
+        log.warning(f"!! claim_queued_job({job_id}) raised", exc_info=True)
+        _claim_ok = False
+    if not _claim_ok:
+        # Another path (redrive on this or a peer hub) already moved the
+        # row off queued. Release our reserved slot and fall through to
+        # the 503 / cross-hub path -- nothing to do here, the other path
+        # will run the job. The session we eagerly registered (if any)
+        # also rolls back so it doesn't pin to a worker that never got
+        # the assign.
+        try:
+            state.registry.release_pending_assign(worker.worker_id, job_id)
+        except Exception:
+            pass
+        if fetch_sid:
+            try:
+                state.sessions.remove(fetch_sid)
+            except Exception:
+                pass
+            info.session_id = None
+        log.info(
+            f"[hub] job {job_id}: claim_queued_job lost the CAS "
+            f"(redrive / peer hub already claimed); deferring to it"
+        )
+        # Re-read the now-running row so the response reflects who took
+        # it. If even that fails, return the local view; the client only
+        # needs the job_id.
+        try:
+            _now = await state.store.get_job_info(job_id)
+            if _now is not None:
+                info = _now
+        except Exception:
+            pass
+        return _proxy_info(info, request)
+    if _sw: _sw.mark("claim")
+    ok = await state.registry.assign(worker, assign)
+    if _sw: _sw.mark("assign")
+    if ok:
+        # Record which worker + (if known) the noVNC URL so clients can
+        # watch the job live. Status was already flipped to running by
+        # the CAS above; mirror that locally so the upsert below doesn't
+        # downgrade it.
+        info.status = JobStatus.running
+        info.worker_id = worker.worker_id
+        info.started_at = _started_at
+        novnc = worker.capabilities.novnc_url
+        if novnc:
+            sep = "&" if "?" in novnc else "?"
+            info.novnc_url = (
+                f"{novnc}{sep}autoconnect=1&resize=scale&reconnect=1"
+                if "autoconnect" not in novnc
+                else novnc
+            )
+        await state.store.save_job_info(info)
+        # GPU gate: register the codegen-loop job so subsequent
+        # submissions see the right in-flight count. Unregister
+        # happens in workers.py when WorkerJobComplete / Failed lands.
+        if _is_codegen_loop:
+            try:
+                from server.hub._gpu_gate import register_codegen_loop
+                register_codegen_loop(job_id)
+            except Exception:
+                pass
+        # ACK watchdog: the WS assign returning True only proves the
+        # message was ENQUEUED, not that the worker actually picked the
+        # job up. If WorkerJobAccepted never lands (worker hung, accept
+        # handler crashed, deploy churn between assign + ack), the row
+        # sits queued+worker_id forever -- pre-fix this drove 80%+ of
+        # "queue timeout" failures (incident 2026-06-15). Spawn a guard
+        # that flips back to "stranded" after _POST_ASSIGN_ACK_TIMEOUT_S
+        # and immediately re-dispatches onto another free lane. Periodic
+        # redrive reclaim is the safety-net for guards killed by a hub
+        # restart before they could fire.
+        try:
+            import asyncio as _asyncio
+            from server.hub._redrive import post_assign_ack_guard
+            _asyncio.create_task(
+                post_assign_ack_guard(job_id, worker.worker_id)
+            )
+        except Exception:
+            pass
+        log.info(
+            f"[hub] job {job_id} → worker {worker.worker_id} "
+            f"(in_flight={worker.in_flight}/"
+            f"{worker.capabilities.max_concurrent})  "
+            f"novnc={info.novnc_url or '(none)'}",
+        )
+        if _sw:
+            _sw.mark("save2")
+            _sw.report(job_id, req.url)
+        return _proxy_info(info, request)
+    # If send failed, fall through to the 503 path below. Roll back
+    # the SessionInfo we eagerly registered so it doesn't stick
+    # around pointing at a worker that never accepted the job.
+    if fetch_sid:
+        try:
+            state.sessions.remove(fetch_sid)
+        except Exception:
+            pass
+        info.session_id = None
+    # We CAS-claimed the row to running before the assign; the WS send
+    # then failed (worker WS dropped between pick + send). Release the
+    # claim back to queued so the redrive (or cross-hub forward below)
+    # can re-dispatch it. Without this the row would sit running+W
+    # until the post_assign_ack_guard expires (30s).
+    try:
+        await state.store.release_claimed_job(job_id)
+        info.status = JobStatus.queued
+        info.worker_id = None
+        info.started_at = None
+    except Exception:
+        log.warning(
+            f"!! release_claimed_job({job_id}) failed after assign send error",
+            exc_info=True,
+        )
+    try:
+        state.registry.release_pending_assign(worker.worker_id, job_id)
+    except Exception:
+        pass
+    log.info(f"!! failed to send job to worker {worker.worker_id}")
+    return None
+
+
+async def _resolve_host_material(
+    req: JobRequest, *, job_id: str, job_owner: str,
+) -> tuple[str | None, list[dict] | None, str]:
+    """Per-host material for a dispatch: (host, cookies, popup_policy).
+
+    Cookie auto-injection, the stale-session re-login, and the fetch-recipe
+    pick — lifted verbatim out of ``create_job`` so the pull claim resolves
+    them identically. Under pull this runs at dispatch time rather than at
+    submit, which is both where it is needed and off the intake path.
+    """
+    auto_cookies: list[dict] | None = None
+    auto_host: str | None = None
+    auto_popup_policy: str = "kill"
+    if state.hosts is not None and req.options.mode == "fetch":
+        try:
+            from urllib.parse import urlparse as _urlparse
+
+            host_raw = _urlparse(req.url).hostname or ""
+            auto_host = _normalise_host(host_raw)
+            if auto_host:
+                # Auto re-login gate: if this host has a login recipe
+                # and its session is stale (last login older than the
+                # configured TTL, or never), refresh it BEFORE reading
+                # the cookies below. Keeps a login-gated fetch
+                # (market.laxd.com etc.) working past the
+                # session-cookie expiry without manual re-login. Only
+                # for fetch mode -- the cookies are fetch-only too.
+                # Best-effort: a failed re-login just proceeds with the
+                # current (possibly stale) cookies.
+                if req.options.mode == "fetch" and state.hosts.is_login_stale(auto_host):
+                    try:
+                        relog = await _ensure_host_login(auto_host)
+                        log.info(
+                            f"[hub] job {job_id}: pre-fetch auto-login "
+                            f"{auto_host} -> {relog.get('relogin')}",
+                        )
+                    except Exception as e:
+                        log.info(
+                            f"[hub] job {job_id}: pre-fetch auto-login "
+                            f"{auto_host} crashed: {type(e).__name__}: {e}",
+                        )
+                rec = state.hosts.get(auto_host)
+                if rec:
+                    auto_popup_policy = rec.popup_policy or "kill"
+                    # Phase 2b: hosts are keyed by hostname (one record per
+                    # host). Under enforce, a record pushed by another tenant
+                    # is invisible to this job — don't inject its cookies AND
+                    # don't let this job's post-fetch dump clobber it (the
+                    # save_cookies_host below keys off ``auto_host``). Nulling
+                    # auto_host makes the job behave as if no record existed.
+                    # No-op under off / optional / admin (owner_can_use=True).
+                    from server.hub.auth import owner_can_use
+                    _host_usable = owner_can_use(
+                        getattr(rec, "owner_id", "default"),
+                        job_owner=job_owner,
+                        shared=getattr(rec, "shared", True),
+                    )
+                    if not _host_usable:
+                        auto_host = None
+                    elif rec.cookies and req.options.mode == "fetch":
+                        auto_cookies = cookies_for_cdp(rec.cookies)
+                    # Pick the best-matching pre-baked recipe (Phase 1)
+                    # and stamp it onto JobOptions so the worker can
+                    # run it right after navigation. Only for Fetch
+                    # mode -- vision-agent / codegen-loop have their
+                    # own LLM-driven flow and don't need the recipe.
+                    if _host_usable and (
+                        req.options.mode == "fetch"
+                        and not req.options.fetch_recipe
+                        and getattr(req.options, "fetch_strategy", "recipe") != "normal"
+                    ):
+                        try:
+                            picked = rec.pick_recipe(req.url)
+                            if picked is not None:
+                                req.options.fetch_recipe = picked.to_json()
+                                log.info(
+                                    f"[hub] job {job_id}: matched "
+                                    f"fetch_recipe pattern="
+                                    f"{picked.pattern!r} for "
+                                    f"host={auto_host!r}"
+                                )
+                        except Exception as e:
+                            log.info(
+                                f"[hub] job {job_id}: fetch_recipe "
+                                f"lookup crashed "
+                                f"({type(e).__name__}: {e}); "
+                                f"continuing without recipe"
+                            )
+        except Exception:
+            auto_cookies = None
+            auto_host = None
+            auto_popup_policy = "kill"
+    return auto_host, auto_cookies, auto_popup_policy
+
+
+@router.post("/jobs/{job_id}/claim", response_model=JobInfo)
+async def claim_job(job_id: str, body: dict, request: Request) -> JobInfo:
+    """A worker with a free lane claims a job it popped off the pull list.
+
+    The worker calls this on the hub holding its OWN WebSocket. That is what
+    keeps the change small: such a hub already has the worker in its registry,
+    so it runs the ordinary dispatch with the worker pre-selected and delivers
+    the assignment over the WS exactly as before. Nothing about how a job is
+    assembled or executed changes -- only who chose the worker.
+
+    ``claim_queued_job``'s CAS stays the arbiter of ownership, so a worker and
+    a concurrent redrive cannot both run one job: the loser gets 409, frees
+    its lane and pops the next id.
+
+    Phase 1: reachable but unused -- nothing reaches the list until
+    ``PAPRIKA_PULL_DISPATCH`` is on.
+    """
+    worker_id = str((body or {}).get("worker_id") or "").strip()
+    if not worker_id:
+        raise HTTPException(400, "worker_id is required")
+    assert state.store is not None and state.registry is not None
+
+    worker = state.registry.connections.get(worker_id)
+    if worker is None:
+        # Only the hub holding this worker's WS can deliver the assignment.
+        raise HTTPException(
+            409, f"worker '{worker_id}' is not connected to this hub"
+        )
+
+    info = await state.store.get_job_info(job_id)
+    if info is None:
+        # Popped an id whose job is gone (cancelled / deleted between submit
+        # and pop). Say so plainly so the worker frees its lane and moves on.
+        raise HTTPException(404, "job no longer exists")
+    _st = info.status.value if hasattr(info.status, "value") else str(info.status)
+    if info.status != JobStatus.queued:
+        raise HTTPException(409, f"job is already {_st}")
+
+    # Resolve the per-host material (cookies, login refresh, fetch recipe) HERE
+    # rather than at submit: under pull, dispatch time is when it is actually
+    # needed, and it keeps that work off the intake path.
+    req = JobRequest(url=info.url, options=info.options)
+    auto_host, auto_cookies, auto_popup_policy = await _resolve_host_material(
+        req, job_id=job_id, job_owner=info.owner_id,
+    )
+
+    placed = await _dispatch_to_worker(
+        req=req, info=info, worker=worker, request=request, job_id=job_id,
+        auto_host=auto_host, auto_cookies=auto_cookies,
+        auto_popup_policy=auto_popup_policy, lane_hint=None,
+        _is_codegen_loop=False,
+    )
+    if placed is None:
+        # The CAS was lost, or the WS send failed after it. Either way this
+        # worker is not running it; the row is back to queued for the redrive.
+        raise HTTPException(409, "job was claimed by another dispatcher")
+    return placed
+
+
 @router.post("/jobs", response_model=JobInfo)
 async def create_job(req: JobRequest, request: Request) -> JobInfo:
     _sw = _StageTimer() if _JOB_TIMING else None
@@ -1804,88 +2270,6 @@ async def create_job(req: JobRequest, request: Request) -> JobInfo:
     # cookies + save_cookies_host stay fetch-only -- vision-agent
     # doesn't dump cookies on exit (no clean "fetch done" boundary
     # to hang the dump callback on; the loop just stops).
-    auto_cookies: list[dict] | None = None
-    auto_host: str | None = None
-    auto_popup_policy: str = "kill"
-    if state.hosts is not None and req.options.mode == "fetch":
-        try:
-            from urllib.parse import urlparse as _urlparse
-
-            host_raw = _urlparse(req.url).hostname or ""
-            auto_host = _normalise_host(host_raw)
-            if auto_host:
-                # Auto re-login gate: if this host has a login recipe
-                # and its session is stale (last login older than the
-                # configured TTL, or never), refresh it BEFORE reading
-                # the cookies below. Keeps a login-gated fetch
-                # (market.laxd.com etc.) working past the
-                # session-cookie expiry without manual re-login. Only
-                # for fetch mode -- the cookies are fetch-only too.
-                # Best-effort: a failed re-login just proceeds with the
-                # current (possibly stale) cookies.
-                if req.options.mode == "fetch" and state.hosts.is_login_stale(auto_host):
-                    try:
-                        relog = await _ensure_host_login(auto_host)
-                        log.info(
-                            f"[hub] job {job_id}: pre-fetch auto-login "
-                            f"{auto_host} -> {relog.get('relogin')}",
-                        )
-                    except Exception as e:
-                        log.info(
-                            f"[hub] job {job_id}: pre-fetch auto-login "
-                            f"{auto_host} crashed: {type(e).__name__}: {e}",
-                        )
-                rec = state.hosts.get(auto_host)
-                if rec:
-                    auto_popup_policy = rec.popup_policy or "kill"
-                    # Phase 2b: hosts are keyed by hostname (one record per
-                    # host). Under enforce, a record pushed by another tenant
-                    # is invisible to this job — don't inject its cookies AND
-                    # don't let this job's post-fetch dump clobber it (the
-                    # save_cookies_host below keys off ``auto_host``). Nulling
-                    # auto_host makes the job behave as if no record existed.
-                    # No-op under off / optional / admin (owner_can_use=True).
-                    from server.hub.auth import owner_can_use
-                    _host_usable = owner_can_use(
-                        getattr(rec, "owner_id", "default"),
-                        job_owner=info.owner_id,
-                        shared=getattr(rec, "shared", True),
-                    )
-                    if not _host_usable:
-                        auto_host = None
-                    elif rec.cookies and req.options.mode == "fetch":
-                        auto_cookies = cookies_for_cdp(rec.cookies)
-                    # Pick the best-matching pre-baked recipe (Phase 1)
-                    # and stamp it onto JobOptions so the worker can
-                    # run it right after navigation. Only for Fetch
-                    # mode -- vision-agent / codegen-loop have their
-                    # own LLM-driven flow and don't need the recipe.
-                    if _host_usable and (
-                        req.options.mode == "fetch"
-                        and not req.options.fetch_recipe
-                        and getattr(req.options, "fetch_strategy", "recipe") != "normal"
-                    ):
-                        try:
-                            picked = rec.pick_recipe(req.url)
-                            if picked is not None:
-                                req.options.fetch_recipe = picked.to_json()
-                                log.info(
-                                    f"[hub] job {job_id}: matched "
-                                    f"fetch_recipe pattern="
-                                    f"{picked.pattern!r} for "
-                                    f"host={auto_host!r}"
-                                )
-                        except Exception as e:
-                            log.info(
-                                f"[hub] job {job_id}: fetch_recipe "
-                                f"lookup crashed "
-                                f"({type(e).__name__}: {e}); "
-                                f"continuing without recipe"
-                            )
-        except Exception:
-            auto_cookies = None
-            auto_host = None
-            auto_popup_policy = "kill"
 
     # ---- GPU concurrency gate (codegen-loop only) ----
     # ぱっぷす環境では Qwen-VL を自前 GPU (RTX 6000 Pro Max-Q) で走らせるが
@@ -1949,6 +2333,10 @@ async def create_job(req: JobRequest, request: Request) -> JobInfo:
     # (job d435107ed59b hit exactly this). Pinned jobs (attach_to_job)
     # skip the grace loop -- they need one specific worker and the
     # assign below queues onto it regardless of its in_flight count.
+    auto_host, auto_cookies, auto_popup_policy = await _resolve_host_material(
+        req, job_id=job_id, job_owner=info.owner_id,
+    )
+
     if _sw: _sw.mark("prep")
 
     # ---- pull dispatch (phase 1: built, off by default) ----------------
@@ -2028,289 +2416,14 @@ async def create_job(req: JobRequest, request: Request) -> JobInfo:
     # are reached precisely when the dispatch block did NOT run.
     fetch_sid: str | None = None
     if worker is not None:
-        # Prefer the URL the worker actually dialled when it connected to
-        # us (recorded on the WS handshake). Falls back to the operator
-        # config / incoming HTTP request only when the worker connected
-        # without a Host header.
-        if _sw: _sw.mark("pick")
-        base = worker.public_base_url or _hub_base_url(request)
-
-        # Allocate a session_id for this fetch so the admin UI can
-        # inspect the running browser via /sessions/{sid}/* while the
-        # fetch is in flight. The worker registers a read-only
-        # SessionState under this id when the browser is attached and
-        # tears it down right before browser.stop() (see fetch()'s
-        # on_browser_ready / on_browser_closing callbacks). The
-        # SessionInfo is removed here in the hub on WorkerJobComplete
-        # / WorkerJobFailed; the id stays on JobInfo as a historical
-        # reference but stops resolving once removed.
-        if (req.options.mode or "fetch") == "fetch" and state.sessions is not None:
-            fetch_sid = new_session_id()
-            try:
-                # keep_session: operator stays attached via noVNC and
-                # the API. The noVNC proxy taps client-side RFB events
-                # (mouse / key / clipboard) and touches the session's
-                # last_active_at so the 60-second idle window is
-                # genuinely "no operator activity for 60 s" rather
-                # than "no API call". 60 s default chosen so a
-                # forgotten / abandoned session doesn't hog a lane;
-                # operator can override per-detach via
-                # ``await sess.detach(idle_ttl_s=...)`` if they want
-                # a longer leash. 24h absolute is the hard backstop.
-                #
-                # State machine after crawl ends:
-                #   keepalive --(RFB activity)--> running
-                #   running --(QUIET_S no RFB)--> keepalive
-                #   keepalive --(idle_ttl_s no RFB)--> IDLE (= reaped)
-                keep_session_req = bool(getattr(req.options, "keep_session", False))
-                _idle_ttl_s = 60 if keep_session_req else 600
-                _abs_ttl_s = 24 * 3600 if keep_session_req else 3600
-                sinfo = SessionInfo(
-                    session_id=fetch_sid,
-                    worker_id=worker.worker_id,
-                    initial_url=req.url,
-                    idle_ttl_s=_idle_ttl_s,
-                    absolute_ttl_s=_abs_ttl_s,
-                    job_id=job_id,
-                )
-                sinfo.state = "fetch_running"
-                state.sessions.add(sinfo)
-                info.session_id = fetch_sid
-            except Exception as e:
-                log.info(
-                    f"[hub] job {job_id}: could not register fetch "
-                    f"session: {type(e).__name__}: {e}",
-                )
-                fetch_sid = None
-
-        # Resolve ``options.use_profile`` (or fall back to the
-        # operator-set default profile) to a profile_url the worker
-        # can GET. We pass the URL (not just the name) so the worker
-        # doesn't need to know hub-side path conventions and so the
-        # tarball can in principle live on a different host later.
-        # Reject explicit names that don't exist with a synchronous
-        # 400; a missing default is silent (the job just runs with
-        # the lane's stock profile, same as before defaults existed).
-        if _sw: _sw.mark("session")
-        _profile_url: str | None = None
-        _profile_etag: str | None = None
-        _profile_name = (req.options.use_profile or "").strip() or None
-        _explicit = _profile_name is not None
-        # Profiles are shared across hubs (MariaDB metadata + MinIO bytes), so
-        # resolve the default + existence/etag from the shared view -- any hub
-        # can dispatch a job using a profile uploaded on any other hub. The
-        # worker fetches the tarball from THIS hub's /profiles/{name}, which
-        # serves it from local disk or pulls it from MinIO on a cache miss.
-        from server.hub.routes.profiles import _shared_default, _shared_meta
-        if _profile_name is None:
-            _profile_name = await _shared_default()
-        if _profile_name:
-            _pmeta = await _shared_meta(_profile_name)
-            if _pmeta is None:
-                if _explicit:
-                    raise HTTPException(
-                        400,
-                        f"use_profile: profile '{_profile_name}' not "
-                        "found. Upload it first via POST /profiles/{name} "
-                        "(paprika-client upload-profile).",
-                    )
-                # default went stale between read + recheck -- treat as
-                # "no default" rather than failing the dispatch.
-                _profile_name = None
-            else:
-                # Phase 2b: tenant isolation on the dispatch path. Inject the
-                # profile only when the job's owner may use it (shared, or
-                # same tenant). The explicit-profile case is already 403'd up
-                # front; this is the belt-and-suspenders for the AMBIENT
-                # default-profile fallback — a private default never rides onto
-                # another tenant's job. No-op under off/optional (owner_can_use
-                # returns True), so ambient behaviour is unchanged.
-                from server.hub.auth import owner_can_use
-                if owner_can_use(
-                    _pmeta.get("owner_id"),
-                    job_owner=info.owner_id,
-                    shared=bool(_pmeta.get("shared", True)),
-                ):
-                    _profile_url = f"{base}/profiles/{_profile_name}"
-                    # Etag lets the worker skip the download when its cache
-                    # already has this exact version (typical after sync).
-                    _profile_etag = _pmeta.get("etag") or None
-                else:
-                    _profile_name = None  # run with the lane's stock profile
-
-        # Asset URL blacklist (V): pull operator-managed list from Settings
-        # and stamp onto every assignment so an admin UI edit takes effect
-        # on the next dispatched job. Stored as newline-separated string;
-        # split + trim + drop blanks here so the worker just iterates.
-        _bl_raw = ""
-        if state.settings is not None:
-            try:
-                _bl_raw = (state.settings.get("asset_url_blacklist", "") or "").strip()
-            except Exception:
-                _bl_raw = ""
-        _asset_url_blacklist = [
-            line.strip()
-            for line in _bl_raw.splitlines()
-            if line.strip() and not line.strip().startswith("#")
-        ]
-        assign = HubAssignJob(
-            job_id=job_id,
-            url=req.url,
-            options=req.options,
-            asset_upload_base=_asset_upload_url(base, job_id),
-            lane_hint=lane_hint,
-            cookies=auto_cookies,
-            save_cookies_host=auto_host if req.options.mode == "fetch" else None,
-            session_id=fetch_sid,
-            popup_policy=auto_popup_policy,
-            profile_url=_profile_url,
-            profile_name=_profile_name,
-            profile_etag=_profile_etag,
-            asset_url_blacklist=_asset_url_blacklist,
+        _placed = await _dispatch_to_worker(
+            req=req, info=info, worker=worker, request=request,
+            job_id=job_id, auto_host=auto_host, auto_cookies=auto_cookies,
+            auto_popup_policy=auto_popup_policy,
+            lane_hint=lane_hint, _is_codegen_loop=_is_codegen_loop, _sw=_sw,
         )
-        # Bump the registry's last_used_at so the Hosts tab reflects
-        # that the cookies actually rode along on a real job.
-        if auto_cookies and auto_host and state.hosts is not None:
-            try:
-                state.hosts.touch_used(auto_host)
-            except Exception:
-                pass
-        # CAS-claim the row from queued -> running BEFORE sending the WS
-        # assign. This makes POST symmetric with redrive (which already uses
-        # claim_queued_job) and closes the race that forced redrive's
-        # _MIN_AGE_S to 90s:
-        #   POST sends WS, then blindly upserts queued+worker_id; if redrive
-        #   had simultaneously CAS'd to running+W2, POST's blind save would
-        #   overwrite running+W2 back to queued+W1 -- both workers then run
-        #   the same job. The CAS here pins ownership at the DB layer, so a
-        #   concurrent redrive sees worker_id NOT NULL (or status running)
-        #   and skips. _MIN_AGE_S can now be lowered safely.
-        if _sw: _sw.mark("profile")
-        _started_at = datetime.utcnow()
-        try:
-            _claim_ok = await state.store.claim_queued_job(
-                job_id, worker.worker_id, _started_at,
-            )
-        except Exception:
-            log.warning(f"!! claim_queued_job({job_id}) raised", exc_info=True)
-            _claim_ok = False
-        if not _claim_ok:
-            # Another path (redrive on this or a peer hub) already moved the
-            # row off queued. Release our reserved slot and fall through to
-            # the 503 / cross-hub path -- nothing to do here, the other path
-            # will run the job. The session we eagerly registered (if any)
-            # also rolls back so it doesn't pin to a worker that never got
-            # the assign.
-            try:
-                state.registry.release_pending_assign(worker.worker_id, job_id)
-            except Exception:
-                pass
-            if fetch_sid:
-                try:
-                    state.sessions.remove(fetch_sid)
-                except Exception:
-                    pass
-                info.session_id = None
-            log.info(
-                f"[hub] job {job_id}: claim_queued_job lost the CAS "
-                f"(redrive / peer hub already claimed); deferring to it"
-            )
-            # Re-read the now-running row so the response reflects who took
-            # it. If even that fails, return the local view; the client only
-            # needs the job_id.
-            try:
-                _now = await state.store.get_job_info(job_id)
-                if _now is not None:
-                    info = _now
-            except Exception:
-                pass
-            return _proxy_info(info, request)
-        if _sw: _sw.mark("claim")
-        ok = await state.registry.assign(worker, assign)
-        if _sw: _sw.mark("assign")
-        if ok:
-            # Record which worker + (if known) the noVNC URL so clients can
-            # watch the job live. Status was already flipped to running by
-            # the CAS above; mirror that locally so the upsert below doesn't
-            # downgrade it.
-            info.status = JobStatus.running
-            info.worker_id = worker.worker_id
-            info.started_at = _started_at
-            novnc = worker.capabilities.novnc_url
-            if novnc:
-                sep = "&" if "?" in novnc else "?"
-                info.novnc_url = (
-                    f"{novnc}{sep}autoconnect=1&resize=scale&reconnect=1"
-                    if "autoconnect" not in novnc
-                    else novnc
-                )
-            await state.store.save_job_info(info)
-            # GPU gate: register the codegen-loop job so subsequent
-            # submissions see the right in-flight count. Unregister
-            # happens in workers.py when WorkerJobComplete / Failed lands.
-            if _is_codegen_loop:
-                try:
-                    from server.hub._gpu_gate import register_codegen_loop
-                    register_codegen_loop(job_id)
-                except Exception:
-                    pass
-            # ACK watchdog: the WS assign returning True only proves the
-            # message was ENQUEUED, not that the worker actually picked the
-            # job up. If WorkerJobAccepted never lands (worker hung, accept
-            # handler crashed, deploy churn between assign + ack), the row
-            # sits queued+worker_id forever -- pre-fix this drove 80%+ of
-            # "queue timeout" failures (incident 2026-06-15). Spawn a guard
-            # that flips back to "stranded" after _POST_ASSIGN_ACK_TIMEOUT_S
-            # and immediately re-dispatches onto another free lane. Periodic
-            # redrive reclaim is the safety-net for guards killed by a hub
-            # restart before they could fire.
-            try:
-                import asyncio as _asyncio
-                from server.hub._redrive import post_assign_ack_guard
-                _asyncio.create_task(
-                    post_assign_ack_guard(job_id, worker.worker_id)
-                )
-            except Exception:
-                pass
-            log.info(
-                f"[hub] job {job_id} → worker {worker.worker_id} "
-                f"(in_flight={worker.in_flight}/"
-                f"{worker.capabilities.max_concurrent})  "
-                f"novnc={info.novnc_url or '(none)'}",
-            )
-            if _sw:
-                _sw.mark("save2")
-                _sw.report(job_id, req.url)
-            return _proxy_info(info, request)
-        # If send failed, fall through to the 503 path below. Roll back
-        # the SessionInfo we eagerly registered so it doesn't stick
-        # around pointing at a worker that never accepted the job.
-        if fetch_sid:
-            try:
-                state.sessions.remove(fetch_sid)
-            except Exception:
-                pass
-            info.session_id = None
-        # We CAS-claimed the row to running before the assign; the WS send
-        # then failed (worker WS dropped between pick + send). Release the
-        # claim back to queued so the redrive (or cross-hub forward below)
-        # can re-dispatch it. Without this the row would sit running+W
-        # until the post_assign_ack_guard expires (30s).
-        try:
-            await state.store.release_claimed_job(job_id)
-            info.status = JobStatus.queued
-            info.worker_id = None
-            info.started_at = None
-        except Exception:
-            log.warning(
-                f"!! release_claimed_job({job_id}) failed after assign send error",
-                exc_info=True,
-            )
-        try:
-            state.registry.release_pending_assign(worker.worker_id, job_id)
-        except Exception:
-            pass
-        log.info(f"!! failed to send job to worker {worker.worker_id}")
+        if _placed is not None:
+            return _placed
 
     # P1 cross-hub dispatch: local dispatch did NOT place the job (no free
     # local worker, or the local send failed). Before rejecting, forward the
