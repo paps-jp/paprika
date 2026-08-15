@@ -625,6 +625,9 @@ class _RunMixin:
         selfcheck_task = asyncio.create_task(self._self_check_loop())
         # Pull dispatch (server/worker/agent/_mix_pull.py). Returns
         # immediately unless PAPRIKA_PULL_DISPATCH is set.
+        if getattr(self, "_lag_task", None) is None:
+            # Never cancelled with the connection -- see _loop_lag.py.
+            self._lag_task = asyncio.create_task(self._loop_lag_sampler())
         pull_task = asyncio.create_task(self._pull_loop())
         try:
             async for raw in self._ws:
@@ -784,6 +787,7 @@ class _RunMixin:
                             mem_majfault_per_s=self._memguard_rates[0],
                             mem_refault_per_s=self._memguard_rates[1],
                             mem_anon_rate_mb_min=self._memguard_anon_rate_mb_min,
+                            loop_lag_ms=self.loop_lag_peak_ms(),
                             memguard=self._memguard_reason,
                         )
                     )

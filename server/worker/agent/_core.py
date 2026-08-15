@@ -99,6 +99,7 @@ from ._mix_maintenance import _MaintenanceMixin
 from ._mix_preview import _PreviewMixin
 from ._mix_uploads import _UploadsMixin
 from ._mix_pull import _PullMixin
+from ._loop_lag import _LoopLagMixin
 from ._mix_videodl import (
     _VideoDownloadMixin,
     download_pool_key_from_env,
@@ -118,6 +119,7 @@ class WorkerAgent(
     _UploadsMixin,
     _VideoDownloadMixin,
     _PullMixin,
+    _LoopLagMixin,
 ):
     PAPRIKA_AGENT_ID = "gmhfgiloilioklcofcinlemifjjaeppe"
 

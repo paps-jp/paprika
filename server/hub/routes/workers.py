@@ -2483,6 +2483,7 @@ async def _handle_worker_message(worker, msg) -> None:
             mem_majfault_per_s=msg.mem_majfault_per_s,
             mem_refault_per_s=msg.mem_refault_per_s,
             mem_anon_rate_mb_min=getattr(msg, "mem_anon_rate_mb_min", 0.0),
+            loop_lag_ms=getattr(msg, "loop_lag_ms", 0.0),
             memguard=msg.memguard,
         )
         # Keep the MariaDB ledger's last_seen_at fresh on heartbeat (NOT just on

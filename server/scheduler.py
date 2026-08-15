@@ -295,6 +295,11 @@ class ConnectedWorker:
     # Anon growth in MB/min. The slope axis: a 1GB/min climb is invisible to
     # the level thresholds until it is already most of the way to the cap.
     mem_anon_rate_mb_min: float = 0.0
+    # Peak event-loop lag (ms) the worker saw since its previous heartbeat.
+    # Says whether the process can still answer anything at all; a stall here
+    # is what precedes a 1011 keepalive close and the mass job failures that
+    # follow it.
+    loop_lag_ms: float = 0.0
     # Non-empty while the worker's own memory guard is draining it for a
     # recycle; carries the reason. Read by the hub's memory-choke salvage
     # escalation to tell "recovering itself" from "stuck and needs a push".
@@ -946,6 +951,7 @@ class WorkerRegistry:
         mem_majfault_per_s: float = 0.0,
         mem_refault_per_s: float = 0.0,
         mem_anon_rate_mb_min: float = 0.0,
+        loop_lag_ms: float = 0.0,
         memguard: str = "",
     ) -> None:
         worker = self.connections.get(worker_id)
@@ -966,6 +972,7 @@ class WorkerRegistry:
         worker.mem_majfault_per_s = mem_majfault_per_s
         worker.mem_refault_per_s = mem_refault_per_s
         worker.mem_anon_rate_mb_min = mem_anon_rate_mb_min
+        worker.loop_lag_ms = loop_lag_ms
         # Stamp the FIRST beat that carried a memguard reason and hold it until
         # the reason clears. The escalation needs "has been trying to recycle
         # itself for N minutes", which a per-beat flag can't express -- and the
@@ -1127,6 +1134,7 @@ class WorkerRegistry:
                              round(worker.mem_refault_per_s, 1)),
                             ("mem_anon_rate_mb_min",
                              round(worker.mem_anon_rate_mb_min, 1)),
+                            ("loop_lag_ms", round(worker.loop_lag_ms, 1)),
                             ("memguard", worker.memguard),
                         ):
                             if d.get(_k) != _v:
@@ -1482,6 +1490,7 @@ class WorkerRegistry:
                     "mem_majfault_per_s": round(w.mem_majfault_per_s, 1),
                     "mem_refault_per_s": round(w.mem_refault_per_s, 1),
                     "mem_anon_rate_mb_min": round(w.mem_anon_rate_mb_min, 1),
+                    "loop_lag_ms": round(w.loop_lag_ms, 1),
                     "memguard": w.memguard,
                     # Seconds this hub has seen the guard tripped without the
                     # worker managing to recycle itself. The hub-side memory
@@ -1708,6 +1717,7 @@ class WorkerRegistry:
                 "mem_anon_rate_mb_min": float(
                     data.get("mem_anon_rate_mb_min") or 0.0
                 ),
+                "loop_lag_ms": float(data.get("loop_lag_ms") or 0.0),
                 "memguard": str(data.get("memguard") or ""),
             })
         return out

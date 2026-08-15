@@ -625,6 +625,14 @@ class WorkerHeartbeat(BaseModel):
     #: for the same reason as the two rates above: so the operator sees the
     #: slope building in the Workers tab BEFORE the guard trips on it.
     mem_anon_rate_mb_min: float = 0.0
+    #: Peak event-loop lag in ms since the previous heartbeat: how late a task
+    #: that asked to sleep 500ms actually woke. The direct measure of "can this
+    #: process still answer anything". A spin in the pull loop on 2026-08-15
+    #: starved the loop until the hub's keepalive ping went unanswered and the
+    #: WS closed with 1011, failing every job the worker was running -- and
+    #: every metric we collected stayed healthy throughout. Peak, not average:
+    #: a 30s stall in a 60s window averages to a reassuring 500ms.
+    loop_lag_ms: float = 0.0
     #: Non-empty when the worker's memory guard has tripped and it is draining
     #: for a recycle -- carries the human-readable reason so the operator sees
     #: WHY in the Workers tab instead of an unexplained restart.
