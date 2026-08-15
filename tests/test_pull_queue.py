@@ -49,12 +49,33 @@ class _Redis:
         return n
 
 
+class _Store:
+    """Stands in for the job store, which is where the client actually lives."""
+
+    def __init__(self, r):
+        self._r = r
+
+
 @pytest.fixture
 def redis(monkeypatch):
     def _install(r):
-        monkeypatch.setattr(_pull_queue.state, "redis", r, raising=False)
+        # Via the STORE, not state.redis -- see _redis()'s docstring. Reaching
+        # for state.redis silently yielded None and the feature never engaged.
+        monkeypatch.setattr(_pull_queue.state, "store", _Store(r), raising=False)
+        monkeypatch.setattr(_pull_queue.state, "hubs", None, raising=False)
         return r
     return _install
+
+
+def test_client_comes_from_the_store():
+    """THE bug that made the first enablement a no-op. There is no
+    state.redis; the client is on the store. Pinning the lookup because the
+    failure is invisible: push returns False, the caller dispatches inline,
+    every job still runs, and nothing looks wrong."""
+    import inspect
+    src = inspect.getsource(_pull_queue._redis)
+    assert '"store"' in src and '"_r"' in src
+    assert src.index('"store"') < src.index('"redis"')
 
 
 def test_disabled_by_default():
@@ -82,6 +103,8 @@ async def test_push_failure_reports_false_so_the_caller_can_fall_back(redis):
 
 @pytest.mark.asyncio
 async def test_push_without_redis_is_false_not_an_exception(monkeypatch):
+    monkeypatch.setattr(_pull_queue.state, "store", None, raising=False)
+    monkeypatch.setattr(_pull_queue.state, "hubs", None, raising=False)
     monkeypatch.setattr(_pull_queue.state, "redis", None, raising=False)
     assert await _pull_queue.push("job-4") is False
 
@@ -92,6 +115,8 @@ async def test_empty_and_unknown_depth_are_distinguishable(redis, monkeypatch):
     assert await _pull_queue.depth() == 0        # genuinely empty
     r.fail = True
     assert await _pull_queue.depth() == -1       # unknown
+    monkeypatch.setattr(_pull_queue.state, "store", None, raising=False)
+    monkeypatch.setattr(_pull_queue.state, "hubs", None, raising=False)
     monkeypatch.setattr(_pull_queue.state, "redis", None, raising=False)
     assert await _pull_queue.depth() == -1
 

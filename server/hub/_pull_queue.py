@@ -48,6 +48,26 @@ from server.hub._state import state  # noqa: E402
 
 
 def _redis():
+    """The hub's async Redis client, or None.
+
+    There is no ``state.redis``: the client is owned by whoever created it.
+    The job store makes one for pub/sub (``state.store._r``, decode_responses
+    on) and the hub registry makes its own. Reaching for ``state.redis`` --
+    which several other modules also do -- silently yields None, and this
+    module's contract turns that into "push failed, dispatch inline". So the
+    first run of pull dispatch looked completely healthy: 180 submissions on
+    hub-41 logged "queue push failed; dispatching inline instead" and every
+    job still ran, over the WS, exactly as before. The fallback did its job;
+    the feature simply never engaged.
+    """
+    st = getattr(state, "store", None)
+    r = getattr(st, "_r", None) if st is not None else None
+    if r is not None:
+        return r
+    hubs = getattr(state, "hubs", None)
+    r = getattr(hubs, "_r", None) if hubs is not None else None
+    if r is not None:
+        return r
     return getattr(state, "redis", None)
 
 
