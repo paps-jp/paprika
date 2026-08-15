@@ -642,7 +642,11 @@ class _ProfileExtMixin:
                         / "User Data"
                     )
                     try:
-                        shutil.copytree(cached_dir, out)
+                        # Off the loop: a cache HIT still copies the whole
+                        # profile tree, and it happens on the job path. The
+                        # watchdog named this once the lane-side copy was
+                        # fixed.
+                        await asyncio.to_thread(shutil.copytree, cached_dir, out)
                         if log:
                             log(f"  ... profile {profile_name!r} from local cache")
                         else:

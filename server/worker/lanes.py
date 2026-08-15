@@ -1084,10 +1084,16 @@ class Lane:
         # asked for this profile to be the default; the previous
         # ambient (or empty lane state) is discarded. clear_ambient_-
         # profile() resets to empty.
-        if lane_dir.exists():
-            shutil.rmtree(lane_dir, ignore_errors=True)
-        try:
+        # Off the loop, same reason as use_profile: a Chrome profile is tens
+        # of thousands of small files, and the watchdog named this exact
+        # copytree once use_profile's was fixed.
+        def _install() -> None:
+            if lane_dir.exists():
+                shutil.rmtree(lane_dir, ignore_errors=True)
             shutil.copytree(profile_dir, lane_dir)
+
+        try:
+            await asyncio.to_thread(_install)
         except Exception as e:
             _log(self.lane_idx, f"ambient profile copy failed: {e!r}")
             lane_dir.mkdir(parents=True, exist_ok=True)
