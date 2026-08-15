@@ -618,6 +618,13 @@ class WorkerHeartbeat(BaseModel):
     #: Reported so a building storm is visible BEFORE the guard trips.
     mem_majfault_per_s: float = 0.0
     mem_refault_per_s: float = 0.0
+    #: Anon growth in MB/min from the guard's last pair of samples. The level
+    #: thresholds cannot see a fast climb in time -- measured on balcony w51177
+    #: (2026-08-14) anon went 5544MB -> 8448MB in 2.7 minutes and the kernel
+    #: OOM-killed the process before the level window could complete. Reported
+    #: for the same reason as the two rates above: so the operator sees the
+    #: slope building in the Workers tab BEFORE the guard trips on it.
+    mem_anon_rate_mb_min: float = 0.0
     #: Non-empty when the worker's memory guard has tripped and it is draining
     #: for a recycle -- carries the human-readable reason so the operator sees
     #: WHY in the Workers tab instead of an unexplained restart.

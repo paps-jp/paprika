@@ -623,6 +623,9 @@ class _RunMixin:
         disk_task = asyncio.create_task(self._disk_cleanup_loop())
         preview_task = asyncio.create_task(self._preview_capture_loop())
         selfcheck_task = asyncio.create_task(self._self_check_loop())
+        # Pull dispatch (server/worker/agent/_mix_pull.py). Returns
+        # immediately unless PAPRIKA_PULL_DISPATCH is set.
+        pull_task = asyncio.create_task(self._pull_loop())
         try:
             async for raw in self._ws:
                 # Any frame from the hub -- even an undecodable one -- proves a
@@ -642,6 +645,7 @@ class _RunMixin:
             disk_task.cancel()
             preview_task.cancel()
             selfcheck_task.cancel()
+            pull_task.cancel()
 
     async def _heartbeat_loop(self) -> None:
         try:
@@ -779,6 +783,7 @@ class _RunMixin:
                             mem_psi_full_avg60=mem_psi_full_avg60,
                             mem_majfault_per_s=self._memguard_rates[0],
                             mem_refault_per_s=self._memguard_rates[1],
+                            mem_anon_rate_mb_min=self._memguard_anon_rate_mb_min,
                             memguard=self._memguard_reason,
                         )
                     )
@@ -928,6 +933,15 @@ class _RunMixin:
                             f"does not serve us"
                         )
                     if misses >= miss_threshold:
+                        held = self._memguard_owns_recycle()
+                        if held:
+                            _logger.warning(
+                                f"[worker {self.worker_id}] self-check: missing "
+                                f"from hub in {misses}/{len(recent)} recent "
+                                f"probes, but standing down -- {held}"
+                            )
+                            await asyncio.sleep(interval)
+                            continue
                         try:
                             _logger.critical(
                                 f"[worker {self.worker_id}] self-check: missing from "
@@ -953,6 +967,15 @@ class _RunMixin:
                     # reply (incl. non-200) resets the counter above.
                     probe_errors += 1
                     if probe_errors >= error_threshold:
+                        held = self._memguard_owns_recycle()
+                        if held:
+                            _logger.warning(
+                                f"[worker {self.worker_id}] self-check: probe "
+                                f"unreachable {probe_errors}x, but standing "
+                                f"down -- {held}"
+                            )
+                            await asyncio.sleep(interval)
+                            continue
                         try:
                             _logger.critical(
                                 f"[worker {self.worker_id}] self-check: probe "
@@ -1057,7 +1080,28 @@ class _RunMixin:
     # MILLION major faults and the node did 24k read IOPS of 2KB random IO.
     # Every threshold below therefore sits an order of magnitude above healthy
     # and an order of magnitude below the incident.
-    _MEMGUARD_ANON_MB = 5500        # ~69% of the fleet's 8GB CT cap
+    # Was 5500 = ~69% of the fleet's THEN-8GB CT cap. The caps were raised to
+    # 12288MB on every node on 2026-08-06 ([[loft-shmem-charged-to-ct-refault-storm]])
+    # and this number was not moved with them, leaving it at 45% of the cap --
+    # low enough that healthy-but-busy workers crossed it and recovered
+    # (measured w5148 2026-08-14: warned at 6676MB, then twelve consecutive
+    # clean samples). 7000 is ~57% of the 12288MB cap and still leaves 5.3GB of
+    # headroom, which is >5 minutes even at the fastest leak rate observed.
+    # The fast leaks are caught earlier by the growth-rate axis below, not by
+    # this absolute floor, so raising it costs nothing in detection latency.
+    _MEMGUARD_ANON_MB = 7000        # ~57% of the fleet's 12288MB CT cap
+    # Growth rate, not level: the axis the absolute threshold above cannot see
+    # in time. Measured on balcony w51177 2026-08-14: anon went 5544MB ->
+    # 8448MB in 2.7 minutes (~1GB/min), and the kernel OOM-killed the process
+    # at 10.4GB before the level-based window could complete. A worker climbing
+    # this fast has minutes, not tens of minutes, so it must be caught on the
+    # slope. Healthy workers sit at 1.4-2.1GB with no sustained climb; the
+    # startup ramp (400MB -> ~2GB as Chrome lanes come up) is steep but ends
+    # well below the floor, which is why the rate only counts ABOVE
+    # _MEMGUARD_ANON_RATE_FLOOR_MB -- rate alone would recycle every worker
+    # during its own boot.
+    _MEMGUARD_ANON_RATE_MB_MIN = 300.0
+    _MEMGUARD_ANON_RATE_FLOOR_MB = 3500.0
     _MEMGUARD_MAJFAULT_PER_S = 1000.0
     _MEMGUARD_PSI_PCT = 20.0
     # Page-cache refaults/s: pages evicted and immediately read back. THE
@@ -1068,7 +1112,15 @@ class _RunMixin:
     # boiler incident: ~48MB/s of 2KB random reads over ~11 CTs is on the
     # order of 1000 pages/s per CT, so 500 trips before it is that bad.
     _MEMGUARD_REFAULT_PER_S = 500.0
-    _MEMGUARD_SUSTAIN_S = 300.0     # must hold this long -- no spike recycles
+    # Was 300s. That window (10-14 samples, tripping at 6-9 of them = ~4
+    # minutes) was sized for the slow leak measured in 2026-08: 35-80MB/min,
+    # where 4 minutes of deliberation costs ~300MB. Against the 1GB/min bursts
+    # measured 2026-08-14 it is longer than the whole runway -- from the
+    # threshold to a full 12GB cap is ~5 minutes, so the guard was still
+    # counting samples when the kernel OOM killer fired. 120s (4-6 samples,
+    # tripping at 3-4) keeps a lone spike from recycling anything while
+    # deciding inside the runway.
+    _MEMGUARD_SUSTAIN_S = 120.0     # must hold this long -- no spike recycles
     # Fraction of the sustain window that must be breaching to trip. Below 1.0
     # deliberately: see the sliding-window note in _memory_guard_loop. 0.6 of a
     # 10-14 sample window is 6-9 breaching samples, so a lone spike (1-2) still
@@ -1077,7 +1129,19 @@ class _RunMixin:
     _MEMGUARD_WINDOW_FRAC = 0.6
     _MEMGUARD_INTERVAL_S = 30.0
     _MEMGUARD_DRAIN_DEADLINE_S = 900.0
-    _MEMGUARD_JITTER_S = 120.0
+    # Halved with the sustain window: jitter is added to the window length, so
+    # leaving it at 120 against a 120s sustain would make the effective window
+    # anywhere from 4 to 8 samples -- a 2x spread that puts the slowest workers
+    # right back outside the runway. 60 keeps the stagger (its point is that a
+    # node-wide event must not drain every CT in the same minute) while
+    # bounding the window to 4-6 samples.
+    _MEMGUARD_JITTER_S = 60.0
+    # How long the self-check loop stands down while the guard is mid-breach,
+    # so a graceful drain beats self-check's abrupt exit. Bounded: a worker
+    # that is BOTH leaking and genuinely absent from the hub must still recycle
+    # rather than sit deferring forever. Sized above the worst-case decision
+    # window (sustain + jitter + a couple of samples) with room to spare.
+    _MEMGUARD_SELFCHECK_DEFER_S = 300.0
 
     def _start_memory_guard(self, loop: "asyncio.AbstractEventLoop") -> None:
         """Arm the memory-guard daemon thread. Kill switch:
@@ -1111,6 +1175,40 @@ class _RunMixin:
             daemon=True,
         ).start()
 
+    def _memguard_owns_recycle(self) -> str:
+        """Why the self-check loop must NOT exit right now, or "" to proceed.
+
+        Both loops recycle a sick worker, but they do it differently: the guard
+        sets ``_draining`` and lets in-flight jobs finish (with its own deadline
+        as the backstop), while the self-check calls ``os._exit`` immediately
+        and those jobs are lost until the redrive path requeues them. When both
+        are firing at once the graceful one should win.
+
+        Measured on balcony w51177 2026-08-14, which is what this exists for:
+        the worker sat at anon 8.4GB with the guard mid-window, and self-check
+        exited it first. The replacement process started at 402MB with an EMPTY
+        guard window, leaked back to 8GB, and was exited again -- a ~5 minute
+        loop in which the guard could never reach its trip count, so a worker
+        that the guard would have recycled cleanly instead lost its in-flight
+        work every time. Deferring is bounded (see _MEMGUARD_SELFCHECK_DEFER_S)
+        so a worker that is both leaking AND genuinely unserved still exits.
+        """
+        if self._memguard_reason:
+            return f"memory guard already draining ({self._memguard_reason})"
+        since = self._memguard_breach_since
+        if not since:
+            return ""
+        held = time.monotonic() - since
+        limit = _num_env(
+            "PAPRIKA_MEMGUARD_SELFCHECK_DEFER_S", self._MEMGUARD_SELFCHECK_DEFER_S
+        )
+        if limit > 0 and held <= limit:
+            return (
+                f"memory guard breaching for {held:.0f}s (limit {limit:.0f}s) "
+                f"-- letting it drain gracefully"
+            )
+        return ""
+
     def _memguard_breaches(self, prev, cur, dt_s: float) -> list[str]:
         """Which thresholds this sample crosses. Empty list == healthy.
 
@@ -1142,17 +1240,39 @@ class _RunMixin:
         rf_limit = _num_env(
             "PAPRIKA_MEMGUARD_REFAULT_PER_S", self._MEMGUARD_REFAULT_PER_S
         )
-        if prev is not None:
+        rate_limit = _num_env(
+            "PAPRIKA_MEMGUARD_ANON_RATE_MB_MIN", self._MEMGUARD_ANON_RATE_MB_MIN
+        )
+        rate_floor = _num_env(
+            "PAPRIKA_MEMGUARD_ANON_RATE_FLOOR_MB",
+            self._MEMGUARD_ANON_RATE_FLOOR_MB,
+        )
+        if prev is not None and dt_s > 0:
             mf_rate = cgroup_mem.majfault_rate(prev, cur, dt_s)
             rf_rate = cgroup_mem.refault_rate(prev, cur, dt_s)
             # Stash for the heartbeat: rates need two samples, so the guard
             # thread is the only place that can compute them, and without
             # reporting them the storm stays invisible until it is fatal.
             self._memguard_rates = (mf_rate, rf_rate)
+            anon_rate = (cur.anon - prev.anon) / (1024 * 1024) / (dt_s / 60.0)
+            self._memguard_anon_rate_mb_min = anon_rate
             if mf_limit > 0 and mf_rate >= mf_limit:
                 out.append(f"majfault {mf_rate:.0f}/s >= {mf_limit:.0f}/s")
             if rf_limit > 0 and rf_rate >= rf_limit:
                 out.append(f"refault {rf_rate:.0f}/s >= {rf_limit:.0f}/s")
+            # Slope, gated on level. Both conditions are load-bearing: without
+            # the floor this fires on every worker's own startup ramp, and
+            # without the rate a 1GB/min climb is invisible until it is already
+            # most of the way to the cap.
+            if (
+                rate_limit > 0
+                and anon_rate >= rate_limit
+                and cur.anon >= rate_floor * 1024 * 1024
+            ):
+                out.append(
+                    f"anon climbing {anon_rate:.0f}MB/min >= {rate_limit:.0f}"
+                    f"MB/min at {cur.anon // (1024 * 1024)}MB"
+                )
         psi_limit = _num_env("PAPRIKA_MEMGUARD_PSI_PCT", self._MEMGUARD_PSI_PCT)
         if psi_limit > 0 and cur.psi_some_avg60 >= psi_limit:
             out.append(
@@ -1241,6 +1361,14 @@ class _RunMixin:
                 window.append(bool(reasons))
                 if reasons:
                     last_reasons = reasons
+                    # Stamp the START of this run of breaching samples and hold
+                    # it until the window goes fully clean. The self-check loop
+                    # reads it to stand down, so it must stay set through the
+                    # dips inside a run -- clearing it per-sample would hand the
+                    # recycle back to self-check exactly on the dips the
+                    # sliding window exists to survive.
+                    if not self._memguard_breach_since:
+                        self._memguard_breach_since = now_m
                 hits = sum(window)
 
                 # Force-exit deadline, evaluated on EVERY iteration once we have
@@ -1286,6 +1414,8 @@ class _RunMixin:
                         f"cleared (no breach in the last {window_n} samples) "
                         f"-- standing down"
                     )
+                if hits == 0:
+                    self._memguard_breach_since = 0.0
 
                 if hits < need_n:
                     continue

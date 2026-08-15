@@ -179,9 +179,44 @@ def test_healthy_boiler_baseline_does_not_trip():
 
 
 def test_anon_leak_trips():
-    cur = _s(anon=6000 * _MB, psi={"some_avg60": 0.0})
+    cur = _s(anon=7100 * _MB, psi={"some_avg60": 0.0})
     reasons = _Agent()._memguard_breaches(None, cur, 0.0)
     assert len(reasons) == 1 and "anon" in reasons[0]
+
+
+def test_anon_level_alone_is_quiet_below_the_raised_threshold():
+    """The absolute threshold moved 5500 -> 7000MB on 2026-08-14 because the
+    CT caps had moved 8192 -> 12288MB without it. 6676MB is the exact level
+    w5148 warned at and then recovered from twelve samples later -- a flat
+    worker at that level is not distressed and must not be recycled."""
+    cur = _s(anon=6676 * _MB, psi={"some_avg60": 0.0})
+    assert _Agent()._memguard_breaches(_s(anon=6676 * _MB), cur, 30.0) == []
+
+
+def test_fast_anon_climb_trips_on_the_rate_before_the_level():
+    """w51177, measured 2026-08-14: 5544 -> 8448MB in 2.7 minutes. The level
+    axis alone would still be waiting at the first of those samples while the
+    kernel OOM-killed the process at 10.4GB. One guard interval of that slope
+    (540MB / 30s = 1080MB/min) has to be enough to start counting."""
+    prev, cur = _s(anon=6000 * _MB), _s(anon=6540 * _MB, psi={"some_avg60": 0.0})
+    reasons = _Agent()._memguard_breaches(prev, cur, 30.0)
+    assert len(reasons) == 1 and "climbing" in reasons[0]
+
+
+def test_startup_ramp_does_not_trip_the_rate_axis():
+    """A worker booting its Chrome lanes climbs 400MB -> 2GB in a couple of
+    minutes, which is steeper than the leak rate. The floor is what separates
+    them: the ramp ends far below it, the leak happens above it. Without this
+    gate the rate axis would recycle every worker during its own startup."""
+    prev, cur = _s(anon=400 * _MB), _s(anon=700 * _MB, psi={"some_avg60": 0.0})
+    assert _Agent()._memguard_breaches(prev, cur, 30.0) == []
+
+
+def test_slow_drift_above_the_floor_does_not_trip_the_rate_axis():
+    """Being above the floor is not itself a breach -- the slope has to be
+    there too, or every busy worker in the 3.5-7GB band would recycle."""
+    prev, cur = _s(anon=6000 * _MB), _s(anon=6025 * _MB, psi={"some_avg60": 0.0})
+    assert _Agent()._memguard_breaches(prev, cur, 30.0) == []
 
 
 def test_thrash_trips_on_majfault_rate():
@@ -271,3 +306,48 @@ def test_multiple_signals_are_all_reported():
     prev = _s(pgmajfault=0)
     cur = _s(pgmajfault=120_000, anon=6000 * _MB, psi={"some_avg60": 40.0})
     assert len(_Agent()._memguard_breaches(prev, cur, 30.0)) == 3
+
+
+# ---------------------------------------------------------------------------
+# The slope has to reach the operator, not just the guard
+# ---------------------------------------------------------------------------
+
+def test_anon_growth_rate_reaches_the_workers_view():
+    """The rate axis exists because the level thresholds cannot see a fast
+    climb in time -- measured on balcony w51177 (2026-08-14), anon went
+    5544MB -> 8448MB in 2.7 minutes and the kernel OOM-killed the process
+    before the level window could complete.
+
+    Computing it is only half the job: the whole point of stashing it on the
+    agent is that the heartbeat carries it, so a building storm is visible in
+    the Workers tab BEFORE the guard trips. This pins the whole path --
+    protocol field, heartbeat send, scheduler mirror, /workers row -- because
+    a break anywhere in it is silent: the guard still works, the operator just
+    cannot see the slope coming."""
+    import inspect
+    from server import protocol, scheduler
+    from server.hub.routes import workers as workers_route
+    from server.worker.agent import _mix_run
+
+    # protocol: the field exists on the heartbeat
+    assert "mem_anon_rate_mb_min" in protocol.WorkerHeartbeat.model_fields
+
+    # worker: the heartbeat sends what the guard stashed
+    hb = inspect.getsource(_mix_run._RunMixin._heartbeat_loop)
+    assert "mem_anon_rate_mb_min=self._memguard_anon_rate_mb_min" in hb
+
+    # hub: the heartbeat handler passes it on
+    assert "mem_anon_rate_mb_min=" in inspect.getsource(workers_route)
+
+    # scheduler: it lands on the worker and is mirrored into the row
+    assert "mem_anon_rate_mb_min" in scheduler.ConnectedWorker.__dataclass_fields__
+    sched = inspect.getsource(scheduler)
+    assert 'worker.mem_anon_rate_mb_min = mem_anon_rate_mb_min' in sched
+    # FOUR sites, and the first version of this test only checked one of them
+    # -- the field then reached the hub and stopped, invisible on 0/170 rows:
+    #   1. the Redis snapshot mirror (tuple form)
+    #   2. the local row builder that /workers serves
+    #   3. the cross-hub restore that rebuilds a peer's row from Redis
+    assert '("mem_anon_rate_mb_min",' in sched, "redis snapshot mirror"
+    assert '"mem_anon_rate_mb_min": round(' in sched, "local row builder"
+    assert 'data.get("mem_anon_rate_mb_min")' in sched, "cross-hub restore"
