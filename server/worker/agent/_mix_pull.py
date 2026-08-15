@@ -30,6 +30,8 @@ from __future__ import annotations
 import asyncio
 import logging
 import os
+import random
+import time
 
 log = logging.getLogger(__name__)
 
@@ -45,6 +47,22 @@ _POP_TIMEOUT_S = float(os.environ.get("PAPRIKA_PULL_POP_TIMEOUT_S") or 5.0)
 
 #: Backoff after a Redis error, so a Redis outage doesn't become a hot loop.
 _ERROR_BACKOFF_S = float(os.environ.get("PAPRIKA_PULL_ERROR_BACKOFF_S") or 5.0)
+
+#: How long a won claim reserves its lane while waiting for the assign to
+#: arrive over the WS. Long enough to cover a slow hub dispatch, short enough
+#: that a lost assign doesn't idle the lane.
+_ASSIGN_GRACE_S = float(os.environ.get("PAPRIKA_PULL_ASSIGN_GRACE_S") or 20.0)
+
+#: Pause after an id we had to put back. The queue can hold ids this worker
+#: cannot claim (a hub that does not hold our WS, a hub we cannot reach), and
+#: without a pause the loop spins pop -> claim -> requeue at request rate.
+#: Jittered so 300 lanes that all start failing do not resynchronise into a
+#: single herd against the hubs.
+_CLAIM_BACKOFF_S = float(os.environ.get("PAPRIKA_PULL_CLAIM_BACKOFF_S") or 0.5)
+
+
+def _claim_backoff() -> float:
+    return _CLAIM_BACKOFF_S * (0.5 + random.random())
 
 
 class _PullMixin:
@@ -84,46 +102,114 @@ class _PullMixin:
         # rows waited out the redrive.
         if getattr(self, "_ws", None) is None:
             return False
-        return self._pull_free_lanes() > 0
+        # Subtract claims we have already won but whose assignment has not
+        # landed yet. Between a 200 and the WS assign that marks the lane
+        # busy, ``_pull_free_lanes`` still reports that lane free, so a worker
+        # popping a non-empty queue claims the same lane over and over. Seen
+        # 2026-08-15 once every hub started pushing: in_flight reached 5 on a
+        # 2-lane worker, the extra Chromes starved the event loop, the hub's
+        # keepalive ping went unanswered and the WS died with 1011 -- failing
+        # every job that worker was running as "disconnected before the job
+        # finished". Over-claiming is not just unfair scheduling; it is how a
+        # worker kills itself.
+        return self._pull_free_lanes() - getattr(self, "_pull_pending", 0) > 0
 
-    async def _pull_claim(self, job_id: str) -> bool:
-        """Claim a popped job on our own hub. False means someone else got it.
+    async def _pull_settle(self) -> None:
+        """Keep a won claim reserved until its lane actually goes busy.
 
-        A 409 is ordinary: a redrive or another worker won the CAS, or the job
-        left ``queued`` while the id sat in the list. A 404 means the job was
-        cancelled or deleted between submit and pop. Neither is an error worth
-        retrying -- drop it and pop the next one.
+        Released early the moment lane state catches up, and on a deadline
+        regardless -- a claim whose assign never arrives (hub restart between
+        the CAS and the send) must not reserve a lane forever.
+        """
+        before = self._pull_free_lanes()
+        deadline = time.monotonic() + _ASSIGN_GRACE_S
+        try:
+            while time.monotonic() < deadline:
+                await asyncio.sleep(0.25)
+                if self._pull_free_lanes() < before:
+                    return
+        finally:
+            self._pull_pending = max(0, getattr(self, "_pull_pending", 0) - 1)
+
+    async def _pull_claim(self, http, job_id: str) -> str:
+        """Claim a popped job. Returns what to do with the id afterwards.
+
+        ``"ok"``       we run it; the reservation becomes a busy lane.
+        ``"done"``     someone else owns it -- drop the id, it is handled.
+        ``"requeue"``  WE could not take it but nobody else has it either;
+                       put it back so another worker gets it now rather than
+                       leaving it for the redrive minutes later.
+
+        Telling those last two apart is the whole point. "job is already
+        running" and "worker is not connected to this hub" are both 409, and
+        they demand opposite responses: the first means the work is in hand,
+        the second means the work is stranded. Treating them alike is how the
+        first production run of pull dispatch discarded every id it popped.
+
+        ``http`` is a long-lived client. Building one per claim -- which this
+        did -- defeats connection pooling and is called out by name in the
+        HTTPX docs ("don't instantiate a client inside a hot loop"); at fleet
+        scale the churn was a large part of what starved the event loop until
+        the hub's keepalive ping went unanswered and the WS died with 1011.
 
         The path carries OUR id, not the job's, because ``hub_http_url`` is the
-        nginx front and nginx routes on the path alone. Addressed as
-        ``/jobs/{id}/claim`` the claim round-robined across all seven hubs and
-        only the one holding our WebSocket could answer it: 6 in 7 came back
-        409 and pull dispatch delivered zero jobs while looking healthy, since
-        the redrive re-dispatched every one of them the old way.
+        nginx front and nginx routes on the path alone.
         """
-        import httpx
         url = f"{self.hub_http_url.rstrip('/')}/workers/{self.worker_id}/claim"
         try:
-            async with httpx.AsyncClient(timeout=30.0) as client:
-                resp = await client.post(url, json={"job_id": job_id})
+            resp = await http.post(url, json={"job_id": job_id})
         except Exception as e:
+            # Never reached the hub: the job is still queued and unowned.
             log.info("[pull] claim %s failed to send: %s", job_id, e)
-            return False
+            return "requeue"
         if resp.status_code == 200:
             log.info("[pull] claim %s -> ok", job_id)
-            return True
-        if resp.status_code in (404, 409):
-            # The reason is the diagnostic that matters: "not connected to
-            # this hub" means routing is broken, "already running" means we
-            # merely lost a race. They demand opposite responses.
-            try:
-                _why = resp.text[:120]
-            except Exception:
-                _why = ""
-            log.info("[pull] claim %s -> %s %s", job_id, resp.status_code, _why)
+            return "ok"
+        try:
+            _why = resp.text[:160]
+        except Exception:
+            _why = ""
+        if resp.status_code == 404:
+            # Cancelled or deleted between submit and pop. Gone for good.
+            log.info("[pull] claim %s -> 404 %s", job_id, _why)
+            return "done"
+        if resp.status_code == 409:
+            log.info("[pull] claim %s -> 409 %s", job_id, _why)
+            return "done" if "already" in _why else "requeue"
+        log.warning("[pull] claim %s -> HTTP %s %s", job_id, resp.status_code, _why)
+        return "requeue"
+
+    def _pull_reserve(self) -> bool:
+        """Take a slot BEFORE polling, or return False.
+
+        Reserving first is the ordering Temporal's workers use -- a poller does
+        not ask the task queue for work unless a slot is already held -- and it
+        is stricter than reserving after the claim. ``BLPOP`` removes the id
+        from the queue, so popping work we then cannot run strands it until the
+        redrive notices; not popping it at all leaves it for a worker that can
+        start immediately.
+        """
+        if not self._pull_should_ask():
             return False
-        log.warning("[pull] claim %s -> HTTP %s", job_id, resp.status_code)
-        return False
+        self._pull_pending = getattr(self, "_pull_pending", 0) + 1
+        return True
+
+    def _pull_release(self) -> None:
+        self._pull_pending = max(0, getattr(self, "_pull_pending", 0) - 1)
+
+    async def _pull_requeue(self, client, job_id: str) -> None:
+        """Put back an id we popped but could not take.
+
+        Appends, so it goes behind work that has been waiting -- a job we
+        failed to claim must not head-of-line block the queue by bouncing
+        between the front and one worker.
+        """
+        try:
+            await client.rpush(QUEUE_KEY, job_id)
+        except Exception:
+            # The row is still `queued`; the redrive is the backstop. Losing
+            # the id here costs latency, never the job.
+            log.warning("[pull] requeue of %s failed", job_id, exc_info=True)
 
     async def _pull_loop(self) -> None:
         """Ask for work whenever we have a lane free."""
@@ -141,29 +227,48 @@ class _PullMixin:
 
         log.info("[pull] loop starting (queue=%s, %d lanes)",
                  QUEUE_KEY, len(getattr(getattr(self, "lane_pool", None), "lanes", [])))
+        import httpx
         client = aioredis.from_url(redis_url, decode_responses=True)
+        # One client for the life of the loop: see _pull_claim.
+        http = httpx.AsyncClient(timeout=30.0)
         try:
             while True:
                 try:
-                    if not self._pull_should_ask():
-                        # No lane, draining, or updating: idle without holding
-                        # a blocked connection open against the queue.
+                    if not self._pull_reserve():
+                        # No free slot, draining, updating, or no WS: idle
+                        # without holding a blocked connection on the queue.
                         await asyncio.sleep(1.0)
                         continue
-                    got = await client.blpop(QUEUE_KEY, timeout=int(_POP_TIMEOUT_S))
-                    if not got:
-                        continue          # timeout -- re-check our lane state
-                    job_id = got[1]
-                    if not job_id:
-                        continue
-                    await self._pull_claim(job_id)
+                    handed_off = False
+                    try:
+                        got = await client.blpop(QUEUE_KEY, timeout=int(_POP_TIMEOUT_S))
+                        if not got or not got[1]:
+                            continue      # timeout -- re-check our lane state
+                        job_id = got[1]
+                        outcome = await self._pull_claim(http, job_id)
+                        if outcome == "ok":
+                            # The reservation lives on until the assign lands;
+                            # _pull_settle owns releasing it from here.
+                            asyncio.create_task(self._pull_settle())
+                            handed_off = True
+                        elif outcome == "requeue":
+                            await self._pull_requeue(client, job_id)
+                            # Yield before popping again. Without this a queue
+                            # full of ids we cannot claim becomes a tight
+                            # pop/claim loop that starves the event loop and
+                            # kills the WS with a keepalive timeout.
+                            await asyncio.sleep(_claim_backoff())
+                    finally:
+                        if not handed_off:
+                            self._pull_release()
                 except asyncio.CancelledError:
                     raise
                 except Exception as e:
                     log.warning("[pull] loop error: %s: %s", type(e).__name__, e)
                     await asyncio.sleep(_ERROR_BACKOFF_S)
         finally:
-            try:
-                await client.aclose()
-            except Exception:
-                pass
+            for _c in (client, http):
+                try:
+                    await _c.aclose()
+                except Exception:
+                    pass

@@ -98,7 +98,8 @@ def test_a_successful_claim_is_logged():
     'queue depth is draining' reads as success while the redrive does the work
     -- exactly how this bug survived its first production run."""
     src = inspect.getsource(_mix_pull._PullMixin._pull_claim)
-    assert re.search(r"status_code == 200:\s*\n\s*log\.", src)
+    ok_branch = src[src.index("status_code == 200:"):src.index("status_code == 404")]
+    assert re.search(r"log\.info\(.*-> ok", ok_branch)
 
 
 def test_a_rejected_claim_logs_the_reason():

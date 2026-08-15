@@ -128,11 +128,13 @@ def test_claim_goes_to_our_own_hub():
     assert "worker_id" in src
 
 
-def test_claim_treats_404_and_409_as_ordinary():
-    """A redrive won the CAS, or the job was cancelled between submit and
-    pop. Neither is worth retrying -- drop it and pop the next id."""
+def test_claim_distinguishes_handled_from_stranded():
+    """404 and "already running" mean the work is in hand -- drop the id. Any
+    other refusal means WE could not take it and nobody else has it either, so
+    the id goes back on the queue instead of waiting out the redrive."""
     src = inspect.getsource(_PullMixin._pull_claim)
-    assert "(404, 409)" in src
+    assert '"done" if "already" in _why else "requeue"' in src
+    assert 'return "done"' in src and 'return "requeue"' in src
 
 
 def test_disconnected_worker_does_not_ask():
@@ -140,3 +142,30 @@ def test_disconnected_worker_does_not_ask():
     the claim is refused ("not connected to this hub"), and the row waits out
     the redrive. w5110 did this for its whole disconnection on 2026-08-15."""
     assert _Agent(_Pool(False), ws=None)._pull_should_ask() is False
+
+
+def test_a_won_claim_reserves_its_lane():
+    """Between the 200 and the WS assign that marks the lane busy, the lane
+    still counts as free -- so a worker popping a non-empty queue claims the
+    same lane repeatedly. On 2026-08-15 in_flight hit 5 on a 2-lane worker;
+    the extra Chromes starved the event loop, the keepalive ping went
+    unanswered, and the WS died with 1011, failing every job that worker had
+    running as "disconnected before the job finished"."""
+    src = inspect.getsource(_PullMixin._pull_loop)
+    assert "_pull_reserve()" in src
+    ask = inspect.getsource(_PullMixin._pull_should_ask)
+    assert "_pull_pending" in ask
+
+
+def test_pending_claims_are_subtracted_from_free_lanes():
+    a = _Agent(_Pool(False, False))
+    assert a._pull_should_ask() is True
+    a._pull_pending = 2
+    assert a._pull_should_ask() is False
+
+
+def test_a_reservation_is_released_on_a_deadline():
+    """An assign that never arrives (hub restart between CAS and send) must
+    not reserve the lane forever."""
+    src = inspect.getsource(_PullMixin._pull_settle)
+    assert "_ASSIGN_GRACE_S" in src and "finally:" in src
