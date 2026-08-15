@@ -27,11 +27,23 @@ is 120s, and a stall anywhere near that is the failure about to happen.
 from __future__ import annotations
 
 import asyncio
+import logging
+import os
+import sys
+import threading
 import time
+import traceback
+
+log = logging.getLogger(__name__)
 
 #: How often to probe. Short enough to catch a stall inside one heartbeat
 #: window, long enough that the probe itself is free (2 wakeups/second).
 _INTERVAL_S = 0.5
+
+#: Stall length that gets a stack dump. Set to 0 to disable the watchdog.
+#: Default 5s: an order of magnitude above the p90 measured in production
+#: (1.0s), so ordinary jitter stays quiet and only real blocking is named.
+_WATCHDOG_S = float(os.environ.get("PAPRIKA_LOOP_WATCHDOG_S") or 5.0)
 
 
 class _LoopLagMixin:
@@ -44,12 +56,60 @@ class _LoopLagMixin:
         stall we most need measured is the one happening while the connection
         is down.
         """
+        self._loop_tick = time.monotonic()
+        self._start_loop_watchdog()
         while True:
             t0 = time.monotonic()
             await asyncio.sleep(_INTERVAL_S)
-            lag_ms = (time.monotonic() - t0 - _INTERVAL_S) * 1000.0
+            now = time.monotonic()
+            self._loop_tick = now
+            lag_ms = (now - t0 - _INTERVAL_S) * 1000.0
             if lag_ms > getattr(self, "_loop_lag_peak_ms", 0.0):
                 self._loop_lag_peak_ms = lag_ms
+
+    def _start_loop_watchdog(self) -> None:
+        """Start the thread that names what is blocking the loop.
+
+        Measuring lag says a stall happened; it cannot say what caused it,
+        because by the time the sampler wakes the offending call has already
+        returned. Only something running OUTSIDE the loop can look while the
+        loop is still stuck -- the same reason Kafka moved consumer heartbeats
+        to a background thread in KIP-62.
+
+        py-spy would answer this from outside the process, but the worker
+        containers have no SYS_PTRACE and granting it means recreating every
+        container in the fleet. ``sys._current_frames()`` gives the same stack
+        from inside, from a plain thread, for free.
+        """
+        if _WATCHDOG_S <= 0 or getattr(self, "_loop_watchdog", None) is not None:
+            return
+        main = threading.main_thread().ident
+
+        def _watch() -> None:
+            reported_for = 0.0
+            while True:
+                time.sleep(1.0)
+                tick = getattr(self, "_loop_tick", 0.0)
+                stalled = time.monotonic() - tick
+                if stalled < _WATCHDOG_S or tick == reported_for:
+                    continue
+                # Once per stall episode: a loop wedged for a minute would
+                # otherwise fill the log with the same stack sixty times.
+                reported_for = tick
+                frame = sys._current_frames().get(main)
+                if frame is None:
+                    continue
+                stack = "".join(traceback.format_stack(frame))
+                log.error(
+                    "[loop-watchdog] event loop blocked %.1fs -- main thread "
+                    "is here:\n%s", stalled, stack,
+                )
+
+        t = threading.Thread(
+            target=_watch, name="loop-watchdog", daemon=True,
+        )
+        self._loop_watchdog = t
+        t.start()
 
     def loop_lag_peak_ms(self) -> float:
         """Peak lag since the last call, then reset.

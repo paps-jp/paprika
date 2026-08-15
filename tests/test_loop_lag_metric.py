@@ -166,3 +166,68 @@ def test_the_heartbeat_sends_it_freshly_read():
     window, so a stale read would report one peak forever."""
     src = _text("server/worker/agent/_mix_run.py")
     assert "loop_lag_ms=self.loop_lag_peak_ms()" in src
+
+
+# --- the watchdog that names the blocker ------------------------------------
+
+def test_the_watchdog_runs_outside_the_loop():
+    """Lag says a stall happened; it cannot say what caused it, because the
+    sampler only wakes after the offending call returns. Only something
+    running outside the loop can look while it is still stuck."""
+    src = inspect.getsource(_LoopLagMixin._start_loop_watchdog)
+    assert "threading.Thread" in src
+    assert "sys._current_frames()" in src
+    assert "daemon=True" in src
+
+
+def test_the_watchdog_reports_once_per_episode():
+    """A loop wedged for a minute would otherwise log the same stack sixty
+    times and bury the first one."""
+    src = inspect.getsource(_LoopLagMixin._start_loop_watchdog)
+    assert "reported_for" in src
+
+
+def test_the_watchdog_can_be_switched_off():
+    """It is always-on instrumentation on 170 production workers; there has to
+    be a way to silence it without a redeploy."""
+    from server.worker.agent import _loop_lag
+    assert "PAPRIKA_LOOP_WATCHDOG_S" in inspect.getsource(_loop_lag)
+    src = inspect.getsource(_LoopLagMixin._start_loop_watchdog)
+    assert "_WATCHDOG_S <= 0" in src
+
+
+def test_the_watchdog_threshold_clears_the_measured_p90():
+    """Production p90 is 1.0s. A threshold at or below that would report
+    ordinary jitter as blocking and train everyone to ignore it."""
+    from server.worker.agent import _loop_lag
+    assert _loop_lag._WATCHDOG_S >= 3.0
+
+
+@pytest.mark.asyncio
+async def test_the_watchdog_starts_with_the_sampler():
+    a = _Agent()
+    task = asyncio.create_task(a._loop_lag_sampler())
+    await asyncio.sleep(0.05)
+    task.cancel()
+    assert getattr(a, "_loop_watchdog", None) is not None
+    assert a._loop_watchdog.is_alive()
+
+
+@pytest.mark.asyncio
+async def test_the_watchdog_names_the_blocking_frame(monkeypatch, caplog):
+    """End to end: block the loop past the threshold and the log must contain
+    the stack of whatever did it."""
+    from server.worker.agent import _loop_lag
+    monkeypatch.setattr(_loop_lag, "_WATCHDOG_S", 1.0)
+    a = _Agent()
+    task = asyncio.create_task(a._loop_lag_sampler())
+    await asyncio.sleep(0.05)
+    with caplog.at_level("ERROR"):
+        def _the_guilty_call():
+            time.sleep(2.5)
+        _the_guilty_call()
+        await asyncio.sleep(1.2)
+    task.cancel()
+    blocked = [r for r in caplog.records if "loop-watchdog" in r.getMessage()]
+    assert blocked, "a 2.5s block was not reported"
+    assert "_the_guilty_call" in blocked[0].getMessage()
