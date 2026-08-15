@@ -228,7 +228,7 @@ async def test_the_watchdog_names_the_blocking_frame(monkeypatch, caplog):
         _the_guilty_call()
         await asyncio.sleep(1.2)
     task.cancel()
-    blocked = [r for r in caplog.records if "loop-watchdog" in r.getMessage()]
+    blocked = [r for r in caplog.records if "loop-stall" in r.getMessage()]
     assert blocked, "a 2.5s block was not reported"
     assert "_the_guilty_call" in blocked[0].getMessage()
 
