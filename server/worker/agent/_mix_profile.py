@@ -548,7 +548,14 @@ class _ProfileExtMixin:
             shutil.rmtree(scratch, ignore_errors=True)
             return None
         extract_dir.mkdir(parents=True, exist_ok=True)
-        try:
+
+        # Off the event loop: gzip decompression plus tens of thousands of
+        # small file writes. Measured by the loop-stall watchdog on 2026-08-15
+        # -- tarfile.extractall / gzip.read were the second most common frames
+        # in 1.0-1.5s stalls, behind the profile copytree. The traversal check
+        # stays inside the thread with the extract it guards, so there is no
+        # window where one runs without the other.
+        def _extract() -> None:
             with tarfile.open(tar_path, "r:gz") as tar:
                 safe_root = extract_dir.resolve()
                 for m in tar.getmembers():
@@ -556,6 +563,9 @@ class _ProfileExtMixin:
                     if not str(dest).startswith(str(safe_root)):
                         raise ValueError(f"tarball member escapes extract dir: {m.name}")
                 tar.extractall(extract_dir)
+
+        try:
+            await asyncio.to_thread(_extract)
         except Exception as e:
             msg = f"  ... profile extract failed: {type(e).__name__}: {e}"
             if log:

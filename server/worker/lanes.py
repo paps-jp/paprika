@@ -970,24 +970,36 @@ class Lane:
             self._watchdog_task = None
         # Stop Chrome.
         self._kill_chrome_proc()
-        # Move the lane's current profile aside. If a previous swap
-        # crashed mid-way and left a stale .lane-default, remove it
-        # first -- the running lane_dir is the authoritative state.
-        if backup_dir.exists():
-            shutil.rmtree(backup_dir, ignore_errors=True)
-        if lane_dir.exists():
+        # Move the lane's current profile aside, then move the operator's in.
+        #
+        # Off the event loop. A Chrome profile is tens of thousands of small
+        # files and the rename is only cheap while both ends are on one
+        # filesystem -- with the profile cache in /tmp and the lane on
+        # /ram/chrome it is cross-device, so it falls through to copytree and
+        # copies the lot. The loop-stall watchdog caught this at 1.0-1.5s on
+        # three sampled workers on 2026-08-15, with copytree the single most
+        # common frame. A worker that cannot answer for 1.5s cannot answer the
+        # hub's keepalive either, and that is how a stall becomes a WS close
+        # and a batch of jobs failed as "disconnected".
+        def _swap() -> None:
+            if backup_dir.exists():
+                # A previous swap crashed mid-way and left a stale
+                # .lane-default; the running lane_dir is authoritative.
+                shutil.rmtree(backup_dir, ignore_errors=True)
+            if lane_dir.exists():
+                try:
+                    lane_dir.rename(backup_dir)
+                except OSError:
+                    # Cross-device or race. Copy then remove as fallback.
+                    shutil.copytree(lane_dir, backup_dir, dirs_exist_ok=True)
+                    shutil.rmtree(lane_dir, ignore_errors=True)
             try:
-                lane_dir.rename(backup_dir)
+                profile_dir.rename(lane_dir)
             except OSError:
-                # Cross-device or race. Copy then remove as fallback.
-                shutil.copytree(lane_dir, backup_dir, dirs_exist_ok=True)
-                shutil.rmtree(lane_dir, ignore_errors=True)
-        # Move the operator's extracted profile into place.
-        try:
-            profile_dir.rename(lane_dir)
-        except OSError:
-            shutil.copytree(profile_dir, lane_dir, dirs_exist_ok=True)
-            shutil.rmtree(profile_dir, ignore_errors=True)
+                shutil.copytree(profile_dir, lane_dir, dirs_exist_ok=True)
+                shutil.rmtree(profile_dir, ignore_errors=True)
+
+        await asyncio.to_thread(_swap)
         # Re-spawn Chrome + watchdog.
         # Spawn Chrome inside a try/finally so the watchdog ALWAYS
         # gets restarted, even when the immediate spawn fails. The
