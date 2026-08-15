@@ -231,3 +231,14 @@ async def test_the_watchdog_names_the_blocking_frame(monkeypatch, caplog):
     blocked = [r for r in caplog.records if "loop-watchdog" in r.getMessage()]
     assert blocked, "a 2.5s block was not reported"
     assert "_the_guilty_call" in blocked[0].getMessage()
+
+
+def test_the_stall_log_prefix_is_unique():
+    """_mix_run logs "loop-watchdog armed" for the WS wedge detector. Sharing
+    that prefix means every grep for one returns the other -- which it did,
+    the first time this was checked in production."""
+    from server.worker.agent import _loop_lag
+    src = inspect.getsource(_loop_lag)
+    assert "[loop-stall]" in src
+    assert "[loop-watchdog]" not in src
+    assert "loop-watchdog armed" in _text("server/worker/agent/_mix_run.py")

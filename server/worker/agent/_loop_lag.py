@@ -100,13 +100,17 @@ class _LoopLagMixin:
                 if frame is None:
                     continue
                 stack = "".join(traceback.format_stack(frame))
+                # NOT "loop-watchdog": _mix_run already logs "loop-watchdog
+                # armed" for the WS wedge detector, and a shared prefix means
+                # every grep for one returns the other -- which it did, the
+                # first time this was checked in production.
                 log.error(
-                    "[loop-watchdog] event loop blocked %.1fs -- main thread "
+                    "[loop-stall] event loop blocked %.1fs -- main thread "
                     "is here:\n%s", stalled, stack,
                 )
 
         t = threading.Thread(
-            target=_watch, name="loop-watchdog", daemon=True,
+            target=_watch, name="loop-stall-watch", daemon=True,
         )
         self._loop_watchdog = t
         t.start()
