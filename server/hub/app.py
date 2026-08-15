@@ -764,7 +764,7 @@ async def lifespan(app: FastAPI):
     redrive_task = salvage_task = storage_metrics_task = None
     ct_scan_task = None
     nightly_review_task = retention_task = spill_task = maintenance_task = None
-    review_retention_task = None
+    review_retention_task = role_rollup_task = None
     if not _ADMIN_MODE:
         reaper_task = asyncio.create_task(_session_reaper_loop())
         retire_task = asyncio.create_task(_skill_convention_reaper_loop())
@@ -897,6 +897,17 @@ async def lifespan(app: FastAPI):
 
         nightly_review_task = asyncio.create_task(_nightly_review_loop())
 
+        # Per-(host, template) page-role rollup. Keeps host_template_roles in
+        # sync with host_url_history so POST /jobs resolves download_video
+        # with one PK lookup instead of aggregating 2000 history rows on the
+        # request path (that cold path was costing 10-45s per submit and
+        # capping crawl intake at ~4 jobs/s with the fleet half idle).
+        # Cross-hub: one hub per pass via a Redis lease.
+        # See server/hub/_role_rollup.py.
+        from server.hub._role_rollup import scheduler_loop as _role_rollup_loop
+
+        role_rollup_task = asyncio.create_task(_role_rollup_loop())
+
         # Push-based previews: while an admin watches a worker (interest-gated
         # via Redis), tell that worker to self-capture + push frames so the
         # #screens grid serves from cache instead of a live cross-hub capture.
@@ -981,7 +992,7 @@ async def lifespan(app: FastAPI):
                stale_reconcile_task, redrive_task, salvage_task,
                ct_scan_task,
                storage_metrics_task, nightly_review_task, repromote_task,
-               reattach_task,
+               reattach_task, role_rollup_task,
                retention_task, review_retention_task, spill_task, maintenance_task):
         if _t is not None:
             _t.cancel()

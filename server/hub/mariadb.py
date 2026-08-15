@@ -180,6 +180,44 @@ _TABLES: list[tuple[str, str]] = [
         ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci
         """,
     ),
+    # ---- Per-(host, template) page-role rollup (materialised view) ----
+    # Pre-computed answer to "what role does this URL template have on this
+    # host", so POST /jobs can settle download_video with ONE primary-key
+    # lookup instead of aggregating host_url_history on the request path.
+    #
+    # Why materialise: host_url_history is 7.7M rows / 532 hosts / 552k
+    # distinct (host, template) pairs. The old hot path pulled the newest
+    # 2000 rows per host and counted them in-process, behind a 10-minute
+    # per-hub cache with no single-flight -- a 10-45s cold path in front of
+    # every job submit (see server/hub/_page_role.role_for_url).
+    #
+    # n / nv are the exact counts even though the classifier saturates at
+    # n>=7 / nv>=2 -- operators want to see the real numbers in the host
+    # edit modal, and keeping them means a threshold change doesn't need a
+    # rebuild. has_page_sibling is the pagination co-occurrence bit, which
+    # can only be computed with the host's FULL template list, so folding it
+    # in here is what lets the read path stay a single row fetch.
+    # Refreshed by server/hub/_role_rollup.py (one hub at a time, Redis lease).
+    (
+        "host_template_roles",
+        """
+        CREATE TABLE IF NOT EXISTS host_template_roles (
+            host             VARCHAR(255) NOT NULL,
+            template_hash    CHAR(40)     NOT NULL,
+            template         VARCHAR(512) NOT NULL,
+            n                INT          NOT NULL DEFAULT 0,
+            nv               INT          NOT NULL DEFAULT 0,
+            has_page_sibling TINYINT(1)   NOT NULL DEFAULT 0,
+            role             VARCHAR(16)  NOT NULL DEFAULT 'unknown',
+            confidence       FLOAT        NOT NULL DEFAULT 0,
+            reason           VARCHAR(64)  NOT NULL DEFAULT '',
+            computed_at      DATETIME(3)  DEFAULT CURRENT_TIMESTAMP(3),
+            PRIMARY KEY (host, template_hash),
+            INDEX idx_host (host),
+            INDEX idx_computed (computed_at)
+        ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci
+        """,
+    ),
     # Operator-set per-host-template page-role overrides. When the URL-based
     # heuristic (server/hub/_page_role.py) misclassifies a template, the
     # operator can pin the correct role here from the Live job panel or the
@@ -1607,6 +1645,184 @@ async def record_host_url_row(
                 (host, url_hash, url, template or None,
                  1 if has_video_evidence else 0),
             )
+
+
+def _template_hash(template: str) -> str:
+    """PK component for ``host_template_roles``. The template itself is up to
+    512 bytes, which is too wide for a utf8mb4 primary key alongside host."""
+    import hashlib
+    return hashlib.sha1((template or "").encode("utf-8", errors="replace")).hexdigest()
+
+
+async def host_template_role_get(pool: Any, host: str, template: str) -> dict | None:
+    """One rollup row by primary key, or None. THE job-submit hot path --
+    keep it a single indexed fetch."""
+    if not host or not template:
+        return None
+    async with pool.acquire() as conn:
+        async with conn.cursor() as cur:
+            await cur.execute(
+                "SELECT n, nv, has_page_sibling, role, confidence, reason "
+                "FROM host_template_roles WHERE host=%s AND template_hash=%s",
+                (host, _template_hash(template)),
+            )
+            row = await cur.fetchone()
+    if not row:
+        return None
+    return {
+        "n": int(row[0] or 0),
+        "nv": int(row[1] or 0),
+        "has_page_sibling": bool(row[2]),
+        "role": str(row[3] or "unknown"),
+        "confidence": float(row[4] or 0.0),
+        "reason": str(row[5] or ""),
+    }
+
+
+async def host_template_roles_for_host(pool: Any, host: str) -> list[dict]:
+    """Every rollup row for ``host`` (host edit modal / nightly review).
+    Served by ``idx_host``; no aggregation on the read side."""
+    if not host:
+        return []
+    async with pool.acquire() as conn:
+        async with conn.cursor() as cur:
+            await cur.execute(
+                "SELECT template, n, nv, has_page_sibling, role, confidence, reason "
+                "FROM host_template_roles WHERE host=%s ORDER BY n DESC",
+                (host,),
+            )
+            rows = await cur.fetchall()
+    return [
+        {
+            "template": str(r[0]), "n": int(r[1] or 0), "nv": int(r[2] or 0),
+            "has_page_sibling": bool(r[3]), "role": str(r[4] or "unknown"),
+            "confidence": float(r[5] or 0.0), "reason": str(r[6] or ""),
+        }
+        for r in rows
+    ]
+
+
+async def host_template_roles_upsert(pool: Any, rows: list[dict]) -> int:
+    """Batch UPSERT rollup rows. Each dict needs host / template / n / nv /
+    has_page_sibling / role / confidence / reason."""
+    if not rows:
+        return 0
+    payload = [
+        (
+            r["host"], _template_hash(r["template"]), r["template"],
+            int(r.get("n") or 0), int(r.get("nv") or 0),
+            1 if r.get("has_page_sibling") else 0,
+            str(r.get("role") or "unknown"), float(r.get("confidence") or 0.0),
+            str(r.get("reason") or "")[:64],
+        )
+        for r in rows
+    ]
+    async with pool.acquire() as conn:
+        async with conn.cursor() as cur:
+            await cur.executemany(
+                """INSERT INTO host_template_roles
+                   (host, template_hash, template, n, nv, has_page_sibling,
+                    role, confidence, reason, computed_at)
+                   VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,CURRENT_TIMESTAMP(3))
+                   ON DUPLICATE KEY UPDATE
+                     n = VALUES(n), nv = VALUES(nv),
+                     has_page_sibling = VALUES(has_page_sibling),
+                     role = VALUES(role), confidence = VALUES(confidence),
+                     reason = VALUES(reason), computed_at = VALUES(computed_at)""",
+                payload,
+            )
+    return len(payload)
+
+
+async def host_template_changed_pairs(
+    pool: Any, since_minutes: int
+) -> list[tuple[str, str]]:
+    """``(host, template)`` pairs touched in the last ``since_minutes``.
+    Measured on prod: ~910 pairs across ~287 hosts for a 15-minute window,
+    2.3s. This is what keeps the refresh incremental."""
+    async with pool.acquire() as conn:
+        async with conn.cursor() as cur:
+            await cur.execute(
+                "SELECT DISTINCT host, template FROM host_url_history "
+                "WHERE last_seen_at >= NOW() - INTERVAL %s MINUTE "
+                "AND template IS NOT NULL",
+                (int(since_minutes),),
+            )
+            rows = await cur.fetchall()
+    return [(str(r[0]), str(r[1])) for r in rows if r and r[0] and r[1]]
+
+
+async def host_template_recount(
+    pool: Any, host: str, templates: list[str]
+) -> list[tuple[str, int, int]]:
+    """Exact ``(template, n, nv)`` for the named templates on ``host``.
+
+    Batched per host (one query covering that host's changed templates)
+    rather than per pair -- 287 such queries totalled 7.4s on prod, vs 23s
+    for the naive "re-aggregate every template of every changed host"
+    (template-exploded hosts carry up to 18k templates each)."""
+    if not host or not templates:
+        return []
+    ph = ",".join(["%s"] * len(templates))
+    async with pool.acquire() as conn:
+        async with conn.cursor() as cur:
+            await cur.execute(
+                "SELECT template, COUNT(*), COALESCE(SUM(video_evidence), 0) "
+                "FROM host_url_history WHERE host=%%s AND template IN (%s) "
+                "GROUP BY template" % ph,
+                [host] + list(templates),
+            )
+            rows = await cur.fetchall()
+    return [(str(r[0]), int(r[1] or 0), int(r[2] or 0)) for r in rows if r]
+
+
+async def host_template_all_pairs(pool: Any) -> list[tuple[str, str, int, int]]:
+    """Full ``(host, template, n, nv)`` aggregate -- the initial build only.
+    552k rows / ~29s on prod; the incremental path handles steady state."""
+    async with pool.acquire() as conn:
+        async with conn.cursor() as cur:
+            await cur.execute(
+                "SELECT host, template, COUNT(*), COALESCE(SUM(video_evidence), 0) "
+                "FROM host_url_history WHERE template IS NOT NULL "
+                "GROUP BY host, template"
+            )
+            rows = await cur.fetchall()
+    return [(str(r[0]), str(r[1]), int(r[2] or 0), int(r[3] or 0)) for r in rows if r]
+
+
+async def host_page_templates(pool: Any, host: str) -> list[str]:
+    """Templates on ``host`` that carry a literal ``page`` segment.
+
+    The pagination co-occurrence bit is a property of the host's WHOLE
+    template set (template T is a listing if some sibling under the same
+    prefix paginates), but only the paginating siblings actually contribute
+    -- so we fetch just those instead of the full list. ``LIKE '%/page/%'``
+    is exact here because ``templatize`` always emits slash-delimited
+    segments, so the pattern matches iff some segment is exactly ``page``.
+
+    Measured across the ~300 hosts a 15-minute window touches: 5.2s and
+    9.8k rows, vs 9.9s and 494k rows for the full ``DISTINCT template``
+    (template-exploded hosts carry up to 18k templates each)."""
+    if not host:
+        return []
+    async with pool.acquire() as conn:
+        async with conn.cursor() as cur:
+            await cur.execute(
+                "SELECT DISTINCT template FROM host_url_history "
+                "WHERE host=%s AND template LIKE %s",
+                (host, "%/page/%"),
+            )
+            rows = await cur.fetchall()
+    return [str(r[0]) for r in rows if r and r[0]]
+
+
+async def host_template_roles_count(pool: Any) -> int:
+    """Row count of the rollup -- used to decide initial-build vs incremental."""
+    async with pool.acquire() as conn:
+        async with conn.cursor() as cur:
+            await cur.execute("SELECT COUNT(*) FROM host_template_roles")
+            row = await cur.fetchone()
+    return int(row[0]) if row else 0
 
 
 async def fetch_host_url_history(

@@ -196,6 +196,116 @@ def templatize(url: str) -> str:
 ROLE_TRUST_THRESHOLD = 0.85
 
 
+def classify_template(
+    tpl: str, *, n: int = 0, nv: int = 0, has_page_sibling: bool = False
+) -> tuple[str, float, str]:
+    """``(role, confidence, reason)`` for one URL template.
+
+    Pure -- no I/O, no host state. Everything the classifier needs from a
+    host's history is these three numbers:
+
+    * ``n``  -- how many distinct URLs on this host templated to ``tpl``
+    * ``nv`` -- how many of those actually yielded a video
+    * ``has_page_sibling`` -- whether a template under the same path prefix
+      carries a literal ``page`` segment (i.e. ``tpl`` is part of a
+      paginated set)
+
+    Rules 1-4b are pure keyword matching and need NO history at all, which
+    is what lets the hot path fall back to ``classify_template(tpl)`` with
+    zeroes when the rollup has no row yet: listing / category / tag / error
+    / top still classify correctly, and only the observation-driven detail
+    rules (5, 6) degrade to a weaker verdict until the next rollup pass.
+
+    ``role`` is one of ``detail`` / ``listing`` / ``category`` / ``tag`` /
+    ``top`` / ``error`` / ``unknown``. ``confidence`` in [0, 1]; the caller
+    should compare it against ``ROLE_TRUST_THRESHOLD`` before acting
+    (low confidence == treat as unknown, let normal escalation run).
+
+    NOTE on saturation: the thresholds are ``n >= 3`` and ``nv >= 2``, and
+    the ratio branch degenerates to ``nv == 1 and 3 <= n <= 6``. So the
+    verdict is fully determined by ``min(n, 7)`` and ``min(nv, 2)`` -- the
+    rollup does not need exact counts for correctness, it keeps them for
+    operator visibility.
+    """
+    if not tpl:
+        return "unknown", 0.0, "empty url"
+    # Bare top: path is root AND no nav query keys folded in.
+    if tpl == "/":
+        return "top", 0.99, "top path"
+
+    # Split path/query halves of the template so both sides feed the
+    # keyword checks. ``?`` is only present when templatize() folded
+    # in at least one nav query key.
+    path_tpl, _sep, query_tpl = tpl.partition("?")
+    qkeys: set[str] = set()
+    if query_tpl:
+        qkeys = {kv.split("=", 1)[0] for kv in query_tpl.split("&") if kv}
+
+    segs = [s for s in path_tpl.strip("/").split("/") if s]
+    statics = [s for s in segs if not s.startswith("{")]
+
+    # 1) static error keyword (path-only; error pages don't use nav query)
+    if any(s in _STATIC_ERROR for s in statics):
+        return "error", 0.95, "static error keyword"
+    # 2) static category / tag (path OR query) -- more specific than listing
+    if any(s in _STATIC_CATEGORY for s in statics):
+        return "category", 0.9, "category keyword"
+    if qkeys & _QUERY_CATEGORY:
+        return "category", 0.9, "category query key"
+    if any(s in _STATIC_TAG for s in statics):
+        return "tag", 0.9, "tag keyword"
+    if qkeys & _QUERY_TAG:
+        return "tag", 0.9, "tag query key"
+    # 3) explicit pagination OR pagination co-occurrence (strongest listing)
+    if has_page_sibling:
+        return "listing", 0.95, "pagination"
+    # 3b) query-side pagination / search / author -- strong listing too
+    if qkeys & _QUERY_LISTING:
+        return "listing", 0.9, "listing query key"
+    # 4) static listing keyword
+    if any(s in _STATIC_LISTING for s in statics):
+        return "listing", 0.85, "listing keyword"
+    # 4b) WP-style detail query key on a top-ish path (?p=123)
+    if (qkeys & _QUERY_DETAIL) and len(segs) <= 1:
+        return "detail", 0.85, "detail query key"
+    # 5) host-observed video evidence on this template -> detail (strong)
+    if nv >= 2 or (n >= 3 and nv >= max(1, int(n * 0.3))):
+        return "detail", 0.95, f"video evidence ({nv}/{n})"
+    # 6) variable segments + multiple observations -> probable detail
+    var_segs = sum(1 for s in segs if s.startswith("{"))
+    if var_segs >= 1 and n >= 3:
+        return "detail", 0.6, f"variable segs ({n} obs)"
+    if var_segs >= 1:
+        return "detail", 0.4, "variable segs (few obs)"
+    return "unknown", 0.3, "no signal"
+
+
+def page_sibling_prefixes(templates: Iterable[str]) -> set[str]:
+    """Prefix set for the pagination co-occurrence rule, built from a host's
+    full template list. Mirrors ``HostPageRoles.observe``'s accumulation so
+    the rollup pass and the in-memory path agree."""
+    out: set[str] = set()
+    for tpl in templates:
+        segs = (tpl or "").partition("?")[0].strip("/").split("/")
+        if "page" in segs:
+            out.add("/".join(segs[: segs.index("page")]))
+    return out
+
+
+def has_page_sibling(tpl: str, prefixes: set[str]) -> bool:
+    """Whether ``tpl`` is part of a paginated set, given a host's prefix set
+    from :func:`page_sibling_prefixes`. Same logic as
+    ``HostPageRoles._page_co_occurs``."""
+    segs = (tpl or "").partition("?")[0].strip("/").split("/")
+    if "page" in segs:
+        return True
+    for prefix in prefixes:
+        psegs = prefix.split("/") if prefix else []
+        if psegs == segs[: len(psegs)]:
+            return True
+    return False
+
+
 class HostPageRoles:
     """Per-host template observations.
 
@@ -232,78 +342,29 @@ class HostPageRoles:
 
     def _page_co_occurs(self, tpl: str) -> bool:
         """True iff some *other* template under the same path prefix has a
-        ``page`` segment -- i.e. this template is part of a paginated set."""
-        segs = tpl.strip("/").split("/")
-        if "page" in segs:
-            return True
-        for prefix in self.pagination_prefixes:
-            psegs = prefix.split("/") if prefix else []
-            if psegs == segs[: len(psegs)]:
-                return True
-        return False
+        ``page`` segment -- i.e. this template is part of a paginated set.
+        Delegates to the shared helper so this path and the rollup pass
+        can't drift apart."""
+        return has_page_sibling(tpl, self.pagination_prefixes)
 
     def role_for_url(self, url: str) -> tuple[str, float, str]:
         """Return ``(role, confidence, reason)`` for ``url``.
 
-        ``role`` is one of ``detail`` / ``listing`` / ``category`` / ``tag`` /
-        ``top`` / ``error`` / ``unknown``. ``confidence`` in [0, 1]; the caller
-        should compare it against ``ROLE_TRUST_THRESHOLD`` before acting
-        (low confidence == treat as unknown, let normal escalation run).
+        Thin wrapper over :func:`classify_template`: pulls this host's
+        observations for the URL's template out of the in-memory counters
+        and hands them to the shared classifier. Used by the bulk-loaded
+        path (host edit modal / nightly review); the job-submit hot path
+        goes through ``role_for_url()`` at module level, which reads the
+        same three numbers from the pre-computed ``host_template_roles``
+        rollup instead of building the whole table.
         """
         tpl = templatize(url)
-        if not tpl:
-            return "unknown", 0.0, "empty url"
-        # Bare top: path is root AND no nav query keys folded in.
-        if tpl == "/":
-            return "top", 0.99, "top path"
-
-        # Split path/query halves of the template so both sides feed the
-        # keyword checks. ``?`` is only present when templatize() folded
-        # in at least one nav query key.
-        path_tpl, _sep, query_tpl = tpl.partition("?")
-        qkeys: set[str] = set()
-        if query_tpl:
-            qkeys = {kv.split("=", 1)[0] for kv in query_tpl.split("&") if kv}
-
-        segs = [s for s in path_tpl.strip("/").split("/") if s]
-        statics = [s for s in segs if not s.startswith("{")]
-
-        # 1) static error keyword (path-only; error pages don't use nav query)
-        if any(s in _STATIC_ERROR for s in statics):
-            return "error", 0.95, "static error keyword"
-        # 2) static category / tag (path OR query) -- more specific than listing
-        if any(s in _STATIC_CATEGORY for s in statics):
-            return "category", 0.9, "category keyword"
-        if qkeys & _QUERY_CATEGORY:
-            return "category", 0.9, "category query key"
-        if any(s in _STATIC_TAG for s in statics):
-            return "tag", 0.9, "tag keyword"
-        if qkeys & _QUERY_TAG:
-            return "tag", 0.9, "tag query key"
-        # 3) explicit pagination OR pagination co-occurrence (strongest listing)
-        if self._page_co_occurs(path_tpl):
-            return "listing", 0.95, "pagination"
-        # 3b) query-side pagination / search / author -- strong listing too
-        if qkeys & _QUERY_LISTING:
-            return "listing", 0.9, "listing query key"
-        # 4) static listing keyword
-        if any(s in _STATIC_LISTING for s in statics):
-            return "listing", 0.85, "listing keyword"
-        # 4b) WP-style detail query key on a top-ish path (?p=123)
-        if (qkeys & _QUERY_DETAIL) and len(segs) <= 1:
-            return "detail", 0.85, "detail query key"
-        # 5) host-observed video evidence on this template -> detail (strong)
-        n = int(self.templates.get(tpl, 0))
-        nv = int(self.video_seen.get(tpl, 0))
-        if nv >= 2 or (n >= 3 and nv >= max(1, int(n * 0.3))):
-            return "detail", 0.95, f"video evidence ({nv}/{n})"
-        # 6) variable segments + multiple observations -> probable detail
-        var_segs = sum(1 for s in segs if s.startswith("{"))
-        if var_segs >= 1 and n >= 3:
-            return "detail", 0.6, f"variable segs ({n} obs)"
-        if var_segs >= 1:
-            return "detail", 0.4, "variable segs (few obs)"
-        return "unknown", 0.3, "no signal"
+        return classify_template(
+            tpl,
+            n=int(self.templates.get(tpl, 0)),
+            nv=int(self.video_seen.get(tpl, 0)),
+            has_page_sibling=self._page_co_occurs(tpl.partition("?")[0]),
+        )
 
 
 # ---------------------------------------------------------------------------
@@ -431,6 +492,28 @@ async def role_for_url(url: str) -> tuple[str, float, str]:
     in the Live job panel / host edit modal corrects EVERY future job whose
     URL templates to the same value. Best-effort: a transient DB hiccup
     falls through to the heuristic.
+
+    Hot path (2026-08-14). This runs inside ``POST /jobs`` for every crawl
+    submission, so it must be a point lookup -- it reads the pre-computed
+    ``host_template_roles`` rollup (PK ``(host, template_hash)``) instead of
+    building the host's whole template table.
+
+    It used to call ``get_host_roles()``, which on a cache miss pulled 2000
+    rows of ``host_url_history`` (or, for a host with no history yet, ran
+    ``url LIKE '%host%'`` across the 1.5M-row jobs table -- two full scans,
+    ~12s measured). With a 10-minute per-process TTL, seven hubs and no
+    single-flight guard, that put a 10-45s cold path in front of job
+    creation and pinned the submitter's 48 POST slots: the fleet sat at 48%
+    utilisation with zero queued jobs while intake capped at ~4 jobs/s.
+    Measured cold POST /jobs latencies before this change: 1.7 / 2.8 / 6.8 /
+    7.3 / 9.2 / 10.5 / 14.3 / 30.6 / 45(timeout) / 45(timeout) seconds;
+    the same URL resubmitted warm took 0.04s.
+
+    Rollup miss (a template nobody has fetched since the last pass) falls
+    back to the keyword-only rules -- no I/O, and listing / category / tag /
+    error / top still classify correctly. Only the observation-driven detail
+    verdict waits for the next rollup pass. ``get_host_roles`` stays for the
+    host edit modal + nightly review, which genuinely want the whole table.
     """
     h = host_from_url(url)
     if not h:
@@ -442,8 +525,62 @@ async def role_for_url(url: str) -> tuple[str, float, str]:
             return ov[tpl], 1.0, "operator override"
     except Exception:
         pass
-    roles = await get_host_roles(h)
-    return roles.role_for_url(url)
+    stats = await _template_stats(h, tpl)
+    if stats is None:
+        # No rollup row (yet). Keyword-only verdict; zero observations.
+        return classify_template(tpl)
+    n, nv, sib = stats
+    return classify_template(tpl, n=n, nv=nv, has_page_sibling=sib)
+
+
+# Rollup point-lookup memo. Tiny TTL: the rollup pass itself refreshes every
+# few minutes, so this only collapses the burst of submits that arrive for the
+# same template within seconds of each other (the crawl hits one template many
+# times in a row). Bounded so a long tail of one-off templates can't grow it
+# without limit.
+_STATS_TTL_S = 60.0
+_STATS_CACHE_MAX = 4096
+_stats_cache: dict[tuple[str, str], tuple[float, tuple[int, int, bool] | None]] = {}
+
+
+def invalidate_template_stats(host: str | None = None) -> None:
+    """Drop memoised rollup lookups (all, or just one host's)."""
+    if host is None:
+        _stats_cache.clear()
+        return
+    h = _normalise_host_str(host)
+    for k in [k for k in _stats_cache if k[0] == h]:
+        _stats_cache.pop(k, None)
+
+
+async def _template_stats(host: str, tpl: str) -> tuple[int, int, bool] | None:
+    """``(n, nv, has_page_sibling)`` from the rollup, or None when absent."""
+    if not tpl:
+        return None
+    key = (host, tpl)
+    now = time.time()
+    hit = _stats_cache.get(key)
+    if hit is not None and (now - hit[0]) < _STATS_TTL_S:
+        return hit[1]
+    out: tuple[int, int, bool] | None = None
+    try:
+        from server.hub._state import state
+        pool = getattr(state, "mariadb_pool", None)
+        if pool is not None:
+            from server.hub.mariadb import host_template_role_get
+            row = await host_template_role_get(pool, host, tpl)
+            if row is not None:
+                out = (
+                    int(row.get("n") or 0),
+                    int(row.get("nv") or 0),
+                    bool(row.get("has_page_sibling")),
+                )
+    except Exception:
+        out = None
+    if len(_stats_cache) >= _STATS_CACHE_MAX:
+        _stats_cache.clear()
+    _stats_cache[key] = (now, out)
+    return out
 
 
 # Per-host override cache (MariaDB read), TTL'd so a fresh override visible
