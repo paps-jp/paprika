@@ -90,3 +90,34 @@ def test_extract_failures_are_still_caught():
     at = src.index("asyncio.to_thread(_extract)")
     assert "try:" in src[:at][-40:], "the thread hop is not inside the try"
     assert "except Exception" in src[at:at + 120]
+
+
+def test_the_chrome_reap_is_off_the_loop_at_every_async_caller():
+    """``_kill_chrome_proc`` blocks up to 5s in ``proc.wait`` reaping the
+    Chrome it just killed -- 5s in which the worker answers nothing, keepalive
+    ping included. It was the top frame in 2 of 3 stalls remaining after the
+    profile-copy fix.
+
+    The sync form stays for ``stop()``: shutdown has no loop left to protect.
+    Any NEW async caller must use the async form, which is why this counts
+    call sites rather than checking one."""
+    src = (_ROOT / "server/worker/lanes.py").read_text(encoding="utf-8")
+    tree = ast.parse(src)
+    sync_callers = []
+    for node in ast.walk(tree):
+        if not isinstance(node, ast.AsyncFunctionDef):
+            continue
+        for sub in ast.walk(node):
+            if (isinstance(sub, ast.Call)
+                    and isinstance(sub.func, ast.Attribute)
+                    and sub.func.attr == "_kill_chrome_proc"):
+                sync_callers.append(f"{node.name}:{sub.lineno}")
+    assert not sync_callers, (
+        f"async callers still block on the sync reap: {sync_callers}"
+    )
+
+
+def test_the_sync_reap_survives_for_shutdown():
+    src = (_ROOT / "server/worker/lanes.py").read_text(encoding="utf-8")
+    assert "def _kill_chrome_proc" in src
+    assert "await asyncio.to_thread(self._kill_chrome_proc)" in src

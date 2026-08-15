@@ -922,6 +922,19 @@ class Lane:
         except Exception:
             pass
 
+    async def _akill_chrome_proc(self) -> None:
+        """``_kill_chrome_proc`` off the event loop.
+
+        It blocks up to 5s in ``proc.wait`` reaping the Chrome it just killed.
+        On the loop that is 5s in which this worker answers nothing -- not the
+        hub's keepalive ping, not a job result. The loop-stall watchdog caught
+        it as the top frame in 2 of 3 post-fix stalls on 2026-08-15.
+
+        The sync form stays for ``stop()``, which runs during shutdown when
+        there is no loop left to protect.
+        """
+        await asyncio.to_thread(self._kill_chrome_proc)
+
     def stop(self) -> None:
         self._stopping = True
         if self._watchdog_task is not None:
@@ -969,7 +982,7 @@ class Lane:
                 pass
             self._watchdog_task = None
         # Stop Chrome.
-        self._kill_chrome_proc()
+        await self._akill_chrome_proc()
         # Move the lane's current profile aside, then move the operator's in.
         #
         # Off the event loop. A Chrome profile is tens of thousands of small
@@ -1065,7 +1078,7 @@ class Lane:
             except (asyncio.CancelledError, Exception):
                 pass
             self._watchdog_task = None
-        self._kill_chrome_proc()
+        await self._akill_chrome_proc()
         # Replace lane_dir's content. Unlike use_profile() we do NOT
         # back up the previous content -- the operator explicitly
         # asked for this profile to be the default; the previous
@@ -1119,7 +1132,7 @@ class Lane:
             except (asyncio.CancelledError, Exception):
                 pass
             self._watchdog_task = None
-        self._kill_chrome_proc()
+        await self._akill_chrome_proc()
         if lane_dir.exists():
             shutil.rmtree(lane_dir, ignore_errors=True)
         lane_dir.mkdir(parents=True, exist_ok=True)
@@ -1159,7 +1172,7 @@ class Lane:
             except (asyncio.CancelledError, Exception):
                 pass
             self._watchdog_task = None
-        self._kill_chrome_proc()
+        await self._akill_chrome_proc()
         # Discard the operator profile -- any cookies / state set
         # during the job stay confined to that scratch dir.
         if lane_dir.exists():
@@ -1222,7 +1235,7 @@ class Lane:
         ):
             return
         # Unresponsive: kill any stale/zombie process group, then respawn.
-        self._kill_chrome_proc()
+        await self._akill_chrome_proc()
         _log(
             self.lane_idx,
             f"acquire: Chrome :{self.chrome_port} not answering; "
