@@ -113,6 +113,17 @@ _IO_DISPATCH_DISABLED = (
 # dead worker can't linger in the list longer than its heartbeat window.
 _KNOWN_WORKERS_CACHE_TTL_S = 60.0
 HEARTBEAT_INTERVAL = 10  # worker sends this often
+
+#: How long a fresh heartbeat outvotes a missing owner lease.
+#:
+#: The lease is absent for up to one heartbeat interval whenever a worker's WS
+#: re-homes (the old hub's unregister deletes it after the new hub has already
+#: refreshed the heartbeat index), so anything at or below HEARTBEAT_INTERVAL
+#: would still hide live workers. 30s = 3 beats: comfortably past the hole,
+#: still 4x faster than WORKER_TTL at dropping a genuinely disconnected worker.
+_OWNER_VETO_GRACE_S = float(
+    os.environ.get("PAPRIKA_OWNER_VETO_GRACE_S") or 30.0
+)
 # 120s TTL = 12 heartbeats of slack. Higher value than the old 30s so a
 # brief event-loop stall (yt-dlp subprocess block, gc pause, big
 # Python compute) doesn't false-positive "worker dead". Worker-side
@@ -1648,13 +1659,56 @@ class WorkerRegistry:
             # so a genuinely-connected worker (incl. one held by a PEER hub) is
             # never wrongly hidden. (owner is fetched above for hub_id.)
             _fresh = bool(last_ts) and (time.time() - float(last_ts)) < WORKER_TTL
-            _alive = _fresh and bool(owner)
+            _age = (time.time() - float(last_ts)) if last_ts else None
+            # Liveness is the heartbeat. The owner lease may only VETO it once
+            # the heartbeat has also gone quiet.
+            #
+            # ``_fresh and bool(owner)`` -- what this was -- made liveness the
+            # AND of two signals, so availability became their product. And the
+            # owner lease has a structural hole the heartbeat index does not:
+            # when a worker's WS re-homes (self-update, hub restart, WS churn),
+            # the NEW hub refreshes the heartbeat index immediately while the
+            # OLD hub's unregister() still runs _OWNER_CAD_LUA and deletes the
+            # lease if it hasn't been overwritten yet. The lease is then absent
+            # until the next heartbeat -- up to HEARTBEAT_INTERVAL (10s).
+            #
+            # Measured 2026-08-16 on all seven hubs simultaneously: count was a
+            # rock-steady 172 while 19-43 workers reported alive=False with
+            # heartbeat ages of 2-14 seconds. ~14-25% of the fleet was hidden
+            # at any instant, the set rotating constantly, and every capacity /
+            # utilisation number derived from `alive` was understated to match.
+            #
+            # Kubernetes settled this shape: the Lease is renewed every 10s and
+            # is the liveness signal on its own; NodeStatus is a separate,
+            # slower channel and is never ANDed into readiness (KEP-589). Its
+            # Ready condition also has three states -- True/False/Unknown --
+            # rather than collapsing "cannot confirm" into "down".
+            #
+            # So the lease keeps the job it was added for (suppressing #screens
+            # ghost tiles for a worker whose WS is gone) but can only act once
+            # the heartbeat agrees. A truly disconnected worker stops beating,
+            # crosses the grace window, and drops out in ~30s instead of
+            # waiting out WORKER_TTL (120s) -- still four times faster than
+            # freshness alone, which was the original complaint.
+            _alive = _fresh and (
+                bool(owner)
+                or (_age is not None and _age < _OWNER_VETO_GRACE_S)
+            )
             out.append({
                 "worker_id": wid,
                 "in_flight": _in_flight,
                 "capacity": int(caps.get("max_concurrent") or 1),
                 "labels": dict(caps.get("labels") or {}),
                 "alive": _alive,
+                # Whether some hub still holds this worker's control WS, as a
+                # field of its own rather than folded into `alive`. This is the
+                # question the preview / #screens / cross-hub-forward paths
+                # actually have -- "can a request for this worker be served
+                # right now" -- and it is a different question from "is the
+                # worker running". Kubernetes keeps the equivalent split
+                # (Lease = liveness, conditions = detail); collapsing them into
+                # one boolean is what hid a quarter of the fleet.
+                "routable": bool(owner),
                 "age_seconds": (
                     int(time.time() - float(last_ts)) if last_ts else None
                 ),
