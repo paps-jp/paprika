@@ -122,6 +122,12 @@ class _SelfUpdateMixin:
             # warn-only mode, or a self-update is already draining -> nothing to do.
             return
         self._pending_update_to = expected or ""
+        # Stamp BEFORE _draining goes up: the heartbeat's recycle check reads
+        # this to stand down, and a heartbeat landing between the two would
+        # otherwise see a drained worker with no owner and exit(0) -- the very
+        # race this exists to close.
+        self._update_drain_m = time.monotonic()
+        self._recycle_hold_logged = False
         self._draining = True
         self._update_gate.clear()
         try:

@@ -799,14 +799,26 @@ class _RunMixin:
                     # Drives the shutdown-on-failure timer in run().
                     self._last_link_ok = time.monotonic()
                     # Recycle: once the drain has emptied in-flight, exit so
-                    # docker restarts us fresh.
+                    # docker restarts us fresh -- UNLESS a rolling self-update
+                    # owns this drain, in which case exiting here restarts us on
+                    # the same old code and the mismatch just fires again (see
+                    # _selfupdate_owns_recycle).
                     if self._draining and self._in_flight <= 0:
-                        _logger.info(
-                            f"[worker {self.worker_id}] drained after "
-                            f"{self._jobs_done} job(s); exiting for recycle "
-                            f"(docker will restart)",
-                        )
-                        os._exit(0)
+                        _hold = self._selfupdate_owns_recycle()
+                        if _hold:
+                            if not self._recycle_hold_logged:
+                                self._recycle_hold_logged = True
+                                _logger.info(
+                                    f"[worker {self.worker_id}] recycle exit "
+                                    f"deferred: {_hold}",
+                                )
+                        else:
+                            _logger.info(
+                                f"[worker {self.worker_id}] drained after "
+                                f"{self._jobs_done} job(s); exiting for recycle "
+                                f"(docker will restart)",
+                            )
+                            os._exit(0)
                 except Exception as e:
                     # Heartbeat send failed -- the WS to nginx is presumed dead.
                     # Used to `return` silently; that left the recv loop blocked
@@ -1150,6 +1162,47 @@ class _RunMixin:
     # rather than sit deferring forever. Sized above the worst-case decision
     # window (sustain + jitter + a couple of samples) with room to spare.
     _MEMGUARD_SELFCHECK_DEFER_S = 300.0
+    # How long the heartbeat's recycle exit stands down while a rolling
+    # self-update owns the drain. Sized above that sequence's own worst case
+    # (600s drain deadline + 900s gate timeout + jitter + fetch) so the update
+    # always gets to finish, and bounded so an update task that dies without
+    # exiting still lets the worker recycle instead of draining forever.
+    _SELFUPDATE_RECYCLE_DEFER_S = 1800.0
+
+    def _selfupdate_owns_recycle(self) -> str:
+        """Why the heartbeat's recycle exit must NOT fire right now, or "".
+
+        Same shape as :meth:`_memguard_owns_recycle`, for the OTHER loop that
+        shares ``_draining``. A rolling self-update sets ``_draining`` and then
+        spends seconds to minutes in gate + jitter + fetch before its own
+        ``exit(42)``. The recycle check runs on every heartbeat (10s) and, seeing
+        an idle drained worker, called ``os._exit(0)`` first -- killing the update
+        BEFORE it fetched. docker restarted the worker on the SAME code, the hub
+        advertised the same mismatch, and the worker looped.
+
+        Measured 2026-08-16 across 18 worker CTs on boiler/foyer/garage: 8-37
+        ``begin rolling self-update`` per hour each but exactly 2 reaching
+        ``fetching source`` -- a mean of 13.8 pointless full restarts per worker
+        per hour. Every one is a WS disconnect, and the hub turns a disconnect
+        into failed jobs for whatever that worker was running.
+        """
+        if not self._pending_update_to:
+            return ""
+        limit = _num_env(
+            "PAPRIKA_SELFUPDATE_RECYCLE_DEFER_S", self._SELFUPDATE_RECYCLE_DEFER_S
+        )
+        if limit <= 0:
+            return ""
+        since = self._update_drain_m
+        if not since:
+            return ""
+        held = time.monotonic() - since
+        if held > limit:
+            return ""
+        return (
+            f"rolling self-update -> {self._pending_update_to[:12]} owns the "
+            f"drain ({held:.0f}s of {limit:.0f}s)"
+        )
 
     def _start_memory_guard(self, loop: "asyncio.AbstractEventLoop") -> None:
         """Arm the memory-guard daemon thread. Kill switch:

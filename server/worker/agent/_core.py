@@ -260,6 +260,15 @@ class WorkerAgent(
         self._update_gate: asyncio.Event = asyncio.Event()
         self._update_jitter_s: float = 0.0
         self._self_update_task: asyncio.Task | None = None
+        #: Monotonic instant the rolling self-update took ownership of the
+        #: drain. Read by the heartbeat's recycle check, which stands down
+        #: while an update is pending so the update's fetch wins the race
+        #: against the recycle's abrupt os._exit(0) -- the same shape as
+        #: _memguard_breach_since. See _selfupdate_owns_recycle().
+        self._update_drain_m: float = 0.0
+        #: One-shot latch so the recycle stand-down logs once per update
+        #: instead of on every heartbeat.
+        self._recycle_hold_logged: bool = False
         # Heartbeat kick: when set, the heartbeat loop wakes immediately
         # instead of waiting the full HEARTBEAT_INTERVAL (10s). The
         # job-exec / session-start / lane-pool paths set this whenever the
