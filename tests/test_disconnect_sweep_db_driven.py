@@ -95,6 +95,40 @@ def test_running_and_downloading_stay_with_the_reconciler():
     assert "_STALE_RUNNING_GRACE_S" in body, "the reason must stay written down"
 
 
+def test_session_derived_running_jobs_are_left_alone_too():
+    """The other half of the same regression.
+
+    Narrowing the STORE query to `queued` only fixed the rows the store
+    contributed. The session registry (``by_worker``) also feeds ids into this
+    sweep, and an ordinary fetch job registers a session -- so every running job
+    on this hub was still failed the instant its worker's WS blipped, with no
+    grace window at all.
+
+    A blip is usually not a death. Measured 2026-08-16 on w51183: job
+    16d15a39a6b4 was failed 5s after it started and 3dd90b37b487 15s in, while
+    the worker process kept running and went on completing jobs -- it had only
+    reconnected. ~39 killed jobs/min hub-wide, each stranding the images it had
+    already uploaded, because image-pull only reads /jobs/completes.
+    """
+    body = _sweep_source()
+    running = body[body.index("elif jinfo.status == JobStatus.running:"):]
+    # It must fall through to the reconciler, NOT to the failed branch below.
+    assert "continue" in running[:running.index("else:")]
+    fail_at = body.index("disconnected before the job ")
+    assert body.index("elif jinfo.status == JobStatus.running:") < fail_at, (
+        "the running branch must be reached before the blanket-fail branch"
+    )
+
+
+def test_keepalive_completion_survives_the_running_carve_out():
+    """A keepalive job whose worker vanished is COMPLETED, not left hanging --
+    its capture is already saved. That branch must stay ahead of the new one."""
+    body = _sweep_source()
+    assert body.index('phase == "keepalive"') < body.index(
+        "elif jinfo.status == JobStatus.running:"
+    )
+
+
 @pytest.mark.parametrize("marker", ["pull", "claim", "_STALE_RUNNING_GRACE_S"])
 def test_the_reason_is_written_down(marker):
     """The next reader needs to know why a store query sits in a disconnect

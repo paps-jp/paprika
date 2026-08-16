@@ -2050,6 +2050,31 @@ async def worker_link(ws: WebSocket, worker_id: str):
                         # mirrors status; "keepalive_closed" is retired.
                         jinfo.progress.phase = "completed"
                     jinfo.completed_at = datetime.utcnow()
+                elif jinfo.status == JobStatus.running:
+                    # Leave it to the stale-job reconciler and its 300s
+                    # _STALE_RUNNING_GRACE_S window -- the SAME reason the store
+                    # lookup above is narrowed to `queued`. This branch is the
+                    # half that fix missed: the session registry also feeds
+                    # `running` ids into this sweep, and an ordinary fetch job
+                    # registers a session, so every running job on this hub was
+                    # failed the instant its worker's WS blipped.
+                    #
+                    # The blip is usually not a death. Measured 2026-08-16 on
+                    # w51183: job 16d15a39a6b4 was failed 5s after it started
+                    # and 3dd90b37b487 15s in, while the worker process kept
+                    # running and went on completing jobs -- it had only
+                    # reconnected. Hub-wide that was ~39 killed jobs/min, and
+                    # each one strands the images it had already uploaded.
+                    #
+                    # A worker that is genuinely gone is still settled: the
+                    # reconciler fails running jobs whose worker is absent from
+                    # the fleet-wide alive set once they pass the grace window.
+                    log.info(
+                        "worker %s disconnect: leaving running job %s to the "
+                        "reconciler (may re-adopt on reconnect)",
+                        worker_id, jid,
+                    )
+                    continue
                 else:
                     jinfo.status = JobStatus.failed
                     jinfo.error = (
@@ -2731,6 +2756,15 @@ async def _handle_worker_message(worker, msg) -> None:
                 worker.worker_id,
                 f"[{jid_short}] complete (assets={n_assets})",
                 kind="info",
+            )
+        except Exception:
+            pass
+        # Where the post-fetch wall time went (see _complete_latency): the
+        # worker's serial upload chain vs. WS queue + this handler's backlog.
+        try:
+            from server.hub import _complete_latency
+            _complete_latency.record(
+                getattr(msg, "sent_at", None), getattr(msg, "upload_ms", None)
             )
         except Exception:
             pass
