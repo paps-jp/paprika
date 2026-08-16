@@ -968,6 +968,120 @@ async def delete_job(job_id: str, request: Request) -> dict:
     }
 
 
+async def _purge_job_bytes(job_id: str, delete_record: bool) -> dict:
+    """Erase every byte a job left behind, in every place it can be.
+
+    A paprika job scatters its output across four stores: the hub's local
+    ``/data/jobs/{id}`` cache, the hot object tier, the spill tier it
+    overflowed to under RAM pressure (docs/ramdisk-asset-spill.md), and the DB
+    row. Consumers only ever see one of them -- the pipeline's image-pull
+    deletes the ``jobs/{id}/`` prefix off the hot store (.47) once it has taken
+    the images, and cannot reach the other three at all.
+
+    So "consumed" has never meant "gone": the spilled copies, the local cache
+    dir and the row all sit there until the 5-day retention pass gets to them.
+    This is the whole-job version, reachable the moment a consumer is done.
+
+    ``objstore.delete_prefix`` already iterates every configured tier, so the
+    spill copies go with the primary. Returns per-store counts so the caller
+    can see what it actually reclaimed.
+    """
+    assert state.store is not None
+    minio_objects = 0
+    minio_bytes = 0
+    if objstore.enabled():
+        try:
+            r = await objstore.delete_prefix(job_id)
+            minio_objects = int(r.get("objects") or 0)
+            minio_bytes = int(r.get("bytes") or 0)
+        except Exception:
+            log.warning("purge: MinIO delete_prefix(%s) failed", job_id, exc_info=True)
+    local_bytes = 0
+    d = get_storage_dir() / job_id
+    try:
+        if d.exists():
+            # Both in a thread: walking a job dir is the kind of sync FS work
+            # that has stalled this event loop before (docs/hub-eventloop-stalls).
+            local_bytes = await asyncio.to_thread(_job_dir_size_bytes, job_id)
+            await asyncio.to_thread(shutil.rmtree, d, True)
+    except Exception:
+        log.warning("purge: rmtree(%s) failed", d, exc_info=True)
+    record_deleted = False
+    if delete_record:
+        try:
+            record_deleted = bool(await state.store.delete_job(job_id))
+        except Exception:
+            log.warning("purge: delete_job(%s) failed", job_id, exc_info=True)
+    return {
+        "job_id": job_id,
+        "minio_objects": minio_objects,
+        "minio_bytes": minio_bytes,
+        "local_bytes": local_bytes,
+        "record_deleted": record_deleted,
+    }
+
+
+@router.post("/jobs/purge")
+async def purge_jobs(body: dict) -> dict:
+    """Reclaim the storage of jobs a downstream consumer has finished with.
+
+    Body::
+
+        {"job_ids": ["ab12...", ...],      # required, <= 1000 per call
+         "delete_record": false}           # default: keep the row
+
+    ``delete_record`` defaults to **false** on purpose. The bytes are what
+    costs (the hot tier is a RAM disk), while the row is what the #jobs
+    dashboard and the consumer's own bookkeeping read -- image-pull's pending
+    GC treats a 404 from ``GET /jobs/{id}`` as "orphan, reclaim it", so
+    dropping rows here would change how a retry classifies a job. Callers that
+    genuinely want the job gone can ask for it; ``DELETE /jobs/{id}`` remains
+    the single-job equivalent.
+
+    Batched because the caller purges a tick's worth at a time (image-pull
+    drains a few hundred per tick), and per-job HTTP would put the round-trip
+    count where the work isn't. Purges run bounded-parallel: each one is
+    dominated by MinIO round-trips across tiers, exactly like the retention
+    pass this shares its shape with.
+
+    Idempotent: purging an already-purged (or unknown) job reports zeros
+    rather than failing, so a consumer can retry a batch freely.
+    """
+    assert state.store is not None
+    body = body or {}
+    job_ids = body.get("job_ids") or []
+    if not isinstance(job_ids, list):
+        raise HTTPException(400, "job_ids must be a list")
+    job_ids = [str(j).strip() for j in job_ids if str(j or "").strip()]
+    if len(job_ids) > 1000:
+        raise HTTPException(400, "at most 1000 job_ids per call")
+    delete_record = bool(body.get("delete_record") or False)
+    sem = asyncio.Semaphore(10)
+
+    async def _one(jid: str) -> dict:
+        async with sem:
+            return await _purge_job_bytes(jid, delete_record)
+
+    results = await asyncio.gather(
+        *(_one(j) for j in job_ids), return_exceptions=True,
+    )
+    ok = [r for r in results if isinstance(r, dict)]
+    failed = [
+        {"job_id": j, "error": f"{type(r).__name__}: {r}"}
+        for j, r in zip(job_ids, results)
+        if not isinstance(r, dict)
+    ]
+    return {
+        "purged": len(ok),
+        "minio_objects": sum(r["minio_objects"] for r in ok),
+        "minio_bytes": sum(r["minio_bytes"] for r in ok),
+        "local_bytes": sum(r["local_bytes"] for r in ok),
+        "records_deleted": sum(1 for r in ok if r["record_deleted"]),
+        "failed": failed,
+        "jobs": ok,
+    }
+
+
 @router.post("/jobs/cleanup")
 async def cleanup_jobs(body: dict) -> dict:
     """Bulk delete old / large jobs to reclaim disk.
