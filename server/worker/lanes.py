@@ -28,10 +28,12 @@ import asyncio
 import json
 import logging
 import os
+import re
 import shutil
 import signal
 import socket
 import subprocess
+import time
 import urllib.request
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -229,6 +231,119 @@ def chrome_lane_tmp_roots() -> list[Path]:
         ]
     except OSError:
         return []
+
+
+#: Touched by the sweeper every pass so the OTHER CTs on this node can tell a
+#: live owner directory from one whose worker no longer exists.
+_CHROME_OWNER_MARKER = ".paprika-owner"
+
+#: Lane-root names are worker ids, and a worker that could not reach the hub at
+#: startup derives a container-hash fallback id (``<hash>-<suffix>``) instead of
+#: the LAN-IP form -- see server/worker/agent/workerid.py. Those are the ones
+#: most likely to be abandoned (the container gets its real id on the next
+#: start and never returns to this directory): 4.1 GB of them on one node's
+#: ramdisk when this was written. Hence the dash.
+_CHROME_OWNER_RE = re.compile(r"^[A-Za-z0-9_-]{2,64}$")
+
+
+def touch_chrome_owner() -> None:
+    """Stamp our own lane root as live. Cheap, and the only positive proof a
+    neighbouring CT gets: the profile trees are mutually visible on the shared
+    ramdisk but the processes using them are not."""
+    if not chrome_on_ramdisk():
+        return
+    try:
+        (chrome_lane_root() / _CHROME_OWNER_MARKER).touch()
+    except OSError:
+        pass
+
+
+def _chrome_owner_last_touch(d: Path) -> float:
+    """Newest sign of life under a lane-root directory.
+
+    The directory's OWN mtime is not enough: it only moves when a lane dir is
+    created or removed, so a worker that has been running the same two lanes
+    for a week looks a week idle. Chrome writes inside the lane dirs
+    continuously, so the newest depth-1 mtime is the real signal -- plus the
+    owner marker for workers new enough to leave one.
+    """
+    newest = 0.0
+    try:
+        newest = d.stat().st_mtime
+    except OSError:
+        return 0.0
+    try:
+        for child in d.iterdir():
+            try:
+                newest = max(newest, child.stat().st_mtime)
+            except OSError:
+                continue
+    except OSError:
+        pass
+    return newest
+
+
+def sweep_chrome_orphans(worker_id: str, min_age_s: float) -> tuple[int, int]:
+    """Remove lane roots belonging to workers that no longer exist.
+
+    ``/ram/chrome`` is one tmpfs per NODE, subdivided by worker id
+    (docs/ramdisk-chrome-lane.md), so a decommissioned or renamed worker
+    leaves a multi-GB Chrome profile tree that no surviving process is allowed
+    to touch -- eight such trees were sitting across the fleet on 2026-08-16,
+    the oldest 76h. This is the pool's :func:`scratch_pool.sweep_orphans` for
+    the Chrome half.
+
+    Conservative by construction: only sibling directories whose name looks
+    like a worker id, only when NOTHING under them has been written for
+    ``min_age_s`` (12h by default -- an idle Chrome still writes its profile
+    every few minutes), and never our own. Losing this race would cost a
+    neighbour its logged-in profile, which the hub can re-push but the
+    operator should never have to notice.
+
+    Returns ``(removed, freed_bytes)``. ``min_age_s <= 0`` disables it.
+    """
+    if min_age_s <= 0 or not chrome_on_ramdisk():
+        return (0, 0)
+    root = chrome_lane_root()
+    mount = root.parent
+    now = time.time()
+    removed = 0
+    freed = 0
+    try:
+        entries = list(mount.iterdir())
+    except OSError:
+        return (0, 0)
+    for d in entries:
+        if d.name == root.name or d.name.startswith("."):
+            continue
+        if not _CHROME_OWNER_RE.match(d.name):
+            continue
+        try:
+            if not d.is_dir():
+                continue
+        except OSError:
+            continue
+        last = _chrome_owner_last_touch(d)
+        if not last or now - last < min_age_s:
+            continue
+        size = 0
+        try:
+            for dirpath, _dirs, files in os.walk(str(d)):
+                for f in files:
+                    try:
+                        size += os.path.getsize(os.path.join(dirpath, f))
+                    except OSError:
+                        pass
+        except OSError:
+            pass
+        shutil.rmtree(d, ignore_errors=True)
+        removed += 1
+        freed += size
+        log.info(
+            "[pool] reclaimed orphan chrome lane root %s (idle %.1fh, %d MB)",
+            d, (now - last) / 3600.0, size // (1024 * 1024),
+        )
+    return (removed, freed)
 
 
 def chrome_live_socket_dirs() -> set[str]:

@@ -277,6 +277,15 @@ class WorkerAgent(
         # vanishing into nothing. Cleared by the deferred task's
         # done_callback on exit.
         self._force_complete_job_ids: set[str] = set()
+        # Set of in-flight deferred-video-DL job_ids the HUB has already
+        # finished with (failed / cancelled / deleted). Nothing we produce
+        # for them can be accepted any more, so the download is pure waste:
+        # of the node ramdisk it holds (0.1-2 GB each), of the CT's memory
+        # cgroup that tmpfs is charged to, and of the bandwidth. The watcher
+        # (_abandoned_download_loop) fills this in; the deferred task's
+        # finally block sees it, skips the uploads + JobComplete, and frees
+        # the scratch directory immediately instead of at the 2h yt-dlp cap.
+        self._abandoned_job_ids: set[str] = set()
         try:
             self._recycle_after = int(os.environ.get("WORKER_RECYCLE_AFTER_JOBS", "200"))
         except (TypeError, ValueError):

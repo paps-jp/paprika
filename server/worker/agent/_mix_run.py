@@ -623,6 +623,9 @@ class _RunMixin:
         disk_task = asyncio.create_task(self._disk_cleanup_loop())
         preview_task = asyncio.create_task(self._preview_capture_loop())
         selfcheck_task = asyncio.create_task(self._self_check_loop())
+        # Frees the node ramdisk the instant a deferred download's job is
+        # over, instead of at the 2h yt-dlp cap -- see the loop's docstring.
+        abandon_task = asyncio.create_task(self._abandoned_download_loop())
         # Pull dispatch (server/worker/agent/_mix_pull.py). Returns
         # immediately unless PAPRIKA_PULL_DISPATCH is set.
         if getattr(self, "_lag_task", None) is None:
@@ -648,6 +651,7 @@ class _RunMixin:
             disk_task.cancel()
             preview_task.cancel()
             selfcheck_task.cancel()
+            abandon_task.cancel()
             pull_task.cancel()
 
     async def _heartbeat_loop(self) -> None:

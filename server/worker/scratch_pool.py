@@ -103,6 +103,7 @@ from __future__ import annotations
 
 import logging
 import os
+import re as _re
 import shutil
 import tempfile
 import time
@@ -406,6 +407,136 @@ def outstanding_bytes(pool: Path, owner: str | None = None) -> int:
 
 def _owner_token(worker_id: str) -> str:
     return f"-{worker_id}-"
+
+
+#: Worker ids are ``w<3rd octet><4th octet>`` (server/worker/agent/workerid.py)
+#: with a container-hash fallback. Anything outside this shape is not an owner
+#: id we put there, and a directory we cannot attribute is never reclaimed.
+_OWNER_RE = _re.compile(r"^[A-Za-z0-9_]{2,64}$")
+
+
+def orphan_min_age_s() -> int:
+    """How long a directory AND its claim must have gone untouched before
+    another worker on the node may reclaim it.
+
+    Deliberately far longer than anything a live owner can be quiet for: the
+    longest download is ``PAPRIKA_VIDEO_DOWNLOAD_TIMEOUT_S`` (2h) and the
+    owner refreshes its claims every sweep (30 min), so 6h of silence on BOTH
+    signals means the owner is not running.
+    """
+    return _env_int("PAPRIKA_SCRATCH_ORPHAN_MIN_AGE_S", 21600)
+
+
+def _dir_owner(name: str) -> str | None:
+    """The worker id embedded in a pool directory name, or None.
+
+    ``acquire`` builds ``<caller prefix><worker_id>-<mkdtemp suffix>``. Neither
+    the job id (hex) nor mkdtemp's suffix (letters/digits/underscore) contains
+    a dash, so the owner is the second-to-last dash-separated field.
+
+    The ``paprika-`` gate is what keeps this from attributing an owner to
+    something we did not create: every caller of :func:`acquire` passes a
+    ``paprika-...`` prefix, and a name we cannot attribute must never become
+    a reclaim candidate.
+    """
+    if not name.startswith("paprika-"):
+        return None
+    parts = name.rsplit("-", 2)
+    if len(parts) != 3:
+        return None
+    owner = parts[1]
+    return owner if owner and _OWNER_RE.match(owner) else None
+
+
+def sweep_orphans(worker_id: str, min_age_s: float | None = None) -> tuple[int, int]:
+    """Reclaim pool directories whose owner no longer exists.
+
+    Every other sweep here is owner-scoped, and that is normally the right
+    contract -- the CTs on a node cannot see each other's processes, so only
+    the owner can prove its own directory is dead. But it leaves one class of
+    garbage with no collector at all: when a worker is deleted, renamed or
+    re-provisioned (a CT rebuild, a changed ``WORKER_ID``), its directories
+    stay on the node tmpfs forever because the one process allowed to remove
+    them is gone. Measured 2026-08-16: ``w51180`` and ``w5143``, both absent
+    from the fleet, between them held 15 directories -- one set 76 hours old --
+    on RAM that the surviving CTs on those nodes were competing for.
+
+    Reclaiming another CT's data needs evidence that cannot be faked by a
+    quiet-but-live neighbour, so THREE things must all hold:
+
+      * the directory itself has not been written to for ``min_age_s``;
+      * its claim file has not been refreshed for ``min_age_s`` either --
+        ``touch_own`` runs every sweep, so a live owner cannot be silent for
+        6h while holding a download that caps out at 2h;
+      * that owner has no OTHER claim in the pool that IS fresh, which is what
+        rules out an owner whose claim file was lost rather than abandoned.
+
+    Deliberately does NOT consult the hub's worker list: ``/workers`` is
+    served per-hub and a degraded hub answers with a fraction of the fleet
+    (observed: 16 of 211), which as an input here would mean deleting live
+    workers' downloads. The pool speaks for itself.
+
+    Returns ``(removed, freed_bytes)``. Set ``PAPRIKA_SCRATCH_ORPHAN_DISABLE``
+    to turn it off.
+    """
+    pool = pool_dir()
+    if pool is None or _truthy("PAPRIKA_SCRATCH_ORPHAN_DISABLE"):
+        return (0, 0)
+    age = float(orphan_min_age_s() if min_age_s is None else min_age_s)
+    if age <= 0:
+        return (0, 0)
+    now = time.time()
+
+    claim_mtime: dict[str, float] = {}
+    fresh_owners: set[str] = set()
+    try:
+        claim_entries = list(_claims_dir(pool).iterdir())
+    except OSError:
+        claim_entries = []
+    for c in claim_entries:
+        if c.suffix != ".claim":
+            continue
+        try:
+            m = c.stat().st_mtime
+        except OSError:
+            continue
+        claim_mtime[c.stem] = m
+        owner = _dir_owner(c.stem)
+        if owner and now - m < age:
+            fresh_owners.add(owner)
+
+    removed = 0
+    freed = 0
+    try:
+        entries = list(pool.iterdir())
+    except OSError:
+        return (0, 0)
+    for d in entries:
+        if d.name == _CLAIMS_DIRNAME or d.name.startswith("."):
+            continue
+        owner = _dir_owner(d.name)
+        if not owner or owner == worker_id or owner in fresh_owners:
+            continue
+        try:
+            if not d.is_dir():
+                continue
+            if now - d.stat().st_mtime < age:
+                continue
+        except OSError:
+            continue
+        m = claim_mtime.get(d.name)
+        if m is not None and now - m < age:
+            continue
+        size = _dir_used_bytes(d)
+        release(d)
+        removed += 1
+        freed += size
+        log.info(
+            "scratch pool: reclaimed orphan %s (owner %s gone, idle %.1fh, "
+            "%d MB)", d.name, owner, (now - m if m else age) / 3600.0,
+            size // _MB,
+        )
+    return (removed, freed)
 
 
 def acquire(prefix: str, worker_id: str, need_bytes: int) -> Path | None:

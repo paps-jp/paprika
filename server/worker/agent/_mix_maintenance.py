@@ -171,6 +171,110 @@ class _MaintenanceMixin:
                     f"tab(s) (kept 1)",
                 )
 
+    async def _abandoned_download_loop(self) -> None:
+        """Drop deferred downloads whose job the hub has already finished.
+
+        A deferred yt-dlp download outlives the job it belongs to. The lane is
+        released before it starts, so the hub is free to fail the job (reaper
+        timeout, worker disconnect, redrive elsewhere) or the pipeline is free
+        to delete it -- while yt-dlp keeps writing up to
+        ``PAPRIKA_VIDEO_DOWNLOAD_TIMEOUT_S`` (2h) into a directory on the node
+        ramdisk that is charged to THIS CT's memory cgroup.
+
+        Nothing tells the worker. Measured across the fleet on 2026-08-16: 398
+        scratch directories, only 53 of which belonged to a job that was still
+        running -- 220 ``failed``, 40 ``completed`` elsewhere, 80 deleted
+        outright. That is the leak this loop closes at the source, ahead of the
+        30-minute sweeper that can only collect a directory once the download
+        has finally given up on it.
+
+        Polling rather than a hub push on purpose: the job can be ended by ANY
+        hub (or by ``DELETE /jobs/{id}`` from the pipeline), not just the one
+        holding our WebSocket, and a push would have to cross that boundary.
+        One GET per in-flight download per interval, and only for downloads
+        past ``grace`` -- a worker with nothing deferred makes no requests.
+        """
+        interval = float(
+            os.environ.get("PAPRIKA_ABANDON_POLL_INTERVAL_S") or 120.0,
+        )
+        # Don't judge a download that has only just started: the hub row can
+        # still be catching up to the phase change (and a job legitimately
+        # sits in ``running`` for a moment before the deferred DL is stamped
+        # ``downloading``).
+        grace = float(os.environ.get("PAPRIKA_ABANDON_GRACE_S") or 180.0)
+        if interval <= 0:
+            return
+        started: dict[str, float] = {}
+        # ``failed`` seen once is not acted on. A row can read failed while we
+        # are perfectly alive -- the downloading reaper marks a job failed when
+        # it believes the worker is gone fleet-wide, which a WS flap is enough
+        # to produce -- so a second identical reading a poll later is required
+        # before killing work that may still be wanted. A deleted or cancelled
+        # job needs no such patience: nobody is waiting for it either way.
+        pending: dict[str, str] = {}
+        try:
+            while True:
+                await asyncio.sleep(interval)
+                bg = getattr(self, "_bg_video_tasks", None) or {}
+                live = {j for j in bg.values() if j} if isinstance(bg, dict) else set()
+                now = time.monotonic()
+                for job_id in live:
+                    started.setdefault(job_id, now)
+                for job_id in [j for j in started if j not in live]:
+                    started.pop(job_id, None)
+                    pending.pop(job_id, None)
+                for job_id in sorted(live):
+                    if job_id in self._abandoned_job_ids:
+                        continue
+                    if now - started.get(job_id, now) < grace:
+                        continue
+                    verdict = await self._hub_job_is_finished(job_id)
+                    if verdict is None:
+                        # Unreachable hub, or the job is still wanted. Either
+                        # way this is not evidence to kill a download on.
+                        pending.pop(job_id, None)
+                        continue
+                    if verdict == "failed" and pending.pop(job_id, None) != "failed":
+                        pending[job_id] = "failed"
+                        continue
+                    pending.pop(job_id, None)
+                    await self._abandon_video_job(job_id, verdict)
+        except asyncio.CancelledError:
+            return
+
+    async def _hub_job_is_finished(self, job_id: str) -> str | None:
+        """Reason string when the hub is done with ``job_id``, else None.
+
+        None means "no answer" -- an unreachable hub, a timeout, an
+        unparseable body. That has to read as "keep downloading": a network
+        blip must never be the thing that kills a 90%-complete video.
+        """
+        try:
+            base = (self.hub_http_url or "").rstrip("/")
+            if not base or self._http is None:
+                return None
+            r = await self._http.get(f"{base}/jobs/{job_id}", timeout=10.0)
+        except Exception:
+            return None
+        if r.status_code == 404:
+            return "deleted"
+        if r.status_code != 200:
+            return None
+        try:
+            status = str((r.json() or {}).get("status") or "").split(".")[-1].lower()
+        except Exception:
+            return None
+        # ``completed`` is deliberately NOT terminal here. It reads like the
+        # safest possible signal and is the opposite: sampled across the fleet
+        # on 2026-08-16, 26 scratch directories belonged to jobs the hub had
+        # marked completed and 20 of them had a live yt-dlp still writing --
+        # the fetch phase completes first and the deferred download uploads
+        # its video afterwards. Abandoning on ``completed`` would throw away
+        # the video on every ordinary job.
+        if status in ("failed", "cancelled", "canceled"):
+            return status
+        return None
+
     async def _disk_cleanup_loop(self) -> None:
         """Periodically prune stale /tmp/paprika-* dirs left behind by
         crashes / ungraceful teardown, plus Chrome's own abandoned scratch
@@ -410,6 +514,48 @@ class _MaintenanceMixin:
             )
             removed += _pr
             freed += _pf
+        except Exception:
+            pass
+        # The one class of garbage owner-scoping cannot collect: directories
+        # whose owner no longer exists at all (CT rebuilt, worker id changed).
+        # Nobody is left to run the sweep above for them, so the surviving
+        # workers on the node do it -- under much stricter evidence. See
+        # scratch_pool.sweep_orphans / lanes.sweep_chrome_orphans.
+        try:
+            _or, _of = scratch_pool.sweep_orphans(self.worker_id)
+            removed += _or
+            freed += _of
+            if _or:
+                # Its own line, at the agent's logger: the summary below folds
+                # these into the /tmp count, and "we deleted another CT's data"
+                # is exactly the event an operator must be able to find.
+                _logger.info(
+                    f"[worker {self.worker_id}] scratch-pool orphan reclaim: "
+                    f"{_or} dir(s) of vanished workers, "
+                    f"~{_of // (1024*1024)} MiB back to the node ramdisk",
+                )
+        except Exception:
+            pass
+        try:
+            from server.worker.lanes import (
+                sweep_chrome_orphans,
+                touch_chrome_owner,
+            )
+
+            touch_chrome_owner()
+            _cr, _cf = sweep_chrome_orphans(
+                self.worker_id,
+                float(os.environ.get("PAPRIKA_CHROME_ORPHAN_MIN_AGE_S") or 43200.0),
+            )
+            removed += _cr
+            freed += _cf
+            chrome_removed += _cr
+            if _cr:
+                _logger.info(
+                    f"[worker {self.worker_id}] chrome orphan reclaim: "
+                    f"{_cr} lane root(s) of vanished workers, "
+                    f"~{_cf // (1024*1024)} MiB back to the node ramdisk",
+                )
         except Exception:
             pass
         return (removed, freed, chrome_removed)

@@ -340,6 +340,119 @@ def test_cgroup_limit_pool_file_beats_env(pool, monkeypatch):
     assert scratch_pool.cgroup_limit_bytes() == 8192 * MB
 
 
+# --- orphan reclaim (owner no longer exists) -------------------------------
+#
+# The one gap owner-scoping leaves: a worker that is deleted or renamed can
+# never run its own sweep again, so its directories sit on the node's RAM
+# forever (measured 2026-08-16: w51180 / w5143, 15 dirs, oldest 76h). The
+# surviving workers collect them -- which means these tests guard a delete of
+# ANOTHER CT's data, and the negative cases matter more than the positive one.
+
+
+def _age(path, seconds):
+    old = os.stat(path).st_mtime - seconds
+    os.utime(path, (old, old))
+
+
+def _age_dir_and_claim(pool, d, seconds):
+    _age(d, seconds)
+    _age(pool / scratch_pool._CLAIMS_DIRNAME / f"{d.name}.claim", seconds)
+
+
+def test_orphan_of_a_vanished_owner_is_reclaimed(pool, monkeypatch):
+    _free(monkeypatch, 10_000 * MB)
+    gone = scratch_pool.acquire("paprika-vid-j1-", "w51180", 10 * MB)
+    (gone / "video.mp4.part").write_bytes(b"\0" * MB)
+    _age_dir_and_claim(pool, gone, 76 * 3600)
+
+    n, freed = scratch_pool.sweep_orphans("w51161", min_age_s=6 * 3600)
+
+    assert n == 1
+    assert not gone.exists()
+    assert freed >= MB
+    # The claim goes with it, or the node keeps reserving space for a
+    # directory that no longer exists.
+    assert not (pool / scratch_pool._CLAIMS_DIRNAME / f"{gone.name}.claim").exists()
+
+
+def test_orphan_reclaim_spares_a_quiet_but_live_neighbour(pool, monkeypatch):
+    """A single-file mp4 download does not bump its directory's mtime once
+    yt-dlp has created the .part, so dir age alone would delete a running 2h
+    download out of another CT. The owner's claim refresh is the signal that
+    overrides it."""
+    _free(monkeypatch, 10_000 * MB)
+    live = scratch_pool.acquire("paprika-vid-j2-", "w51176", 10 * MB)
+    _age(live, 76 * 3600)          # dir looks ancient...
+    scratch_pool.touch_own("w51176")  # ...but its owner is alive and touching
+
+    n, _freed = scratch_pool.sweep_orphans("w51161", min_age_s=6 * 3600)
+
+    assert n == 0
+    assert live.is_dir()
+
+
+def test_orphan_reclaim_spares_an_owner_alive_elsewhere_in_the_pool(pool, monkeypatch):
+    """Claim files can be lost (a stray rmtree of .paprika-claims, an older
+    worker version). A fresh claim on ANY other directory of the same owner
+    proves the owner is running, so its silent directory stays."""
+    _free(monkeypatch, 10_000 * MB)
+    quiet = scratch_pool.acquire("paprika-vid-j3-", "w51176", 10 * MB)
+    busy = scratch_pool.acquire("paprika-vid-j4-", "w51176", 10 * MB)
+    _age_dir_and_claim(pool, quiet, 76 * 3600)
+    _age(busy, 76 * 3600)          # busy's claim stays fresh
+
+    n, _freed = scratch_pool.sweep_orphans("w51161", min_age_s=6 * 3600)
+
+    assert n == 0
+    assert quiet.is_dir() and busy.is_dir()
+
+
+def test_orphan_reclaim_never_touches_a_recent_directory(pool, monkeypatch):
+    _free(monkeypatch, 10_000 * MB)
+    recent = scratch_pool.acquire("paprika-vid-j5-", "w51176", 10 * MB)
+    _age(pool / scratch_pool._CLAIMS_DIRNAME / f"{recent.name}.claim", 76 * 3600)
+
+    n, _freed = scratch_pool.sweep_orphans("w51161", min_age_s=6 * 3600)
+
+    assert n == 0
+    assert recent.is_dir()
+
+
+def test_orphan_reclaim_never_touches_our_own(pool, monkeypatch):
+    """Ours are sweep_own's business: it knows which job ids are still live,
+    and this pass does not."""
+    _free(monkeypatch, 10_000 * MB)
+    mine = scratch_pool.acquire("paprika-vid-j6-", "w51161", 10 * MB)
+    _age_dir_and_claim(pool, mine, 76 * 3600)
+
+    n, _freed = scratch_pool.sweep_orphans("w51161", min_age_s=6 * 3600)
+
+    assert n == 0
+    assert mine.is_dir()
+
+
+def test_orphan_reclaim_kill_switch(pool, monkeypatch):
+    _free(monkeypatch, 10_000 * MB)
+    gone = scratch_pool.acquire("paprika-vid-j7-", "w51180", 10 * MB)
+    _age_dir_and_claim(pool, gone, 76 * 3600)
+    monkeypatch.setenv("PAPRIKA_SCRATCH_ORPHAN_DISABLE", "1")
+
+    assert scratch_pool.sweep_orphans("w51161", min_age_s=6 * 3600) == (0, 0)
+    assert gone.is_dir()
+
+
+@pytest.mark.parametrize("name,owner", [
+    ("paprika-vid-abc123-w51180-x7yz", "w51180"),
+    ("paprika-abc123-w5143-a_b1", "w5143"),
+    (".paprika-claims", None),        # the claims dir is not an owner dir
+    ("noleadingprefix", None),        # not ours -> not attributable
+    ("some-other-tool-dir-x", None),  # ...even with an owner-shaped middle
+    ("paprika-two", None),            # too few fields to carry an owner
+])
+def test_dir_owner_parsing(name, owner):
+    assert scratch_pool._dir_owner(name) == owner
+
+
 # --- ENOSPC classifier (the local-disk retry trigger) ----------------------
 
 

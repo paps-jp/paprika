@@ -106,6 +106,16 @@ from .workerid import WORKER_ID_FILE, _WorkerIdReassigned, hub_http_base
 _DISK_PRESSURE_FAIL_PCT = 90.0
 
 
+class _AbandonedJob(Exception):
+    """Raised inside the deferred-download task when the hub has already
+    finished with the job (failed / cancelled / deleted).
+
+    Not an error condition: it is the unwind path that skips the uploads and
+    the completion send while still running the ``finally`` that hands the
+    node's ramdisk back. See ``_abandon_video_job``.
+    """
+
+
 def _looks_like_enospc(msg: object) -> bool:
     """True when a yt-dlp failure message reads as "the filesystem is full".
 
@@ -1143,6 +1153,12 @@ class _JobExecMixin:
                     ref = t.get("referer")
                     if not u:
                         continue
+                    if job_id in self._abandoned_job_ids:
+                        # The hub finished with this job while we were on an
+                        # earlier target. Starting the next download would
+                        # hold the node's ramdisk for another hour for an
+                        # asset nobody can accept.
+                        break
                     _cur["key"] = u
                     _cur["label"] = (
                         u.split("?", 1)[0].rsplit("/", 1)[-1] or u
@@ -1188,6 +1204,11 @@ class _JobExecMixin:
                         ))
                 # Upload every completed file (skip in-progress parts).
                 _video_ext = {".mp4", ".webm", ".mkv", ".mov", ".m4v", ".ts"}
+                if job_id in self._abandoned_job_ids:
+                    # Terminal on the hub: the asset POST would 404 and the
+                    # bytes are already unwanted. Fall through to the finally,
+                    # which releases the scratch directory.
+                    raise _AbandonedJob(job_id)
                 for p in sorted(_f for _d in _dl_dirs for _f in _d.iterdir()):
                     if not p.is_file():
                         continue
@@ -1213,6 +1234,12 @@ class _JobExecMixin:
                     line=f"  [downloading] done: {len(added)} video asset(s) "
                          f"uploaded",
                 ))
+            except _AbandonedJob:
+                _logger.info(
+                    "[%s] deferred download abandoned: hub already finished "
+                    "with this job; dropping %d scratch dir(s)",
+                    job_id, len(_dl_dirs),
+                )
             except Exception as e:
                 await self._send(WorkerJobLog(
                     job_id=job_id,
@@ -1228,7 +1255,10 @@ class _JobExecMixin:
                 # repackages whatever the MPEG-TS / fMP4 buffer holds
                 # without re-encoding -- typically a clean playable
                 # truncation of the stream so far.
-                _is_force = job_id in self._force_complete_job_ids
+                _is_abandoned = job_id in self._abandoned_job_ids
+                _is_force = (not _is_abandoned) and (
+                    job_id in self._force_complete_job_ids
+                )
                 if _is_force:
                     try:
                         await self._send(WorkerJobLog(
@@ -1276,28 +1306,40 @@ class _JobExecMixin:
                 # accounting frees up the instant the bytes do.
                 for _d in _dl_dirs:
                     _pool.release(_d)
-                # ALWAYS finish the job so it can never hang in
-                # "downloading" -- include whatever video assets landed.
-                try:
-                    base_result.assets = list(base_result.assets) + added
-                except Exception:
-                    pass
-                if _is_force:
+                if _is_abandoned:
+                    # The hub expects no result here: the job is already
+                    # failed / cancelled / deleted, and a late
+                    # WorkerJobComplete would either 404 or overwrite whatever
+                    # a redrive on another worker produced. The scratch is
+                    # freed above, which is the whole point of abandoning.
+                    # (Guarded by a flag rather than an early ``return``: a
+                    # return inside ``finally`` would also swallow the
+                    # CancelledError of a worker shutting down.)
+                    self._abandoned_job_ids.discard(job_id)
+                    self._force_complete_job_ids.discard(job_id)
+                else:
+                    # ALWAYS finish the job so it can never hang in
+                    # "downloading" -- include whatever video assets landed.
                     try:
-                        base_result.partial = True
+                        base_result.assets = list(base_result.assets) + added
                     except Exception:
                         pass
-                    # Clear the flag now that we've handled this job.
+                    if _is_force:
+                        try:
+                            base_result.partial = True
+                        except Exception:
+                            pass
+                        # Clear the flag now that we've handled this job.
+                        try:
+                            self._force_complete_job_ids.discard(job_id)
+                        except Exception:
+                            pass
                     try:
-                        self._force_complete_job_ids.discard(job_id)
+                        await self._send(WorkerJobComplete(
+                            job_id=job_id, result=base_result,
+                        ))
                     except Exception:
                         pass
-                try:
-                    await self._send(WorkerJobComplete(
-                        job_id=job_id, result=base_result,
-                    ))
-                except Exception:
-                    pass
 
         task = asyncio.create_task(_run())
         # Track {task: job_id} so two consumers can find the in-flight
@@ -1315,6 +1357,47 @@ class _JobExecMixin:
             self._bg_video_tasks = {}
         self._bg_video_tasks[task] = job_id
         task.add_done_callback(lambda t: self._bg_video_tasks.pop(t, None))
+
+    async def _abandon_video_job(self, job_id: str, reason: str) -> int:
+        """Stop an in-flight deferred download whose job the hub has ENDED.
+
+        The mirror image of ``_force_complete_video_job``: that one wraps a
+        download up because the hub still wants a result, this one drops it
+        because the hub has moved on. Nothing we upload afterwards can be
+        accepted -- the row is ``failed`` / ``cancelled``, or gone entirely --
+        so every further second costs a slice of the node ramdisk (0.1-2 GB,
+        charged to THIS CT's memory cgroup) and the bandwidth to fill it, for
+        bytes that are already garbage.
+
+        Left to itself the download runs to ``PAPRIKA_VIDEO_DOWNLOAD_TIMEOUT_S``
+        (2h by default). Measured on 2026-08-16: 345 of the 398 scratch
+        directories fleet-wide belonged to jobs the hub had already finished.
+
+        Same mechanics as force-complete: flag the id, SIGTERM only the
+        yt-dlp / ffmpeg descendants whose argv carries ``paprika-vid-{job_id}``,
+        and let the deferred task's ``finally`` release the directory.
+        Idempotent. Returns the number of processes signalled.
+        """
+        from server.worker.agent.video import _terminate_ytdlp_descendants_for_job
+
+        try:
+            self._abandoned_job_ids.add(job_id)
+        except Exception:
+            pass
+        killed = 0
+        try:
+            killed = await asyncio.to_thread(
+                _terminate_ytdlp_descendants_for_job, job_id,
+            )
+        except Exception:
+            _logger.warning(
+                "[%s] abandon: descendant SIGTERM failed", job_id, exc_info=True,
+            )
+        _logger.info(
+            "[%s] abandoning deferred download (%s): SIGTERM'd %d "
+            "yt-dlp/ffmpeg descendant(s)", job_id, reason, killed,
+        )
+        return killed
 
     async def _force_complete_video_job(self, job_id: str, reason: str) -> None:
         """Hub-driven graceful wrap-up of an in-flight deferred video DL.
