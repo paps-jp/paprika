@@ -182,6 +182,95 @@ _OWNER_CAD_LUA = (
 )
 
 
+
+# --------------------------------------------------------------------------
+# One field list, two readers.
+#
+# ``/workers`` rows are built by two independent places: one from the live
+# ``ConnectedWorker`` this hub holds a WS for, one from the JSON blob a peer
+# hub wrote to Redis. Each hand-listed its own fields, and in two days that
+# arrangement silently dropped four of them:
+#
+#   mem_anon_rate_mb_min  wired in 1 of 4 mirrors -> read 0 on all 170 workers
+#   loop_lag_ms           the same trap, caught only by testing every mirror
+#   routable              set on redis rows only -> locally-held workers, the
+#                         most routable there are, all reported False
+#   address / cpu / mem / disk / profiles
+#                         absent from the LOCAL builder -> whichever hub nginx
+#                         picked showed ITS OWN ~27 workers with blank columns,
+#                         and a page refresh moved the blanks elsewhere
+#
+# The values genuinely differ per source (an attribute vs a dict key, and
+# ConnectedWorker calls it ``client_address`` while the blob says ``address``),
+# so the readers stay separate. What must not differ is the SET of keys -- so
+# that is named once here and asserted equal in tests.
+# --------------------------------------------------------------------------
+
+#: Canonical detail keys every worker row carries, whatever built it.
+_ROW_DETAIL_FIELDS = (
+    "address", "cpu_pct", "mem_pct", "disk_pct", "disk_free_gb", "load1",
+    "nproc", "mem_scope", "mem_current_mb", "mem_anon_mb",
+    "mem_psi_some_avg60", "mem_psi_full_avg60", "mem_majfault_per_s",
+    "mem_refault_per_s", "mem_anon_rate_mb_min", "loop_lag_ms", "memguard",
+    "profiles_cached", "pending_update_to",
+)
+
+
+def _row_detail_from_worker(w: "ConnectedWorker") -> dict:
+    """Detail keys for a worker whose WS this hub holds."""
+    return {
+        # The blob calls it "address"; the dataclass calls it
+        # "client_address". That rename is why the local builder emitted no
+        # IP at all -- there was no attribute of the expected name to reach
+        # for, and nothing failed loudly about it.
+        "address": str(getattr(w, "client_address", "") or ""),
+        "cpu_pct": float(w.cpu_pct or 0.0),
+        "mem_pct": float(w.mem_pct or 0.0),
+        "disk_pct": float(w.disk_pct or 0.0),
+        "disk_free_gb": float(w.disk_free_gb or 0.0),
+        "load1": float(w.load1 or 0.0),
+        "nproc": int(w.nproc or 0),
+        "mem_scope": str(w.mem_scope or ""),
+        "mem_current_mb": float(w.mem_current_mb or 0.0),
+        "mem_anon_mb": float(w.mem_anon_mb or 0.0),
+        "mem_psi_some_avg60": float(w.mem_psi_some_avg60 or 0.0),
+        "mem_psi_full_avg60": float(w.mem_psi_full_avg60 or 0.0),
+        "mem_majfault_per_s": float(w.mem_majfault_per_s or 0.0),
+        "mem_refault_per_s": float(w.mem_refault_per_s or 0.0),
+        "mem_anon_rate_mb_min": float(w.mem_anon_rate_mb_min or 0.0),
+        "loop_lag_ms": float(w.loop_lag_ms or 0.0),
+        "memguard": str(w.memguard or ""),
+        "profiles_cached": list(w.profiles_cached or []),
+        "pending_update_to": w.pending_update_to,
+    }
+
+
+def _row_detail_from_blob(data: dict) -> dict:
+    """The same keys, read from the JSON blob a peer hub wrote."""
+    d = data or {}
+    return {
+        "address": str(d.get("address") or ""),
+        "cpu_pct": float(d.get("cpu_pct") or 0.0),
+        "mem_pct": float(d.get("mem_pct") or 0.0),
+        "disk_pct": float(d.get("disk_pct") or 0.0),
+        "disk_free_gb": float(d.get("disk_free_gb") or 0.0),
+        "load1": float(d.get("load1") or 0.0),
+        "nproc": int(d.get("nproc") or 0),
+        "mem_scope": str(d.get("mem_scope") or ""),
+        "mem_current_mb": float(d.get("mem_current_mb") or 0.0),
+        "mem_anon_mb": float(d.get("mem_anon_mb") or 0.0),
+        "mem_psi_some_avg60": float(d.get("mem_psi_some_avg60") or 0.0),
+        "mem_psi_full_avg60": float(d.get("mem_psi_full_avg60") or 0.0),
+        "mem_majfault_per_s": float(d.get("mem_majfault_per_s") or 0.0),
+        "mem_refault_per_s": float(d.get("mem_refault_per_s") or 0.0),
+        "mem_anon_rate_mb_min": float(d.get("mem_anon_rate_mb_min") or 0.0),
+        "loop_lag_ms": float(d.get("loop_lag_ms") or 0.0),
+        "memguard": str(d.get("memguard") or ""),
+        "profiles_cached": list(d.get("profiles_cached") or []),
+        "pending_update_to": d.get("pending_update_to"),
+    }
+
+
 WorkerStatus = str  # "active" | "drain" | "standby"
 ALLOWED_STATUSES = {"active", "drain", "standby"}
 
@@ -1458,6 +1547,7 @@ class WorkerRegistry:
             )
             workers.append(
                 {
+                    **_row_detail_from_worker(w),
                     "worker_id": w.worker_id,
                     "in_flight": w.in_flight,
                     "capacity": w.capabilities.max_concurrent,
@@ -1704,6 +1794,7 @@ class WorkerRegistry:
                 or (_age is not None and _age < _OWNER_VETO_GRACE_S)
             )
             out.append({
+                **_row_detail_from_blob(data),
                 "worker_id": wid,
                 "in_flight": _in_flight,
                 "capacity": int(caps.get("max_concurrent") or 1),

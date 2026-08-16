@@ -151,3 +151,63 @@ def test_locally_connected_workers_are_routable_by_definition():
     assert '"routable": True,' in before[-1200:], (
         "the local builder must mark its own workers routable"
     )
+
+
+# --- one field list, two readers --------------------------------------------
+
+def test_both_readers_emit_exactly_the_canonical_keys():
+    """THE guard for this whole family of bugs. Two builders hand-listing their
+    own fields dropped four of them in two days:
+
+        mem_anon_rate_mb_min   1 of 4 mirrors wired -> 0 on all 170 workers
+        loop_lag_ms            the same trap
+        routable               redis rows only -> locally-held workers False
+        address/cpu/mem/disk   local builder only -> whichever hub nginx picked
+                               showed its own ~27 workers with blank columns
+
+    Naming the set once and asserting both readers match it is what makes the
+    next omission impossible rather than merely unlikely."""
+    class _W:
+        client_address = "10.10.51.1"
+        cpu_pct = mem_pct = disk_pct = disk_free_gb = load1 = 1.0
+        nproc = 8
+        mem_scope = "cgroup"
+        mem_current_mb = mem_anon_mb = 1.0
+        mem_psi_some_avg60 = mem_psi_full_avg60 = 0.0
+        mem_majfault_per_s = mem_refault_per_s = mem_anon_rate_mb_min = 0.0
+        loop_lag_ms = 2.0
+        memguard = ""
+        profiles_cached = []
+        pending_update_to = None
+
+    live = set(scheduler._row_detail_from_worker(_W()))
+    blob = set(scheduler._row_detail_from_blob({}))
+    canonical = set(scheduler._ROW_DETAIL_FIELDS)
+    assert live == canonical, f"live reader drifted: {live ^ canonical}"
+    assert blob == canonical, f"blob reader drifted: {blob ^ canonical}"
+
+
+def test_the_address_rename_is_handled():
+    """ConnectedWorker calls it client_address; the blob calls it address.
+    That rename is the entire reason local rows carried no IP -- there was no
+    attribute of the expected name and nothing failed loudly."""
+    class _W:
+        client_address = "10.10.51.9"
+        def __getattr__(self, k): return 0
+    assert scheduler._row_detail_from_worker(_W())["address"] == "10.10.51.9"
+
+
+def test_both_builders_use_the_shared_readers():
+    src = inspect.getsource(scheduler)
+    assert "**_row_detail_from_worker(w)," in src
+    assert "**_row_detail_from_blob(data)," in src
+
+
+def test_a_missing_blob_still_yields_every_key():
+    """Some workers' blobs genuinely lack the detail keys (w516 on 2026-08-16
+    had address/cpu/mem/disk all None). The row must still be shaped the same
+    -- a missing VALUE is a display question, a missing KEY is a KeyError in
+    whatever consumes it."""
+    assert set(scheduler._row_detail_from_blob(None)) == set(
+        scheduler._ROW_DETAIL_FIELDS
+    )
