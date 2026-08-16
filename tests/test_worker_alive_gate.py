@@ -125,3 +125,29 @@ def test_the_reason_is_written_down(marker):
     """The next reader will see a grace window bolted onto a liveness check and
     want to delete it. The measurement and the mechanism have to be there."""
     assert marker in inspect.getsource(scheduler)
+
+
+# --- routable must reach BOTH row builders ---------------------------------
+
+def test_routable_is_set_in_both_row_builders():
+    """`/workers` merges two builders: locally-connected workers and
+    redis-known ones. The first cut of `routable` touched only the redis
+    builder, so every worker whose WS this hub actually holds -- the most
+    routable there is -- came back False. Measured on hub-37: 63 rows said
+    routable=False while their leases had 112-119s of TTL left.
+
+    Counting occurrences rather than checking one site, because "wired one of
+    N mirrors" is the failure mode this whole family of fields keeps hitting
+    (mem_anon_rate_mb_min, loop_lag_ms, and now this)."""
+    src = inspect.getsource(scheduler)
+    assert src.count('"routable"') >= 2
+
+
+def test_locally_connected_workers_are_routable_by_definition():
+    """A row built from self.connections means this hub holds the WS."""
+    src = inspect.getsource(scheduler)
+    local = src[src.index('"last_heartbeat": w.last_heartbeat'):]
+    before = src[:src.index('"last_heartbeat": w.last_heartbeat')]
+    assert '"routable": True,' in before[-1200:], (
+        "the local builder must mark its own workers routable"
+    )

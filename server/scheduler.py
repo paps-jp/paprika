@@ -1463,6 +1463,15 @@ class WorkerRegistry:
                     "capacity": w.capabilities.max_concurrent,
                     "labels": w.capabilities.labels,
                     "alive": (time.time() - w.last_heartbeat) < WORKER_TTL,
+                    # Always true here: these rows come from
+                    # ``self.connections``, i.e. THIS hub holds the WS. Setting
+                    # it only on the redis-known rows -- as the first cut of
+                    # this field did -- left every locally-owned worker
+                    # reporting routable=False, which is precisely backwards:
+                    # they are the most routable workers there are. Measured on
+                    # hub-37: 63 of its rows said routable=False while their
+                    # leases sat in Redis with 112-119s of TTL left.
+                    "routable": True,
                     "age_seconds": int(time.time() - w.last_heartbeat),
                     "last_heartbeat": w.last_heartbeat,
                     # Per-lane noVNC URLs (index = lane_idx). Admin UI uses
