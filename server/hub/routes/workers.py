@@ -2001,6 +2001,7 @@ async def worker_link(ws: WebSocket, worker_id: str):
         # (state.local_tasks) and survive a worker disconnect -- they
         # just lose a session and recover via the session-404 path --
         # so skip anything with a live local task.
+        deferred_running: list[str] = []
         if state.store is not None and orphan_job_ids:
             for jid in set(orphan_job_ids):
                 if jid in state.local_tasks:
@@ -2066,12 +2067,16 @@ async def worker_link(ws: WebSocket, worker_id: str):
                     # reconnected. Hub-wide that was ~39 killed jobs/min, and
                     # each one strands the images it had already uploaded.
                     #
-                    # A worker that is genuinely gone is still settled: the
-                    # reconciler fails running jobs whose worker is absent from
-                    # the fleet-wide alive set once they pass the grace window.
+                    # A worker that is genuinely gone is still settled, two ways:
+                    # the reconciler (worker absent from the fleet-wide alive
+                    # set), and the deferred watch armed below -- which is the
+                    # one that matters here, because a worker that RESTARTED
+                    # comes back with the same worker_id and is therefore alive,
+                    # so the reconciler's test never fires for it.
+                    deferred_running.append(jid)
                     log.info(
                         "worker %s disconnect: leaving running job %s to the "
-                        "reconciler (may re-adopt on reconnect)",
+                        "deferred watch (may re-adopt on reconnect)",
                         worker_id, jid,
                     )
                     continue
@@ -2096,6 +2101,10 @@ async def worker_link(ws: WebSocket, worker_id: str):
                     jid,
                     jinfo.status,
                 )
+        if deferred_running:
+            asyncio.create_task(
+                _settle_abandoned_running(worker_id, deferred_running)
+            )
         log.info("worker disconnected: %s", worker_id)
         try:
             state.registry.log_event(
@@ -2311,6 +2320,81 @@ def _drop_fetch_session_if_any(info) -> None:
         state.sessions.remove(sid)
     except Exception:
         pass
+
+
+#: How long a running job gets to be finished by a re-adopting worker before we
+#: call it abandoned. Fetch service time is ~48s (82s under load), so this is
+#: ~7x headroom; a job still `running` this long after its worker's WS dropped
+#: is not coming back.
+_ABANDONED_RUNNING_GRACE_S = float(
+    os.environ.get("PAPRIKA_ABANDONED_RUNNING_GRACE_S", "600")
+)
+
+
+async def _settle_abandoned_running(worker_id: str, job_ids: list[str]) -> None:
+    """Settle running jobs their worker never came back to finish.
+
+    The disconnect sweep deliberately no longer fails `running` jobs, because a
+    WS blip is usually not a death: the same process reconnects and reports the
+    job complete over the new socket, and failing it on the blip destroyed ~39
+    jobs/min along with the images they had already uploaded.
+
+    But sparing them needs an owner for the other case. When the worker actually
+    RESTARTED it comes back with the same worker_id, so it is in the fleet-wide
+    alive set and the stale-job reconciler's "worker is gone" test never fires --
+    the job would sit `running` forever, never reaching /jobs/completes, holding
+    its .47 prefix, and never ingested. Measured 2026-08-16 right after the sweep
+    change: running climbed 745 -> 940 in seven minutes, ~30/min.
+
+    So: wait out the grace, then settle whatever is still `running`. Re-adoption
+    wins the race by simply finishing (the job goes terminal and is skipped), and
+    a job re-dispatched to a different worker is skipped too. Nothing here is a
+    guess about topology -- only about time, and only after 7x the service time.
+    """
+    try:
+        await asyncio.sleep(_ABANDONED_RUNNING_GRACE_S)
+    except asyncio.CancelledError:
+        return
+    if state.store is None:
+        return
+    settled = 0
+    for jid in job_ids:
+        if jid in state.local_tasks:
+            continue
+        try:
+            jinfo = await state.store.get_job_info(jid)
+        except Exception:
+            continue
+        if jinfo is None or jinfo.status != JobStatus.running:
+            continue  # finished, failed, or re-queued -- someone owned it
+        if getattr(jinfo, "worker_id", None) != worker_id:
+            continue  # re-dispatched elsewhere; not ours to settle
+        phase = getattr(jinfo.progress, "phase", "") if jinfo.progress else ""
+        if phase == "keepalive":
+            jinfo.status = JobStatus.completed
+            if jinfo.progress is not None:
+                jinfo.progress.phase = "completed"
+        else:
+            jinfo.status = JobStatus.failed
+            jinfo.error = (
+                f"worker {worker_id} disconnected and did not finish this job "
+                f"within {_ABANDONED_RUNNING_GRACE_S:.0f}s (restart / crash); "
+                f"re-submit to retry"
+            )
+            if jinfo.progress is not None:
+                jinfo.progress.phase = "failed"
+        jinfo.completed_at = jinfo.completed_at or datetime.utcnow()
+        try:
+            await state.store.save_job_info(jinfo)
+            await state.store.publish_log(jid, DONE_SENTINEL)
+        except Exception:
+            continue
+        settled += 1
+    if settled:
+        log.info(
+            "worker %s: settled %d abandoned running job(s) after the %.0fs grace",
+            worker_id, settled, _ABANDONED_RUNNING_GRACE_S,
+        )
 
 
 async def _reconcile_worker_sessions(worker, snapshots: list) -> None:

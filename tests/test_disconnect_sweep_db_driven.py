@@ -120,6 +120,30 @@ def test_session_derived_running_jobs_are_left_alone_too():
     )
 
 
+def test_spared_running_jobs_get_a_deferred_owner():
+    """Sparing `running` on disconnect must not become a leak.
+
+    A worker that RESTARTED comes back with the same worker_id, so it is in the
+    fleet-wide alive set and the reconciler's "worker is gone" test never fires
+    for it. Measured right after the sweep change: running climbed 745 -> 940 in
+    seven minutes (~30/min) with nothing to settle them -- those jobs never reach
+    /jobs/completes, hold their .47 prefix, and are never ingested.
+    """
+    body = _sweep_source()
+    assert "deferred_running" in body, "spared running jobs must be handed to someone"
+    assert "_settle_abandoned_running" in body
+
+    src = inspect.getsource(workers_route._settle_abandoned_running)
+    # Re-adoption must win by simply finishing.
+    assert "JobStatus.running" in src, "only still-running jobs may be settled"
+    assert 'worker_id", None) != worker_id' in src, (
+        "a job re-dispatched to another worker is not ours to settle"
+    )
+    assert "local_tasks" in src
+    # The grace must clear the measured service time by a wide margin.
+    assert workers_route._ABANDONED_RUNNING_GRACE_S >= 300
+
+
 def test_announce_settles_jobs_a_restarted_worker_let_go_of():
     """The counterweight to leaving `running` alone on disconnect.
 
