@@ -2359,12 +2359,68 @@ async def _reconcile_worker_sessions(worker, snapshots: list) -> None:
         s.session_id: s for s in state.sessions.all() if s.worker_id == worker.worker_id
     }
     dropped = 0
+    dropped_job_ids: list[str] = []
     for sid in set(hub_for_worker.keys()) - snapshot_sids:
+        _jid = getattr(hub_for_worker.get(sid), "job_id", None)
+        if _jid:
+            dropped_job_ids.append(_jid)
         try:
             state.sessions.remove(sid)
             dropped += 1
         except Exception:
             pass
+
+    # Pass 1b: settle jobs the worker has provably let go of.
+    #
+    # The disconnect sweep deliberately leaves `running` jobs alone, because a
+    # WS blip is usually not a death -- the same process reconnects and finishes
+    # the work (see the sweep's comment). But that leaves the OTHER case with no
+    # owner: when the worker actually restarted, it comes back with the same
+    # worker_id and an EMPTY session set, so the stale-job reconciler's "worker
+    # is not in the live fleet" test never fires and the job would sit `running`
+    # forever.
+    #
+    # This announce is the exact signal that tells the two apart, with no timing
+    # heuristic: a fetch job holds a fetch-owned session for its whole run, so a
+    # reconnecting process re-announces it (and is skipped here), while a fresh
+    # process announces nothing and its abandoned jobs land in dropped_job_ids.
+    settled = 0
+    for jid in set(dropped_job_ids):
+        if jid in state.local_tasks:
+            continue  # runs in-process on this hub; the worker never owned it
+        try:
+            jinfo = await state.store.get_job_info(jid)
+        except Exception:
+            continue
+        if jinfo is None or jinfo.status not in IN_FLIGHT_STATUSES:
+            continue
+        phase = getattr(jinfo.progress, "phase", "") if jinfo.progress else ""
+        if phase == "keepalive":
+            # Capture already saved; only the interactive session died.
+            jinfo.status = JobStatus.completed
+            if jinfo.progress is not None:
+                jinfo.progress.phase = "completed"
+        else:
+            jinfo.status = JobStatus.failed
+            jinfo.error = (
+                f"worker {worker.worker_id} restarted and no longer holds this "
+                f"job's session (it announced none on reconnect); re-submit to "
+                f"retry"
+            )
+            if jinfo.progress is not None:
+                jinfo.progress.phase = "failed"
+        jinfo.completed_at = jinfo.completed_at or datetime.utcnow()
+        try:
+            await state.store.save_job_info(jinfo)
+            await state.store.publish_log(jid, DONE_SENTINEL)
+        except Exception:
+            continue
+        settled += 1
+        log.info(
+            "worker %s announce: settled abandoned job %s -> %s "
+            "(session dropped, worker holds none)",
+            worker.worker_id, jid, jinfo.status,
+        )
 
     # Pass 2: confirm / rebuild / orphan-cleanup per worker snapshot.
     confirmed = 0

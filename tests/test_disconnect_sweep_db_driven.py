@@ -120,6 +120,28 @@ def test_session_derived_running_jobs_are_left_alone_too():
     )
 
 
+def test_announce_settles_jobs_a_restarted_worker_let_go_of():
+    """The counterweight to leaving `running` alone on disconnect.
+
+    Sparing running jobs is right for a WS blip -- the same process reconnects
+    and finishes them. But a worker that actually RESTARTED comes back with the
+    same worker_id and an empty session set, so the stale-job reconciler's
+    "worker is not in the live fleet" test never fires and the job would sit
+    `running` forever. Without this the disconnect fix trades one leak for
+    another.
+
+    The session announce tells the two apart exactly, with no timing heuristic:
+    a fetch job holds a fetch-owned session for its whole run, so a reconnecting
+    process re-announces it, while a fresh process announces nothing.
+    """
+    src = inspect.getsource(workers_route._reconcile_worker_sessions)
+    assert "dropped_job_ids" in src
+    assert "IN_FLIGHT_STATUSES" in src, "only non-terminal jobs may be settled"
+    assert "local_tasks" in src, "hub-local tasks were never the worker's to lose"
+    # keepalive keeps its completed-not-failed treatment here too.
+    assert src.index('phase == "keepalive"') < src.index("JobStatus.failed")
+
+
 def test_keepalive_completion_survives_the_running_carve_out():
     """A keepalive job whose worker vanished is COMPLETED, not left hanging --
     its capture is already saved. That branch must stay ahead of the new one."""
