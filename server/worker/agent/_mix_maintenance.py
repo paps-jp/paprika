@@ -302,6 +302,14 @@ class _MaintenanceMixin:
         core_min_age = float(
             os.environ.get("PAPRIKA_CORE_SWEEP_MIN_AGE_S") or 120.0,
         )
+        # Chrome's download dir (see _sweep_chrome_downloads). Same thin-pool
+        # cost as a core dump, but unlike a dump -- which the kernel writes in
+        # seconds -- a legitimate transfer can stall for minutes and must not
+        # be unlinked mid-flight. So this inherits the Chrome-scratch window
+        # rather than the 2-minute core one. 0 disables it.
+        downloads_min_age = float(
+            os.environ.get("PAPRIKA_DOWNLOADS_SWEEP_MIN_AGE_S") or 1800.0,
+        )
         # One pass immediately on startup so a worker that just came up
         # from a previous crash starts clean. Subsequent passes are spaced
         # by ``interval``.
@@ -344,6 +352,24 @@ class _MaintenanceMixin:
                     except Exception as e:
                         _logger.info(
                             f"[worker {self.worker_id}] core sweep failed: "
+                            f"{type(e).__name__}: {e}",
+                        )
+                # Third try, same reasoning: Chrome's download dir sits on the
+                # same thin pool as the core dumps and is the bigger leak.
+                if downloads_min_age > 0:
+                    try:
+                        n_dl, dl_freed = await asyncio.to_thread(
+                            self._sweep_chrome_downloads, downloads_min_age,
+                        )
+                        if n_dl:
+                            _logger.info(
+                                f"[worker {self.worker_id}] downloads sweep: "
+                                f"removed {n_dl} file(s), "
+                                f"~{dl_freed // (1024*1024)} MiB freed",
+                            )
+                    except Exception as e:
+                        _logger.info(
+                            f"[worker {self.worker_id}] downloads sweep failed: "
                             f"{type(e).__name__}: {e}",
                         )
         except asyncio.CancelledError:
@@ -617,6 +643,76 @@ class _MaintenanceMixin:
                     continue
                 try:
                     if not entry.is_file():   # /app/core is the source package
+                        continue
+                    st = entry.stat()
+                    if (now - st.st_mtime) < min_age_s:
+                        continue
+                    size = st.st_size
+                    entry.unlink()
+                except OSError:
+                    continue
+                removed += 1
+                freed += size
+        return (removed, freed)
+
+    # Chrome's own download directory.
+    #
+    # yt-dlp writes into the ramdisk scratch pool, but a *browser-native*
+    # download -- a click, an auto-download link, a Content-Disposition
+    # response -- is saved by Chrome to its configured download dir. Nothing
+    # in paprika configures that, so it stays the default $HOME/Downloads,
+    # which in the worker container is /root/Downloads on the container's
+    # writable layer = the node's LVM thin pool. The ramdisk never sees these
+    # bytes, so none of the scratch-pool machinery bounds them.
+    #
+    # Measured 2026-08-17 on depot: 21.1 GB across 34 CTs = 9% of a 234 GB
+    # pool, growing ~350 MB/day/CT with no ceiling. Roughly half of it was
+    # abandoned ``Unconfirmed NNNNNN.crdownload`` partials, which Chrome never
+    # cleans up because the session died mid-transfer. It also propagates: a
+    # vzdump seed taken from a running CT bakes its Downloads into every CT
+    # restored from it (all 16 restored that day started at an identical
+    # 442 MB).
+    #
+    # Nothing reads this directory back -- no code path in the repo references
+    # it -- so its entire contents are garbage. The only risk is unlinking a
+    # transfer that is still running, which the mtime guard covers: an active
+    # download keeps its mtime fresh.
+    def _download_sweep_roots(self) -> list[Path]:
+        """Chrome's download dir: ``$HOME/Downloads`` in the container.
+
+        ``PAPRIKA_DOWNLOADS_SWEEP_ROOT`` overrides it (tests, or a lane
+        pointed somewhere else).
+        """
+        raw = os.environ.get("PAPRIKA_DOWNLOADS_SWEEP_ROOT")
+        try:
+            root = Path(raw) if raw else (Path.home() / "Downloads")
+            return [root] if root.is_dir() else []
+        except (OSError, RuntimeError):
+            # RuntimeError: Path.home() with no resolvable HOME.
+            return []
+
+    def _sweep_chrome_downloads(self, min_age_s: float) -> tuple[int, int]:
+        """Delete stale browser downloads. Returns ``(removed, bytes_freed)``.
+
+        Files at any depth: Chrome nests a download in a subdirectory when the
+        site sends one, and leaving those unreachable would defeat the sweep.
+        Directories are never removed -- an empty one costs nothing, and
+        rmdir'ing the root out from under a live Chrome would make it fall
+        back to a location we do not sweep at all.
+        """
+        import time as _t
+
+        now = _t.time()
+        removed = 0
+        freed = 0
+        for root in self._download_sweep_roots():
+            try:
+                entries = list(root.rglob("*"))
+            except OSError:
+                continue
+            for entry in entries:
+                try:
+                    if not entry.is_file():
                         continue
                     st = entry.stat()
                     if (now - st.st_mtime) < min_age_s:
