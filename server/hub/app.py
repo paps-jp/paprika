@@ -242,7 +242,7 @@ async def _store_repromote_loop():
             log.warning("store re-promote loop error: %s", e)
 
 
-# --- Redis auto-reattach: heal a hub that booted while Redis was down --------
+# --- Redis auto-reattach: heal a hub whose Redis wiring is dead or missing ---
 # EVERY Redis consumer is wired ONCE, in lifespan, from
 # ``getattr(state.store, "_r", None)``. When Redis is mid-``LOADING`` at that
 # instant -- which is exactly what a fleet-wide restart produces, since Redis
@@ -253,11 +253,23 @@ async def _store_repromote_loop():
 # Workers count then flaps (11 <-> 20) depending on which hub answered.
 # Observed 2026-08-03 and again 2026-08-04 (5 of 7 hubs).
 #
+# A SECOND, distinct failure mode hits a hub that WAS wired: the long-lived
+# async client goes silently dead later (NAT/conntrack idle timeout,
+# half-open TCP, a pool slot stuck forever behind one hung command) without
+# ever raising on the ``_r is not None`` check itself. Observed 2026-08-29:
+# hub-37/hub-38 sat wired for 3+ hours while every peer-aggregation query
+# (stats_async -> _fetch_known_workers, used by both /workers/capacity and
+# the admin /overview) silently missed its 1.5s deadline and fell back to
+# local-only -- a fresh client from the same host proved Redis itself was
+# fine (<2ms round trip). The loop below actively PINGs a wired client on
+# every tick (not just an attribute check) so this case rebuilds too.
+#
 # The store already self-heals (_store_repromote_loop) but it only swaps
 # ``state.store`` -- which makes it WORSE to diagnose: jobs work, the UI
 # works, and the hub stays silently invisible to its peers. This loop closes
 # the gap for the rest of the wiring. Env: PAPRIKA_REDIS_REATTACH_DISABLE=1
-# off; PAPRIKA_REDIS_REATTACH_INTERVAL_S tune (default 30s).
+# off; PAPRIKA_REDIS_REATTACH_INTERVAL_S tune (default 30s);
+# PAPRIKA_REDIS_REATTACH_PING_TIMEOUT_S tune (default 2s).
 
 # Set by lifespan when it starts the cross-hub invalidation subscriber, so the
 # heal below can tell "already running" from "never started (store was on the
@@ -267,7 +279,7 @@ _invalidate_task_ref = {"t": None}
 _healed_tasks: list[asyncio.Task] = []
 
 
-async def _redis_client_for_heal():
+async def _redis_client_for_heal(force_new: bool = False):
     """A LIVE Redis client, or None if Redis still isn't answering.
 
     Prefers the client the job store already holds (a store healed by
@@ -276,8 +288,12 @@ async def _redis_client_for_heal():
     PING, and lends it to the store too -- a dozen call sites
     (_invalidate / _reaper / _spill / _storage_metrics / routes) read
     ``getattr(state.store, "_r", None)`` and are just as stuck as the
-    registry is."""
-    r = getattr(state.store, "_r", None)
+    registry is.
+
+    ``force_new=True`` skips the reuse-existing-client shortcut. Use it when
+    the caller already knows ``state.store._r`` is the SAME object that just
+    failed a liveness probe -- reusing it would hand back the dead client."""
+    r = None if force_new else getattr(state.store, "_r", None)
     if r is not None:
         return r
     if not config.redis_url:
@@ -396,7 +412,23 @@ async def _rewire_redis_consumers(client) -> None:
 
 
 async def _redis_reattach_loop():
-    """Re-probe Redis while any consumer is unwired and rewire on success."""
+    """Re-probe Redis while any consumer is unwired, AND actively verify a
+    wired client is still answering -- rewire on failure either way.
+
+    ``state.registry._r is not None`` used to be trusted as "healthy" outright.
+    That only covers the boot-time case (Redis mid-LOADING). A long-idle async
+    socket can go silently dead later -- NAT/conntrack idle timeout, a
+    half-open TCP peer, a connection-pool slot stuck forever behind one hung
+    command -- without ever raising on the attribute itself. Confirmed
+    2026-08-29: hub-37 and hub-38 sat for 3+ hours with ``_r`` fully wired
+    while every ``_fetch_known_workers`` pipeline (stats_async, called by
+    BOTH /workers/capacity and the admin /overview) missed its 1.5s deadline,
+    collapsing both hubs to a local-only worker view (~80 of the ~520-lane
+    fleet). A brand-new client built from the same host round-tripped the
+    identical Redis query in <2ms, proving Redis and the network were fine --
+    only the long-lived wired client was stuck. This loop never fired because
+    it never checked past "is the attribute set".
+    """
     if os.environ.get("PAPRIKA_REDIS_REATTACH_DISABLE"):
         return
     try:
@@ -404,17 +436,37 @@ async def _redis_reattach_loop():
             os.environ.get("PAPRIKA_REDIS_REATTACH_INTERVAL_S") or 30.0)
     except Exception:
         interval = 30.0
+    try:
+        ping_timeout = float(
+            os.environ.get("PAPRIKA_REDIS_REATTACH_PING_TIMEOUT_S") or 2.0)
+    except Exception:
+        ping_timeout = 2.0
     while True:
         try:
             await asyncio.sleep(interval)
             if not config.redis_url:
                 continue  # no shared Redis configured (dev / single host)
-            # The healthy path is one attribute read: the registry's client is
-            # the canonical "am I wired?" signal (it is what every peer-facing
-            # read depends on).
-            if getattr(state.registry, "_r", None) is not None:
-                continue
-            client = await _redis_client_for_heal()
+            r = getattr(state.registry, "_r", None)
+            force_new = False
+            if r is not None:
+                # Wired -- but don't trust the attribute alone. Bound the
+                # probe so a stuck connection/pool can't wedge this loop the
+                # same way it wedges the real callers.
+                try:
+                    await asyncio.wait_for(r.ping(), timeout=ping_timeout)
+                    continue  # genuinely healthy, nothing to do
+                except Exception as e:
+                    log.warning(
+                        "redis reattach: wired client failed liveness probe "
+                        "(%s) -- rebuilding (fleet aggregation was likely "
+                        "silently degraded to local-only)", e,
+                    )
+                    try:
+                        await r.aclose()
+                    except Exception:
+                        pass
+                    force_new = True
+            client = await _redis_client_for_heal(force_new=force_new)
             if client is None:
                 continue
             await _rewire_redis_consumers(client)
