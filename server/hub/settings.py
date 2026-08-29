@@ -72,6 +72,23 @@ _SCHEMA: dict[str, tuple[Any, str]] = {
     "review_retention_enabled": (False, "bool"),
     "review_retention_days": (7, "int"),
     "review_retention_dry_run": (True, "bool"),
+    # failed 資産の早期 expiry -- status=failed の job の MinIO 資産だけを
+    # failed_asset_expiry_hours 後に消す。DB 行は残す (失敗解析のメタは温存)。
+    # WHY: image-pull は completed/review しか消費しないので failed の
+    # スクリーンショット/画像は誰にも読まれないまま画像 RAM (.47) に居座る。
+    # 2026-08-29 実測で .47 の 58% (21.7 GB/日) が failed で、削除フロンティア
+    # 7.4 日ぶんだと約 160 GB -- spill 閾値 216 GB の 3/4 を failed だけで食う。
+    # 失敗率が 8%→40% に跳ねた 8/26 以降に顕在化した。一般 retention は
+    # 全 terminal を created_at 昇順で舐めるので failed だけ早く消すことは
+    # できず、専用パスが要る (review_retention と同じ理由)。
+    # DB 行を消さないので /jobs の失敗一覧・error 文言・job_results は残り、
+    # 消えるのは重い資産だけ。行そのものは job_retention_days で消える。
+    # OFF 既定・dry_run 既定 ON。env kill-switch
+    # PAPRIKA_FAILED_ASSET_EXPIRY_DISABLE=1。
+    # See _reaper.py:_failed_asset_expiry_loop.
+    "failed_asset_expiry_enabled": (False, "bool"),
+    "failed_asset_expiry_hours": (2, "int"),
+    "failed_asset_expiry_dry_run": (True, "bool"),
     # When ON, the reasoning distiller translates a newly-learned, replayable
     # barrier strategy (kind=click/sequence) into a per-host fetch_recipe so
     # plain mode=fetch jobs replay it and get past the barrier (age gate /

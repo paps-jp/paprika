@@ -984,21 +984,32 @@ async def list_tree(job_id: str, subdir: str = "assets") -> list[dict]:
 
 async def delete_prefix(job_id: str, *, dry_run: bool = False) -> dict:
     """Delete EVERY object under a job's dir in the bucket
-    (``{prefix}/{job_id}/...``). Returns ``{"objects", "bytes", "deleted"}``.
+    (``{prefix}/{job_id}/...``). Returns
+    ``{"objects", "bytes", "deleted", "tiers", "failed_tiers"}``.
     ``dry_run=True`` counts only (no delete).
+
+    ``deleted`` is True only when EVERY configured tier was walked without
+    error, so a caller may treat it as "this prefix is now gone". Callers that
+    then drop the job's DB row MUST check it: a tier that errored leaves
+    objects behind, and once the ledger row is gone nothing lists that prefix
+    again. ``failed_tiers`` says how many tiers errored (0 on a clean pass).
 
     DESTRUCTIVE + permanent: the bucket is the durable store, so a job's assets
     are gone for good. Used by the job-cleanup / orphan-sweep path so deleting a
     job actually reclaims its storage instead of orphaning it. Returns
     ``objects=0`` when disabled / boto3 missing / nothing there."""
     if not enabled() or not job_id:
-        return {"objects": 0, "bytes": 0, "deleted": False}
+        return {"objects": 0, "bytes": 0, "deleted": False,
+                "tiers": 0, "failed_tiers": 0}
     prefix = _job_prefix(job_id)
 
     def _delete() -> dict:
         n = 0
         total = 0
+        tiers = 0
+        failed_tiers = 0
         for client, bucket in _all_cbs():
+            tiers += 1
             batch: list[dict] = []
             try:
                 paginator = client.get_paginator("list_objects_v2")
@@ -1019,13 +1030,34 @@ async def delete_prefix(job_id: str, *, dry_run: bool = False) -> dict:
                         Bucket=bucket, Delete={"Objects": batch, "Quiet": True}
                     )
             except Exception:
+                # A tier that errors used to be indistinguishable from a tier
+                # that was simply empty: the ``continue`` was silent and the
+                # return still claimed ``deleted=True``. Callers that delete a
+                # job's DB row on the strength of that then orphan the objects
+                # permanently -- nothing lists a prefix whose ledger row is
+                # gone. Count it so ``deleted`` can tell the truth.
+                failed_tiers += 1
+                log.debug(
+                    "delete_prefix(%s): tier %s failed", job_id, bucket, exc_info=True
+                )
                 continue
-        return {"objects": n, "bytes": total, "deleted": not dry_run}
+        return {
+            "objects": n,
+            "bytes": total,
+            # Only claim success when EVERY tier was purged cleanly.
+            "deleted": (not dry_run) and failed_tiers == 0,
+            "tiers": tiers,
+            "failed_tiers": failed_tiers,
+        }
 
     try:
         return await _run_io(_delete)
     except Exception:
-        return {"objects": 0, "bytes": 0, "deleted": False}
+        log.debug("delete_prefix(%s) failed", job_id, exc_info=True)
+        return {
+            "objects": 0, "bytes": 0, "deleted": False,
+            "tiers": 0, "failed_tiers": 1,
+        }
 
 
 async def list_job_prefixes() -> list[str]:

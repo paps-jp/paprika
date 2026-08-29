@@ -1643,3 +1643,316 @@ async def _run_review_retention_once() -> dict:
             deleted, days,
         )
     return out
+
+
+# --------------------------------------------------------------------------- #
+# failed 資産の早期 expiry
+# --------------------------------------------------------------------------- #
+# status=failed の job の MinIO 資産だけを failed_asset_expiry_hours 後に消す。
+# DB 行は残す -- 消えるのは重い資産 (スクリーンショット / 画像 / page.html) だけで、
+# /jobs の失敗一覧・error 文言・job_results はそのまま。行そのものは従来どおり
+# job_retention_days で _job_retention_loop が消す。
+#
+# WHY このパスが要るのか (2026-08-29 実測):
+#   * 画像 RAM (.47) の 29,101 prefix / 37.4 GB を全件突合したところ、
+#     failed が 15,407 prefix / 21.7 GB = 58% を占めていた。全件 24 時間以内で、
+#     「古いゴミの堆積」ではなく 1 日分の流量そのもの。
+#   * pipeline 側の image-pull は completed/review しか消費しないので、
+#     failed の画像は誰にも読まれないまま滞留する。
+#   * 一般 retention は全 terminal ステータスを created_at 昇順で舐めるため
+#     failed だけを早く消せない -- 実効 TTL は削除フロンティアの深さ (実測 7.4 日)
+#     に固定される。21.7 GB/日 x 7.4 日 = 約 160 GB で、spill 閾値 216 GB の
+#     3/4 を failed だけで食う。review_retention_loop を足したのと同じ理屈。
+#   * 失敗率が 8.1% (8/25) -> 40.1% (8/29) に跳ねた 8/26 以降に顕在化した。
+#     失敗率が 1 桁だった頃は 32 GB 程度で収まっていたので問題にならなかった。
+#
+# assets/ だけ消して page.html / final.jpg / log.txt を残す案も測ったが、
+# assets/ は全体の 69% しかない (19.91 / 29.05 GB)。31% を 5 日間残すと定常
+# 50 GB になるので prefix 丸ごと消す。
+#
+# カーソルは redis の watermark (created_at) で前進させる。下限があるので
+# 「毎 tick 同じ先頭を読み直す」ことがなく、走査量は流入分だけで済む。
+# 削除に失敗した job は retry セットへ積んで次 tick で拾う -- ここを黙って
+# 捨てると _purge_job と同じく「DB には無いが MinIO には在る」孤児を作る。
+_FAILED_ASSET_EXPIRY_INTERVAL_S = float(
+    os.environ.get("PAPRIKA_FAILED_ASSET_EXPIRY_INTERVAL_S", "300") or 300
+)
+_FAILED_ASSET_EXPIRY_BATCH = int(
+    os.environ.get("PAPRIKA_FAILED_ASSET_EXPIRY_BATCH", "500") or 500
+)
+# 流入は実測 183k failed/日 = 7.6k/時。interval 300s なら 1 tick 635 件で足りる
+# ので、既定 20000 は「詰まったあとの取り戻し」用の余裕。実測 108 job/s
+# (concurrency 32) なので 20000 件でも約 185s、ロック TTL 270s に収まる。
+_FAILED_ASSET_EXPIRY_MAX_PER_TICK = int(
+    os.environ.get("PAPRIKA_FAILED_ASSET_EXPIRY_MAX_PER_TICK", "20000") or 20000
+)
+# delete_prefix は 4 層 (.48 / .8 / .47 / .17) を毎回 LIST するので直列だと
+# 1 件 1.5 秒かかる (実測)。並列度がそのままスループット。S3 IO プールは
+# 40 スレッド (PAPRIKA_S3_IO_THREADS) なので、常駐アップロードの取り分を
+# 残して 32 まで。
+_FAILED_ASSET_EXPIRY_CONCURRENCY = max(
+    1, int(os.environ.get("PAPRIKA_FAILED_ASSET_EXPIRY_CONCURRENCY", "32") or 32)
+)
+_FAILED_ASSET_EXPIRY_MINIO_TIMEOUT_S = float(
+    os.environ.get("PAPRIKA_FAILED_ASSET_EXPIRY_MINIO_TIMEOUT_S", "30") or 30
+)
+# watermark が無い (初回 / redis flush 後) ときにどこまで遡るか。
+# 短くしてある理由: 実測で [now-24h, now-2h) には failed が 176,573 件あり、
+# その大半は既に prefix が消えている (image-pull のスイープ / 一般 retention /
+# one-shot の後)。空の prefix でも delete_prefix は 4 層を LIST するので、
+# 24h ぶん遡ると初回有効化だけで 2 時間以上 MinIO を叩き続けることになる。
+# 既存バックログは一般 retention の担当と割り切り、ここは「hub や redis が
+# 短時間落ちた分を取り戻す」ぶんだけ見る。取りこぼしても job_retention_days
+# で必ず消えるので、悪化はしない。
+_FAILED_ASSET_EXPIRY_COLD_START_H = float(
+    os.environ.get("PAPRIKA_FAILED_ASSET_EXPIRY_COLD_START_H", "6") or 6
+)
+_FAILED_ASSET_EXPIRY_RETRY_PER_TICK = int(
+    os.environ.get("PAPRIKA_FAILED_ASSET_EXPIRY_RETRY_PER_TICK", "2000") or 2000
+)
+# Hard cap on the retry set. If a tier is down every purge fails and the set
+# would otherwise grow by MAX_PER_TICK every tick (~5.7M/day) -- unbounded
+# redis memory for prefixes a later orphan sweep can find anyway.
+_FAILED_ASSET_EXPIRY_RETRY_MAX = int(
+    os.environ.get("PAPRIKA_FAILED_ASSET_EXPIRY_RETRY_MAX", "200000") or 200000
+)
+_FAILED_ASSET_EXPIRY_LOCK_KEY = "paprika:failed_asset_expiry:lock"
+_FAILED_ASSET_EXPIRY_WM_KEY = "paprika:failed_asset_expiry:watermark"
+_FAILED_ASSET_EXPIRY_RETRY_KEY = "paprika:failed_asset_expiry:retry"
+_WM_FMT = "%Y-%m-%d %H:%M:%S.%f"
+
+_last_failed_asset_expiry_run_at: datetime | None = None
+_last_failed_asset_expiry_purged = 0
+
+
+async def _expire_job_assets(jid: str, sem, minio_timeout: float) -> bool:
+    """Delete ONE failed job's objects across every tier. Leaves the DB row.
+
+    Returns True only when every tier was purged cleanly.
+    ``objstore.delete_prefix`` never raises on a tier error -- it reports
+    ``deleted=False`` / ``failed_tiers>0`` instead -- so a caller that ignores
+    the return value (as ``_purge_job`` still does) cannot tell a real purge
+    from a partial one. That is exactly how orphaned prefixes get minted, so
+    the False is propagated here and the caller re-queues."""
+    from server.hub import objstore
+
+    async with sem:
+        try:
+            r = await asyncio.wait_for(
+                objstore.delete_prefix(jid), timeout=minio_timeout
+            )
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            # Includes TimeoutError: one hung tier must not stall the pass.
+            log.debug("failed-asset-expiry: purge %s raised", jid, exc_info=True)
+            return False
+        return bool(r.get("deleted"))
+
+
+async def _failed_asset_expiry_loop() -> None:
+    """Background failed-asset expiry. Idempotent; safe on every hub (a redis
+    lock elects one per tick). Inert unless failed_asset_expiry_enabled."""
+    if os.environ.get("PAPRIKA_FAILED_ASSET_EXPIRY_DISABLE") == "1":
+        return
+    first = True
+    while True:
+        try:
+            await asyncio.sleep(300 if first else _FAILED_ASSET_EXPIRY_INTERVAL_S)
+        except asyncio.CancelledError:
+            return
+        first = False
+        try:
+            await _run_failed_asset_expiry_once()
+        except Exception:
+            # WARNING not debug -- a silent pass failure is what kept the
+            # general retention loop's stall invisible for hours (2026-07-11).
+            log.warning("failed-asset-expiry pass failed", exc_info=True)
+
+
+async def _run_failed_asset_expiry_once() -> dict:
+    """One failed-asset expiry pass. Returns a small stats dict."""
+    global _last_failed_asset_expiry_run_at, _last_failed_asset_expiry_purged
+    from datetime import timedelta as _td
+
+    out = {
+        "enabled": False, "dry_run": True, "hours": 0,
+        "candidates": 0, "purged": 0, "requeued": 0, "retried": 0,
+    }
+    store = state.store
+    if store is None or not hasattr(store, "list_jobs_by_status_between"):
+        return out
+    if state.settings is None or not bool(
+        state.settings.get("failed_asset_expiry_enabled", False)
+    ):
+        return out
+    out["enabled"] = True
+    # NB: no ``or 2`` -- an explicit 0 must mean "paused", not "fall back to
+    # the default and start deleting 2h-old assets" (same trap as
+    # review_retention_days).
+    try:
+        hours = int(state.settings.get("failed_asset_expiry_hours", 2))
+    except (TypeError, ValueError):
+        hours = 2
+    if hours <= 0:
+        return out
+    out["hours"] = hours
+    dry = bool(state.settings.get("failed_asset_expiry_dry_run", True))
+    out["dry_run"] = dry
+
+    r = getattr(store, "_r", None)
+    # Elect ONE hub per tick. Best-effort: purge is idempotent, so a missing
+    # lock only costs duplicate LISTs, never correctness.
+    if r is not None:
+        try:
+            got = await r.set(
+                _FAILED_ASSET_EXPIRY_LOCK_KEY, config.hub_id or "1",
+                nx=True, ex=max(60, int(_FAILED_ASSET_EXPIRY_INTERVAL_S * 0.9)),
+            )
+            if not got:
+                return out
+        except Exception:
+            pass
+
+    now = datetime.utcnow()
+    hi = now - _td(hours=hours)
+    lo = now - _td(hours=_FAILED_ASSET_EXPIRY_COLD_START_H)
+    if r is not None:
+        try:
+            raw = await r.get(_FAILED_ASSET_EXPIRY_WM_KEY)
+            if raw:
+                lo = max(lo, datetime.strptime(raw, _WM_FMT))
+        except Exception:
+            log.debug("failed-asset-expiry: watermark read failed", exc_info=True)
+    if lo >= hi:
+        return out
+
+    if dry:
+        try:
+            rows = await store.list_jobs_by_status_between(
+                "failed", lo, hi, _FAILED_ASSET_EXPIRY_MAX_PER_TICK
+            )
+        except Exception:
+            log.warning(
+                "failed-asset-expiry: dry-run candidate query failed", exc_info=True
+            )
+            return out
+        out["candidates"] = len(rows)
+        _last_failed_asset_expiry_run_at = now
+        _last_failed_asset_expiry_purged = 0
+        log.info(
+            "failed-asset-expiry[dry-run]: %s%d failed job(s) in [%s, %s) would "
+            "have their MinIO assets purged (DB rows kept). Set "
+            "failed_asset_expiry_dry_run=false to enact.",
+            (">=" if len(rows) >= _FAILED_ASSET_EXPIRY_MAX_PER_TICK else ""),
+            len(rows), lo, hi,
+        )
+        return out
+
+    t0 = datetime.utcnow()
+    sem = asyncio.Semaphore(_FAILED_ASSET_EXPIRY_CONCURRENCY)
+    purged = failures = retried = 0
+    watermark = lo
+
+    async def _requeue(ids: list[str]) -> None:
+        """Park prefixes we could not purge so a later tick revisits them.
+        Without this the watermark walks past them and the objects become
+        orphans nobody lists again."""
+        if not ids or r is None:
+            return
+        try:
+            if await r.scard(_FAILED_ASSET_EXPIRY_RETRY_KEY) >= (
+                _FAILED_ASSET_EXPIRY_RETRY_MAX
+            ):
+                # Backlog this deep means a tier is down, not that individual
+                # prefixes are cursed. Stop growing the set (WARNING, not
+                # debug -- this is the one state an operator must see) and let
+                # the orphan sweep mop up once the tier is back.
+                log.warning(
+                    "failed-asset-expiry: retry set at cap (%d); dropping %d "
+                    "prefix(es) -- object tier likely down",
+                    _FAILED_ASSET_EXPIRY_RETRY_MAX, len(ids),
+                )
+                return
+            await r.sadd(_FAILED_ASSET_EXPIRY_RETRY_KEY, *ids)
+        except Exception:
+            log.debug("failed-asset-expiry: requeue failed", exc_info=True)
+
+    # 1) Drain the retry set first -- those are already past their expiry.
+    if r is not None:
+        try:
+            stale = await r.spop(
+                _FAILED_ASSET_EXPIRY_RETRY_KEY, _FAILED_ASSET_EXPIRY_RETRY_PER_TICK
+            )
+        except Exception:
+            stale = None
+        stale = list(stale or [])
+        if stale:
+            res = await asyncio.gather(
+                *(
+                    _expire_job_assets(j, sem, _FAILED_ASSET_EXPIRY_MINIO_TIMEOUT_S)
+                    for j in stale
+                )
+            )
+            retried = sum(1 for ok in res if ok)
+            await _requeue([j for j, ok in zip(stale, res) if not ok])
+            purged += retried
+            failures += len(stale) - retried
+
+    # 2) Walk the watermark forward through newly-expired failed jobs.
+    while purged < _FAILED_ASSET_EXPIRY_MAX_PER_TICK:
+        try:
+            rows = await store.list_jobs_by_status_between(
+                "failed", watermark, hi, _FAILED_ASSET_EXPIRY_BATCH
+            )
+        except Exception:
+            log.warning("failed-asset-expiry: candidate query failed", exc_info=True)
+            break
+        if not rows:
+            watermark = hi  # window fully drained
+            break
+        ids = [j for j, _ in rows]
+        res = await asyncio.gather(
+            *(
+                _expire_job_assets(j, sem, _FAILED_ASSET_EXPIRY_MINIO_TIMEOUT_S)
+                for j in ids
+            )
+        )
+        ok_n = sum(1 for ok in res if ok)
+        purged += ok_n
+        failures += len(ids) - ok_n
+        await _requeue([j for j, ok in zip(ids, res) if not ok])
+        # created_at is the cursor. The window is half-open on the low side, so
+        # stepping to the LAST row's created_at would re-read that row forever;
+        # nudge past it by 1ms (the column is DATETIME(3), so 1ms is exactly
+        # one representable step).
+        watermark = rows[-1][1] + _td(milliseconds=1)
+        if r is not None:
+            try:
+                await r.set(_FAILED_ASSET_EXPIRY_WM_KEY, watermark.strftime(_WM_FMT))
+            except Exception:
+                log.debug("failed-asset-expiry: watermark write failed", exc_info=True)
+        try:
+            await asyncio.sleep(0.2)  # never monopolise the DB pool / loop
+        except asyncio.CancelledError:
+            raise
+        if len(rows) < _FAILED_ASSET_EXPIRY_BATCH:
+            break
+
+    out["purged"] = purged
+    out["retried"] = retried
+    out["candidates"] = purged + failures
+    out["requeued"] = failures
+    _last_failed_asset_expiry_run_at = datetime.utcnow()
+    _last_failed_asset_expiry_purged = purged
+    if purged or failures:
+        # INFO with elapsed time + failure count on purpose: "deleted N" alone
+        # cannot distinguish "caught up" from "wedged", which is what made the
+        # general retention loop's shortfall invisible for so long.
+        log.info(
+            "failed-asset-expiry: purged %d failed-job asset prefix(es) older "
+            "than %dh (%d requeued, %d from retry set) in %.1fs; watermark=%s",
+            purged, hours, failures, retried,
+            (datetime.utcnow() - t0).total_seconds(), watermark,
+        )
+    return out

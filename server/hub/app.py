@@ -817,6 +817,7 @@ async def lifespan(app: FastAPI):
     ct_scan_task = None
     nightly_review_task = retention_task = spill_task = maintenance_task = None
     review_retention_task = role_rollup_task = None
+    failed_asset_expiry_task = None
     if not _ADMIN_MODE:
         reaper_task = asyncio.create_task(_session_reaper_loop())
         retire_task = asyncio.create_task(_skill_convention_reaper_loop())
@@ -883,6 +884,17 @@ async def lifespan(app: FastAPI):
         from server.hub._reaper import _review_retention_loop
 
         review_retention_task = asyncio.create_task(_review_retention_loop())
+
+        # failed 資産の早期 expiry (settings.failed_asset_expiry_enabled で opt-in,
+        # dry_run 既定 ON): status=failed の job の MinIO 資産だけを数時間で消し、
+        # DB 行は job_retention_days まで残す。image-pull は completed/review しか
+        # 消費しないので failed の画像は誰にも読まれないまま画像 RAM (.47) に
+        # 居座り、実測で .47 の 58% を占めていた。一般 retention の oldest-first
+        # フロンティアでは failed だけ早く消せないので専用パスが要る。
+        # See _reaper.py:_failed_asset_expiry_loop.
+        from server.hub._reaper import _failed_asset_expiry_loop
+
+        failed_asset_expiry_task = asyncio.create_task(_failed_asset_expiry_loop())
 
         # Success Audit: periodically sample completed video-download jobs +
         # ask a VisionAI whether the saved video is actually the page's main
@@ -1045,7 +1057,8 @@ async def lifespan(app: FastAPI):
                ct_scan_task,
                storage_metrics_task, nightly_review_task, repromote_task,
                reattach_task, role_rollup_task,
-               retention_task, review_retention_task, spill_task, maintenance_task):
+               retention_task, review_retention_task, failed_asset_expiry_task,
+               spill_task, maintenance_task):
         if _t is not None:
             _t.cancel()
     # Tasks the Redis reattach heal started late (invalidation subscriber).

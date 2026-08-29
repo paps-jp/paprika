@@ -800,6 +800,31 @@ class MariaDBJobStore:
                 rows = await cur.fetchall()
         return [r[0] for r in rows]
 
+    async def list_jobs_by_status_between(
+        self, status: str, lo, hi, limit: int
+    ) -> list[tuple[str, object]]:
+        """``(job_id, created_at)`` for one status in the half-open created_at
+        window ``[lo, hi)``, oldest-first -- the cursor batch for the
+        failed-asset expiry pass.
+
+        Distinct from ``list_deletable_job_ids`` in three ways that matter:
+        a LOWER bound (so a watermark can walk forward instead of re-reading
+        the same head every tick), a single status (served straight off
+        ``idx_status_created``), and created_at comes back with the id so the
+        caller can advance its watermark without a second round-trip."""
+        if not status or int(limit) <= 0:
+            return []
+        sql = (
+            "SELECT job_id, created_at FROM jobs "
+            "WHERE status=%s AND created_at >= %s AND created_at < %s "
+            "ORDER BY created_at ASC LIMIT %s"
+        )
+        async with self._pool.acquire() as conn:
+            async with conn.cursor() as cur:
+                await cur.execute(sql, (status, lo, hi, int(limit)))
+                rows = await cur.fetchall()
+        return [(r[0], r[1]) for r in rows]
+
     # ------------------------------------------------------------------ #
     # Job result
     # ------------------------------------------------------------------ #
