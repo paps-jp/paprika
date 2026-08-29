@@ -1394,6 +1394,7 @@ class _SessionsMixin:
                         f"{type(e).__name__}: {e}",
                     )
             if state.lane is not None and self.lane_pool is not None:
+                self._close_screencasts_for_lane(state.lane.lane_idx)
                 self.lane_pool.release(state.lane)
                 # Free lane -- kick the heartbeat so the hub picks us
                 # up as available immediately.
@@ -1626,6 +1627,7 @@ class _SessionsMixin:
                 pass
             try:
                 if state.lane is not None and self.lane_pool is not None:
+                    self._close_screencasts_for_lane(state.lane.lane_idx)
                     self.lane_pool.release(state.lane)
                     try:
                         self._heartbeat_kick.set()

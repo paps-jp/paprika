@@ -461,6 +461,25 @@ async function refresh() {
           const title = opts.title ? ` title="${esc(opts.title)}"` : '';
           return `<span${title} style="color:${c};background:${bg};padding:1px 5px;border-radius:3px;font-variant-numeric:tabular-nums;">${Math.round(v)}%</span>`;
         };
+        // A draining worker reports in_flight == capacity on purpose ("full,
+        // don't dispatch"), which made it identical to a busy one in this
+        // column. On 2026-08-18 that hid 200 of 255 workers: drained, idle,
+        // and never exiting, every row reading a healthy "2 / 2". The badge
+        // is the difference between a worker on its way out and one that will
+        // never leave -- draining_s says which.
+        const drainBadge = (() => {
+          if (!w.draining) return '';
+          const secs = Math.round(w.draining_s || 0);
+          const stuck = secs >= 900;
+          const c = stuck ? '#c00' : '#a04a00';
+          const bg = stuck ? '#fde7e7' : '#fff4d9';
+          const why = w.drain_reason ? ` — ${esc(w.drain_reason)}` : '';
+          return ` <span title="draining for ${secs}s${why}. `
+            + `A draining worker reports itself full and takes no new work."`
+            + ` style="color:${c};background:${bg};padding:1px 5px;`
+            + `border-radius:3px;white-space:nowrap;font-size:11px;">`
+            + `${stuck ? '⚠ stuck draining' : 'draining'} ${secs}s</span>`;
+        })();
         const cpuCell = _fmtPct(w.cpu_pct);
         // Memory cell. mem_pct is only a real per-worker percentage when
         // mem_scope === 'cgroup'. On the docker-in-LXC fleet the container has
@@ -541,7 +560,7 @@ async function refresh() {
               ${statusInner}
             </span>
           </td>
-          <td>${w.in_flight} / ${w.capacity}</td>
+          <td>${w.in_flight} / ${w.capacity}${drainBadge}</td>
           <td>${cpuCell}</td>
           <td>${memCell}</td>
           <td>${diskCell}</td>

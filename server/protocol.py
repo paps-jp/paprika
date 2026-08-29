@@ -501,6 +501,17 @@ class WorkerCapabilities(BaseModel):
         "HubPreviewSubscribe to workers that advertise this; older "
         "workers keep the legacy pull path. Set by new worker builds.",
     )
+    screencast_relay: bool = Field(
+        False,
+        description="Worker relays CDP Page.startScreencast frames over "
+        "this control WS instead of exposing a novnc/x11vnc bridge for "
+        "the Live viewer -- set from PAPRIKA_LIVE_VIEW_SCREENCAST=1 on the "
+        "worker (Linux fleet only; Windows portable already gets the "
+        "screencast viewer via chrome_attach_port, unrelated to this "
+        "flag). The worker still starts x11vnc/websockify on every lane "
+        "regardless of this flag -- it only changes which live-viewer URL "
+        "the hub hands to clients, so flipping it back is a no-op restart.",
+    )
     role: str = Field(
         "browser",
         description="Worker role. 'browser' (default) runs the lane/Chrome "
@@ -641,6 +652,18 @@ class WorkerHeartbeat(BaseModel):
     # load1 into "load per core" for I/O-aware dispatch across a fleet mixing
     # Proxmox nodes and bare-metal boxes of different sizes. 0 = older worker.
     nproc: int = 0
+    #: True while the worker is draining (recycle-after-N, memory guard, or a
+    #: rolling self-update) and will accept no new work. A draining worker
+    #: reports ``in_flight == capacity`` on purpose -- "full, don't dispatch"
+    #: -- which made it INDISTINGUISHABLE from a genuinely busy one. On
+    #: 2026-08-18, 200 of 255 workers sat exactly there: drained, idle,
+    #: never exiting (their in-flight counter never reached 0), and shown as
+    #: healthy+busy in the Workers tab the whole time. The hub mirrors this
+    #: into /workers so "stuck draining" is visible instead of silent.
+    draining: bool = False
+    #: Why the drain started ("recycle after 200 job(s)", the memory-guard
+    #: reason, "self-update -> <hash>"). Empty when not draining.
+    drain_reason: str = ""
 
 
 class WorkerJobAccepted(BaseModel):
@@ -723,6 +746,16 @@ class WorkerJobComplete(BaseModel):
     type: Literal["complete"] = "complete"
     job_id: str
     result: JobResult
+    # Timing instrumentation for the "silent gap" between the worker's last
+    # job log line and the hub stamping completed_at (measured 2026-08-16:
+    # non-video p50 work=11s but gap=21s, video 18s vs 50s). Both optional so
+    # an older worker that doesn't send them still validates.
+    #   sent_at   -- epoch seconds when the worker handed this message to the
+    #                WS. Hub subtracts to get queue+transit+handler latency.
+    #   upload_ms -- wall time the worker spent in _upload_files (the serial
+    #                POST chain for log.txt / page.html / sidecars / assets).
+    sent_at: float | None = None
+    upload_ms: float | None = None
 
 
 class WorkerJobFailed(BaseModel):
@@ -988,6 +1021,60 @@ class WorkerVideoDownloadComplete(BaseModel):
     message: str = ""
 
 
+class HubScreencastOpen(BaseModel):
+    """Ask the worker to open a CDP ``Page.startScreencast`` stream on one
+    lane's Chrome and relay events back as ``WorkerScreencastEvent``,
+    instead of the hub dialing Chrome's CDP port directly. Linux fleet lane
+    CDP ports aren't LAN-reachable the way Windows portable's is (see
+    ``WorkerCapabilities.screencast_relay``), so the worker opens its own
+    loopback CDP connection and rides the existing control WS instead of
+    the hub needing a fresh network hop + handshake per viewer."""
+
+    type: Literal["screencast_open"] = "screencast_open"
+    session_id: str
+    lane_idx: int
+    quality: int = 60
+    max_width: int = 1280
+    max_height: int = 720
+
+
+class HubScreencastClose(BaseModel):
+    """Stop a screencast relay previously opened by HubScreencastOpen."""
+
+    type: Literal["screencast_close"] = "screencast_close"
+    session_id: str
+
+
+class HubScreencastCmd(BaseModel):
+    """Forward one raw CDP command (input event, cursor probe, screenshot
+    request, screencast resize) from the viewer to the worker's local CDP
+    connection for this session."""
+
+    type: Literal["screencast_cmd"] = "screencast_cmd"
+    session_id: str
+    payload: dict[str, Any]
+
+
+class WorkerScreencastEvent(BaseModel):
+    """One raw CDP event/reply from the worker's local screencast
+    connection (``Page.screencastFrame``, or a reply to a
+    ``HubScreencastCmd``), relayed verbatim to the browser-side viewer."""
+
+    type: Literal["screencast_event"] = "screencast_event"
+    session_id: str
+    payload: dict[str, Any]
+
+
+class WorkerScreencastClosed(BaseModel):
+    """The worker's screencast relay for this session ended (lane
+    released, local CDP connection dropped, or explicit
+    HubScreencastClose)."""
+
+    type: Literal["screencast_closed"] = "screencast_closed"
+    session_id: str
+    error: str | None = None
+
+
 WorkerToHubMsg = Annotated[
     Union[
         WorkerRegister,
@@ -1009,6 +1096,8 @@ WorkerToHubMsg = Annotated[
         WorkerSessionAgentResult,
         WorkerSessionAnnounce,
         WorkerDraining,
+        WorkerScreencastEvent,
+        WorkerScreencastClosed,
     ],
     Field(discriminator="type"),
 ]
@@ -1576,6 +1665,9 @@ HubToWorkerMsg = Annotated[
         HubSessionInteraction,
         HubUpdateGate,
         HubExpectedVersion,
+        HubScreencastOpen,
+        HubScreencastClose,
+        HubScreencastCmd,
     ],
     Field(discriminator="type"),
 ]

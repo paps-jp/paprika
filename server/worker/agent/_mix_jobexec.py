@@ -625,7 +625,18 @@ class _JobExecMixin:
                 # incremental on_asset_saved callback are skipped; this
                 # pass reconciles page.html, log, late yt-dlp output and
                 # any inline-upload failures.
+                #
+                # Timed (2026-08-16): this serial POST chain runs AFTER the
+                # last job-log line, so it was invisible in the worker log
+                # while accounting for the bulk of a job's wall time. The
+                # measurement rides WorkerJobComplete.upload_ms.
+                _upl_t0 = time.monotonic()
                 await self._upload_files(assign, workdir, result, uploaded_names)
+                _upload_ms = (time.monotonic() - _upl_t0) * 1000.0
+                _logger.info(
+                    "[%s] uploads settled in %.1fs (%d asset(s) shipped inline)",
+                    job_id, _upload_ms / 1000.0, len(uploaded_names),
+                )
 
                 # Build the JobResult Pydantic object with hub-side hrefs.
                 # page_url: every fetch-mode asset belongs to the single
@@ -696,6 +707,8 @@ class _JobExecMixin:
                         WorkerJobComplete(
                             job_id=job_id,
                             result=job_result,
+                            sent_at=time.time(),
+                            upload_ms=_upload_ms,
                         )
                     )
                 # keep_session: hand the (now post-fetch) browser /
@@ -794,6 +807,11 @@ class _JobExecMixin:
                     and self.lane_pool is not None
                     and not (keep_session and inspect_sid in self._sessions)
                 ):
+                    # A screencast relay opened against this lane must not
+                    # keep streaming once the lane goes back to the pool --
+                    # the next job to grab it would otherwise leak frames
+                    # of someone else's page to a stale viewer.
+                    self._close_screencasts_for_lane(lane.lane_idx)
                     self.lane_pool.release(lane)
                 # For keep_session jobs the lane stays held by the
                 # live session; keeping _in_flight incremented mirrors
@@ -1337,6 +1355,7 @@ class _JobExecMixin:
                     try:
                         await self._send(WorkerJobComplete(
                             job_id=job_id, result=base_result,
+                            sent_at=time.time(),
                         ))
                     except Exception:
                         pass

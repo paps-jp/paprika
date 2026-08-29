@@ -242,6 +242,109 @@ class _MaintenanceMixin:
         except asyncio.CancelledError:
             return
 
+    async def _stuck_job_loop(self) -> None:
+        """Cancel a running assignment whose job the hub has already ended.
+
+        The hub can finish a job out from under the worker that is still
+        executing it: the stale-job reconciler settles anything whose worker
+        it cannot see in the live fleet (a WS flap is enough), the lease
+        reaper re-dispatches orphans elsewhere, and the pipeline can DELETE
+        the row outright. Nothing told the worker, so the job kept its lane
+        and its ``_in_flight`` slot for the life of the process.
+
+        That is the leak behind the 2026-08-18 strand: one such job per
+        worker was enough that the 200-job recycle drain could never reach
+        ``_in_flight == 0``, and 200 of 255 workers sat drained, idle and
+        reporting themselves full -- 78% of the fleet's lanes, indefinitely.
+        The drain watchdog (_DRAIN_DEADLINE_S) is the blunt backstop; this
+        loop is the specific fix, and it returns the lane in ~2 minutes
+        instead of losing the whole worker for 15.
+
+        Polls rather than waits for a push, for the same reason as
+        _abandoned_download_loop: the job can be ended by ANY hub, not just
+        the one holding our WebSocket.
+        """
+        interval = float(
+            os.environ.get("PAPRIKA_STUCK_JOB_POLL_INTERVAL_S") or 120.0,
+        )
+        # Never judge a job that is simply still working. Fetch service time
+        # is ~23s p50 / ~82s under load, and a recipe with a big inline
+        # download legitimately runs minutes -- so this is a "the hub gave up
+        # on you long ago" threshold, not a service-time budget.
+        grace = float(os.environ.get("PAPRIKA_STUCK_JOB_GRACE_S") or 300.0)
+        if interval <= 0:
+            return
+        started: dict[str, float] = {}
+        # One reading of ``failed`` is not evidence: the reconciler marks a
+        # job failed the moment it believes the worker is gone fleet-wide,
+        # which a WS flap produces on a worker that is perfectly alive and
+        # about to finish the job successfully. Two identical readings a poll
+        # apart are. ``deleted`` needs no such patience -- the row is gone.
+        pending: dict[str, str] = {}
+        try:
+            while True:
+                await asyncio.sleep(interval)
+                live = {j for j in list(self._job_tasks) if j}
+                now = time.monotonic()
+                for job_id in live:
+                    started.setdefault(job_id, now)
+                for job_id in [j for j in started if j not in live]:
+                    started.pop(job_id, None)
+                    pending.pop(job_id, None)
+                for job_id in sorted(live):
+                    if now - started.get(job_id, now) < grace:
+                        continue
+                    verdict = await self._hub_job_is_over(job_id)
+                    if verdict is None:
+                        pending.pop(job_id, None)
+                        continue
+                    if verdict == "failed" and pending.pop(job_id, None) != "failed":
+                        pending[job_id] = "failed"
+                        continue
+                    pending.pop(job_id, None)
+                    task = self._job_tasks.get(job_id)
+                    if task is None or task.done():
+                        continue
+                    _logger.warning(
+                        f"[worker {self.worker_id}] job {job_id} is {verdict} "
+                        f"on the hub but still running here after "
+                        f"{now - started.get(job_id, now):.0f}s -- cancelling "
+                        f"to reclaim the lane",
+                    )
+                    task.cancel()
+        except asyncio.CancelledError:
+            return
+
+    async def _hub_job_is_over(self, job_id: str) -> str | None:
+        """Terminal status the hub holds for ``job_id``, else None.
+
+        Sibling of :meth:`_hub_job_is_finished`, and it differs in exactly one
+        place: ``completed`` counts. There, a completed row is normal -- the
+        fetch phase finishes first and the deferred download uploads its video
+        afterwards, so abandoning on it would throw away every video. Here the
+        job body itself is still executing, and a completed row means the hub
+        has already accepted a result and moved on; nothing this task can
+        still produce will be stored.
+        """
+        try:
+            base = (self.hub_http_url or "").rstrip("/")
+            if not base or self._http is None:
+                return None
+            r = await self._http.get(f"{base}/jobs/{job_id}", timeout=10.0)
+        except Exception:
+            return None
+        if r.status_code == 404:
+            return "deleted"
+        if r.status_code != 200:
+            return None
+        try:
+            status = str((r.json() or {}).get("status") or "").split(".")[-1].lower()
+        except Exception:
+            return None
+        if status in ("failed", "cancelled", "canceled", "completed", "review"):
+            return status
+        return None
+
     async def _hub_job_is_finished(self, job_id: str) -> str | None:
         """Reason string when the hub is done with ``job_id``, else None.
 

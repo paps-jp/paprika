@@ -245,6 +245,42 @@ async def _recover_orphan_running_jobs_scan() -> int:
     return n
 
 
+#: How many TTL-expired "running"/"fetch_running" sessions the reaper may
+#: check against the job store in one 5s tick. Only expired sessions are ever
+#: probed, so a healthy hub does zero of these; the cap exists for the leaked
+#: state, where the alternative is thousands of store reads per tick.
+_SESSION_JOB_PROBES_PER_TICK = int(
+    os.environ.get("PAPRIKA_SESSION_JOB_PROBES_PER_TICK", "50")
+)
+
+
+async def _session_job_is_over(s) -> str | None:
+    """Terminal disposition of the job that pins session ``s``, else None.
+
+    None means "leave it alone": no job id to check, an unreadable store, or a
+    job that really is still running. Only a positive answer -- a terminal
+    status, or a row that no longer exists -- releases the session, so a store
+    blip can never evict a live one.
+    """
+    job_id = getattr(s, "job_id", None)
+    if not job_id or state.store is None:
+        return None
+    try:
+        info = await state.store.get_job_info(job_id)
+    except Exception:
+        return None
+    if info is None:
+        return "gone"
+    try:
+        status = getattr(info.status, "value", info.status)
+    except Exception:
+        return None
+    status = str(status or "").split(".")[-1].lower()
+    if status in ("completed", "failed", "cancelled", "canceled", "review"):
+        return status
+    return None
+
+
 async def _session_reaper_loop():
     """Periodically close sessions whose idle_ttl_s / absolute_ttl_s
     has elapsed. Runs forever; cancelled by the lifespan teardown.
@@ -266,10 +302,12 @@ async def _session_reaper_loop():
         except Exception:
             pass
         now = datetime.utcnow()
+        probes_left = _SESSION_JOB_PROBES_PER_TICK
         for s in list(state.sessions.all()):
             if s.state == "closing":
                 continue
-            # Skip sessions with an action currently in flight. The
+            # Sessions with an action currently in flight are protected --
+            # see the state check further down, after the TTL test. The
             # reaper used to only look at last_active_at, which gets
             # updated AFTER the action returns -- so a legitimately
             # long page.download_video() (10+ min for big yt-dlp jobs)
@@ -285,8 +323,6 @@ async def _session_reaper_loop():
             # the fresh timestamp. If the worker disconnects
             # mid-action, drop_by_worker tears the session down
             # directly, so no zombie "running" state can sit forever.
-            if s.state == "running" or s.state == "fetch_running":
-                continue
             try:
                 idle = (now - s.last_active_at).total_seconds()
                 age = (now - s.created_at).total_seconds()
@@ -307,6 +343,32 @@ async def _session_reaper_loop():
             if not expired:
                 continue
             reason = "idle_ttl" if (s.idle_ttl_s and idle > s.idle_ttl_s) else "absolute_ttl"
+            # An action is in flight -- normally. The skip above used to be
+            # unconditional and permanent: a session sits in "fetch_running"
+            # until its job's WorkerJobComplete flips it back, and a job that
+            # the HUB terminates instead (stale-job reconciler, lease reaper,
+            # downloading reaper, DELETE /jobs/{id}) never sends one. The
+            # session then outlived every TTL with nothing able to collect it,
+            # holding a worker lane the whole time. Measured 2026-08-18: 494
+            # sessions, ALL "fetch_running", p50 age 2.3h, oldest 18.9h, 367
+            # of them past idle_ttl.
+            #
+            # So: still never evict a session whose job is genuinely running
+            # (that was the b79ab7d5e813 fix -- a 652s download_video must not
+            # be reaped mid-action), but a TTL-expired session whose job the
+            # store says is OVER is exactly the leak, and it goes.
+            if s.state == "running" or s.state == "fetch_running":
+                if probes_left <= 0:
+                    # Bounded work per tick: in a leaked fleet this branch can
+                    # be thousands of sessions, and the reaper must not turn
+                    # into a store-scan storm. The backlog drains over the
+                    # next few ticks (5s apart).
+                    continue
+                probes_left -= 1
+                over = await _session_job_is_over(s)
+                if not over:
+                    continue
+                reason = f"{reason} + job {over}"
             log.info(
                 "reaper: closing %s (reason=%s idle=%.0fs age=%.0fs)",
                 s.session_id,

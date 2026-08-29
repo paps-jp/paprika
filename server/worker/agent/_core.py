@@ -97,6 +97,7 @@ from ._mix_jobexec import _JobExecMixin
 from ._mix_profile import _ProfileExtMixin
 from ._mix_maintenance import _MaintenanceMixin
 from ._mix_preview import _PreviewMixin
+from ._mix_screencast import _ScreencastRelayMixin, screencast_relay_enabled
 from ._mix_uploads import _UploadsMixin
 from ._mix_pull import _PullMixin
 from ._loop_lag import _LoopLagMixin
@@ -116,6 +117,7 @@ class WorkerAgent(
     _ProfileExtMixin,
     _MaintenanceMixin,
     _PreviewMixin,
+    _ScreencastRelayMixin,
     _UploadsMixin,
     _VideoDownloadMixin,
     _PullMixin,
@@ -216,6 +218,12 @@ class WorkerAgent(
         self._preview_max_width = 320
         self._preview_quality = 5
 
+        # --- CDP-screencast relay (PAPRIKA_LIVE_VIEW_SCREENCAST=1) --------
+        # Keyed by session_id. See _mix_screencast.py for the full picture.
+        self._screencast_upstreams: dict[str, websockets.WebSocketClientProtocol] = {}
+        self._screencast_tasks: dict[str, asyncio.Task] = {}
+        self._screencast_lanes: dict[str, int] = {}
+
         self._send_lock = asyncio.Lock()
         self._ws: websockets.WebSocketClientProtocol | None = None
         self._sem = asyncio.Semaphore(max_concurrent)
@@ -227,6 +235,25 @@ class WorkerAgent(
         # SE_DRAIN_AFTER_SESSION_COUNT does. 0 disables.
         self._jobs_done = 0
         self._draining = False
+        #: Monotonic instant ``_draining`` last went up, and why. Stamped by
+        #: the heartbeat loop for WHICHEVER owner set the flag (recycle,
+        #: memory guard, rolling self-update), so the drain watchdog covers
+        #: all three with one deadline. 0.0 == not draining.
+        #:
+        #: Exists because a drain that never completes used to be permanent:
+        #: the recycle exit waits for ``_in_flight <= 0`` and one job that
+        #: never gives its slot back (hub settled it from under us, a parked
+        #: await, a lost completion) pins the worker forever. It keeps
+        #: heartbeating, keeps reporting itself full, and takes no work ever
+        #: again. 200 of 255 workers were in exactly that state on
+        #: 2026-08-18 -- 78% of the fleet, invisible in every dashboard.
+        self._drain_since_m: float = 0.0
+        self._drain_reason: str = ""
+        #: job_id -> the asyncio Task running that assignment. The stuck-job
+        #: watchdog (_stuck_job_loop) needs a handle to cancel one; cancelling
+        #: runs the job body's ``finally``, which is what actually returns the
+        #: lane and decrements ``_in_flight``.
+        self._job_tasks: dict[str, "asyncio.Task"] = {}
         # --- memory guard (server/worker/cgroup_mem.py) --------------------
         # Set by the memory-guard THREAD when it trips: the human-readable
         # reason (reported to the hub in the heartbeat so the operator sees
@@ -517,5 +544,6 @@ class WorkerAgent(
             role=role_from_env(),
             download_pool_key=download_pool_key_from_env(),
             download_slots=download_slots_from_env(),
+            screencast_relay=screencast_relay_enabled(),
         )
 

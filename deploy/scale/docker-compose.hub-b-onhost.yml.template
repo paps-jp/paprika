@@ -1,0 +1,57 @@
+# Second PRODUCTION hub replica on the SAME host as hub-a (not the isolated
+# smoke-test stack that used to live at docker-compose.hub-b.yml on the hub
+# hosts -- that one used a local Redis and touched no shared state).
+#
+# 2026-08-29: found via load testing that a single hub process caps out at
+# ~1 CPU core (GIL-bound event loop) regardless of client-side concurrency --
+# docker top showed 89.5% on one PID under a 48-concurrent POST /jobs burst,
+# on an 8-core host. The fleet's 7 existing replicas already prove the
+# scale-out pattern works (WS ownership + session map + hub->hub forwarding
+# all already live in Redis, per deploy/scale/README.md). This just adds
+# ANOTHER replica on hosts that have spare cores, instead of a new host.
+#
+# Deploy (run ON the hub host, e.g. 10.10.50.35):
+#   docker compose -f docker-compose.hub-a.yml -f docker-compose.hub-b.yml \
+#     -p hub up -d hub-b
+# (same project "hub" as hub-a, so it joins the existing hub_default network
+# and PAPRIKA_RUNNER_NETWORK=hub_default still resolves for codegen-loop.)
+#
+# Then on the router (.34): add "server <this-host>:8101" to BOTH the
+# `hubs` and `hubs_sticky` upstreams in nginx.conf, `nginx -s reload`.
+#
+# HUB_ID is the only thing that must differ from hub-a's env: hub-a has no
+# HUB_ID set and auto-derives "hub-<last octet>" from its LAN IP (see
+# server/hub/app.py:747 `if _host_ip and not os.environ.get("HUB_ID")`).
+# Explicitly pinning HUB_ID here skips that derivation entirely, so hub-b
+# does NOT collide with hub-a's auto-derived id even though they share a host
+# (and therefore a LAN IP).
+services:
+  hub-b:
+    image: paprika-hub:latest
+    restart: unless-stopped
+    privileged: true
+    ulimits:
+      nofile:
+        soft: 65536
+        hard: 65536
+    env_file:
+      - hub.env
+    environment:
+      - PAPRIKA_RUNNER_HUB_URL=http://10.10.50.34:8000
+      - PAPRIKA_RUNNER_NETWORK=hub_default
+      - HUB_ID=hub-35b
+    command: >
+      python -m server --mode hub
+      --host 0.0.0.0 --port 8000
+      --redis-url redis://10.10.50.34:6379
+      --data-dir /data/jobs
+      --public-base-url http://10.10.50.34:8000
+    ports:
+      - "8101:8000"
+    volumes:
+      - ./hub-data-b:/data/jobs
+      - ./server:/app/server
+      - ./core:/app/core
+      - ./VERSION:/app/VERSION:ro
+      - ./data/tools:/data/tools
+      - /var/run/docker.sock:/var/run/docker.sock:rw

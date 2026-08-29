@@ -2352,9 +2352,20 @@ class Page:
             reply = {}
         self._detached = True
         job_id = (reply or {}).get("job_id")
+        # Read the real (hub-proxied) URL back from the keepalive reply
+        # instead of hardcoding /novnc/ -- some workers (Windows portable,
+        # or Linux fleet with PAPRIKA_LIVE_VIEW_SCREENCAST=1) route the
+        # Live viewer to /screencast/ instead, and a hardcoded /novnc/
+        # 404s for those. Falls back to the old hardcoded path only if
+        # the keepalive call itself failed (reply == {}).
+        novnc_url = (
+            (reply or {}).get("novnc_url_autoconnect")
+            or (reply or {}).get("novnc_url")
+            or f"/sessions/{self._sid}/novnc/"
+        )
         return HandoffInfo(
             session_id=self._sid,
-            novnc_url=f"/sessions/{self._sid}/novnc/",
+            novnc_url=novnc_url,
             refresh_url=(f"/jobs/{job_id}/refresh" if job_id else None),
             end_url=f"/sessions/{self._sid}",
             idle_ttl_s=int(reply.get("idle_ttl_s") or idle_ttl_s),

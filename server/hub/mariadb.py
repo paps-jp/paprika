@@ -692,6 +692,16 @@ async def create_pool(
         maxsize=_maxsize,
         autocommit=True,
         charset="utf8mb4",
+        # .20's system/session time_zone is JST, but every timestamp this app
+        # writes from Python (jobs.created_at/completed_at etc.) is naive-UTC
+        # (datetime.utcnow(), see _redrive.py/_reaper.py). Any SQL-side NOW()/
+        # CURRENT_TIMESTAMP() therefore reads 9h ahead of those columns --
+        # e.g. "WHERE last_seen_at >= NOW() - INTERVAL 15 MINUTE" silently
+        # matches nothing. Pin this pool's sessions to UTC so NOW() lines up
+        # with what Python already writes, without touching the shared
+        # server-wide time_zone (10.10.50.20 also serves the unrelated
+        # `delian` database).
+        init_command="SET time_zone='+00:00'",
     )
 
 

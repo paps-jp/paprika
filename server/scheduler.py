@@ -212,7 +212,7 @@ _ROW_DETAIL_FIELDS = (
     "nproc", "mem_scope", "mem_current_mb", "mem_anon_mb",
     "mem_psi_some_avg60", "mem_psi_full_avg60", "mem_majfault_per_s",
     "mem_refault_per_s", "mem_anon_rate_mb_min", "loop_lag_ms", "memguard",
-    "profiles_cached", "pending_update_to",
+    "profiles_cached", "pending_update_to", "draining", "drain_reason",
 )
 
 
@@ -242,6 +242,12 @@ def _row_detail_from_worker(w: "ConnectedWorker") -> dict:
         "memguard": str(w.memguard or ""),
         "profiles_cached": list(w.profiles_cached or []),
         "pending_update_to": w.pending_update_to,
+        # Worker-side drain (recycle / memory guard / self-update). A draining
+        # worker reports in_flight == capacity by design, so without this flag
+        # "drained and stuck" and "genuinely busy" are the same row. That is
+        # how 200 of 255 workers hid for a day on 2026-08-18.
+        "draining": bool(getattr(w, "self_draining", False)),
+        "drain_reason": str(getattr(w, "self_drain_reason", "") or ""),
     }
 
 
@@ -266,6 +272,8 @@ def _row_detail_from_blob(data: dict) -> dict:
         "mem_anon_rate_mb_min": float(d.get("mem_anon_rate_mb_min") or 0.0),
         "loop_lag_ms": float(d.get("loop_lag_ms") or 0.0),
         "memguard": str(d.get("memguard") or ""),
+        "draining": bool(d.get("draining") or False),
+        "drain_reason": str(d.get("drain_reason") or ""),
         "profiles_cached": list(d.get("profiles_cached") or []),
         "pending_update_to": d.get("pending_update_to"),
     }
@@ -442,6 +450,17 @@ class ConnectedWorker:
     # updating (either matches the hub version or is operator-controlled
     # drain rather than auto-update drain).
     pending_update_to: str | None = None
+    # Worker-reported drain state from the latest WorkerHeartbeat: the worker
+    # itself decided to stop taking work (recycle-after-N, memory guard, or a
+    # rolling self-update) and is waiting for its in-flight jobs to finish.
+    # Distinct from ``status="drain"``, which is a HUB-side decision (operator,
+    # prepare-restart, no-free-lane). Both stop dispatch; only this one is
+    # invisible without the flag, because a draining worker reports itself
+    # full on purpose. ``self_drain_since`` is monotonic and hub-local -- how
+    # long THIS hub has watched the drain fail to complete.
+    self_draining: bool = False
+    self_drain_reason: str = ""
+    self_drain_since: float = 0.0
     # In-flight screenshot RPCs: req_id -> Future[WorkerScreenshotReply].
     # WorkerScreenshotReply messages from the worker resolve the matching
     # future so the requesting HTTP handler can return the JPEG.
@@ -1053,6 +1072,8 @@ class WorkerRegistry:
         mem_anon_rate_mb_min: float = 0.0,
         loop_lag_ms: float = 0.0,
         memguard: str = "",
+        draining: bool = False,
+        drain_reason: str = "",
     ) -> None:
         worker = self.connections.get(worker_id)
         if worker is None:
@@ -1084,6 +1105,17 @@ class WorkerRegistry:
         else:
             worker.memguard_since = 0.0
         worker.memguard = memguard
+        # Same shape as memguard_since: stamp the first beat that reported a
+        # drain and hold it until the drain clears, so the row can answer "has
+        # been draining for N seconds" -- the question that distinguishes a
+        # worker on its way out from one that will never leave.
+        if draining:
+            if not worker.self_draining:
+                worker.self_drain_since = time.monotonic()
+        else:
+            worker.self_drain_since = 0.0
+        worker.self_draining = bool(draining)
+        worker.self_drain_reason = str(drain_reason or "")
         # nproc is static; a heartbeat may omit it (default 0) -- keep the last
         # known non-zero value so io_sat stays computable across such beats.
         if nproc:
@@ -1236,6 +1268,8 @@ class WorkerRegistry:
                              round(worker.mem_anon_rate_mb_min, 1)),
                             ("loop_lag_ms", round(worker.loop_lag_ms, 1)),
                             ("memguard", worker.memguard),
+                            ("draining", bool(worker.self_draining)),
+                            ("drain_reason", worker.self_drain_reason),
                         ):
                             if d.get(_k) != _v:
                                 d[_k] = _v
@@ -1623,6 +1657,17 @@ class WorkerRegistry:
                     # as a "draining (→ vX)" badge so operators can see
                     # which workers are mid-update vs operator-drained.
                     "pending_update_to": w.pending_update_to,
+                    # Worker-side drain + how long it has been stuck in one.
+                    # in_flight reads as "full" for the whole drain, so these
+                    # two are the only way to tell a recycling worker from a
+                    # working one.
+                    "draining": bool(w.self_draining),
+                    "drain_reason": w.self_drain_reason,
+                    "draining_s": (
+                        round(time.monotonic() - w.self_drain_since, 1)
+                        if w.self_drain_since
+                        else 0.0
+                    ),
                 }
             )
         # Pass 2 (historical workers from Redis) lives in ``stats_async``
@@ -1873,6 +1918,8 @@ class WorkerRegistry:
                 ),
                 "loop_lag_ms": float(data.get("loop_lag_ms") or 0.0),
                 "memguard": str(data.get("memguard") or ""),
+                "draining": bool(data.get("draining") or False),
+                "drain_reason": str(data.get("drain_reason") or ""),
             })
         return out
 

@@ -1535,6 +1535,8 @@ from server.protocol import (
     WorkerJobProgress,
     WorkerPreviewFrame,
     WorkerRegister,
+    WorkerScreencastClosed,
+    WorkerScreencastEvent,
     WorkerScreenshotReply,
     WorkerSessionActionResult,
     WorkerSessionAgentResult,
@@ -1925,7 +1927,14 @@ async def worker_link(ws: WebSocket, worker_id: str):
             await _drain_update_queue()
         except Exception:
             log.warning("rolling-update: drain after disconnect failed", exc_info=True)
-        await state.registry.unregister(worker_id)
+        # Pass OUR ws so unregister() can compare-and-delete: if the worker
+        # already reconnected (reconnect storm after a hub stall -> the same
+        # worker_id connects twice within seconds), a NEWER ws owns the
+        # registry slot and this stale finally must not evict it. Dropping the
+        # arg makes the guard in Scheduler.unregister a no-op and leaves the
+        # worker with a live, echoing WS but no registry entry -- every
+        # /workers/{id}/claim then 409s forever and /workers shows it dead.
+        await state.registry.unregister(worker_id, ws)
         # Drop any sessions that were bound to this worker -- their Lane
         # is gone and the next /sessions/{id}/* call should 404, not
         # hang waiting on a dead WS connection.
@@ -2626,6 +2635,29 @@ async def _reconcile_worker_sessions(worker, snapshots: list) -> None:
 _WORKER_SEEN_SAVE: dict = {}  # worker_id -> monotonic ts of last ledger last_seen save (throttle)
 
 
+def _bg(coro, *, what: str) -> None:
+    """Run ``coro`` off to the side instead of awaiting it inline.
+
+    The per-worker WS receive loop (``worker_link``) does
+    ``await _handle_worker_message(...)`` for every message in order --
+    so any ``await`` inside a handler delays reading the NEXT message off
+    that worker's socket, including a ``WorkerJobComplete`` sitting right
+    behind a burst of log/progress lines. Log/progress persistence is
+    best-effort telemetry (never load-bearing for dispatch correctness),
+    so it's safe to hand off to a background task and let the receive
+    loop move on immediately. Exceptions are swallowed here (matching the
+    try/except the call sites already had) so a store hiccup can't surface
+    as an "unretrieved task exception" warning.
+    """
+    async def _runner() -> None:
+        try:
+            await coro
+        except Exception:
+            log.debug("background %s failed", what, exc_info=True)
+
+    asyncio.create_task(_runner())
+
+
 async def _handle_worker_message(worker, msg) -> None:
     """Dispatch a worker->hub message."""
     assert state.store is not None and state.registry is not None
@@ -2650,6 +2682,11 @@ async def _handle_worker_message(worker, msg) -> None:
             mem_anon_rate_mb_min=getattr(msg, "mem_anon_rate_mb_min", 0.0),
             loop_lag_ms=getattr(msg, "loop_lag_ms", 0.0),
             memguard=msg.memguard,
+            # getattr: a worker on pre-2026-08-18 code sends no drain fields,
+            # and must keep reading as "not draining" rather than crashing the
+            # heartbeat handler mid-rollout.
+            draining=bool(getattr(msg, "draining", False)),
+            drain_reason=str(getattr(msg, "drain_reason", "") or ""),
         )
         # Keep the MariaDB ledger's last_seen_at fresh on heartbeat (NOT just on
         # register) so salvage's age-window can tell a just-ghosted worker from a
@@ -2827,15 +2864,12 @@ async def _handle_worker_message(worker, msg) -> None:
             # progress bar without subscribing to the log stream.
             # Throttled per-job to ~once every 5s so we don't UPDATE the
             # row 20 times/sec under a fast download.
+            # Fired off, not awaited: see _bg's docstring -- a chatty
+            # marker burst (netcap/progress) must not delay this worker's
+            # receive loop from reaching the next message behind it.
             if msg.line.startswith(JOB_PROGRESS_MARKER):
-                try:
-                    await _persist_dl_progress(msg.job_id, msg.line)
-                except Exception:
-                    pass
-            try:
-                await state.store.publish_log(msg.job_id, msg.line)
-            except Exception:
-                pass
+                _bg(_persist_dl_progress(msg.job_id, msg.line), what="persist_dl_progress")
+            _bg(state.store.publish_log(msg.job_id, msg.line), what="publish_log(marker)")
             return
         # When the LogBatcher is active (Redis store), buffer the line
         # and let it flush in pipeline batches (50 lines or 100ms).
@@ -2852,28 +2886,23 @@ async def _handle_worker_message(worker, msg) -> None:
         # substring + "%" check before the regex; the inner persist itself
         # is throttled per-job.
         if "[download]" in msg.line and "%" in msg.line:
-            try:
-                await _persist_dl_progress(msg.job_id, msg.line)
-            except Exception:
-                pass
+            _bg(_persist_dl_progress(msg.job_id, msg.line), what="persist_dl_progress")
         # Persisting a log line is best-effort telemetry and must NEVER
-        # tear down the worker control link. A store error -- e.g. a
+        # tear down the worker control link, NOR delay this worker's
+        # receive loop from reaching the next queued message (a burst of
+        # log lines must not hold up a WorkerJobComplete sitting right
+        # behind them -- see _bg's docstring). A store error -- e.g. a
         # MariaDB FK violation when the parent job was deleted mid-stream
         # (job_logs -> jobs is ON DELETE CASCADE), a deadlock, or a
-        # timeout -- would otherwise escape the WS receive loop and
-        # disconnect the worker, sending the whole fleet into a
-        # reconnect/restart storm.
-        try:
+        # timeout -- is swallowed inside _bg's runner rather than
+        # propagating.
+        async def _persist_line(_job_id=msg.job_id, _line=msg.line) -> None:
             if state.log_batcher is not None:
-                await state.log_batcher.add(msg.job_id, msg.line)
+                await state.log_batcher.add(_job_id, _line)
             else:
-                await state.store.append_log_line(msg.job_id, msg.line)
-                await state.store.publish_log(msg.job_id, msg.line)
-        except Exception:
-            log.debug(
-                "drop log line for job %s (store error)",
-                msg.job_id, exc_info=True,
-            )
+                await state.store.append_log_line(_job_id, _line)
+                await state.store.publish_log(_job_id, _line)
+        _bg(_persist_line(), what=f"persist_line(job={msg.job_id[:8]})")
         # Mirror onto the per-worker ring buffer so the operator can
         # browse "what has this worker been doing" without correlating
         # job ids by hand. Short job-id prefix keeps lines greppable.
@@ -3399,6 +3428,20 @@ async def _handle_worker_message(worker, msg) -> None:
 
     if isinstance(msg, WorkerScreenshotReply):
         worker.deliver_screenshot_reply(msg)
+        return
+
+    if isinstance(msg, WorkerScreencastEvent):
+        # Relay-mode (PAPRIKA_LIVE_VIEW_SCREENCAST=1): route the worker's
+        # local CDP event to whichever /sessions/{sid}/screencast/ws
+        # bridge is currently open for this session, if any (best-effort
+        # -- a frame that arrives after the viewer closed is just dropped).
+        from server.hub.routes.screencast import deliver_relay_event
+        deliver_relay_event(msg.session_id, msg.payload)
+        return
+
+    if isinstance(msg, WorkerScreencastClosed):
+        from server.hub.routes.screencast import deliver_relay_closed
+        deliver_relay_closed(msg.session_id, msg.error)
         return
 
     if isinstance(msg, WorkerPreviewFrame):

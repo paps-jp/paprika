@@ -95,9 +95,16 @@ def _resolve_session_novnc_target(
 
 
 def _has_screencast_target(session_id: str) -> bool:
-    """True iff this session's worker advertises ``chrome_attach_port``
-    (= it can serve the CDP-screencast live viewer at
-    ``/sessions/{sid}/screencast/``)."""
+    """True iff this session's worker can serve the CDP-screencast live
+    viewer at ``/sessions/{sid}/screencast/`` -- either because it
+    advertises ``chrome_attach_port`` (Windows portable: hub dials the
+    worker's Chrome CDP port directly) or ``screencast_relay`` (Linux
+    fleet with ``PAPRIKA_LIVE_VIEW_SCREENCAST=1``: the worker relays
+    frames over the control WS instead, see routes/screencast.py's
+    ``_run_screencast_bridge_relay``). The relay path additionally needs
+    ``lane_idx`` to address the worker's lane-local CDP connection --
+    unset briefly right after dispatch, same window the VNC branch
+    already tolerates (frontend skips mounting until a URL appears)."""
     if state.sessions is None or state.registry is None:
         return False
     sess = state.sessions.get(session_id)
@@ -106,7 +113,11 @@ def _has_screencast_target(session_id: str) -> bool:
     worker = state.registry.connections.get(sess.worker_id)
     if worker is None:
         return False
-    return bool(getattr(worker.capabilities, "chrome_attach_port", None))
+    if bool(getattr(worker.capabilities, "chrome_attach_port", None)):
+        return True
+    if getattr(worker.capabilities, "screencast_relay", False) and sess.lane_idx is not None:
+        return True
+    return False
 
 
 def _find_active_session_id(info: JobInfo) -> str | None:

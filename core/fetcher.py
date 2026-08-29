@@ -30,6 +30,8 @@ from pathlib import Path
 from typing import Any, Callable, Optional
 from urllib.parse import urlparse
 
+from core.url_blacklist import is_manifest_url
+
 
 # ---------------------------------------------------------------------------
 # websockets.connect open_timeout bump (CDP handshake on loaded workers)
@@ -86,6 +88,12 @@ _EGRESS_PROXY_CACHE = ""
 # value is AUTHORITATIVE: ``[]`` means the operator cleared the pool, so the
 # worker egresses directly (no env fallback).
 _EGRESS_POOL_OVERRIDE = None
+
+# Max network-capture entries per "[[paprika:netcap]]" live-view emit (see
+# the url-capture poller below). Caps the worst-case single WorkerJobLog
+# line size so a page with heavy XHR/fetch churn can't produce one giant
+# message that queues in front of everything the worker sends after it.
+_NETCAP_MAX_PER_EMIT = int(os.environ.get("PAPRIKA_NETCAP_MAX_PER_EMIT", "150") or "150")
 
 
 def set_egress_pool(pool) -> None:
@@ -474,6 +482,54 @@ def clone_chrome_profile(
 #     this whitelist used to cover).
 # Adding a new video site no longer needs a code edit; if a specific
 # site needs the page URL fed to yt-dlp directly, register a recipe.
+
+# A URL that names a video file directly, as opposed to a manifest or a page
+# URL a HostRecipe handed us. Only these are eligible for the observed-size
+# gate in add_target -- a recipe's page URL is small on the wire but the video
+# behind it is not, so gating on the page's own byte count would be wrong.
+_DIRECT_VIDEO_FILE_RE = re.compile(r"\.(mp4|webm|mov|m4v|mkv|ts)($|\?)", re.I)
+
+
+def video_target_too_small(
+    url: str, observed_size: Optional[int], min_bytes: int
+) -> bool:
+    """True when ``url`` should NOT be handed to yt-dlp because the network
+    layer already watched it go by, and it was too small to be the video we
+    came for.
+
+    Measured 2026-08-16 across three workers: 74-84% of the video downloads
+    that COMPLETED were under 5 MB -- ad bumpers and ``*_9s.mp4`` hover-preview
+    clips, the same handful of creatives recurring across unrelated jobs. Each
+    cost ~3.5s of yt-dlp process + generic-extractor startup for well under 1s
+    of transfer, and the deferred downloader runs them strictly one after
+    another, so a page carrying a dozen added 30-45s of pure overhead to the
+    job. One job spawned 17.
+
+    This is the policy the code ALREADY applies -- video output below
+    ``min_asset_size`` is discarded after download (server/worker/agent/
+    video.py) -- moved ahead of the spawn so we stop paying to fetch bytes we
+    then throw away.
+
+    Answers False unless every condition holds, so a real video can never be
+    suppressed:
+      * gating is enabled (``min_bytes`` > 0),
+      * the URL names a video file directly. A manifest is a few KB that
+        expands into the whole stream, and a HostRecipe can hand us the page
+        URL itself -- neither one's own byte count says anything about the
+        video behind it,
+      * a size was actually observed on the wire. Targets that came from the
+        DOM, or responses without a length, keep the old behaviour rather
+        than being guessed at.
+    """
+    if min_bytes <= 0:
+        return False
+    if not url or not _DIRECT_VIDEO_FILE_RE.search(url):
+        return False
+    if is_manifest_url(url):
+        return False
+    if not isinstance(observed_size, int) or observed_size <= 0:
+        return False
+    return observed_size < min_bytes
 
 
 def _fmp4_box_type(path: Path) -> bytes:
@@ -2834,20 +2890,38 @@ async def fetch(opts: FetchOptions) -> FetchResult:
                     if len(_net_log) > _net_emit_idx[0]:
                         _net_delta = _net_log[_net_emit_idx[0]:]
                         _net_emit_idx[0] = len(_net_log)
+                        # Backpressure: a page with heavy XHR/fetch churn
+                        # (thousands of requests in one 1.5s window) would
+                        # otherwise emit one giant WorkerJobLog line -- a
+                        # large json.dumps + large WS frame + large hub-side
+                        # Redis PUBLISH, all of which sit in front of
+                        # whatever this worker sends next (including its
+                        # eventual WorkerJobComplete, since the worker's own
+                        # _send is single-lock/single-WS serial). Thin the
+                        # delta to the most recent _NETCAP_MAX_PER_EMIT
+                        # entries per emit and drop the rest from the LIVE
+                        # view only -- this is a best-effort display feed,
+                        # not persisted/replayed, so dropped entries never
+                        # affect asset capture or job correctness.
+                        _dropped = max(0, len(_net_delta) - _NETCAP_MAX_PER_EMIT)
+                        if _dropped:
+                            _net_delta = _net_delta[-_NETCAP_MAX_PER_EMIT:]
                         try:
+                            _payload = {"net": [
+                                {
+                                    "url": _e.get("url", ""),
+                                    "mime": _e.get("mime", ""),
+                                    "size": _e.get("size"),
+                                    "saved": bool(_e.get("saved")),
+                                    "source": _e.get("source", ""),
+                                }
+                                for _e in _net_delta
+                                if isinstance(_e, dict) and _e.get("url")
+                            ]}
+                            if _dropped:
+                                _payload["dropped"] = _dropped
                             log("[[paprika:netcap]] " + json.dumps(
-                                {"net": [
-                                    {
-                                        "url": _e.get("url", ""),
-                                        "mime": _e.get("mime", ""),
-                                        "size": _e.get("size"),
-                                        "saved": bool(_e.get("saved")),
-                                        "source": _e.get("source", ""),
-                                    }
-                                    for _e in _net_delta
-                                    if isinstance(_e, dict) and _e.get("url")
-                                ]},
-                                ensure_ascii=False,
+                                _payload, ensure_ascii=False,
                             ))
                         except Exception:
                             pass
@@ -3215,6 +3289,26 @@ async def fetch(opts: FetchOptions) -> FetchResult:
             ytdlp_targets: list[tuple[str, Optional[str], str]] = []
             seen_targets: set[str] = set()
 
+            # Sizes the network layer already observed on the wire, keyed by
+            # URL. Snapshot rather than a live read: capture is finished by
+            # the time targets are chosen, so _net_log no longer grows.
+            _observed_size: dict[str, int] = {}
+            try:
+                _min_video_bytes = int(
+                    os.environ.get("PAPRIKA_MIN_VIDEO_BYTES")
+                    or (2 * 1024 * 1024)
+                )
+            except ValueError:
+                _min_video_bytes = 2 * 1024 * 1024
+            if _min_video_bytes > 0:
+                for _e in _net_log:
+                    if not isinstance(_e, dict):
+                        continue
+                    _u = _e.get("url") or ""
+                    _sz = _e.get("size")
+                    if _u and isinstance(_sz, int) and _sz > 0:
+                        _observed_size[_u] = _sz
+
             def add_target(u: str, ref: Optional[str], lbl: str):
                 if not u or u in seen_targets:
                     return
@@ -3233,6 +3327,22 @@ async def fetch(opts: FetchOptions) -> FetchResult:
                     try:
                         log(
                             f"  [video-target] SKIP (blacklist='{_bl_pat}') "
+                            f"{u[:120]}"
+                        )
+                    except Exception:
+                        pass
+                    return
+                # Size gate: don't spawn yt-dlp for a direct file URL the
+                # network layer already watched go by as tiny. See
+                # video_target_too_small() for the measurement and the
+                # conditions that keep this from touching a real video.
+                _obs = _observed_size.get(u)
+                if video_target_too_small(u, _obs, _min_video_bytes):
+                    try:
+                        log(
+                            f"  [video-target] SKIP (observed "
+                            f"{(_obs or 0) / 1024:.0f} KB < min "
+                            f"{_min_video_bytes / 1024 / 1024:.1f} MB) "
                             f"{u[:120]}"
                         )
                     except Exception:

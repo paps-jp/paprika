@@ -941,7 +941,16 @@ async def session_keepalive(
     # future "just bump TTL without detaching" need would warrant a
     # ``detach=False`` body field.
     sinfo.detached = True
-    out = sinfo.to_json()
+    # Docstring promises "same shape as GET /sessions/{sid}" but this used
+    # to return the raw (un-proxied) novnc_url -- always null, since that
+    # field is only ever populated by _proxy_session_dict's rewrite. The
+    # SDK's Session.detach() (the only caller) papered over it by
+    # hardcoding a /novnc/ URL, which silently breaks for any worker
+    # routed to the screencast viewer instead (Windows portable, or Linux
+    # fleet with PAPRIKA_LIVE_VIEW_SCREENCAST=1). Apply the same rewrite
+    # GET /sessions/{sid} uses so detach() can read the real URL back.
+    out = _proxy_session_dict(sinfo.to_json())
+    out["novnc_url_autoconnect"] = _novnc_autoconnect(out.get("novnc_url"))
     out["job_id"] = sinfo.job_id
     return out
 

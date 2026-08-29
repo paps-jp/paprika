@@ -47,6 +47,7 @@ from fastapi import APIRouter, HTTPException, Request, WebSocket, WebSocketDisco
 from fastapi.responses import HTMLResponse
 
 from server.hub._state import state
+from server.protocol import HubScreencastClose, HubScreencastCmd, HubScreencastOpen
 
 log = logging.getLogger(__name__)
 router = APIRouter(tags=["Screencast"])
@@ -94,6 +95,88 @@ def _resolve_session_chrome_target(session_id: str) -> tuple[str, int] | None:
         or "127.0.0.1"
     ).strip()
     return (host, int(chrome_port))
+
+
+def _resolve_session_relay_target(session_id: str) -> tuple[str, int] | None:
+    """Find ``(worker_id, lane_idx)`` for a Linux-fleet relay-mode
+    screencast (``PAPRIKA_LIVE_VIEW_SCREENCAST=1`` on the worker).
+
+    Unlike :func:`_resolve_session_chrome_target` this doesn't return a
+    network address -- the worker's lane CDP port isn't dialable from the
+    hub. Instead the caller sends ``HubScreencastOpen`` over the worker's
+    existing control WS and the worker opens its own loopback CDP
+    connection (see ``server/worker/agent/_mix_screencast.py``).
+
+    Returns ``None`` when the session is unknown, has no lane bound yet,
+    the worker isn't connected, or the worker didn't opt into relay mode."""
+    if state.sessions is None or state.registry is None:
+        return None
+    sess = state.sessions.get(session_id)
+    if sess is None or sess.lane_idx is None or not sess.worker_id:
+        return None
+    worker = state.registry.connections.get(sess.worker_id)
+    if worker is None:
+        return None
+    if not getattr(worker.capabilities, "screencast_relay", False):
+        return None
+    return (sess.worker_id, int(sess.lane_idx))
+
+
+# ---------------------------------------------------------------------------
+# Relay-mode frame routing: WorkerScreencastEvent/-Closed arriving on the
+# worker's control WS (routes/workers.py's _handle_worker_message) land
+# here, keyed by session_id. Only populated while at least one relay
+# bridge (_run_screencast_bridge_relay) is actively running for that
+# session.
+#
+# One session_id -> a SET of queues, not a single queue: the worker only
+# opens ONE local CDP connection per session_id (_handle_screencast_open
+# no-ops if already open) and fans its events out to every attached
+# viewer. A plain dict[session_id, Queue] silently handed the whole
+# stream to whichever bridge connected LAST -- a second browser tab, or
+# the noVNC-style auto-reconnect retrying after a transient 403 (see
+# _run_screencast_bridge_relay), would steal every subsequent frame from
+# the first viewer, which then sits on a dead queue looking "connected"
+# but frozen. Confirmed live 2026-08-28: a canary session's browser tab
+# stopped updating the instant a second probe connection opened.
+# ---------------------------------------------------------------------------
+_RELAY_QUEUES: dict[str, set["asyncio.Queue[str | None]"]] = {}
+
+
+def register_relay_queue(session_id: str, queue: "asyncio.Queue[str | None]") -> None:
+    _RELAY_QUEUES.setdefault(session_id, set()).add(queue)
+
+
+def unregister_relay_queue(session_id: str, queue: "asyncio.Queue[str | None]") -> None:
+    qs = _RELAY_QUEUES.get(session_id)
+    if qs is None:
+        return
+    qs.discard(queue)
+    if not qs:
+        _RELAY_QUEUES.pop(session_id, None)
+
+
+def deliver_relay_event(session_id: str, payload: dict) -> None:
+    qs = _RELAY_QUEUES.get(session_id)
+    if not qs:
+        return
+    raw = json.dumps(payload)
+    for q in qs:
+        try:
+            q.put_nowait(raw)
+        except Exception:
+            pass
+
+
+def deliver_relay_closed(session_id: str, error: str | None) -> None:
+    qs = _RELAY_QUEUES.get(session_id)
+    if not qs:
+        return
+    for q in qs:
+        try:
+            q.put_nowait(None)  # sentinel: ends that bridge's upstream iterator
+        except Exception:
+            pass
 
 
 def _resolve_worker_chrome_target(
@@ -1172,6 +1255,127 @@ async def _run_screencast_bridge(
             pass
 
 
+class _RelayUpstream:
+    """Adapter that gives ``_pump_cdp_to_client``/``_pump_client_to_cdp``
+    the same ``async for raw in upstream`` + ``await upstream.send(raw)``
+    interface they use for a direct ``websockets`` connection, but backed
+    by the worker relay instead of a socket: reads come off a per-session
+    queue fed by ``WorkerScreencastEvent``, writes go out as
+    ``HubScreencastCmd`` over the worker's control WS. The pump functions
+    are byte-for-byte unaware of which transport they're driving."""
+
+    def __init__(self, worker, session_id: str, queue: "asyncio.Queue[str | None]") -> None:
+        self._worker = worker
+        self._session_id = session_id
+        self._queue = queue
+
+    async def send(self, raw: str) -> None:
+        try:
+            payload = json.loads(raw)
+        except (ValueError, json.JSONDecodeError):
+            return
+        await self._worker.send(HubScreencastCmd(
+            session_id=self._session_id, payload=payload,
+        ))
+
+    def __aiter__(self):
+        return self
+
+    async def __anext__(self) -> str:
+        item = await self._queue.get()
+        if item is None:
+            raise StopAsyncIteration
+        return item
+
+
+async def _run_screencast_bridge_relay(
+    ws: WebSocket,
+    *,
+    worker_id: str,
+    lane_idx: int,
+    session_id: str,
+    label: str,
+) -> None:
+    """Relay variant of :func:`_run_screencast_bridge` for the Linux fleet
+    (``PAPRIKA_LIVE_VIEW_SCREENCAST=1``): instead of the hub dialing
+    Chrome's CDP port directly (only reachable for Windows portable's
+    exposed ``chrome_attach_port``), ask the WORKER to open its own local
+    CDP connection and relay events back over the already-open
+    worker<->hub control WebSocket. No fresh network dial + RFB/CDP
+    handshake per viewer -- that's the entire point over the VNC bridge.
+
+    Reuses ``_pump_cdp_to_client``/``_pump_client_to_cdp`` unchanged via
+    the ``_RelayUpstream`` adapter."""
+    worker = state.registry.connections.get(worker_id) if state.registry else None
+    if worker is None:
+        await ws.close(code=1011, reason="worker not connected")
+        return
+
+    queue: "asyncio.Queue[str | None]" = asyncio.Queue()
+    register_relay_queue(session_id, queue)
+    await ws.accept()
+    upstream = _RelayUpstream(worker, session_id, queue)
+    next_id = _id_seq()
+
+    try:
+        await worker.send(HubScreencastOpen(session_id=session_id, lane_idx=lane_idx))
+
+        cursor_query_ids: set[int] = set()
+        probe_ids: set[int] = set()
+        screenshot_ids: set[int] = set()
+        up_task = asyncio.create_task(
+            _pump_cdp_to_client(
+                upstream, ws, next_id,
+                session_id=session_id,
+                cursor_query_ids=cursor_query_ids,
+                probe_ids=probe_ids,
+                screenshot_ids=screenshot_ids,
+            ),
+            name=f"screencast-relay-up-{label}",
+        )
+        dn_task = asyncio.create_task(
+            _pump_client_to_cdp(
+                ws, upstream, next_id,
+                session_id=session_id,
+                cursor_query_ids=cursor_query_ids,
+                probe_ids=probe_ids,
+                screenshot_ids=screenshot_ids,
+            ),
+            name=f"screencast-relay-down-{label}",
+        )
+        done, pending = await asyncio.wait(
+            [up_task, dn_task],
+            return_when=asyncio.FIRST_COMPLETED,
+        )
+        for t in pending:
+            t.cancel()
+        for t in pending:
+            try:
+                await t
+            except (asyncio.CancelledError, Exception):
+                pass
+    except WebSocketDisconnect:
+        pass
+    except Exception:
+        log.exception("screencast relay bridge failed for %s", label)
+    finally:
+        unregister_relay_queue(session_id, queue)
+        # Only tear down the worker's shared local CDP connection once
+        # the LAST viewer of this session has gone -- an unconditional
+        # close here would kill the stream for every OTHER still-open
+        # tab/probe watching the same session (see the _RELAY_QUEUES
+        # docstring above).
+        if session_id not in _RELAY_QUEUES:
+            try:
+                await worker.send(HubScreencastClose(session_id=session_id))
+            except Exception:
+                pass
+        try:
+            await ws.close()
+        except Exception:
+            pass
+
+
 # ---------------------------------------------------------------------------
 # Public WS endpoints (session + worker/lane variants)
 # ---------------------------------------------------------------------------
@@ -1179,16 +1383,28 @@ async def _run_screencast_bridge(
 
 @router.websocket("/sessions/{session_id}/screencast/ws")
 async def screencast_ws_session(ws: WebSocket, session_id: str) -> None:
-    """Session-keyed variant. Resolves chrome_port from the session
-    registry; touches session.last_active_at on each frame/input so
-    the reaper doesn't kill an actively-watched session."""
+    """Session-keyed variant. Direct-CDP (Windows portable) takes
+    priority when both are somehow advertised; falls back to the
+    Linux-fleet relay mode (PAPRIKA_LIVE_VIEW_SCREENCAST=1); 1008-closes
+    if neither is available. Both branches touch session.last_active_at
+    on each frame/input so the reaper doesn't kill an actively-watched
+    session."""
     target = _resolve_session_chrome_target(session_id)
-    await _run_screencast_bridge(
-        ws,
-        target=target,
-        session_id=session_id,
-        label=f"sess-{session_id[:8]}",
-    )
+    if target is not None:
+        await _run_screencast_bridge(
+            ws, target=target, session_id=session_id,
+            label=f"sess-{session_id[:8]}",
+        )
+        return
+    relay = _resolve_session_relay_target(session_id)
+    if relay is not None:
+        worker_id, lane_idx = relay
+        await _run_screencast_bridge_relay(
+            ws, worker_id=worker_id, lane_idx=lane_idx, session_id=session_id,
+            label=f"sess-{session_id[:8]}",
+        )
+        return
+    await ws.close(code=1008, reason=f"no screencast target for session {session_id}")
 
 
 @router.websocket("/workers/{worker_id}/lanes/{lane_idx}/screencast/ws")

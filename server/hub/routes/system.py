@@ -196,6 +196,17 @@ async def health(request: Request = None) -> dict:  # noqa: B008 - FastAPI injec
     except Exception:
         vision_inference = None
 
+    # Post-fetch completion latency, split into the worker's serial upload
+    # chain vs. WS queue + handler backlog. This is the leg that was invisible
+    # in the worker log while dominating job wall time -- see
+    # server/hub/_complete_latency.py for the measurement that motivated it.
+    complete_latency: dict | None = None
+    try:
+        from server.hub import _complete_latency
+        complete_latency = _complete_latency.summary()
+    except Exception:
+        complete_latency = None
+
     # RAM-disk spill-over (2026-07-21): which store NEW assets are going to
     # right now, per tier, plus the usage % that decision came from. This is
     # the signal that was missing on 2026-07-20 -- /info and /jobs/completes
@@ -303,6 +314,10 @@ async def health(request: Request = None) -> dict:  # noqa: B008 - FastAPI injec
         # "age_s": float, "stale": bool}. spill=true means NEW assets for that
         # tier are going to the durable spill store instead of the RAM disk.
         "asset_spill": asset_spill,
+        # {"upload_ms": {n,p50,p90}, "transit_ms": {n,p50,p90}} -- which leg of
+        # the post-fetch gap to attack. Nulls mean no samples yet (e.g. every
+        # connected worker is still on a build that doesn't report timings).
+        "complete_latency": complete_latency,
         # The caller's address as this hub sees it (post-NAT). Workers read
         # this at startup to derive their IP-pinned worker_id -- see
         # caller_ip() above and server/worker/agent/workerid.py.
@@ -507,23 +522,41 @@ async def fleet_egress_allow() -> PlainTextResponse:
                         pass
         except Exception:
             pass
-    # 1b) The hub's own object-store (MinIO/S3) endpoint host. Workers PUT
-    #     assets STRAIGHT there when PAPRIKA_WORKER_MINIO_DIRECT=1, so the
-    #     egress firewall MUST allow it -- otherwise every direct PUT is
-    #     silently DROPped by the 10/8 rule and the socket leaks in SYN_SENT
-    #     for the full PUT timeout (incident 2026-06-24: egress-guard canary
-    #     workers .150/.151/.157 piled up ~50 SYN_SENT sockets each to the
-    #     MinIO .8 and churned on the fd-budget recycle). Derived from the
-    #     live settings/env, so it self-maintains across a MinIO move
-    #     (.16 -> .8) exactly like the hub IPs above. IP literals only -- a
-    #     hostname endpoint is skipped (DNS is already broadly allowed).
+    # 1b) EVERY object-store (MinIO/S3) endpoint a presigned PUT can point at.
+    #     Workers PUT assets STRAIGHT there when PAPRIKA_WORKER_MINIO_DIRECT=1,
+    #     so the egress firewall MUST allow all of them -- otherwise the direct
+    #     PUT is silently DROPped by the 10/8 rule and the socket leaks in
+    #     SYN_SENT for the full PUT timeout (incident 2026-06-24: egress-guard
+    #     canary workers .150/.151/.157 piled up ~50 SYN_SENT sockets each to
+    #     the MinIO .8 and churned on the fd-budget recycle).
+    #
+    #     This listed only the primary endpoint until 2026-08-16. The tiering
+    #     added afterwards (video vs non-video, each with its own RAM store and
+    #     spill target) means objstore._write_cb can hand back any of FOUR
+    #     hosts, and the common case -- an image asset -> the non-video hot
+    #     tier -- was NOT among them. Enabling MinIO-direct with only the
+    #     primary allowed would therefore have reproduced the 2026-06-24
+    #     incident on the majority of assets. Pull the whole set from the same
+    #     accessors objstore signs URLs with, so this can't drift again.
+    #
+    #     IP literals only -- a hostname endpoint is skipped (DNS is already
+    #     broadly allowed and the firewall rules take addresses).
     try:
         from server.hub import objstore as _objstore
-        _ep = _objstore._s3cfg("s3_endpoint", "PAPRIKA_S3_ENDPOINT")
-        _mhost = (urlparse(_ep).hostname or "") if _ep else ""
-        if _mhost:
-            ipaddress.ip_address(_mhost)  # IP literal only; raises otherwise
-            ips.add(_mhost)
+        for _ep in (
+            _objstore._s3cfg("s3_endpoint", "PAPRIKA_S3_ENDPOINT"),
+            _objstore._nonvideo_endpoint(),
+            _objstore._spill_endpoint(),
+            _objstore._nv_spill_endpoint(),
+        ):
+            try:
+                _mhost = (urlparse(_ep).hostname or "") if _ep else ""
+                if not _mhost:
+                    continue
+                ipaddress.ip_address(_mhost)  # IP literal only; raises otherwise
+                ips.add(_mhost)
+            except Exception:
+                continue
     except Exception:
         pass
     # 2) Operator-configured extras (MinIO / Redis / etc.) — IPs or CIDRs.

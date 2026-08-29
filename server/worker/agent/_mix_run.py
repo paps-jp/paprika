@@ -40,6 +40,9 @@ from server.protocol import (
     HubProfileSync,
     HubRegistered,
     HubPreviewSubscribe,
+    HubScreencastClose,
+    HubScreencastCmd,
+    HubScreencastOpen,
     HubScreenshotRequest,
     HubSessionAction,
     HubSessionAgent,
@@ -626,6 +629,9 @@ class _RunMixin:
         # Frees the node ramdisk the instant a deferred download's job is
         # over, instead of at the 2h yt-dlp cap -- see the loop's docstring.
         abandon_task = asyncio.create_task(self._abandoned_download_loop())
+        # Same idea one level up: drops a RUNNING assignment whose job the hub
+        # has already finished, so its lane + in-flight slot come back.
+        stuck_task = asyncio.create_task(self._stuck_job_loop())
         # Pull dispatch (server/worker/agent/_mix_pull.py). Returns
         # immediately unless PAPRIKA_PULL_DISPATCH is set.
         if getattr(self, "_lag_task", None) is None:
@@ -652,6 +658,7 @@ class _RunMixin:
             preview_task.cancel()
             selfcheck_task.cancel()
             abandon_task.cancel()
+            stuck_task.cancel()
             pull_task.cancel()
 
     async def _heartbeat_loop(self) -> None:
@@ -705,8 +712,16 @@ class _RunMixin:
                     # before lane.acquire(), so during that sliver the job counter
                     # is the higher (safe) number.
                     if self._draining:
+                        # Stamp the drain clock for whichever owner set the
+                        # flag (recycle / memory guard / self-update). The
+                        # watchdog below reads it; doing it here means no
+                        # owner can forget to arm the deadline.
+                        if not self._drain_since_m:
+                            self._drain_since_m = time.monotonic()
                         eff_in_flight = self.max_concurrent
                     else:
+                        self._drain_since_m = 0.0
+                        self._drain_reason = ""
                         eff_in_flight = self._in_flight
                         if self.lane_pool is not None:
                             try:
@@ -793,11 +808,44 @@ class _RunMixin:
                             mem_anon_rate_mb_min=self._memguard_anon_rate_mb_min,
                             loop_lag_ms=self.loop_lag_peak_ms(),
                             memguard=self._memguard_reason,
+                            draining=bool(self._draining),
+                            drain_reason=self._drain_reason,
                         )
                     )
                     # A successful heartbeat == the hub link is alive.
                     # Drives the shutdown-on-failure timer in run().
                     self._last_link_ok = time.monotonic()
+                    # A drain that never completes. The recycle exit below waits for
+                    # ``_in_flight <= 0``, so ONE job that never returns its
+                    # slot pins the worker for good: it keeps heartbeating,
+                    # keeps reporting itself full (see eff_in_flight above),
+                    # and never takes work again. Measured 2026-08-18: 200 of
+                    # 255 workers were stuck exactly here, 1-8h each, some
+                    # since their first recycle of the day -- 78% of the
+                    # fleet's lanes, with every worker still shown "active".
+                    # The memory guard has carried this deadline since it was
+                    # written (_MEMGUARD_DRAIN_DEADLINE_S); the recycle and
+                    # self-update drains had none. One watchdog now covers
+                    # all three.
+                    _drain_deadline_s = _num_env(
+                        "PAPRIKA_DRAIN_DEADLINE_S", self._DRAIN_DEADLINE_S
+                    )
+                    if (
+                        self._draining
+                        and self._in_flight > 0
+                        and _drain_deadline_s > 0
+                        and self._drain_since_m
+                        and (time.monotonic() - self._drain_since_m)
+                        >= _drain_deadline_s
+                    ):
+                        _logger.critical(
+                            f"[worker {self.worker_id}] drain did not complete "
+                            f"within {_drain_deadline_s:.0f}s "
+                            f"({self._in_flight} in-flight, reason="
+                            f"{self._drain_reason or 'unknown'}) -- force-exiting "
+                            f"now (docker will restart)",
+                        )
+                        os._exit(0)
                     # Recycle: once the drain has emptied in-flight, exit so
                     # docker restarts us fresh -- UNLESS a rolling self-update
                     # owns this drain, in which case exiting here restarts us on
@@ -1110,6 +1158,14 @@ class _RunMixin:
     # The fast leaks are caught earlier by the growth-rate axis below, not by
     # this absolute floor, so raising it costs nothing in detection latency.
     _MEMGUARD_ANON_MB = 7000        # ~57% of the fleet's 12288MB CT cap
+    #: Hard cap on how long ANY drain (recycle / memory guard / self-update)
+    #: may sit with work still in flight before the process force-exits.
+    #: Same 900s the memory guard has always used for its own drain: long
+    #: enough that ordinary work finishes (fetch p50 is ~23s, and a deferred
+    #: video download does NOT hold an in-flight slot), short enough that a
+    #: stuck worker is back in the fleet within a quarter hour instead of
+    #: never. Env: PAPRIKA_DRAIN_DEADLINE_S (0 disables).
+    _DRAIN_DEADLINE_S = 900.0
     # Growth rate, not level: the axis the absolute threshold above cannot see
     # in time. Measured on balcony w51177 2026-08-14: anon went 5544MB ->
     # 8448MB in 2.7 minutes (~1GB/min), and the kernel OOM-killed the process
@@ -1596,7 +1652,8 @@ class _RunMixin:
 
     async def _handle_hub_message(self, msg) -> None:
         if isinstance(msg, HubAssignJob):
-            t = asyncio.create_task(self._run_assigned_job(msg))
+            t = asyncio.create_task(self._run_job_guarded(msg))
+            self._job_tasks[msg.job_id] = t
             t.add_done_callback(self._on_job_task_done)
             return
         if isinstance(msg, HubAssignVideoDownload):
@@ -1636,6 +1693,15 @@ class _RunMixin:
             # Push-based previews: an admin is watching us -> (re)arm the
             # self-capture loop. Cheap synchronous state update.
             self._on_preview_subscribe(msg)
+            return
+        if isinstance(msg, HubScreencastOpen):
+            asyncio.create_task(self._handle_screencast_open(msg))
+            return
+        if isinstance(msg, HubScreencastClose):
+            asyncio.create_task(self._handle_screencast_close(msg))
+            return
+        if isinstance(msg, HubScreencastCmd):
+            asyncio.create_task(self._handle_screencast_cmd(msg))
             return
         if isinstance(msg, HubSessionStart):
             asyncio.create_task(self._handle_session_start(msg))
@@ -1697,6 +1763,58 @@ class _RunMixin:
                 )
             return
 
+    #: Hard wall-clock cap on a single assignment. Not a service-time budget
+    #: -- fetch p50 is ~23s -- but a backstop against the one job that never
+    #: returns: a parked await, a CDP call with no timeout, a completion send
+    #: into a half-dead socket. Before this, such a job kept its in-flight
+    #: slot for the life of the process, which is what turned a routine
+    #: 200-job recycle into a permanent strand (2026-08-18, 200/255 workers).
+    #: Deliberately generous: a deferred video download is detached and holds
+    #: no slot, so nothing legitimate runs for two hours inside a job task.
+    #: Env: PAPRIKA_JOB_MAX_WALL_S (0 disables).
+    _JOB_MAX_WALL_S = 7200.0
+
+    async def _run_job_guarded(self, msg) -> None:
+        """``_run_assigned_job`` with a wall-clock cap and task registration.
+
+        Cancelling the inner coroutine is what actually recovers the slot:
+        the job body's ``finally`` releases the lane and decrements
+        ``_in_flight`` on every exit path, including cancellation. The hub is
+        told explicitly rather than left to its reconciler, so the job is
+        re-dispatchable in seconds instead of after the stale-job grace.
+        """
+        job_id = getattr(msg, "job_id", "") or ""
+        limit = _num_env("PAPRIKA_JOB_MAX_WALL_S", self._JOB_MAX_WALL_S)
+        try:
+            if limit <= 0:
+                await self._run_assigned_job(msg)
+                return
+            try:
+                await asyncio.wait_for(
+                    self._run_assigned_job(msg), timeout=limit
+                )
+            except asyncio.TimeoutError:
+                _logger.critical(
+                    f"[worker {self.worker_id}] job {job_id} exceeded the "
+                    f"{limit:.0f}s wall-clock cap -- cancelled; lane + "
+                    f"in-flight slot reclaimed",
+                )
+                try:
+                    await self._send(
+                        WorkerJobFailed(
+                            job_id=job_id,
+                            error=(
+                                f"worker wall-clock cap: job ran longer than "
+                                f"{limit:.0f}s without finishing; cancelled so "
+                                f"the lane could be reclaimed. Re-submit to retry."
+                            ),
+                        )
+                    )
+                except Exception:
+                    pass
+        finally:
+            self._job_tasks.pop(job_id, None)
+
     def _on_job_task_done(self, task) -> None:
         """Fires once per finished assignment (success, failure, or early
         return). Counts it and trips the recycle drain at the threshold."""
@@ -1718,6 +1836,9 @@ class _RunMixin:
             and self._jobs_done >= self._recycle_after
         ):
             self._draining = True
+            self._drain_reason = (
+                f"recycle after {self._jobs_done} job(s)"
+            )
             _logger.info(
                 f"[worker {self.worker_id}] recycle threshold reached "
                 f"({self._jobs_done} >= {self._recycle_after}); draining "

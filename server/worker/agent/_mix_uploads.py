@@ -342,7 +342,33 @@ class _UploadsMixin:
     def _minio_direct_enabled(self) -> bool:
         """Gate for the worker->MinIO-direct asset upload (off by default).
         Flip ``PAPRIKA_WORKER_MINIO_DIRECT=1`` to enable; the path always falls
-        back to the legacy bytes-through-hub POST on any failure."""
+        back to the legacy bytes-through-hub POST on any failure.
+
+        Default was flipped ON on 2026-08-16 and reverted the same day --
+        DON'T flip it again without fixing the request amplification first.
+        The reasoning for turning it on was that asset bytes through the hub
+        are ~45% of hub load, so moving them off should free the hub. What it
+        actually did was double the hub's asset REQUEST count: the legacy path
+        is one POST per asset, while the direct path still calls the hub twice
+        (presign, then complete) and only the bytes bypass it. Measured on one
+        hub over 5 minutes with the fleet at ~210 workers:
+
+            9,697 POST /jobs/{id}/assets/presign
+            8,909 POST /jobs/{id}/assets/complete
+              785 POST /jobs/{id}/assets      (legacy fallback + oversize)
+
+        The hub was request-bound, not byte-bound. Worker->hub completion
+        latency (see server/hub/_complete_latency.py) went from a p50 of
+        ~0.02-0.3s right after the flip to 28-38s on four of seven hubs two
+        hours later, p90 100-107s, and job wall time roughly doubled
+        (non-video p50 24.3s -> 38.4s). Object storage was healthy throughout
+        (tiers at 43% / 35%, no spill), so this was the hub's per-worker
+        message queue backing up behind the extra HTTP traffic.
+
+        Making this a win needs the round trips gone, not just the bytes:
+        presign in bulk at dispatch (or derive the key worker-side from an
+        already-shared secret) and batch the completes, so a job costs O(1)
+        hub requests instead of O(assets)."""
         return (os.environ.get("PAPRIKA_WORKER_MINIO_DIRECT") or "").strip().lower() in (
             "1", "true", "yes", "on",
         )
