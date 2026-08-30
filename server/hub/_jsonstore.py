@@ -316,10 +316,13 @@ class TieredJsonRecordRegistry(Generic[T]):
                     pass
         return removed
 
-    def _write(self, rec: T) -> None:
+    def _write(self, rec: T, *, durable: bool = True) -> None:
+        """Persist ``rec``. ``durable=False`` skips the fsync -- see
+        :func:`atomic_write_json` for when that is the right choice."""
         atomic_write_json(
             self._path(self._key_of(rec), self._tier_of(rec)),
             self._to_json(rec),
+            durable=durable,
         )
 
 

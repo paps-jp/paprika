@@ -209,3 +209,33 @@ def test_operator_host_edits_stay_durable():
         "routes/hosts.py is the operator API -- it must rely on the durable "
         "default, not opt out"
     )
+
+
+# ── tiered registries (skills / conventions) ─────────────────────────────────
+# The hub's boot restore also mirrors these, and they were still fsync-rewriting
+# every record on every start (py-spy: 18/20 samples in ``_jsonstore.py:322``'s
+# write path). Adding durable=False at the restore call site without widening
+# the registry signature raises TypeError at startup and kills every hub, so
+# pin both halves.
+
+def test_tiered_write_accepts_durable():
+    src = _src("server", "hub", "_jsonstore.py")
+    body = src.split("class TieredJsonRecordRegistry", 1)[1]
+    assert "def _write(self, rec: T, *, durable: bool = True)" in body
+    assert "durable=durable" in body
+
+
+@pytest.mark.parametrize("mod", ["skills", "conventions"])
+def test_tiered_registry_upsert_accepts_durable(mod):
+    """restore_* passes durable=False -- the signature must accept it."""
+    src = _src("server", "hub", f"{mod}.py")
+    body = src.split("    def upsert(", 1)[1].split("\n    def ", 1)[0]
+    assert "durable: bool = True" in body, f"{mod}.upsert must accept durable"
+    assert "self._write(rec, durable=durable)" in body
+
+
+@pytest.mark.parametrize("fn", ["restore_skills", "restore_conventions"])
+def test_tiered_restore_is_not_durable(fn):
+    src = _src("server", "hub", "mariadb.py")
+    body = src.split(f"async def {fn}(", 1)[1].split("\nasync def ", 1)[0]
+    assert "durable=False" in body, f"{fn} must not fsync (MariaDB is the source)"

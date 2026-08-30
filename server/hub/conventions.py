@@ -173,6 +173,7 @@ class ConventionRegistry(TieredJsonRecordRegistry[ConventionRecord]):
         tags: list[str] | None = None,
         extracted_from: list[str] | None = None,
         tier: ConventionTier = "auto",
+        durable: bool = True,
     ) -> ConventionRecord:
         slug = normalise_slug(slug)
         if not slug:
@@ -203,7 +204,7 @@ class ConventionRegistry(TieredJsonRecordRegistry[ConventionRecord]):
             updated_at=now,
             last_used_at=(existing.last_used_at if existing else None),
         )
-        self._write(rec)
+        self._write(rec, durable=durable)
         return rec
 
     def promote(self, slug: str) -> ConventionRecord | None:

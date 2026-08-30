@@ -2195,6 +2195,7 @@ async def restore_skills(pool: Any, skill_registry: Any) -> int:
                 auto_extracted=bool(row[8]),
                 extracted_from=json.loads(row[9]) if row[9] else [],
                 tier=row[1] or "auto",
+                durable=False,  # MariaDB が正。キャッシュを fsync する意味は無い
             )
             restored += 1
         except Exception as e:
@@ -2267,6 +2268,7 @@ async def restore_conventions(pool: Any, convention_registry: Any) -> int:
                 tags=json.loads(row[8]) if row[8] else [],
                 extracted_from=json.loads(row[9]) if row[9] else [],
                 tier=row[1] or "auto",
+                durable=False,  # MariaDB が正。キャッシュを fsync する意味は無い
             )
             restored += 1
         except Exception as e:

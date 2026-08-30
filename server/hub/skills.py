@@ -162,6 +162,7 @@ class SkillRegistry(TieredJsonRecordRegistry[SkillRecord]):
         auto_extracted: bool = True,
         extracted_from: list[str] | None = None,
         tier: SkillTier = "auto",
+        durable: bool = True,
     ) -> SkillRecord:
         slug = normalise_slug(slug)
         if not slug:
@@ -191,7 +192,7 @@ class SkillRegistry(TieredJsonRecordRegistry[SkillRecord]):
             updated_at=now,
             last_used_at=(existing.last_used_at if existing else None),
         )
-        self._write(rec)
+        self._write(rec, durable=durable)
         return rec
 
     def promote(self, slug: str) -> SkillRecord | None:
