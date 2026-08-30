@@ -7,7 +7,20 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import re
 from pathlib import Path
+
+# multipart をハンドラ内でストリーム解析するために、 Starlette が内部で使う
+# のと同じ parser を直接使う。 配布によって python_multipart / multipart の
+# 二通りの名前があるので、 Starlette 自身と同じ順で探す。
+try:
+    from python_multipart.multipart import MultipartParser, parse_options_header
+except ImportError:  # pragma: no cover - 古い配布名
+    try:
+        from multipart.multipart import MultipartParser, parse_options_header
+    except ImportError:  # pragma: no cover - 未インストール
+        MultipartParser = None  # type: ignore[assignment]
+        parse_options_header = None  # type: ignore[assignment]
 from fastapi import APIRouter, File, Form, HTTPException, Request, UploadFile
 from fastapi.responses import FileResponse, HTMLResponse, StreamingResponse
 from server.hub._state import config, get_storage_dir, state
@@ -189,18 +202,158 @@ async def take_job_screenshot_legacy(
     )
 
 
+# --------------------------------------------------------------------------
+# ストリーミング multipart 受信 (2026-08-31)
+# --------------------------------------------------------------------------
+# FastAPI の ``file: UploadFile = File(...)`` は Starlette の
+# ``SpooledTemporaryFile(max_size=1MB)`` に載る。 1 MB を超えるボディは
+# **ハンドラが呼ばれる前に全量が /tmp へ書き出される**。 コンテナの /tmp は
+# overlayfs = CT のディスクなので、 worker が上げてくる動画 (実測で 1 本
+# 660 MB / 126 MB / 116 MB) がまるごと SSD に落ち、 そのあとハンドラが
+# assets/*.part へもう一度書く —— **同じバイト列を 2 回書いて、 1 回目は
+# 読み返して捨てるだけ**だった。
+#
+# 2026-08-31 実測 (hub-903, 75 秒, 書き込み fd のみサンプリング):
+#     /tmp スプール           1,798 MB  76.8%
+#     assets/*.part (保存)      528 MB  22.6%
+#     その他                     14 MB   0.6%
+# base の書き込みは 400 MB/s に達し、 コンシューマ SSD (pve/data =
+# Predator GM7, DRAM-less) が util 91-100% / await 38.9 ms で飽和していた。
+# その結果ハブのイベントループが fsync 待ちで数秒単位に固まり、 POST /jobs の
+# 内訳が capacity=11,372 ms、 stats_async の 1.5 秒 wait_for が発火して fleet
+# 集約が local-only へ縮退する (Workers が 8 <-> 270 で振れる) —— 一連の症状の
+# 出どころがこの二重書き込みだった。
+#
+# ここでは python_multipart のコールバック API でボディを 1 パス舐め、
+# **file パートだけを直接 assets/*.part へ流す**。 非ファイルフィールド
+# (asset_name / secret / source_url / mime / page_url) は小さいのでメモリに
+# 溜める (合計 _MAX_FIELD_BYTES で頭打ち)。 スプールが消えるので SSD への
+# 書き込みは保存分だけになる。
+#
+# 注意: multipart はフィールド順を保証しない。 httpx は data -> files の順に
+# 送るので実運用では file パート開始時点で asset_name が既に読めているが、
+# **順序に依存しない**ように最終名は解析完了後に決め、 .part からの rename で
+# 確定させる (.part 中の暫定名が見えても実害はない)。
+
+_MAX_FIELD_BYTES = 1 << 20        # 非ファイルフィールドの合計上限
+
+
+class _MultipartSink:
+    """multipart を舐めて file パートだけディスクへ流すためのシンク。
+
+    python_multipart のコールバックは同期関数なので、 ここではバイト列を
+    溜めるだけにして、 実際の write は呼び出し側が 1 ネットワークチャンク
+    につき 1 回 ``asyncio.to_thread`` でまとめて行う。 旧実装の「ディスク
+    書き込みはイベントループの外」という性質を保ちつつ、 溜まる量は
+    1 チャンク分で頭打ちになる。
+    """
+
+    def __init__(self) -> None:
+        self.fields: dict[str, str] = {}
+        self.filename: str | None = None
+        self.file_seen = False
+        self.pending: list[bytes] = []
+        self.pending_n = 0
+        self._field_bytes = 0
+        self._hdr_name = b""
+        self._hdr_value = b""
+        self._disposition = b""
+        self._part_name: str | None = None
+        self._part_is_file = False
+        self._buf = bytearray()
+
+    # ---- python_multipart コールバック (すべて同期) ----
+    def on_part_begin(self) -> None:
+        self._hdr_name = b""
+        self._hdr_value = b""
+        self._disposition = b""
+        self._part_name = None
+        self._part_is_file = False
+        self._buf = bytearray()
+
+    def on_header_field(self, data: bytes, start: int, end: int) -> None:
+        self._hdr_name += data[start:end]
+
+    def on_header_value(self, data: bytes, start: int, end: int) -> None:
+        self._hdr_value += data[start:end]
+
+    def on_header_end(self) -> None:
+        if self._hdr_name.lower() == b"content-disposition":
+            self._disposition = self._hdr_value
+        self._hdr_name = b""
+        self._hdr_value = b""
+
+    def on_headers_finished(self) -> None:
+        _, opts = parse_options_header(self._disposition)
+        raw_name = opts.get(b"name")
+        self._part_name = (
+            raw_name.decode("utf-8", "replace") if raw_name else None
+        )
+        # Starlette と同じ判定: filename が「有る」ならファイルパート
+        # (filename="" の空アップロードも含む)。
+        raw_fn = opts.get(b"filename")
+        self._part_is_file = raw_fn is not None
+        if self._part_is_file:
+            self.file_seen = True
+            self.filename = raw_fn.decode("utf-8", "replace")
+
+    def on_part_data(self, data: bytes, start: int, end: int) -> None:
+        if self._part_is_file:
+            blob = bytes(data[start:end])
+            self.pending.append(blob)
+            self.pending_n += len(blob)
+            return
+        self._field_bytes += end - start
+        if self._field_bytes > _MAX_FIELD_BYTES:
+            # 巨大な非ファイルフィールドでメモリを食わせない。
+            raise ValueError("multipart form fields too large")
+        self._buf.extend(data[start:end])
+
+    def on_part_end(self) -> None:
+        if not self._part_is_file and self._part_name:
+            self.fields[self._part_name] = self._buf.decode("utf-8", "replace")
+        self._buf = bytearray()
+
+    def on_end(self) -> None:
+        return None
+
+    def callbacks(self) -> dict:
+        return {
+            "on_part_begin": self.on_part_begin,
+            "on_part_data": self.on_part_data,
+            "on_part_end": self.on_part_end,
+            "on_header_field": self.on_header_field,
+            "on_header_value": self.on_header_value,
+            "on_header_end": self.on_header_end,
+            "on_headers_finished": self.on_headers_finished,
+            "on_end": self.on_end,
+        }
+
+    def take(self) -> bytes:
+        """溜まったファイルバイトを取り出して空にする。"""
+        if not self.pending:
+            return b""
+        blob = b"".join(self.pending)
+        self.pending.clear()
+        self.pending_n = 0
+        return blob
+
+
+def _sanitise_asset_name(raw: str) -> str:
+    return re.sub(r'[<>:"/\\|?*]', "_", raw)[:180]
+
+
 @router.post("/jobs/{job_id}/assets")
-async def upload_asset(
-    job_id: str,
-    file: UploadFile = File(...),
-    asset_name: str | None = Form(None),
-    secret: str | None = Form(None),
-    source_url: str | None = Form(None),
-    mime: str | None = Form(None),
-    page_url: str | None = Form(None),
-):
+async def upload_asset(job_id: str, request: Request) -> dict:
     """Receive a file uploaded by a worker. Stored under
     data/jobs/{job_id}/assets/{asset_name}.
+
+    The body is parsed as a STREAM (see the comment above
+    ``_MultipartSink``): the file part goes straight to
+    ``assets/<name>.part`` and is renamed into place, so the bytes hit the
+    disk exactly once. The previous ``UploadFile = File(...)`` signature
+    made Starlette spool the whole body to /tmp first, which doubled every
+    asset write onto the hub's SSD.
 
     Optional metadata captured by the session-mode passive listener:
       - ``source_url``: the URL the browser fetched this resource from
@@ -213,8 +366,15 @@ async def upload_asset(
     When provided, persisted to a JSON sidecar
     (``assets/.meta/<name>.json``) the gallery endpoint reads back.
     """
-    if config.worker_secret and secret != config.worker_secret:
-        raise HTTPException(401, "bad secret")
+    if parse_options_header is None:
+        raise HTTPException(500, "python-multipart is not installed")
+    _mt, _opts = parse_options_header(request.headers.get("content-type") or "")
+    if _mt.lower() != b"multipart/form-data":
+        raise HTTPException(400, "expected multipart/form-data")
+    boundary = _opts.get(b"boundary")
+    if not boundary:
+        raise HTTPException(400, "multipart boundary missing")
+
     # Soft 404 via the shared helper: accept session-routed
     # parent_job_ids whose assets dir create_session pre-made, so raw
     # cli.session(parent_job_id=...) callers (e.g. an external crawler
@@ -223,48 +383,105 @@ async def upload_asset(
     # first POSTing a /jobs entry. The 404 still fires for unknown ids.
     await _soft_resolve_job(job_id, require_subdir="assets")
 
-    name = asset_name or file.filename or "unnamed"
-    # sanitize
-    import re
-
-    name = re.sub(r'[<>:"/\\|?*]', "_", name)[:180]
-
     target_dir = get_storage_dir() / job_id / "assets"
     target_dir.mkdir(parents=True, exist_ok=True)
-    target = target_dir / name
 
-    # Stream the upload to disk in 1 MiB chunks instead of loading
-    # the entire body into memory via ``await file.read()``. For a
-    # large video (1+ GB iframe-mp4 captured by the passive m3u8 /
-    # mp4 listener) the buffered form pushed the hub container past
-    # its 2 GB cgroup memory cap and tripped the OOM killer mid-
-    # upload -- the file was lost AND every other in-flight session
-    # died because the hub process was replaced. Streaming write keeps
-    # peak memory bounded at chunk size regardless of body length.
-    # Use a .part suffix + atomic rename so readers never see a half-
-    # written file under the final name.
-    part = target.with_suffix(target.suffix + ".part")
+    sink = _MultipartSink()
+    parser = MultipartParser(boundary, sink.callbacks())
+
+    def _secret_rejected() -> bool:
+        """secret が既に届いていて、 かつ違うときだけ True。
+
+        まだ届いていない (= file パートが先に来た) 場合は判定を保留し、
+        解析完了後にもう一度見る。"""
+        if not config.worker_secret:
+            return False
+        got = sink.fields.get("secret")
+        return got is not None and got != config.worker_secret
+
+    out = None
+    part: Path | None = None
     written = 0
+    target: Path | None = None
     try:
-        with open(part, "wb") as out:
-            while True:
-                chunk = await file.read(1024 * 1024)  # 1 MiB
-                if not chunk:
-                    break
-                # Disk write OFF the event loop: a 1 GB video = ~1000 sync
-                # writes that otherwise block the loop between the async reads
-                # (py-spy 2026-06-08). One thread hop per 1 MiB chunk; the writes
-                # stay sequential (we await each before the next read).
-                await asyncio.to_thread(out.write, chunk)
-                written += len(chunk)
-        part.replace(target)
+        try:
+            async for chunk in request.stream():
+                if chunk:
+                    parser.write(chunk)
+                if sink.pending_n:
+                    if out is None:
+                        if _secret_rejected():
+                            raise HTTPException(401, "bad secret")
+                        # 一時ファイルは **リクエストごとに一意な名前**にする。
+                        # 同じ job へ同名アセットが並行で上がってくることが
+                        # あり (2026-08-31 実測 5,000 件に 1-7 件)、 固定の
+                        # "<name>.part" を共有すると
+                        #   * 先に終わった方が rename した瞬間、 後続の
+                        #     part.replace() が FileNotFoundError で 500
+                        #   * それ以前に、 2 本が同じファイルへ書くので
+                        #     バイト列が混ざって壊れる
+                        # という 2 つの事故になる。 旧実装も同じ固定名だったが、
+                        # Starlette が先に全量スプールしていたぶん実際に
+                        # ディスクへ書いている区間が短く、 表に出にくかった。
+                        # 最終名は解析完了後に確定させ rename でそこへ移すので、
+                        # フィールド順にも依存しない。
+                        part = target_dir / f".upload-{uuid.uuid4().hex}.part"
+                        out = open(part, "wb")
+                    blob = sink.take()
+                    # Disk write OFF the event loop: a 1 GB video = ~1000 sync
+                    # writes that otherwise block the loop between the async
+                    # reads (py-spy 2026-06-08). One thread hop per network
+                    # chunk; the writes stay sequential (we await each before
+                    # reading the next chunk).
+                    await asyncio.to_thread(out.write, blob)
+                    written += len(blob)
+            parser.finalize()
+            if sink.pending_n and out is not None:
+                blob = sink.take()
+                await asyncio.to_thread(out.write, blob)
+                written += len(blob)
+        except HTTPException:
+            raise
+        except ValueError as e:
+            raise HTTPException(413, str(e)) from e
+        except Exception as e:  # noqa: BLE001 -- 壊れた multipart / 途中切断
+            raise HTTPException(400, f"malformed multipart body: {e}") from e
+
+        if config.worker_secret and sink.fields.get("secret") != config.worker_secret:
+            raise HTTPException(401, "bad secret")
+        if not sink.file_seen:
+            raise HTTPException(422, "missing 'file' part")
+
+        name = _sanitise_asset_name(
+            sink.fields.get("asset_name") or sink.filename or "unnamed"
+        )
+        target = target_dir / name
+        if out is not None:
+            out.close()
+            out = None
+            # .part -> 最終名は atomic rename。 readers が半端なファイルを
+            # 最終名で見ることは無い (旧実装と同じ保証)。
+            part.replace(target)
+            part = None
+        else:
+            # filename は有るが中身 0 バイトだったケース。
+            await asyncio.to_thread(target.write_bytes, b"")
     finally:
-        # If the upload was interrupted, .part may still exist.
-        if part.exists():
+        if out is not None:
+            try:
+                out.close()
+            except OSError:
+                pass
+        # 中断された場合、 .part が残っていれば消す。
+        if part is not None and part.exists():
             try:
                 part.unlink()
             except OSError:
                 pass
+
+    source_url = sink.fields.get("source_url") or None
+    mime = sink.fields.get("mime") or None
+    page_url = sink.fields.get("page_url") or None
 
     # Sidecar metadata. Best-effort -- failure to write the .meta JSON
     # must not fail the asset upload (the file itself is the important
@@ -277,9 +494,9 @@ async def upload_asset(
                 json.dumps(
                     {
                         "name": name,
-                        "source_url": source_url or None,
-                        "page_url": page_url or None,
-                        "mime": mime or None,
+                        "source_url": source_url,
+                        "page_url": page_url,
+                        "mime": mime,
                         "size": written,
                     },
                     ensure_ascii=False,
