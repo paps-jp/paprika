@@ -165,3 +165,47 @@ def test_touch_login_does_not_fsync():
            / "server" / "hub" / "hosts.py").read_text(encoding="utf-8")
     body = src.split("def touch_login(", 1)[1].split("\n    def ", 1)[0]
     assert "self._write(rec, durable=False)" in body
+
+
+# ── the real hot path: automatic cookie saves ────────────────────────────────
+# The first cut of this fix patched ``touch_used`` and missed the actual
+# writer. py-spy on the patched hub showed the loop still in ``os.fsync``,
+# called from ``HostRegistry.upsert`` -- the per-job cookie harvest
+# (``routes/jobs/_base.py``) and the per-session auto-save
+# (``routes/sessions/_base.py``). Those are the ones that fire per crawl.
+
+def _src(*parts):
+    return (Path(__file__).resolve().parents[1].joinpath(*parts)
+            .read_text(encoding="utf-8"))
+
+
+def test_upsert_accepts_durable_flag():
+    body = _src("server", "hub", "hosts.py").split("def upsert(", 1)[1]
+    sig = body.split(") -> HostRecord:", 1)[0]
+    assert "durable: bool = True" in sig, "upsert must expose durable (default True)"
+    assert "self._write(rec, durable=durable)" in body.split("\n    def ", 1)[0]
+
+
+def test_per_job_cookie_save_is_not_durable():
+    """Once per job, rewriting ~600 KB. An fsync here stalls the whole hub."""
+    src = _src("server", "hub", "routes", "jobs", "_base.py")
+    assert "state.hosts.upsert(host, merged, durable=False)" in src
+
+
+def test_per_session_cookie_save_is_not_durable():
+    src = _src("server", "hub", "routes", "sessions", "_base.py")
+    block = src.split("state.hosts.upsert(", 1)[1].split(")", 1)[0]
+    assert "durable=False" in block
+
+
+def test_operator_host_edits_stay_durable():
+    """The operator's own ``PUT /hosts/{host}`` must keep the fsync.
+
+    Losing an operator's cookie paste to a crash is a real loss; losing an
+    auto-harvested refresh is not. This is the line that keeps the two apart.
+    """
+    src = _src("server", "hub", "routes", "hosts.py")
+    assert "durable" not in src, (
+        "routes/hosts.py is the operator API -- it must rely on the durable "
+        "default, not opt out"
+    )

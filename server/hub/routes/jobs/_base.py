@@ -391,7 +391,11 @@ async def _preflight_cf_plugin(url: str, job_id: str) -> list[str]:
         existing_records = list(existing.cookies) if existing and existing.cookies else []
         new_names = {c["name"] for c in cookie_records}
         merged = [c for c in existing_records if c.get("name") not in new_names] + cookie_records
-        state.hosts.upsert(host, merged)
+        # durable=False: this fires once per job and rewrites the whole host
+        # record (cookie jar, ~600 KB). An fsync here blocks the hub's event
+        # loop -- and with it the admin UI and POST /jobs. A crash costs at
+        # most the newest cookie refresh, which the next job re-harvests.
+        state.hosts.upsert(host, merged, durable=False)
         log_lines.append(
             f"    merged into HostRecord ({host}): "
             f"{', '.join(sorted(new_names))}"

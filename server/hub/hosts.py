@@ -577,7 +577,17 @@ class HostRegistry(JsonRecordRegistry[HostRecord]):
         shared: bool | None = None,
         excluded: bool | None = None,
         download_video: bool | None = None,
+        durable: bool = True,
     ) -> HostRecord:
+        """``durable=False`` skips the fsync -- see :func:`atomic_write_json`.
+
+        Pass it from the **automatic** save paths (per-job / per-session cookie
+        harvest), never from an operator edit. Those fire once per crawl and
+        rewrite the host's whole record (cookie jar included, ~600 KB observed);
+        fsync-ing that on the hub's asyncio event loop stalls the admin UI and
+        ``POST /jobs`` along with it (2026-08-30: py-spy caught the loop here in
+        28-60% of samples; admin UI p90 12.7s under load vs 0.02s idle).
+        """
         h = _normalise_host(host)
         if not h:
             raise ValueError("host cannot be empty")
@@ -679,7 +689,7 @@ class HostRegistry(JsonRecordRegistry[HostRecord]):
             excluded=merged_excluded,
             download_video=merged_download_video,
         )
-        self._write(rec)
+        self._write(rec, durable=durable)
         return rec
 
     def append_recipe(self, host: str, recipe: dict) -> HostRecord:

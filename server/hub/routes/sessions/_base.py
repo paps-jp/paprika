@@ -394,6 +394,9 @@ async def _auto_save_session_cookies(info) -> dict | None:
             host=host,
             cookies=cookies_to_save,
             notes=notes,
+            # Same reasoning as the per-job harvest: an automatic save must
+            # not fsync on the event loop. Operator edits keep durable=True.
+            durable=False,
         )
     except Exception:
         log.warning(
