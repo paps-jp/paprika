@@ -31,18 +31,38 @@ def atomic_write_json(
     *,
     indent: int = 2,
     ensure_ascii: bool = False,
+    durable: bool = True,
 ) -> None:
     """Atomically write ``data`` as JSON to ``path``.
 
-    The bytes are written to a sibling ``*.tmp`` file, flushed +
-    ``fsync``-ed, then ``os.replace``-d over the target. ``os.replace``
-    is atomic on the same filesystem on both POSIX and Windows, so a
-    reader (or a crash) never observes a half-written record -- it sees
-    either the old file or the complete new one. The parent directory is
-    created if missing.
+    The bytes are written to a sibling ``*.tmp`` file then ``os.replace``-d
+    over the target. ``os.replace`` is atomic on the same filesystem on both
+    POSIX and Windows, so a reader (or a crash) never observes a half-written
+    record -- it sees either the old file or the complete new one. The parent
+    directory is created if missing.
 
     Use this for every config-registry write so a power loss / OOM-kill
     mid-save can't corrupt the operator's hosts / engines / settings.
+
+    ``durable`` (default True) additionally ``fsync``-s the temp file before
+    the rename, so the new bytes survive a power loss. **Pass False for
+    high-frequency bookkeeping writes** (usage timestamps and the like):
+
+      - ``fsync`` is a *blocking* syscall. These registries are written from
+        the hub's asyncio event loop, so every fsync stalls the whole hub --
+        the admin UI, ``POST /jobs`` and asset uploads all share that one
+        loop. 2026-08-30 measurement: with jobs flowing, py-spy caught the
+        event loop inside this function in 28-60% of samples across three
+        hubs, and the admin UI went from 0.02s (idle) to p90 12.7s / max
+        26.6s. Stop the job flow and the same hubs go 25/25 samples idle.
+      - Atomicity does NOT depend on fsync. ``os.replace`` still guarantees
+        readers see the old or the new file, never a mix. Dropping fsync only
+        means a power loss may lose the *most recent* update and leave the
+        previous complete record in place -- which is the right trade for a
+        ``last_used_at`` bump, and the wrong one for an operator's edit.
+
+    So: operator/config writes keep ``durable=True``; per-request telemetry
+    passes ``durable=False``.
     """
     p = Path(path)
     p.parent.mkdir(parents=True, exist_ok=True)
@@ -52,7 +72,8 @@ def atomic_write_json(
         with open(tmp, "w", encoding="utf-8") as f:
             f.write(text)
             f.flush()
-            os.fsync(f.fileno())
+            if durable:
+                os.fsync(f.fileno())
         os.replace(tmp, p)
     except Exception:
         # Best-effort cleanup of the temp file so a failed write doesn't
@@ -170,8 +191,11 @@ class JsonRecordRegistry(Generic[T]):
         except Exception:
             return False
 
-    def _write(self, rec: T) -> None:
-        atomic_write_json(self._path(self._key_of(rec)), self._to_json(rec))
+    def _write(self, rec: T, *, durable: bool = True) -> None:
+        """Persist ``rec``. ``durable=False`` skips the fsync -- see
+        :func:`atomic_write_json` for when that is the right choice."""
+        atomic_write_json(self._path(self._key_of(rec)), self._to_json(rec),
+                          durable=durable)
 
 
 class TieredJsonRecordRegistry(Generic[T]):

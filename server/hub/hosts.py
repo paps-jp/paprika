@@ -746,12 +746,23 @@ class HostRegistry(JsonRecordRegistry[HostRecord]):
     def touch_used(self, host: str) -> HostRecord | None:
         """Bump ``last_used_at`` to now. Returns the updated record,
         or None if no record exists for ``host``. Called by the hub
-        when a session starts that auto-injected this host's cookies."""
+        when a session starts that auto-injected this host's cookies.
+
+        Written **without fsync** (``durable=False``): this fires once per
+        crawl session, and the record it rewrites carries the host's whole
+        cookie jar (~600 KB observed). Paying a blocking fsync for a
+        timestamp bump stalled the hub's event loop -- and with it the admin
+        UI and ``POST /jobs`` -- for a measurable fraction of the time
+        (2026-08-30: py-spy caught the loop in ``atomic_write_json`` in
+        28-60% of samples; admin UI p90 12.7s under load vs 0.02s idle).
+        Losing the newest ``last_used_at`` in a crash costs nothing; the
+        previous complete record survives, and the next session re-bumps it.
+        """
         rec = self.get(host)
         if rec is None:
             return None
         rec.last_used_at = _utcnow_iso()
-        self._write(rec)
+        self._write(rec, durable=False)
         return rec
 
     def touch_login(self, host: str) -> HostRecord | None:
@@ -762,7 +773,9 @@ class HostRegistry(JsonRecordRegistry[HostRecord]):
         if rec is None:
             return None
         rec.last_login_at = _utcnow_iso()
-        self._write(rec)
+        # Same reasoning as touch_used: a timestamp bump must not fsync on
+        # the event loop. A lost bump only costs one redundant re-login.
+        self._write(rec, durable=False)
         return rec
 
     def is_login_stale(self, host: str) -> bool:
