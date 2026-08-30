@@ -18,6 +18,7 @@ triggers a migration or the schema endpoint.
 
 from __future__ import annotations
 
+import asyncio
 import hashlib
 import json
 import logging
@@ -883,6 +884,50 @@ def _json_dumps(v: Any) -> str | None:
     return json.dumps(v, ensure_ascii=False, default=str)
 
 
+def _dt_to_iso_z(v: Any) -> str | None:
+    """A DATETIME(3) column value as the ISO+Z string the file registries
+    store (``hosts._utcnow_iso`` shape). None/empty stays None.
+
+    Normalising here is what keeps the disk mirror byte-stable across
+    restarts -- an un-normalised value would differ from what the registry
+    itself writes and make every restore look like a change."""
+    dt = _parse_dt(v)
+    if dt is not None:
+        return dt.isoformat() + "Z"
+    s = "" if v is None else str(v).strip()
+    return s or None
+
+
+async def _existing_keys(
+    pool: Any, table: str, col: str, keys: list[str], *, chunk: int = 1000,
+) -> set[str]:
+    """Which of ``keys`` already exist in ``table``.``col``.
+
+    The startup auto-migrate re-pushes every source row with INSERT IGNORE,
+    and on a steady-state fleet essentially all of them collide. aiomysql
+    emits a Python warning for each duplicate, which costs an extra
+    ``SHOW WARNINGS`` round-trip per statement -- so the push degrades into
+    2xN serial round-trips against .20 (65k jobs => ~130k round-trips, ~70s
+    per hub start, x20 hubs). Selecting the existing keys up front collapses
+    that to N/chunk SELECTs and leaves only genuinely-new rows to insert.
+    """
+    found: set[str] = set()
+    if not keys:
+        return found
+    async with pool.acquire() as conn:
+        async with conn.cursor() as cur:
+            for i in range(0, len(keys), chunk):
+                batch = keys[i : i + chunk]
+                placeholders = ",".join(["%s"] * len(batch))
+                await cur.execute(
+                    f"SELECT `{col}` FROM `{table}` WHERE `{col}` IN ({placeholders})",
+                    tuple(batch),
+                )
+                for r in await cur.fetchall():
+                    found.add(r[0])
+    return found
+
+
 # ---------------------------------------------------------------------------
 # Migration: Jobs  (Redis → MariaDB)
 # ---------------------------------------------------------------------------
@@ -899,14 +944,26 @@ async def migrate_jobs(
     Returns ``{"migrated": N, "skipped": M, "errors": [...]}``
     where *skipped* counts rows that already existed (INSERT IGNORE).
     """
-    job_ids = await store.list_job_ids(offset=0, limit=0)
-    total = len(job_ids)
+    all_ids = await store.list_job_ids(offset=0, limit=0)
+    total = len(all_ids)
     migrated = 0
     skipped = 0
     errors: list[dict] = []
 
+    # Rows already in MariaDB are a no-op below (INSERT IGNORE affects 0 rows
+    # and the result+logs are skipped), so drop them before the loop instead
+    # of paying a duplicate-key round-trip each. See _existing_keys.
+    try:
+        already = await _existing_keys(pool, "jobs", "job_id", all_ids)
+    except Exception as e:
+        log.warning("migrate jobs: existing-id prefilter failed: %s", e)
+        already = set()
+    job_ids = [j for j in all_ids if j not in already]
+    skipped += len(all_ids) - len(job_ids)
+    pending = len(job_ids)
+
     BATCH = 50
-    for i in range(0, total, BATCH):
+    for i in range(0, pending, BATCH):
         batch_ids = job_ids[i : i + BATCH]
         async with pool.acquire() as conn:
             async with conn.cursor() as cur:
@@ -1004,12 +1061,12 @@ async def migrate_jobs(
                         log.warning("migrate job %s failed: %s", jid, e)
 
         if progress:
-            progress(min(i + BATCH, total), total)
+            progress(min(i + BATCH, pending), pending)
 
     # ---- Purge source data (Redis) after successful migration ----
     purged = 0
     if purge and not errors:
-        for jid in job_ids:
+        for jid in all_ids:
             try:
                 await store.delete_job(jid)
                 purged += 1
@@ -1047,9 +1104,23 @@ async def migrate_hosts(
     skipped = 0
     errors: list[dict] = []
 
+    # Startup runs this straight after restore_hosts, which already made the
+    # files an exact mirror of the table -- so without a prefilter every one
+    # of the ~8k rows is a duplicate-key round-trip. See _existing_keys.
+    try:
+        already = await _existing_keys(
+            pool, "hosts", "host",
+            [h for h in (getattr(r, "host", "") for r in all_hosts) if h],
+        )
+    except Exception as e:
+        log.warning("migrate hosts: existing-host prefilter failed: %s", e)
+        already = set()
+    pending_hosts = [r for r in all_hosts if getattr(r, "host", "") not in already]
+    skipped += total - len(pending_hosts)
+
     async with pool.acquire() as conn:
         async with conn.cursor() as cur:
-            for idx, rec in enumerate(all_hosts):
+            for idx, rec in enumerate(pending_hosts):
                 try:
                     d = asdict(rec) if hasattr(rec, "__dataclass_fields__") else rec
                     recipes = d.get("fetch_recipes", [])
@@ -1098,10 +1169,10 @@ async def migrate_hosts(
                     log.warning("migrate host %s failed: %s", host_name, e)
 
                 if progress and (idx + 1) % 50 == 0:
-                    progress(idx + 1, total)
+                    progress(idx + 1, len(pending_hosts))
 
     if progress:
-        progress(total, total)
+        progress(len(pending_hosts), len(pending_hosts))
 
     # ---- Purge source data (JSON files) after successful migration ----
     purged = 0
@@ -1227,9 +1298,20 @@ async def migrate_skills(
     skipped = 0
     errors: list[dict] = []
 
+    try:
+        already = await _existing_keys(
+            pool, "skills", "slug",
+            [s for s in (getattr(r, "slug", "") for r in all_skills) if s],
+        )
+    except Exception as e:
+        log.warning("migrate skills: existing-slug prefilter failed: %s", e)
+        already = set()
+    pending_skills = [r for r in all_skills if getattr(r, "slug", "") not in already]
+    skipped += total - len(pending_skills)
+
     async with pool.acquire() as conn:
         async with conn.cursor() as cur:
-            for rec in all_skills:
+            for rec in pending_skills:
                 try:
                     d = asdict(rec) if hasattr(rec, "__dataclass_fields__") else rec
                     await cur.execute(
@@ -1308,9 +1390,20 @@ async def migrate_conventions(
     skipped = 0
     errors: list[dict] = []
 
+    try:
+        already = await _existing_keys(
+            pool, "conventions", "slug",
+            [s for s in (getattr(r, "slug", "") for r in all_convs) if s],
+        )
+    except Exception as e:
+        log.warning("migrate conventions: existing-slug prefilter failed: %s", e)
+        already = set()
+    pending_convs = [r for r in all_convs if getattr(r, "slug", "") not in already]
+    skipped += total - len(pending_convs)
+
     async with pool.acquire() as conn:
         async with conn.cursor() as cur:
-            for rec in all_convs:
+            for rec in pending_convs:
                 try:
                     d = asdict(rec) if hasattr(rec, "__dataclass_fields__") else rec
                     await cur.execute(
@@ -1560,7 +1653,10 @@ async def restore_hosts(pool: Any, host_registry: Any) -> int:
     missing from MariaDB is removed from disk. See ``restore_engines``
     for the original rationale (phpMyAdmin / direct-SQL deletions
     need to survive a hub restart instead of being undone by the
-    file mirror)."""
+    file mirror).
+
+    The disk pass runs in a worker thread and only rewrites files whose
+    content actually differs -- see ``_restore_hosts_to_disk``."""
     async with pool.acquire() as conn:
         async with conn.cursor() as cur:
             await cur.execute(
@@ -1573,51 +1669,85 @@ async def restore_hosts(pool: Any, host_registry: Any) -> int:
             )
             rows = await cur.fetchall()
 
-    # Deletion reconciliation (runs BEFORE upsert pass so a row
-    # dropped from MariaDB doesn't survive on disk). Normalise both
-    # sides via the same ``_normalise_host`` the registry applies on
-    # write, so a "FOO.com" row in MariaDB doesn't false-positive
-    # against a "foo.com" file (delete-then-recreate cycle).
-    from server.hub.hosts import _normalise_host as _norm_host
-    mariadb_hosts = {_norm_host(row[0]) for row in rows if row[0]}
-    for existing in list(host_registry.list_all()):
-        if _norm_host(existing.host) not in mariadb_hosts:
-            try:
-                if host_registry.delete(existing.host):
-                    log.info(
-                        "restore: removed host %s (no longer in MariaDB)",
-                        existing.host,
-                    )
-            except Exception as e:
-                log.warning(
-                    "restore: removing host %s failed: %s", existing.host, e,
-                )
+    return await asyncio.to_thread(_restore_hosts_to_disk, rows, host_registry)
 
-    restored = 0
+
+def _restore_hosts_to_disk(rows: list, host_registry: Any) -> int:
+    """Bring ``{data_dir}/hosts/`` into line with the ``hosts`` rows.
+
+    Runs off the event loop (~8k records at prod scale) and is a no-op for
+    records that already match, which is nearly all of them on a restart.
+    The previous version routed every row through ``HostRegistry.upsert``,
+    which re-stamped ``updated_at`` with the current time -- so each of the
+    ~8k files was read, re-serialised and fsync-rewritten on every hub start
+    even though nothing had changed. That took 2-6 minutes on the event loop
+    and left /health unanswered for the duration. Mirroring MariaDB's own
+    timestamps instead makes the mirror byte-stable across restarts, so the
+    comparison below actually short-circuits.
+    """
+    from server.hub._jsonstore import atomic_write_json
+    from server.hub.hosts import HostRecord, _normalise_host as _norm_host
+
+    wanted: dict[str, dict] = {}
     for row in rows:
+        host = _norm_host(row[0] or "")
+        if not host:
+            continue
         try:
-            host_registry.upsert(
-                host=row[0],
-                cookies=json.loads(row[1]) if row[1] else [],
-                notes=row[2],
-                recrawl_patterns=json.loads(row[3]) if row[3] else [],
-                popup_policy=row[4] or "kill",
-                login_url=row[5],
-                login_goal=row[6],
-                login_check=row[7],
-                login_refresh_ttl_s=row[8],
-                last_login_at=str(row[9]) if row[9] else None,
-                fetch_recipes=json.loads(row[10]) if row[10] else [],
+            wanted[host] = HostRecord.from_json({
+                "host": host,
+                "cookies": json.loads(row[1]) if row[1] else [],
+                "notes": row[2],
+                "recrawl_patterns": json.loads(row[3]) if row[3] else [],
+                "popup_policy": row[4] or "kill",
+                "login_url": row[5],
+                "login_goal": row[6],
+                "login_check": row[7],
+                "login_refresh_ttl_s": row[8],
+                "last_login_at": _dt_to_iso_z(row[9]),
+                "fetch_recipes": json.loads(row[10]) if row[10] else [],
+                "created_at": _dt_to_iso_z(row[11]) or "",
+                "updated_at": _dt_to_iso_z(row[12]) or "",
+                "last_used_at": _dt_to_iso_z(row[13]),
                 # Phase 2b: MariaDB is SoT — mirror owner/shared onto the file
                 # registry so a restart / peer hub keeps tenant attribution.
-                owner_id=row[14] or "default",
-                shared=bool(row[15]) if row[15] is not None else True,
-                excluded=bool(row[16]) if len(row) > 16 and row[16] is not None else False,
-                download_video=bool(row[17]) if len(row) > 17 and row[17] is not None else False,
-            )
-            restored += 1
+                "owner_id": row[14] or "default",
+                "shared": bool(row[15]) if row[15] is not None else True,
+                "excluded": bool(row[16]) if row[16] is not None else False,
+                "download_video": bool(row[17]) if row[17] is not None else False,
+            }).to_json()
         except Exception as e:
             log.warning("restore host %s failed: %s", row[0], e)
+
+    # Deletion reconciliation (runs BEFORE the write pass so a row dropped
+    # from MariaDB doesn't survive on disk). Compared on the registry's own
+    # filename slug: a file at any other path is unreachable by
+    # HostRegistry.get() anyway, and it saves parsing every file twice.
+    keep = {host_registry._slug(h) for h in wanted}
+    for p in host_registry.dir.glob("*.json"):
+        if p.name.startswith("_") or p.stem in keep:
+            continue
+        try:
+            p.unlink()
+            log.info("restore: removed host %s (no longer in MariaDB)", p.stem)
+        except OSError as e:
+            log.warning("restore: removing host %s failed: %s", p.stem, e)
+
+    restored = 0
+    for host, target in wanted.items():
+        path = host_registry._path(host)
+        try:
+            if path.exists():
+                current = HostRecord.from_json(
+                    json.loads(path.read_text(encoding="utf-8"))
+                ).to_json()
+                if current == target:
+                    restored += 1
+                    continue
+            atomic_write_json(path, target)
+            restored += 1
+        except Exception as e:
+            log.warning("restore host %s failed: %s", host, e)
     return restored
 
 
