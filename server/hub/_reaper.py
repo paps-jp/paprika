@@ -816,6 +816,12 @@ async def _reconcile_stale_jobs() -> tuple[int, int]:
             await store.publish_log(jid, DONE_SENTINEL)
         except Exception:
             continue
+        # Retiring the ROW is not enough: the id may still be sitting on the
+        # redis pull list, and a worker that BLPOPs it puts the job straight
+        # back into flight -- which is half of the 2026-08-30 resurrection
+        # cycle (the other half was redrive having no upper age bound). Evict
+        # it so "failed" actually sticks.
+        await _evict_from_pull_queue(jid, "reconciler")
         queued_failed += 1
         log.info(
             "reconciler: failed stuck queued job %s (queued %.0f min)",
@@ -1354,6 +1360,23 @@ _last_retention_run_at: datetime | None = None
 _last_retention_deleted = 0
 
 
+async def _evict_from_pull_queue(jid: str, why: str) -> None:
+    """Drop a job id from the redis pull list. Best-effort and inert when pull
+    dispatch is off.
+
+    Every path that makes a job "no longer runnable" -- terminal state, row
+    deleted -- must call this. The list is the ONE piece of job state that
+    outlives the DB row, so an id left behind is a job that comes back from the
+    dead the moment a worker has a free lane."""
+    try:
+        from server.hub import _pull_queue
+
+        if _pull_queue.ENABLED:
+            await _pull_queue.remove(jid)
+    except Exception:
+        log.debug("%s: pull-list evict %s failed", why, jid, exc_info=True)
+
+
 async def _purge_job(store, jid: str, sem, minio_timeout: float) -> bool:
     """Purge one job everywhere: MinIO/S3 prefix + DB row (+CASCADE) + local
     cache dir. Returns True on a successful DB-row delete. A MinIO / FS hiccup
@@ -1380,6 +1403,14 @@ async def _purge_job(store, jid: str, sem, minio_timeout: float) -> bool:
                     # Includes TimeoutError: a hung tier can't stall the pass.
                     log.debug("retention: MinIO purge %s failed", jid, exc_info=True)
             await store.delete_job(jid)
+            # The row is gone, but the id can still be on the redis pull list
+            # (it outlives the row). A worker that pops it re-dispatches the
+            # job, and save_job_info -- an upsert -- re-INSERTS the row with its
+            # ORIGINAL created_at. That is how deleted May/June jobs kept
+            # reappearing at the head of the deletion frontier on 2026-08-30,
+            # walking it backwards from 08-22 to 05-30. Deleting without this
+            # is not a delete, it is a pause.
+            await _evict_from_pull_queue(jid, "retention")
             try:
                 d = get_storage_dir() / jid
                 if d.exists():

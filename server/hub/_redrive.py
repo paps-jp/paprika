@@ -102,6 +102,28 @@ _MIN_AGE_S = _num("PAPRIKA_QUEUE_REDRIVE_MIN_AGE_S", 5.0)
 # between assign + ack timeout -> guard task died with the process).
 _STALE_WORKER_ID_AGE_S = _num("PAPRIKA_QUEUE_REDRIVE_STALE_WORKER_AGE_S", 120.0)
 
+# UPPER age bound (incident 2026-08-30). Redrive had a MINIMUM age gate and no
+# maximum, so it re-dispatched a queued row forever -- including rows the stale
+# reconciler had already retired. The two loops then fought over the same ids:
+#
+#   redrive:    re-queued 9338a308e6f4 onto the pull list
+#   reconciler: failed stuck queued job 9338a308e6f4 (queued 97216 min)
+#   lifecycle:  [hub] job 9338a308e6f4 -> worker w51238
+#
+# 97,216 minutes = 67 days. 6,468 May/June rows were caught in that cycle,
+# 33 of them re-terminated every ~30s. Each turn burned a real worker lane,
+# uploaded assets for a job nobody wanted, and -- because save_job_info is an
+# upsert -- re-INSERTED the row with its ORIGINAL created_at right after
+# retention had deleted it. That is why the deletion frontier walked BACKWARDS
+# from 2026-08-22 to 2026-05-30 and why the 5-day backlog grew while retention
+# was running at full budget.
+#
+# Past the reconciler's queue deadline a job is ITS to retire, not ours to
+# re-dispatch -- it was going to be failed on the reconciler's next tick
+# regardless, so refusing to place it costs no throughput. Read from the same
+# env var the reconciler uses so the two thresholds cannot drift apart.
+_MAX_AGE_S = _num("PAPRIKA_QUEUE_TIMEOUT_S", 180.0)
+
 # POST /jobs ACK-watchdog timeout. Each successful inline assign spawns a
 # guard task that flips back to "stranded" if WorkerJobAccepted doesn't land
 # within this window. Should be SHORT (we want fast recovery) but generous
@@ -387,6 +409,7 @@ async def _redrive_pass() -> int:
     # oldest-first) and the stale reclaim mutates ``info`` per row -- both rare
     # and cheap. Produces the ``eligible`` list ready for dispatch.
     eligible: list = []
+    expired: list[str] = []
     for info in infos:  # oldest first
         try:
             age = (now - info.created_at).total_seconds() if info.created_at else 1e9
@@ -394,6 +417,15 @@ async def _redrive_pass() -> int:
             age = 1e9
         if age < _MIN_AGE_S:
             break  # sorted oldest-first -> everything after is younger too
+        if age >= _MAX_AGE_S:
+            # Reconciler's job (see _MAX_AGE_S). Drop it from the pull list on
+            # the way past: leaving the id there lets a worker BLPOP it after
+            # the reconciler failed the row, which restarts the whole cycle.
+            # ``continue``, NOT ``break`` -- the list is oldest-first, so the
+            # over-age rows are at the FRONT and the placeable ones are behind
+            # them.
+            expired.append(info.job_id)
+            continue
         if info.worker_id:
             # Two cases:
             #   * age < _STALE_WORKER_ID_AGE_S -> a live POST may still be in
@@ -429,6 +461,24 @@ async def _redrive_pass() -> int:
         eligible.append(info)
         if _MAX_PER_PASS and len(eligible) >= _MAX_PER_PASS:
             break
+
+    # Evict the over-age ids from the pull list in ONE batch, and log a single
+    # count rather than a line per job: the backlog that motivated this was
+    # 6,468 rows, which would be 6,468 log lines every 20s pass.
+    if expired:
+        from server.hub import _pull_queue as _pq
+        if _pq.ENABLED:
+            removed = 0
+            for _jid in expired:
+                try:
+                    removed += await _pq.remove(_jid)
+                except Exception:
+                    log.debug("redrive: pull-list evict %s failed", _jid, exc_info=True)
+            log.info(
+                "redrive: %d queued job(s) past the %.0fs queue deadline left to "
+                "the reconciler (%d pull-list entries evicted)",
+                len(expired), _MAX_AGE_S, removed,
+            )
 
     # ---- Phase 2 (bounded-parallel): dispatch eligible jobs concurrently -------
     # Each _redrive_dispatch_one reserves its OWN lane atomically (pick_worker,
