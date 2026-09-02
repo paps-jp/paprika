@@ -48,6 +48,7 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import os
 import time
 from typing import Any
 
@@ -63,8 +64,17 @@ _STATE_KEY = "paprika:spill:state"
 _SAMPLER_LOCK_KEY = "paprika:spill:sample_lock"
 _PIN_KEY_FMT = "paprika:spill:job:%s"
 
-# Pins outlive any realistic job; cheap to keep (one small string per job).
-_PIN_TTL_S = 7 * 24 * 3600
+# Pins only need to outlive ONE job's asset-upload window (minutes, hours for
+# a big video) -- 24h is already generous. The original 7-day TTL looked
+# "cheap to keep" per key but was not in aggregate: at ~490k jobs/day one pin
+# per job × 7 days ≈ 3.4M keys ≈ 92% of the ENTIRE Redis keyspace (measured
+# 2026-08-30, RANDOMKEY sample). That inflated the dataset to ~3GB, which made
+# every AOF rewrite a ~3GB disk burst every ~10 min on the shared thin pool,
+# delayed AOF fsync past redis's 2s write-block threshold (aof_delayed_fsync
+# 1009), and swapped the 8G .34 CT -- the root mass behind the 2026-08-30
+# fleet-view flap cascade. Existing 7d pins age out over the week after this
+# deploys; the steady-state keyspace lands around ~500k keys.
+_PIN_TTL_S = int(os.environ.get("PAPRIKA_SPILL_PIN_TTL_S") or 24 * 3600)
 
 # ---------------------------------------------------------------------------
 # Process-local snapshot of the shared decision.
