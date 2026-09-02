@@ -438,9 +438,27 @@ async def _redis_reattach_loop():
         interval = 30.0
     try:
         ping_timeout = float(
-            os.environ.get("PAPRIKA_REDIS_REATTACH_PING_TIMEOUT_S") or 2.0)
+            os.environ.get("PAPRIKA_REDIS_REATTACH_PING_TIMEOUT_S") or 5.0)
     except Exception:
-        ping_timeout = 2.0
+        ping_timeout = 5.0
+    # Consecutive probe misses required before the wired client is declared
+    # dead and rebuilt. A single missed ping is NOT proof of a dead socket:
+    # under fleet load Redis (single-threaded) stalls for seconds at a time
+    # (command bursts, bgsave fork CoW), and treating one slow PING as death
+    # made every hub aclose() its SHARED connection pool and rebuild -- a
+    # reattach flap loop that collapsed fleet views cluster-wide the moment
+    # crawl intake resumed (observed 2026-08-30: 8/20 hubs degraded, view
+    # local-only between rewires). A genuinely dead socket -- the hub-37/38
+    # case this probe exists for -- fails EVERY probe, so requiring three in
+    # a row only delays that detection to ~3 intervals (90s), still hours
+    # better than the original bug while never flapping on a busy-but-alive
+    # Redis.
+    try:
+        ping_fails_needed = max(1, int(
+            os.environ.get("PAPRIKA_REDIS_REATTACH_PING_FAILS") or 3))
+    except Exception:
+        ping_fails_needed = 3
+    ping_misses = 0
     while True:
         try:
             await asyncio.sleep(interval)
@@ -454,12 +472,23 @@ async def _redis_reattach_loop():
                 # same way it wedges the real callers.
                 try:
                     await asyncio.wait_for(r.ping(), timeout=ping_timeout)
+                    ping_misses = 0
                     continue  # genuinely healthy, nothing to do
                 except Exception as e:
+                    ping_misses += 1
+                    if ping_misses < ping_fails_needed:
+                        log.info(
+                            "redis reattach: liveness probe miss %d/%d (%s) "
+                            "-- tolerating (busy Redis?), not rebuilding yet",
+                            ping_misses, ping_fails_needed, e,
+                        )
+                        continue
+                    ping_misses = 0
                     log.warning(
-                        "redis reattach: wired client failed liveness probe "
-                        "(%s) -- rebuilding (fleet aggregation was likely "
-                        "silently degraded to local-only)", e,
+                        "redis reattach: wired client failed %d consecutive "
+                        "liveness probes (%s) -- rebuilding (fleet "
+                        "aggregation was likely silently degraded to "
+                        "local-only)", ping_fails_needed, e,
                     )
                     try:
                         await r.aclose()
