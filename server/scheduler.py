@@ -112,6 +112,46 @@ _IO_DISPATCH_DISABLED = (
 # poll across hubs with different local fleets. Kept <= WORKER_TTL so a genuinely
 # dead worker can't linger in the list longer than its heartbeat window.
 _KNOWN_WORKERS_CACHE_TTL_S = 60.0
+
+# SERVE-from-cache TTL for the cross-hub worker aggregation (distinct from the
+# 60s FALLBACK TTL above, which only kicks in when a fresh fetch fails). While
+# the last good aggregation is younger than this, stats_async() returns it
+# outright and skips the Redis fetch entirely. Rationale (2026-08-30): the
+# fetch costs Redis ~N+3 commands per call and is invoked from many places on
+# each hub (admin polls, capacity checks on POST /jobs, reapers) -- at crawl
+# peak the fleet aggregate hit ~30 fetches/s, the dominant load on the
+# single-threaded shared Redis. Freshness tolerance is easy: heartbeats
+# themselves are seconds apart, and dispatch already reserves in_flight
+# locally, so a <=2s-stale view changes nothing. Local (this-hub) workers are
+# never cached -- they come straight from self.connections either way.
+# 0 disables (= every call fetches, the pre-2026-08-30 behaviour).
+try:
+    _WORKERS_SERVE_CACHE_TTL_S = float(
+        os.environ.get("PAPRIKA_WORKERS_CACHE_TTL_S", "2.0") or 2.0)
+except (TypeError, ValueError):
+    _WORKERS_SERVE_CACHE_TTL_S = 2.0
+
+# How long the BACKGROUND cross-hub refresh may run before it is abandoned.
+# Generous on purpose: since 2026-08-30 this fetch no longer sits on the
+# request path, so a slow Redis or a stalled event loop costs freshness and
+# nothing else. The previous 1.5s ceiling was a request-path ``wait_for``,
+# which CANCELS the fetch -- during a stall episode that meant no fetch ever
+# completed, so the fallback cache aged out and the fleet view collapsed to
+# local connections only. See stats_async().
+try:
+    _KNOWN_WORKERS_FETCH_TIMEOUT_S = float(
+        os.environ.get("PAPRIKA_WORKERS_FETCH_TIMEOUT_S") or 20.0)
+except (TypeError, ValueError):
+    _KNOWN_WORKERS_FETCH_TIMEOUT_S = 20.0
+
+# Cold start only: how long the FIRST stats_async() after boot waits for the
+# initial aggregation instead of answering with this hub's local workers only.
+# Every later call is served from cache and never awaits Redis.
+try:
+    _KNOWN_WORKERS_COLD_WAIT_S = float(
+        os.environ.get("PAPRIKA_WORKERS_COLD_WAIT_S") or 2.5)
+except (TypeError, ValueError):
+    _KNOWN_WORKERS_COLD_WAIT_S = 2.5
 HEARTBEAT_INTERVAL = 10  # worker sends this often
 
 #: How long a fresh heartbeat outvotes a missing owner lease.
@@ -796,6 +836,9 @@ class WorkerRegistry:
         # _KNOWN_WORKERS_CACHE_TTL_S.
         self._last_known_extra: list[dict] | None = None
         self._last_known_extra_at: float = 0.0
+        # Single-flight handle for the background refresh of the above.
+        self._known_refresh_task: "asyncio.Task | None" = None
+        self._known_stale_warned = False
 
     # ----- registration ----------------------------------------------------
 
@@ -1686,7 +1729,10 @@ class WorkerRegistry:
         if self._r is None:
             return []
         try:
-            ids = await self._r.zrange(_k_index(), 0, -1)
+            # WITHSCORES: the score IS the last-heartbeat timestamp, so
+            # fetching it here removes the per-worker ZSCORE from the batch
+            # below (272 commands at prod fleet size).
+            ids_scores = await self._r.zrange(_k_index(), 0, -1, withscores=True)
         except Exception:
             return []
         # Build the candidate id list (skip the alive set already in snap),
@@ -1697,32 +1743,46 @@ class WorkerRegistry:
         # -> .34 redis) on EVERY /overview admin poll (~2s) + tab switch. A
         # brief RTT inflation turned that into a 10-20s poll hang ("もっさり").
         # Pipelining collapses it to ~1 RTT regardless of fleet/history size.
+        #
+        # 2026-08-30: RTTs were already collapsed, but the COMMAND count was
+        # not -- 4 commands × N workers per fetch was the single largest load
+        # on the shared single-threaded Redis at crawl peak (the pipeline
+        # unrolls server-side; Redis still executes every command). Fold the
+        # two GET streams into one MGET each and take the heartbeat score from
+        # the ZRANGE above: N+3 commands instead of 4N+1.
         out: list[dict] = []
         wids: list[str] = []
-        for raw_id in ids:
+        scores: dict[str, float] = {}
+        for raw_id, score in ids_scores:
             wid = raw_id.decode() if isinstance(raw_id, bytes) else str(raw_id)
             if wid in exclude_ids:
                 continue
             wids.append(wid)
+            try:
+                scores[wid] = float(score)
+            except (TypeError, ValueError):
+                pass
         if not wids:
             return out
         try:
             pipe = self._r.pipeline(transaction=False)
+            pipe.mget([_k_worker(w) for w in wids])
+            pipe.mget([_k_owner(w) for w in wids])
             for wid in wids:
-                pipe.get(_k_worker(wid))
-                pipe.zscore(_k_index(), wid)
-                pipe.get(_k_owner(wid))
                 pipe.hgetall(_k_worker(wid) + ":counts")
             results = await pipe.execute()
         except Exception:
             return out
+        _rows_blob = results[0]
+        _owners = results[1]
+        _counts_list = results[2:]
         # Decode the per-worker JSON blobs in ONE worker thread, off the event
         # loop. With ~80 known rows this json.loads batch was ~20/2600 of the
         # hub's on-CPU loop samples on EVERY ~2s /overview admin poll (py-spy
         # 2026-06-08) -- a contributor to the intermittent multi-second poll
         # stalls. The redis round-trip above stays async; only the CPU-bound
         # decode moves off the loop. One hop for the whole batch (not N).
-        _raw_rows = [results[_i * 4] for _i in range(len(wids))]
+        _raw_rows = list(_rows_blob or [])
 
         def _decode_rows(rows: list) -> list:
             decoded: list = []
@@ -1751,9 +1811,9 @@ class WorkerRegistry:
         except Exception:
             _decoded_rows = [None] * len(wids)
         for _i, wid in enumerate(wids):
-            last_ts = results[_i * 4 + 1]
-            owner = results[_i * 4 + 2]
-            counts = results[_i * 4 + 3]
+            last_ts = scores.get(wid)
+            owner = _owners[_i] if _i < len(_owners or []) else None
+            counts = _counts_list[_i] if _i < len(_counts_list) else None
             data = _decoded_rows[_i]
             if data is None:
                 continue
@@ -1923,55 +1983,146 @@ class WorkerRegistry:
             })
         return out
 
+    def _known_extra_for(self, seen: set) -> list:
+        """Serve peer-hub rows out of the last GOOD cross-hub aggregation.
+
+        Rows are re-aged at SERVE time from their cached ``last_heartbeat``:
+        ``alive``/``routable`` decay to False once that heartbeat crosses
+        WORKER_TTL. So an aggregation we can no longer refresh degrades into
+        "these workers exist, we just can't confirm them" -- instead of the
+        two wrong answers this code used to pick between: dropping the rows
+        entirely (the count flap) or serving them as confidently alive.
+        """
+        rows = self._last_known_extra
+        if not rows:
+            return []
+        now = time.time()
+        out: list = []
+        for w in rows:
+            if w.get("worker_id") in seen:
+                continue
+            hb = w.get("last_heartbeat")
+            if not hb:
+                out.append(w)
+                continue
+            age = now - float(hb)
+            fresh = age < WORKER_TTL
+            out.append({
+                **w,
+                "age_seconds": int(age),
+                "alive": bool(w.get("alive")) and fresh,
+                "routable": bool(w.get("routable")) and fresh,
+            })
+        return out
+
+    def _ensure_known_refresh(self) -> None:
+        """Kick a single background refresh of the cross-hub aggregation.
+
+        Single-flight: while one refresh is in flight every other caller just
+        keeps serving the cache. That matters under load -- ``stats_async`` is
+        called from the admin poll, /workers/capacity (crawler-facing, ~5-10
+        req/s), the reapers and salvage. Without this, a hub whose loop is
+        stalled piles up N concurrent ~N+3-command pipelines against the
+        shared single-threaded Redis, each of which the old request-path
+        ``wait_for`` then cancelled, so not one of them refreshed the cache.
+        """
+        t = self._known_refresh_task
+        if t is not None and not t.done():
+            return
+        try:
+            loop = asyncio.get_running_loop()
+        except RuntimeError:
+            return
+        self._known_refresh_task = loop.create_task(
+            self._refresh_known_workers()
+        )
+
+    async def _refresh_known_workers(self) -> None:
+        """Background body of :meth:`_ensure_known_refresh`."""
+        try:
+            extra = await asyncio.wait_for(
+                # Fetch the FULL index (no exclude set): the cache is shared by
+                # every caller, and which ids are local is a per-call question
+                # answered at serve time by _known_extra_for(seen).
+                self._fetch_known_workers(set()),
+                timeout=_KNOWN_WORKERS_FETCH_TIMEOUT_S,
+            )
+        except Exception:
+            extra = []
+        if extra:
+            self._last_known_extra = extra
+            self._last_known_extra_at = time.time()
+            self._known_stale_warned = False
+            return
+        # Empty is AMBIGUOUS: _fetch_known_workers swallows redis hiccups and
+        # returns [] rather than raising, so it means either "no peer workers"
+        # or "redis blipped". Never overwrite a good cache with it. But DO say
+        # so out loud once per stale episode -- the old code degraded in total
+        # silence, which is why a hub could serve a local-only fleet view for
+        # a minute at a time with nothing in the log to show for it.
+        age = time.time() - self._last_known_extra_at
+        if (
+            self._last_known_extra is not None
+            and age > _KNOWN_WORKERS_CACHE_TTL_S
+            and not self._known_stale_warned
+        ):
+            self._known_stale_warned = True
+            log.warning(
+                "workers: cross-hub aggregation stale for %.0fs (redis fetch "
+                "failing); serving the cached fleet view, liveness decays "
+                "with each row's heartbeat age",
+                age,
+            )
+
     async def stats_async(self) -> dict:
-        """Async-aware variant of :func:`stats` that pulls historical
-        worker rows from Redis. Use this from FastAPI handlers (which
-        are themselves async); ``stats()`` is kept as a sync stub for
-        any legacy caller that can't await."""
+        """Async-aware variant of :func:`stats` that merges this hub's live
+        connections with the cross-hub (Redis) worker rows. Use this from
+        FastAPI handlers; ``stats()`` is the sync local-only stub.
+
+        The Redis half is served from a background-refreshed cache and this
+        method NEVER awaits Redis once that cache exists.
+
+        Why (2026-08-30 investigation, "worker 数が不安定"): the fetch used to
+        run inline under ``asyncio.wait_for(..., 1.5)``. A timeout there
+        CANCELS the fetch, so it never populates the cache -- and the hub
+        event loop stalls for multiple seconds often enough (measured: /workers
+        replies of 2.0s / 3.4s / 7.9s / 9.7s on one hub inside 75s) that entire
+        stall episodes produced zero successful fetches. Once the 60s fallback
+        TTL then expired, the hub answered with its own ~7-26 local workers
+        instead of the fleet's 272. nginx round-robins /workers across 19 hubs,
+        so the admin tab (and /workers/capacity, which gates crawler
+        admission) bounced between 272 and whatever the sick hub held. One
+        sweep caught 8 of 19 hubs collapsed at the same instant.
+        """
         snap = self.stats()
         if self._r is None:
             return snap
         seen = {w["worker_id"] for w in snap["workers"]}
-        # Defensive ceiling: _fetch_known_workers is now pipelined (~1 RTT),
-        # but if redis itself stalls we must NOT hang the /overview admin poll
-        # (called every ~2s). Cap the wait at 1.5s.
-        def _fresh_cache() -> list:
-            # Reuse the most recent GOOD (non-empty) aggregation if still fresh,
-            # dropping any id that is now a live local connection (already in
-            # ``snap`` with fresher data) to avoid duplicate rows.
-            if (
-                self._last_known_extra is not None
-                and (time.time() - self._last_known_extra_at)
-                <= _KNOWN_WORKERS_CACHE_TTL_S
-            ):
-                return [
-                    w for w in self._last_known_extra
-                    if w.get("worker_id") not in seen
-                ]
-            return []
-        try:
-            extra = await asyncio.wait_for(
-                self._fetch_known_workers(seen), timeout=1.5
-            )
-            # Only a NON-EMPTY aggregation is trusted as the GOOD fallback.
-            # _fetch_known_workers swallows redis pipeline/zrange hiccups and
-            # returns [] (NOT an exception), so an empty result here is
-            # AMBIGUOUS: either the fleet genuinely has no peer workers, or
-            # redis blipped this once. Overwriting the cache with [] made ONE
-            # HUB AT A TIME collapse to local-only and flap the Workers count
-            # (2 <-> 20) as nginx round-robined the poll. Treat empty as "no
-            # fresh data": keep + reuse the last GOOD cache instead of poisoning
-            # it. (A genuine empty fleet just shows the stale cache for <=TTL.)
-            if extra:
-                self._last_known_extra = extra
-                self._last_known_extra_at = time.time()
-            else:
-                extra = _fresh_cache()
-        except Exception:
-            # Redis stalled / timed out -- reuse the most recent GOOD cache.
-            extra = _fresh_cache()
-        snap["workers"].extend(extra)
+        have_cache = self._last_known_extra is not None
+        age = time.time() - self._last_known_extra_at
+        if (not have_cache) or age > _WORKERS_SERVE_CACHE_TTL_S:
+            self._ensure_known_refresh()
+        if not have_cache:
+            # Cold start (first call after hub boot) is the one case where a
+            # cache-only answer would itself be the local-only collapse, so
+            # wait briefly on the refresh. ``shield`` so this bounded wait
+            # cannot cancel the shared background fetch.
+            t = self._known_refresh_task
+            if t is not None:
+                try:
+                    await asyncio.wait_for(
+                        asyncio.shield(t), timeout=_KNOWN_WORKERS_COLD_WAIT_S
+                    )
+                except Exception:
+                    pass
+        snap["workers"].extend(self._known_extra_for(seen))
         snap["count"] = len(snap["workers"])
+        # Age of the cross-hub half, so an operator (and /health) can tell a
+        # degraded view from a healthy one instead of guessing from the count.
+        snap["aggregate_stale_s"] = (
+            round(time.time() - self._last_known_extra_at, 1)
+            if self._last_known_extra is not None else None
+        )
         return snap
 
     async def forget(self, worker_id: str) -> bool:

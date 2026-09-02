@@ -33,6 +33,9 @@ class _Pipeline:
     def get(self, key):
         self._ops.append(("get", key))
 
+    def mget(self, keys):
+        self._ops.append(("mget", list(keys)))
+
     def zscore(self, key, member):
         self._ops.append(("zscore", (key, member)))
 
@@ -44,6 +47,8 @@ class _Pipeline:
         for op, arg in self._ops:
             if op == "get":
                 out.append(self._store.kv.get(arg))
+            elif op == "mget":
+                out.append([self._store.kv.get(k) for k in arg])
             elif op == "zscore":
                 out.append(self._store.zsets.get(arg[0], {}).get(arg[1]))
             else:
@@ -66,8 +71,11 @@ class _FakeRedis:
     async def zadd(self, key, mapping):
         self.zsets.setdefault(key, {}).update(mapping)
 
-    async def zrange(self, key, start, stop):
-        return list(self.zsets.get(key, {}))
+    async def zrange(self, key, start, stop, withscores=False):
+        z = self.zsets.get(key, {})
+        if withscores:
+            return [(m, float(sc)) for m, sc in z.items()]
+        return list(z)
 
     async def hset(self, key, mapping=None, **kw):
         self.hashes.setdefault(key, {}).update(mapping or {})
