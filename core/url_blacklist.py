@@ -35,12 +35,40 @@ hot path inside the per-response handler does the minimum work:
 
 Empty patterns lists are a degenerate fast-path: ``match()`` returns
 None immediately without touching the input string.
+
+Two input guards protect the caller's event loop (see ``match()``):
+inline-payload URLs (``data:`` / ``blob:``) skip matching entirely, and
+the regex path only ever sees the first ``_REGEX_MAX_URL_CHARS`` chars.
 """
 from __future__ import annotations
 
 import fnmatch
 import re
 from typing import Iterable
+
+
+#: How much of a URL the regex path is allowed to see.
+#:
+#: Glob patterns starting with ``*`` translate to a lazy-any prefix, so a
+#: FAILED ``re.search()`` retries from every offset -- O(n^2) in URL length.
+#: Measured with the production blacklist (9 patterns, 5 of them ``*``-led):
+#: 2 KB URL = 49 ms, 20 KB = 4.6 s, 40 KB = 18.5 s. A ~400 KB inline URI
+#: therefore pins the worker's asyncio loop for ~35 minutes inside ONE
+#: ``on_response`` callback: no heartbeat, no logs, hub marks the worker
+#: offline and its job dies with it. Twelve of 272 workers were sitting in
+#: exactly that state when this was diagnosed (2026-08-30, py-spy: 6/6
+#: wedged workers stuck at ``_regex.search``).
+#:
+#: Blacklist patterns address a host + path, which live in the first few
+#: hundred chars; truncating past 2 KB costs no realistic match and caps the
+#: worst case at ~50 ms. Truncate rather than skip so a long-but-ordinary URL
+#: (tracking query strings) still matches on its host/path prefix.
+_REGEX_MAX_URL_CHARS = 2048
+
+#: URL schemes whose "URL" is an inline payload, not a network location --
+#: a base64 image can be megabytes long and can never meaningfully match a
+#: host/path pattern, so it is not worth a single regex step.
+_INLINE_SCHEMES = ("data:", "blob:")
 
 
 class _CompiledPattern:
@@ -105,7 +133,9 @@ class _CompiledPattern:
     def matches(self, url_lower: str, url_raw: str) -> bool:
         if self._kind == "substring":
             return self._lower_substring in url_lower
-        # regex path — match against raw URL (regex is case-insensitive)
+        # regex path — match against raw URL (regex is case-insensitive).
+        # ``url_raw`` arrives already capped to _REGEX_MAX_URL_CHARS by
+        # BlacklistMatcher.match(); do not re-widen it here.
         return bool(self._regex.search(url_raw))
 
 
@@ -144,9 +174,17 @@ class BlacklistMatcher:
         if not self._compiled:
             return None
         u = url or ""
+        # Guard 1: inline payloads (data: / blob:) are never a host+path,
+        # so no operator pattern can meaningfully describe them -- and they
+        # are the URLs long enough to make the regex path pathological.
+        if u[:5].lower() in _INLINE_SCHEMES:
+            return None
         u_lower = u.lower()
+        # Guard 2: bound what the regex path sees. The substring path stays
+        # on the full URL -- ``in`` is a linear C scan, not a backtracker.
+        u_regex = u if len(u) <= _REGEX_MAX_URL_CHARS else u[:_REGEX_MAX_URL_CHARS]
         for cp in self._compiled:
-            if cp.matches(u_lower, u):
+            if cp.matches(u_lower, u_regex):
                 return cp.source
         return None
 
