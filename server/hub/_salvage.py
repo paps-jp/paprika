@@ -713,6 +713,10 @@ async def _salvage_one(wid: str, ip: str) -> str:
                     f"{hub_id}|{ip}|{method}|{int(time.time())}",
                     ex=900,
                 )
+                # Mirror into the small index SET so _resolve_pending / the
+                # skip-check in _salvage_pass never need a keyspace-wide SCAN
+                # to find pending records -- see _PENDING_INDEX_KEY.
+                await r.sadd(_PENDING_INDEX_KEY, wid)
             except Exception:
                 pass
         return method
@@ -746,6 +750,22 @@ async def _salvage_one(wid: str, ip: str) -> str:
 # 案D: give up restarting a worker after this many confirmed re-ghosts, so we
 # don't restart-loop a worker that keeps landing back on a stale-upstream hub.
 _SALVAGE_FAIL_GIVEUP = _int("PAPRIKA_SALVAGE_FAIL_GIVEUP", 3)
+
+# Index of worker_ids with an outstanding pending-restart record
+# (`paprika:salvage:pending:{wid}`), maintained as a plain SET instead of
+# discovered via `SCAN ... MATCH "paprika:salvage:pending:*"`.
+#
+# WHY: prod Redis holds millions of keys (270+ crawler workers' session/job
+# state), and SCAN's COUNT is a "keys examined per call" hint, not a "matches
+# found" hint -- finding a handful (usually zero) of sparse-pattern keys means
+# walking the ENTIRE keyspace with the cursor. _resolve_pending + the
+# skip-check below did this TWICE per pass, on EVERY hub (~20 in prod),
+# independently, every ~60s -- measured 2026-08-30: ~1.05B SCAN calls / 7
+# days (~1,730/s sustained), ~31h of cumulative CPU, pinning the single-
+# threaded Redis at 100% and causing intermittent hub-API unresponsiveness.
+# The set this indexes stays tiny (bounded by PAPRIKA_SALVAGE_MAX_PER_PASS
+# candidates per hub per pass), so SMEMBERS is O(pending), not O(keyspace).
+_PENDING_INDEX_KEY = "paprika:salvage:pending:index"
 
 # SAFETY (2026-07-09): skip a salvage pass when the cross-hub "alive" set has
 # collapsed to below this fraction of the ledger -- an almost-certain sign of a
@@ -784,18 +804,27 @@ async def _resolve_pending(r, alive: set) -> None:
     observed recovery_events 'ok' spam)."""
     hub_id = getattr(state.registry, "_hub_id", "") or ""
     try:
-        keys = [k async for k in r.scan_iter(match="paprika:salvage:pending:*", count=200)]
+        raw_wids = await r.smembers(_PENDING_INDEX_KEY)
     except Exception:
         return
+    wids = {w.decode() if isinstance(w, bytes) else str(w) for w in (raw_wids or [])}
     now = time.time()
-    for k in keys:
-        ks = k.decode() if isinstance(k, bytes) else str(k)
-        wid = ks.rsplit(":", 1)[-1]
+    for wid in wids:
+        ks = f"paprika:salvage:pending:{wid}"
         try:
             raw = await r.get(ks)
             raw = raw.decode() if isinstance(raw, bytes) else (raw or "")
         except Exception:
             raw = ""
+        if not raw:
+            # Indexed but the record itself is gone (TTL(900s) beat us to it,
+            # or it was never written) -- nothing to resolve; just drop the
+            # stale index entry so it doesn't get re-checked forever.
+            try:
+                await r.srem(_PENDING_INDEX_KEY, wid)
+            except Exception:
+                pass
+            continue
         parts = raw.split("|")
         ipv = parts[1] if len(parts) > 1 else ""
         method = parts[2] if len(parts) > 2 else "restart"
@@ -807,6 +836,7 @@ async def _resolve_pending(r, alive: set) -> None:
             # genuine recovery: the worker re-registered after the restart.
             try:
                 await r.delete(ks)
+                await r.srem(_PENDING_INDEX_KEY, wid)
                 await r.delete(f"paprika:salvage:fails:{wid}")
                 await state.store.bump_worker_recovery(wid, f"{method} re-register")
                 await state.store.record_recovery_event(
@@ -820,6 +850,7 @@ async def _resolve_pending(r, alive: set) -> None:
         # window elapsed, still not alive -> re-ghosted. Count a failure.
         try:
             await r.delete(ks)
+            await r.srem(_PENDING_INDEX_KEY, wid)
             fkey = f"paprika:salvage:fails:{wid}"
             fails = await r.incr(fkey)
             await r.expire(fkey, 21600)  # 6h: forget the streak if it settles
@@ -950,13 +981,15 @@ async def _salvage_pass() -> int:
     max_age = _int("PAPRIKA_SALVAGE_GHOST_MAX_AGE_S", 86400)
     cooldown = _int("PAPRIKA_SALVAGE_COOLDOWN_S", 600)
     # 案D: workers with a restart already issued + awaiting re-register -- don't
-    # double-issue (one scan, not a get per wid).
+    # double-issue. Reads the small maintained index SET (see
+    # _PENDING_INDEX_KEY) instead of a keyspace-wide SCAN.
     pending: set = set()
     if r is not None:
         try:
+            raw_pending = await r.smembers(_PENDING_INDEX_KEY)
             pending = {
-                (k.decode() if isinstance(k, bytes) else str(k)).rsplit(":", 1)[-1]
-                async for k in r.scan_iter(match="paprika:salvage:pending:*", count=200)
+                w.decode() if isinstance(w, bytes) else str(w)
+                for w in (raw_pending or [])
             }
         except Exception:
             pending = set()
