@@ -41,6 +41,7 @@ disk or logged here.
 from __future__ import annotations
 
 import asyncio
+import functools
 import logging
 import os
 import threading
@@ -1003,61 +1004,70 @@ async def delete_prefix(job_id: str, *, dry_run: bool = False) -> dict:
                 "tiers": 0, "failed_tiers": 0}
     prefix = _job_prefix(job_id)
 
-    def _delete() -> dict:
+    def _delete_tier(client, bucket) -> tuple[int, int, bool]:
+        """LIST + DELETE one tier. Returns (objects, bytes, ok)."""
         n = 0
         total = 0
-        tiers = 0
-        failed_tiers = 0
-        for client, bucket in _all_cbs():
-            tiers += 1
-            batch: list[dict] = []
-            try:
-                paginator = client.get_paginator("list_objects_v2")
-                for page in paginator.paginate(Bucket=bucket, Prefix=prefix):
-                    for o in page.get("Contents", []):
-                        n += 1
-                        total += int(o.get("Size", 0))
-                        if not dry_run:
-                            batch.append({"Key": o["Key"]})
-                            if len(batch) >= 1000:  # S3 delete_objects caps at 1000
-                                client.delete_objects(
-                                    Bucket=bucket,
-                                    Delete={"Objects": batch, "Quiet": True},
-                                )
-                                batch = []
-                if not dry_run and batch:
-                    client.delete_objects(
-                        Bucket=bucket, Delete={"Objects": batch, "Quiet": True}
-                    )
-            except Exception:
-                # A tier that errors used to be indistinguishable from a tier
-                # that was simply empty: the ``continue`` was silent and the
-                # return still claimed ``deleted=True``. Callers that delete a
-                # job's DB row on the strength of that then orphan the objects
-                # permanently -- nothing lists a prefix whose ledger row is
-                # gone. Count it so ``deleted`` can tell the truth.
-                failed_tiers += 1
-                log.debug(
-                    "delete_prefix(%s): tier %s failed", job_id, bucket, exc_info=True
+        batch: list[dict] = []
+        try:
+            paginator = client.get_paginator("list_objects_v2")
+            for page in paginator.paginate(Bucket=bucket, Prefix=prefix):
+                for o in page.get("Contents", []):
+                    n += 1
+                    total += int(o.get("Size", 0))
+                    if not dry_run:
+                        batch.append({"Key": o["Key"]})
+                        if len(batch) >= 1000:  # S3 delete_objects caps at 1000
+                            client.delete_objects(
+                                Bucket=bucket,
+                                Delete={"Objects": batch, "Quiet": True},
+                            )
+                            batch = []
+            if not dry_run and batch:
+                client.delete_objects(
+                    Bucket=bucket, Delete={"Objects": batch, "Quiet": True}
                 )
-                continue
-        return {
-            "objects": n,
-            "bytes": total,
-            # Only claim success when EVERY tier was purged cleanly.
-            "deleted": (not dry_run) and failed_tiers == 0,
-            "tiers": tiers,
-            "failed_tiers": failed_tiers,
-        }
+            return n, total, True
+        except Exception:
+            # A tier that errors used to be indistinguishable from a tier
+            # that was simply empty: the ``continue`` was silent and the
+            # return still claimed ``deleted=True``. Callers that delete a
+            # job's DB row on the strength of that then orphan the objects
+            # permanently -- nothing lists a prefix whose ledger row is
+            # gone. Count it so ``deleted`` can tell the truth.
+            log.debug(
+                "delete_prefix(%s): tier %s failed", job_id, bucket, exc_info=True
+            )
+            return n, total, False
 
     try:
-        return await _run_io(_delete)
+        cbs = await _run_io(_all_cbs)
+        # The tiers used to be walked one after another on a single pool
+        # thread, so a job with nothing in any of them still paid four
+        # sequential LIST round-trips (~0.6 s p50 at 32-way on 2026-11-02, and
+        # that was the retention pass's whole cost). The tiers are independent
+        # stores, so walk them side by side; the per-job wall time is now the
+        # slowest tier, not the sum.
+        results = await asyncio.gather(
+            *(_run_io(functools.partial(_delete_tier, c, b)) for c, b in cbs)
+        )
     except Exception:
         log.debug("delete_prefix(%s) failed", job_id, exc_info=True)
         return {
             "objects": 0, "bytes": 0, "deleted": False,
             "tiers": 0, "failed_tiers": 1,
         }
+    n = sum(r[0] for r in results)
+    total = sum(r[1] for r in results)
+    failed_tiers = sum(1 for r in results if not r[2])
+    return {
+        "objects": n,
+        "bytes": total,
+        # Only claim success when EVERY tier was purged cleanly.
+        "deleted": (not dry_run) and failed_tiers == 0,
+        "tiers": len(cbs),
+        "failed_tiers": failed_tiers,
+    }
 
 
 async def list_job_prefixes() -> list[str]:

@@ -1348,6 +1348,16 @@ _RETENTION_MAX_PER_TICK = int(
 _RETENTION_COOLDOWN_S = max(
     1, int(os.environ.get("PAPRIKA_JOB_RETENTION_COOLDOWN_S", "30") or 30)
 )
+# How long the pass lock may be held before another hub treats the holder as
+# dead. It used to be INTERVAL*0.9 (540 s), which the first 20k-job passes
+# (488-969 s measured 2026-11-02) ran straight through: the lock lapsed
+# mid-pass, the next hub started its own pass on top, and both slowed down
+# sharing MinIO. This is a crash safety net, not a scheduler -- the lock is
+# normally handed back by _release_pass_lock within seconds of the pass
+# finishing -- so it only has to be comfortably longer than the slowest pass.
+_RETENTION_LOCK_TTL_S = max(
+    60, int(os.environ.get("PAPRIKA_JOB_RETENTION_LOCK_TTL_S", "1800") or 1800)
+)
 # Per-job deletes (MinIO purge + DB row + local rmtree) run BOUNDED-PARALLEL
 # within a batch instead of strictly sequential -- the MinIO delete_prefix RTT
 # was the pass's wall-clock bottleneck, so one slow object tier throttled the
@@ -1509,7 +1519,7 @@ async def _run_job_retention_once() -> int:
     # Elect ONE hub per tick. Delete is idempotent so a missing lock only costs
     # duplicate work, never correctness -> best-effort; proceed if redis absent.
     r = getattr(store, "_r", None)
-    if not await _acquire_pass_lock(r, _RETENTION_LOCK_KEY, _RETENTION_INTERVAL_S * 0.9):
+    if not await _acquire_pass_lock(r, _RETENTION_LOCK_KEY, _RETENTION_LOCK_TTL_S):
         return 0
     from datetime import timedelta as _td
 
@@ -1664,7 +1674,7 @@ async def _run_review_retention_once() -> dict:
     # MinIO churn). Best-effort -- proceed if redis absent.
     r = getattr(store, "_r", None)
     if not await _acquire_pass_lock(
-        r, _REVIEW_RETENTION_LOCK_KEY, _REVIEW_RETENTION_INTERVAL_S * 0.9
+        r, _REVIEW_RETENTION_LOCK_KEY, _RETENTION_LOCK_TTL_S
     ):
         return out
 

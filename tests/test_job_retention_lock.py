@@ -109,6 +109,28 @@ async def test_lock_is_shortened_to_cooldown_after_the_pass(monkeypatch):
 
 
 @pytest.mark.asyncio
+async def test_lock_ttl_is_its_own_knob_not_the_interval(monkeypatch):
+    """The lock must outlive the slowest pass. It used to be INTERVAL*0.9, so a
+    pass longer than 9 minutes lost its lock mid-flight and a second hub piled
+    on. Pin it to the dedicated setting, independent of INTERVAL."""
+    monkeypatch.setattr(_reaper, "_RETENTION_INTERVAL_S", 600.0)
+    monkeypatch.setattr(_reaper, "_RETENTION_LOCK_TTL_S", 1800)
+    seen = {}
+    orig_set = _FakeRedis.set
+
+    async def _spy_set(self, key, value, nx=False, ex=None):
+        seen["ex"] = ex
+        return await orig_set(self, key, value, nx=nx, ex=ex)
+
+    monkeypatch.setattr(_FakeRedis, "set", _spy_set)
+    store = _FakeStore(["a"])
+    _install_store(monkeypatch, store)
+    await _reaper._run_job_retention_once()
+    assert seen["ex"] == 1800
+    assert seen["ex"] != int(600 * 0.9)
+
+
+@pytest.mark.asyncio
 async def test_another_hubs_lock_is_left_alone(monkeypatch):
     store = _FakeStore(["a"])
     _install_store(monkeypatch, store)
