@@ -1432,7 +1432,9 @@ async def _evict_from_pull_queue(jid: str, why: str) -> None:
         log.debug("%s: pull-list evict %s failed", why, jid, exc_info=True)
 
 
-async def _purge_job(store, jid: str, sem, minio_timeout: float) -> bool:
+async def _purge_job(
+    store, jid: str, sem, minio_timeout: float, timings: dict | None = None,
+) -> bool:
     """Purge one job everywhere: MinIO/S3 prefix + DB row (+CASCADE) + local
     cache dir. Returns True on a successful DB-row delete. A MinIO / FS hiccup
     is logged but never fails the row delete (a stray object is reclaimable by
@@ -1440,14 +1442,25 @@ async def _purge_job(store, jid: str, sem, minio_timeout: float) -> bool:
 
     Shared by the general job-retention pass and the review-specific expiry
     pass so both delete identically (one code path = one behaviour to reason
-    about). ``sem`` bounds how many purges run at once."""
+    about). ``sem`` bounds how many purges run at once.
+
+    ``timings`` (optional) accumulates wall-seconds per phase -- ``minio`` /
+    ``db`` / ``evict`` / ``fs`` -- summed across every purge of a pass, so the
+    pass summary can say WHERE a slow pass spent its time. Standalone probes
+    (2026-11-02) put every phase at milliseconds while in-hub passes took
+    8-16 min for 20k jobs; without this the gap could only be guessed at."""
     from server.hub import objstore
     from server.hub._state import get_storage_dir
     import shutil as _shutil
 
+    def _tick(phase: str, t0: float) -> None:
+        if timings is not None:
+            timings[phase] = timings.get(phase, 0.0) + (time.monotonic() - t0)
+
     async with sem:
         try:
             if objstore.enabled():
+                t0 = time.monotonic()
                 try:
                     await asyncio.wait_for(
                         objstore.delete_prefix(jid), timeout=minio_timeout
@@ -1457,7 +1470,10 @@ async def _purge_job(store, jid: str, sem, minio_timeout: float) -> bool:
                 except Exception:
                     # Includes TimeoutError: a hung tier can't stall the pass.
                     log.debug("retention: MinIO purge %s failed", jid, exc_info=True)
+                _tick("minio", t0)
+            t0 = time.monotonic()
             await store.delete_job(jid)
+            _tick("db", t0)
             # The row is gone, but the id can still be on the redis pull list
             # (it outlives the row). A worker that pops it re-dispatches the
             # job, and save_job_info -- an upsert -- re-INSERTS the row with its
@@ -1465,13 +1481,17 @@ async def _purge_job(store, jid: str, sem, minio_timeout: float) -> bool:
             # reappearing at the head of the deletion frontier on 2026-08-30,
             # walking it backwards from 08-22 to 05-30. Deleting without this
             # is not a delete, it is a pause.
+            t0 = time.monotonic()
             await _evict_from_pull_queue(jid, "retention")
+            _tick("evict", t0)
+            t0 = time.monotonic()
             try:
                 d = get_storage_dir() / jid
                 if d.exists():
                     await asyncio.to_thread(_shutil.rmtree, d, True)
             except Exception:
                 pass
+            _tick("fs", t0)
             return True
         except asyncio.CancelledError:
             raise
@@ -1527,12 +1547,15 @@ async def _run_job_retention_once() -> int:
     deleted = 0
     attempted = 0
     t0 = time.monotonic()
+    phases: dict[str, float] = {}
 
     # Bound how many job purges run at once (see _RETENTION_DELETE_CONCURRENCY).
     _sem = asyncio.Semaphore(_RETENTION_DELETE_CONCURRENCY)
 
     async def _del_one(jid: str) -> bool:
-        return await _purge_job(store, jid, _sem, _RETENTION_MINIO_TIMEOUT_S)
+        return await _purge_job(
+            store, jid, _sem, _RETENTION_MINIO_TIMEOUT_S, timings=phases
+        )
 
     try:
         while deleted < _RETENTION_MAX_PER_TICK:
@@ -1572,11 +1595,14 @@ async def _run_job_retention_once() -> int:
     _last_retention_deleted = deleted
     took = time.monotonic() - t0
     if deleted:
+        # Phase sums are summed over CONCURRENT purges, so they add up to
+        # roughly took * concurrency, not to took; read them as proportions.
         log.info(
             "job-retention: deleted %d/%d jobs older than %d days in %.1fs "
-            "(DB + MinIO + cache)%s",
+            "(DB + MinIO + cache)%s phases[s]: %s",
             deleted, attempted, days, took,
             " [hit per-tick cap]" if deleted >= _RETENTION_MAX_PER_TICK else "",
+            " ".join(f"{k}={v:.0f}" for k, v in sorted(phases.items())) or "-",
         )
     elif attempted:
         # A pass that found candidates and deleted none used to leave no trace
