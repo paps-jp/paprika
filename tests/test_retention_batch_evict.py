@@ -115,6 +115,94 @@ async def test_retention_pass_evicts_per_batch_not_per_job(monkeypatch):
     assert calls["single"] == []  # no per-job LREM inside the pass
 
 
+class _BatchStore(_FakeStore):
+    """A store with the batched delete: the pass must use ONE statement per
+    batch and never fall back to delete_job."""
+
+    def __init__(self, ids, redis):
+        super().__init__(ids, redis)
+        self.batches: list[list[str]] = []
+
+    async def delete_jobs(self, ids):
+        self.batches.append(list(ids))
+        self.deleted.extend(ids)
+        return len(ids)
+
+    async def delete_job(self, jid):  # pragma: no cover - must not be called
+        raise AssertionError("per-job delete used although delete_jobs exists")
+
+
+@pytest.mark.asyncio
+async def test_retention_pass_deletes_rows_one_statement_per_batch(monkeypatch, tmp_path):
+    import server.hub.objstore as objstore
+    from server.hub import _state
+
+    purged = []
+
+    async def _delete_prefix(jid, **kw):
+        purged.append(jid)
+        return {"deleted": True}
+
+    monkeypatch.setattr(objstore, "enabled", lambda: True, raising=False)
+    monkeypatch.setattr(objstore, "delete_prefix", _delete_prefix, raising=False)
+    monkeypatch.setattr(_state, "get_storage_dir", lambda: tmp_path, raising=False)
+    monkeypatch.setattr(_state.state, "settings", _FakeSettings(), raising=False)
+    monkeypatch.setattr(config, "hub_id", "hub-test", raising=False)
+
+    class _FakePQ:
+        ENABLED = True
+
+        @staticmethod
+        async def remove_many(ids):
+            return 0
+
+    monkeypatch.setattr(server.hub, "_pull_queue", _FakePQ, raising=False)
+    store = _BatchStore(["j1", "j2", "j3", "j4", "j5"], _FakeRedis([]))
+    monkeypatch.setattr(_state.state, "store", store, raising=False)
+    monkeypatch.setattr(_reaper, "_RETENTION_BATCH", 2)
+    monkeypatch.setattr(_reaper, "_RETENTION_MAX_PER_TICK", 100)
+
+    n = await _reaper._run_job_retention_once()
+    assert n == 5
+    assert store.batches == [["j1", "j2"], ["j3", "j4"], ["j5"]]
+    assert sorted(purged) == ["j1", "j2", "j3", "j4", "j5"]  # MinIO still per job
+
+
+@pytest.mark.asyncio
+async def test_stale_lock_from_our_previous_process_is_cleared(monkeypatch):
+    """A hub restarted mid-pass leaves its lock for the whole TTL; the new
+    process must drop it at loop start (only its OWN id)."""
+    import asyncio
+    from server.hub import _state
+
+    monkeypatch.setattr(config, "hub_id", "hub-test", raising=False)
+
+    class _R(_FakeRedis):
+        def __init__(self):
+            super().__init__([])
+            self.kv = {}
+            self.deleted = []
+
+        async def get(self, key):
+            v = self.kv.get(key)
+            return None if v is None else v.encode()
+
+        async def delete(self, key):
+            self.deleted.append(key)
+            self.kv.pop(key, None)
+            return 1
+
+    r = _R()
+    r.kv[_reaper._RETENTION_LOCK_KEY] = "hub-test"
+    await _reaper._clear_own_stale_lock(r, _reaper._RETENTION_LOCK_KEY)
+    assert r.deleted == [_reaper._RETENTION_LOCK_KEY]
+
+    r2 = _R()
+    r2.kv[_reaper._RETENTION_LOCK_KEY] = "hub-other"
+    await _reaper._clear_own_stale_lock(r2, _reaper._RETENTION_LOCK_KEY)
+    assert r2.deleted == []  # someone else's live lock is left alone
+
+
 @pytest.mark.asyncio
 async def test_single_job_purge_still_evicts_per_job(monkeypatch, tmp_path):
     """Reconciler-style single purges keep the per-job evict (default)."""

@@ -773,6 +773,36 @@ class MariaDBJobStore:
         self._log_locks.pop(job_id, None)
         return deleted
 
+    async def delete_jobs(self, job_ids: list[str]) -> int:
+        """Delete a BATCH of rows in one statement (CASCADE as in delete_job).
+        Returns the number of rows actually deleted.
+
+        One ``DELETE ... WHERE job_id IN (...)`` instead of one round-trip per
+        id: the retention pass measured 0.21 s per single-row delete IN-HUB
+        (0.4 ms standalone) -- not the SQL, but 32 concurrent purges queuing on
+        the connection pool and the event loop for 500 acquisitions per batch.
+        One acquisition per batch takes that term out. Log files + lock
+        entries are cleaned per id like delete_job, best-effort."""
+        ids = [j for j in job_ids if j]
+        if not ids:
+            return 0
+        placeholders = ",".join(["%s"] * len(ids))
+        async with self._pool.acquire() as conn:
+            async with conn.cursor() as cur:
+                await cur.execute(
+                    f"DELETE FROM jobs WHERE job_id IN ({placeholders})", ids
+                )
+                deleted = int(cur.rowcount or 0)
+        for jid in ids:
+            path = self._log_path(jid)
+            if path is not None:
+                try:
+                    await asyncio.to_thread(path.unlink, True)
+                except Exception as e:
+                    log.debug("unlink %s: %s", path, e)
+            self._log_locks.pop(jid, None)
+        return deleted
+
     async def list_deletable_job_ids(
         self, cutoff, status_in: list[str], limit: int
     ) -> list[str]:

@@ -1520,10 +1520,96 @@ async def _purge_job(
             return False
 
 
+async def _purge_batch(
+    store, ids: list[str], sem, minio_timeout: float, timings: dict | None = None,
+) -> int:
+    """Purge a whole retention batch: MinIO prefixes bounded-parallel, then
+    the DB rows in ONE statement, then the local cache dirs. Returns the
+    number of rows the DB reported deleted.
+
+    This is :func:`_purge_job` restructured around the batch so the DB phase
+    is one pool acquisition instead of one per job (see
+    ``MariaDBJobStore.delete_jobs`` for the 2026-11-02 numbers). Stores
+    without ``delete_jobs`` fall back to per-job :func:`_purge_job`. The
+    caller has already evicted the batch from the pull list."""
+    from server.hub import objstore
+    from server.hub._state import get_storage_dir
+    import shutil as _shutil
+
+    if not ids:
+        return 0
+    if not hasattr(store, "delete_jobs"):
+        results = await asyncio.gather(
+            *(_purge_job(store, j, sem, minio_timeout, timings, evict=False) for j in ids)
+        )
+        return sum(1 for ok in results if ok)
+
+    def _tick(phase: str, t0: float) -> None:
+        if timings is not None:
+            timings[phase] = timings.get(phase, 0.0) + (time.monotonic() - t0)
+
+    async def _minio_one(jid: str) -> None:
+        async with sem:
+            t0 = time.monotonic()
+            try:
+                await asyncio.wait_for(objstore.delete_prefix(jid), timeout=minio_timeout)
+            except asyncio.CancelledError:
+                raise
+            except Exception:
+                log.debug("retention: MinIO purge %s failed", jid, exc_info=True)
+            _tick("minio", t0)
+
+    if objstore.enabled():
+        await asyncio.gather(*(_minio_one(j) for j in ids))
+
+    t0 = time.monotonic()
+    try:
+        deleted = int(await store.delete_jobs(list(ids)))
+    except asyncio.CancelledError:
+        raise
+    except Exception:
+        log.debug("retention: batch delete failed", exc_info=True)
+        deleted = 0
+    _tick("db", t0)
+
+    t0 = time.monotonic()
+    try:
+        root = get_storage_dir()
+        for jid in ids:
+            d = root / jid
+            if d.exists():
+                await asyncio.to_thread(_shutil.rmtree, d, True)
+    except Exception:
+        pass
+    _tick("fs", t0)
+    return deleted
+
+
+async def _clear_own_stale_lock(r, key: str) -> None:
+    """At loop start, drop a pass lock that THIS hub still holds from a
+    previous life. A hub that is restarted mid-pass (docker restart does not
+    wait for the pass's ``finally``) leaves its lock behind for the full TTL,
+    and with the TTL at 30 min (crash safety net) every other hub sits out
+    that long -- 2026-11-02 17:45-18:14, one single-hub restart, zero passes
+    fleet-wide. Only our own id is touched; another hub's live lock is left."""
+    if r is None:
+        return
+    try:
+        cur = await r.get(key)
+        if cur is not None and not isinstance(cur, str):
+            cur = cur.decode("utf-8", "replace")
+        if cur == (config.hub_id or "1"):
+            await r.delete(key)
+            log.info("retention: cleared stale %s left by our previous process", key)
+    except Exception:
+        log.debug("retention: stale-lock check failed", exc_info=True)
+
+
 async def _job_retention_loop() -> None:
     """Background auto-retention GC. Idempotent; wired only on non-admin hubs."""
     if os.environ.get("PAPRIKA_JOB_RETENTION_DISABLE") == "1":
         return
+    await _clear_own_stale_lock(getattr(state.store, "_r", None), _RETENTION_LOCK_KEY)
     first = True
     while True:
         try:
@@ -1572,12 +1658,6 @@ async def _run_job_retention_once() -> int:
     # Bound how many job purges run at once (see _RETENTION_DELETE_CONCURRENCY).
     _sem = asyncio.Semaphore(_RETENTION_DELETE_CONCURRENCY)
 
-    async def _del_one(jid: str) -> bool:
-        return await _purge_job(
-            store, jid, _sem, _RETENTION_MINIO_TIMEOUT_S, timings=phases,
-            evict=False,  # the batch was evicted below, in one LRANGE
-        )
-
     try:
         while deleted < _RETENTION_MAX_PER_TICK:
             try:
@@ -1594,13 +1674,12 @@ async def _run_job_retention_once() -> int:
             te = time.monotonic()
             await _evict_many_from_pull_queue(ids, "retention")
             phases["evict"] = phases.get("evict", 0.0) + (time.monotonic() - te)
-            # Delete the batch BOUNDED-PARALLEL (was strictly sequential -- the
-            # per-job MinIO delete_prefix RTT made a full pass slower than the
-            # job inflow, so the backlog never actually shrank). gather never
-            # raises here: _del_one swallows per-job errors -> False;
-            # CancelledError still propagates out for a clean shutdown.
-            results = await asyncio.gather(*(_del_one(j) for j in ids))
-            ok_n = sum(1 for ok in results if ok)
+            # MinIO purges BOUNDED-PARALLEL, then ONE batched row delete (see
+            # _purge_batch). Per-job errors are swallowed inside; CancelledError
+            # still propagates out for a clean shutdown.
+            ok_n = await _purge_batch(
+                store, ids, _sem, _RETENTION_MINIO_TIMEOUT_S, timings=phases
+            )
             attempted += len(ids)
             deleted += ok_n
             if ok_n == 0:
@@ -1677,6 +1756,9 @@ async def _review_retention_loop() -> None:
     (a redis lock elects one hub per tick). Inert unless review_retention_enabled."""
     if os.environ.get("PAPRIKA_REVIEW_RETENTION_DISABLE") == "1":
         return
+    await _clear_own_stale_lock(
+        getattr(state.store, "_r", None), _REVIEW_RETENTION_LOCK_KEY
+    )
     first = True
     while True:
         try:
@@ -1771,15 +1853,9 @@ async def _run_review_retention_once() -> dict:
             if not ids:
                 break
             await _evict_many_from_pull_queue(ids, "review-retention")
-            results = await asyncio.gather(
-                *(
-                    _purge_job(
-                        store, j, _sem, _REVIEW_RETENTION_MINIO_TIMEOUT_S, evict=False
-                    )
-                    for j in ids
-                )
+            ok_n = await _purge_batch(
+                store, ids, _sem, _REVIEW_RETENTION_MINIO_TIMEOUT_S
             )
-            ok_n = sum(1 for ok in results if ok)
             deleted += ok_n
             if ok_n == 0:
                 break  # same ids would come back; don't spin (see job-retention)
