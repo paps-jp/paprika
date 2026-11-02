@@ -152,6 +152,49 @@ def test_liveness_error_skips_the_scan(monkeypatch):
     assert scanned == []  # never reached the full-table walk
 
 
+def test_scan_asks_for_running_rows_only_never_the_full_walk(monkeypatch):
+    """2026-11-02: with every peer restarting at once the liveness probe found
+    nobody, and the scan's ``list_job_ids()`` pulled all 52M ids into memory
+    (RSS 5.6 GB, main thread pegged, /health dead) -- one hub per fleet-wide
+    restart. A store that can list by status must be asked for ``running``
+    rows only, bounded, and the full walk must not be touched."""
+    async def _alone():
+        return False
+
+    monkeypatch.setattr(_reaper, "_any_peer_hub_alive", _alone)
+    monkeypatch.setattr(_reaper, "_ORPHAN_SCAN_MAX", 123)
+
+    from datetime import datetime
+    from server.protocol import JobInfo, JobOptions, JobStatus
+
+    asked = {}
+    saved = []
+
+    class _Store:
+        async def list_job_ids(self):
+            raise AssertionError("full-table walk must not run")
+
+        async def list_jobs_by_status_between(self, status, lo, hi, limit):
+            asked.update(status=status, lo=lo, limit=limit)
+            return [("r1", datetime(2026, 11, 2)), ("r2", datetime(2026, 11, 2))]
+
+        async def get_job_info(self, jid):
+            return JobInfo(job_id=jid, url="http://x", status=JobStatus.running,
+                           options=JobOptions(), created_at=datetime(2026, 11, 2))
+
+        async def save_job_info(self, info):
+            saved.append((info.job_id, info.status))
+
+        async def publish_log(self, *a, **k):
+            pass
+
+    monkeypatch.setattr(state, "store", _Store(), raising=False)
+    assert asyncio.run(_reaper._recover_orphan_running_jobs_scan()) == 2
+    assert asked["status"] == "running" and asked["limit"] == 123
+    assert asked["lo"] == datetime(1970, 1, 1)
+    assert saved == [("r1", JobStatus.failed), ("r2", JobStatus.failed)]
+
+
 def test_entrypoint_returns_immediately_and_defers_scan(monkeypatch):
     """The lifespan must not wait on the full-table walk."""
     started = asyncio.Event()

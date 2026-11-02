@@ -136,6 +136,13 @@ async def _any_peer_hub_alive() -> bool:
     return False
 
 
+# Upper bound on how many running rows the startup orphan scan will touch.
+# Production holds ~500-700 running rows at any moment; anything near this cap
+# means the store is not what we think it is, and the scan must not grow
+# without bound (see _recover_orphan_running_jobs_scan).
+_ORPHAN_SCAN_MAX = int(os.environ.get("PAPRIKA_ORPHAN_SCAN_MAX", "20000") or 20000)
+
+
 async def _recover_orphan_running_jobs() -> int:
     """Schedule the orphan-running-job recovery scan in the background.
 
@@ -204,8 +211,24 @@ async def _recover_orphan_running_jobs_scan() -> int:
         return 0
     # state.local_tasks is empty at this point (fresh process), so any
     # in-store "running" job is by definition an orphan.
+    #
+    # Ask the store for RUNNING ids only when it can (idx_status_created,
+    # a few hundred rows) instead of walking every id. The unbounded walk is
+    # what froze one hub per fleet-wide restart on 2026-11-02 (CT901 17:40,
+    # CT128 18:33): with every peer restarting at the same moment the
+    # liveness probe above found nobody, the scan pulled all 52M job ids
+    # into memory (RSS 0.4 -> 5.6 GB, main thread 100%, accept queue 1,038)
+    # and the hub never answered /health until it was restarted by hand.
     try:
-        job_ids = await state.store.list_job_ids()
+        lister = getattr(state.store, "list_jobs_by_status_between", None)
+        if lister is not None:
+            rows = await lister(
+                JobStatus.running.value, datetime(1970, 1, 1), datetime.utcnow(),
+                _ORPHAN_SCAN_MAX,
+            )
+            job_ids = [r[0] for r in rows]
+        else:
+            job_ids = await state.store.list_job_ids()
     except Exception:
         return 0
     n = 0
