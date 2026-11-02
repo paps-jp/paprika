@@ -30,6 +30,7 @@ import asyncio
 import logging
 import os
 import re
+import time
 from datetime import datetime
 
 from server.hub._state import config, state
@@ -1331,9 +1332,21 @@ _RETENTION_INTERVAL_S = float(
 )
 _RETENTION_BATCH = int(os.environ.get("PAPRIKA_JOB_RETENTION_BATCH", "500") or 500)
 # Cap per tick so a huge first-run backlog drains GRADUALLY instead of one
-# multi-hour delete storm hammering MariaDB + MinIO.
+# multi-hour delete storm hammering MariaDB + MinIO. 20k is sized against the
+# 2026-11-02 measurement: a pass purges ~75 jobs/s (MinIO p50 0.6 s at 32-way),
+# so this is a ~4.5 min pass, well inside one INTERVAL even on a slow day.
 _RETENTION_MAX_PER_TICK = int(
-    os.environ.get("PAPRIKA_JOB_RETENTION_MAX_PER_TICK", "5000") or 5000
+    os.environ.get("PAPRIKA_JOB_RETENTION_MAX_PER_TICK", "20000") or 20000
+)
+# After a pass FINISHES the lock is shortened to this instead of being left to
+# run out its full TTL. Until 2026-11-02 the holder kept the lock for the whole
+# INTERVAL*0.9 even when the pass took 2 min, so the fleet-wide drain rate was
+# pinned to MAX_PER_TICK per INTERVAL (8000/600 s = 1.15M/day) against an inflow
+# of 1.6M/day -- the table grew for weeks with every delete finishing fast. The
+# cooldown is only there so 20 hubs don't start back-to-back passes the same
+# second; the TTL stays as the crash safety net.
+_RETENTION_COOLDOWN_S = max(
+    1, int(os.environ.get("PAPRIKA_JOB_RETENTION_COOLDOWN_S", "30") or 30)
 )
 # Per-job deletes (MinIO purge + DB row + local rmtree) run BOUNDED-PARALLEL
 # within a batch instead of strictly sequential -- the MinIO delete_prefix RTT
@@ -1355,6 +1368,38 @@ _RETENTION_MINIO_TIMEOUT_S = float(
     os.environ.get("PAPRIKA_JOB_RETENTION_MINIO_TIMEOUT_S", "30") or 30
 )
 _RETENTION_LOCK_KEY = "paprika:retention:lock"
+
+
+async def _acquire_pass_lock(r, key: str, ttl_s: float) -> bool:
+    """Elect ONE hub for a GC pass via ``SET NX EX``. Best-effort: a redis
+    error means "proceed" (delete is idempotent, the lock only avoids N-fold
+    MinIO churn), a held lock means "not this hub, not this tick"."""
+    if r is None:
+        return True
+    try:
+        got = await r.set(key, config.hub_id or "1", nx=True, ex=max(60, int(ttl_s)))
+        return bool(got)
+    except Exception:
+        return True
+
+
+async def _release_pass_lock(r, key: str, cooldown_s: float) -> None:
+    """Hand the lock back as soon as the pass is over (keeping it for
+    ``cooldown_s`` so the next hub's tick isn't the very same second).
+    Only our own lock is touched: if the TTL already expired and another hub
+    re-took it, leave theirs alone. Best-effort -- failure here just means
+    the lock runs out its original TTL like it always did."""
+    if r is None:
+        return
+    try:
+        cur = await r.get(key)
+        if cur is not None and not isinstance(cur, str):
+            cur = cur.decode("utf-8", "replace")
+        if cur == (config.hub_id or "1"):
+            await r.expire(key, max(1, int(cooldown_s)))
+    except Exception:
+        log.debug("retention: lock release failed", exc_info=True)
+
 
 _last_retention_run_at: datetime | None = None
 _last_retention_deleted = 0
@@ -1464,20 +1509,14 @@ async def _run_job_retention_once() -> int:
     # Elect ONE hub per tick. Delete is idempotent so a missing lock only costs
     # duplicate work, never correctness -> best-effort; proceed if redis absent.
     r = getattr(store, "_r", None)
-    if r is not None:
-        try:
-            got = await r.set(
-                _RETENTION_LOCK_KEY, config.hub_id or "1",
-                nx=True, ex=max(60, int(_RETENTION_INTERVAL_S * 0.9)),
-            )
-            if not got:
-                return 0
-        except Exception:
-            pass
+    if not await _acquire_pass_lock(r, _RETENTION_LOCK_KEY, _RETENTION_INTERVAL_S * 0.9):
+        return 0
     from datetime import timedelta as _td
 
     cutoff = datetime.utcnow() - _td(days=days)
     deleted = 0
+    attempted = 0
+    t0 = time.monotonic()
 
     # Bound how many job purges run at once (see _RETENTION_DELETE_CONCURRENCY).
     _sem = asyncio.Semaphore(_RETENTION_DELETE_CONCURRENCY)
@@ -1485,36 +1524,57 @@ async def _run_job_retention_once() -> int:
     async def _del_one(jid: str) -> bool:
         return await _purge_job(store, jid, _sem, _RETENTION_MINIO_TIMEOUT_S)
 
-    while deleted < _RETENTION_MAX_PER_TICK:
-        try:
-            ids = await store.list_deletable_job_ids(
-                cutoff, _RETENTION_STATUSES, _RETENTION_BATCH
-            )
-        except Exception:
-            log.warning("job-retention: candidate query failed", exc_info=True)
-            break
-        if not ids:
-            break
-        # Delete the batch BOUNDED-PARALLEL (was strictly sequential -- the
-        # per-job MinIO delete_prefix RTT made a full pass slower than the job
-        # inflow, so the backlog never actually shrank). gather never raises
-        # here: _del_one swallows per-job errors -> False; CancelledError still
-        # propagates out for a clean shutdown.
-        results = await asyncio.gather(*(_del_one(j) for j in ids))
-        deleted += sum(1 for ok in results if ok)
-        # Yield between batches so we never monopolise the DB pool / loop.
-        try:
-            await asyncio.sleep(0.5)
-        except asyncio.CancelledError:
-            raise
-        if len(ids) < _RETENTION_BATCH:
-            break  # backlog drained for this window
+    try:
+        while deleted < _RETENTION_MAX_PER_TICK:
+            try:
+                ids = await store.list_deletable_job_ids(
+                    cutoff, _RETENTION_STATUSES, _RETENTION_BATCH
+                )
+            except Exception:
+                log.warning("job-retention: candidate query failed", exc_info=True)
+                break
+            if not ids:
+                break
+            # Delete the batch BOUNDED-PARALLEL (was strictly sequential -- the
+            # per-job MinIO delete_prefix RTT made a full pass slower than the
+            # job inflow, so the backlog never actually shrank). gather never
+            # raises here: _del_one swallows per-job errors -> False;
+            # CancelledError still propagates out for a clean shutdown.
+            results = await asyncio.gather(*(_del_one(j) for j in ids))
+            ok_n = sum(1 for ok in results if ok)
+            attempted += len(ids)
+            deleted += ok_n
+            if ok_n == 0:
+                # Every delete in the batch failed. The candidate query would
+                # hand back the SAME ids next round, so without this the pass
+                # spins on them forever (the loop only ends on progress).
+                break
+            # Yield between batches so we never monopolise the DB pool / loop.
+            try:
+                await asyncio.sleep(0.5)
+            except asyncio.CancelledError:
+                raise
+            if len(ids) < _RETENTION_BATCH:
+                break  # backlog drained for this window
+    finally:
+        await _release_pass_lock(r, _RETENTION_LOCK_KEY, _RETENTION_COOLDOWN_S)
     _last_retention_run_at = datetime.utcnow()
     _last_retention_deleted = deleted
+    took = time.monotonic() - t0
     if deleted:
         log.info(
-            "job-retention: deleted %d jobs older than %d days (DB + MinIO + cache)",
-            deleted, days,
+            "job-retention: deleted %d/%d jobs older than %d days in %.1fs "
+            "(DB + MinIO + cache)%s",
+            deleted, attempted, days, took,
+            " [hit per-tick cap]" if deleted >= _RETENTION_MAX_PER_TICK else "",
+        )
+    elif attempted:
+        # A pass that found candidates and deleted none used to leave no trace
+        # at all, which is how a non-draining fleet stays invisible (2026-11-02:
+        # unexplained 50-70 min gaps between passes with nothing in any log).
+        log.warning(
+            "job-retention: 0/%d candidates deleted in %.1fs -- every purge "
+            "failed (DB/MinIO error? see debug log)", attempted, took,
         )
     return deleted
 
@@ -1603,66 +1663,66 @@ async def _run_review_retention_once() -> dict:
     # Elect ONE hub per tick (delete is idempotent; the lock just avoids 7x
     # MinIO churn). Best-effort -- proceed if redis absent.
     r = getattr(store, "_r", None)
-    if r is not None:
-        try:
-            got = await r.set(
-                _REVIEW_RETENTION_LOCK_KEY, config.hub_id or "1",
-                nx=True, ex=max(60, int(_REVIEW_RETENTION_INTERVAL_S * 0.9)),
-            )
-            if not got:
-                return out
-        except Exception:
-            pass
+    if not await _acquire_pass_lock(
+        r, _REVIEW_RETENTION_LOCK_KEY, _REVIEW_RETENTION_INTERVAL_S * 0.9
+    ):
+        return out
 
     from datetime import timedelta as _td
 
     cutoff = datetime.utcnow() - _td(days=days)
 
-    # DRY-RUN: probe candidate volume without touching anything. One indexed
-    # query (capped) -- if it returns the cap, report ">=cap".
-    if dry:
-        try:
-            ids = await store.list_deletable_job_ids(
-                cutoff, ["review"], _REVIEW_RETENTION_MAX_PER_TICK
+    try:
+        # DRY-RUN: probe candidate volume without touching anything. One
+        # indexed query (capped) -- if it returns the cap, report ">=cap".
+        if dry:
+            try:
+                ids = await store.list_deletable_job_ids(
+                    cutoff, ["review"], _REVIEW_RETENTION_MAX_PER_TICK
+                )
+            except Exception:
+                log.warning("review-retention: dry-run candidate query failed", exc_info=True)
+                return out
+            out["candidates"] = len(ids)
+            _last_review_retention_run_at = datetime.utcnow()
+            _last_review_retention_deleted = 0
+            log.info(
+                "review-retention[dry-run]: %s%d review job(s) older than %d days "
+                "would be purged (DB + MinIO + cache). Set review_retention_dry_run=false "
+                "to enact.",
+                (">=" if len(ids) >= _REVIEW_RETENTION_MAX_PER_TICK else ""),
+                len(ids), days,
             )
-        except Exception:
-            log.warning("review-retention: dry-run candidate query failed", exc_info=True)
             return out
-        out["candidates"] = len(ids)
-        _last_review_retention_run_at = datetime.utcnow()
-        _last_review_retention_deleted = 0
-        log.info(
-            "review-retention[dry-run]: %s%d review job(s) older than %d days "
-            "would be purged (DB + MinIO + cache). Set review_retention_dry_run=false "
-            "to enact.",
-            (">=" if len(ids) >= _REVIEW_RETENTION_MAX_PER_TICK else ""),
-            len(ids), days,
-        )
-        return out
 
-    # ENACT: delete review-only, oldest-first, bounded-parallel + per-tick cap.
-    _sem = asyncio.Semaphore(_RETENTION_DELETE_CONCURRENCY)
-    deleted = 0
-    while deleted < _REVIEW_RETENTION_MAX_PER_TICK:
-        try:
-            ids = await store.list_deletable_job_ids(
-                cutoff, ["review"], _REVIEW_RETENTION_BATCH
+        # ENACT: delete review-only, oldest-first, bounded-parallel + per-tick cap.
+        _sem = asyncio.Semaphore(_RETENTION_DELETE_CONCURRENCY)
+        deleted = 0
+        while deleted < _REVIEW_RETENTION_MAX_PER_TICK:
+            try:
+                ids = await store.list_deletable_job_ids(
+                    cutoff, ["review"], _REVIEW_RETENTION_BATCH
+                )
+            except Exception:
+                log.warning("review-retention: candidate query failed", exc_info=True)
+                break
+            if not ids:
+                break
+            results = await asyncio.gather(
+                *(_purge_job(store, j, _sem, _REVIEW_RETENTION_MINIO_TIMEOUT_S) for j in ids)
             )
-        except Exception:
-            log.warning("review-retention: candidate query failed", exc_info=True)
-            break
-        if not ids:
-            break
-        results = await asyncio.gather(
-            *(_purge_job(store, j, _sem, _REVIEW_RETENTION_MINIO_TIMEOUT_S) for j in ids)
-        )
-        deleted += sum(1 for ok in results if ok)
-        try:
-            await asyncio.sleep(0.5)
-        except asyncio.CancelledError:
-            raise
-        if len(ids) < _REVIEW_RETENTION_BATCH:
-            break
+            ok_n = sum(1 for ok in results if ok)
+            deleted += ok_n
+            if ok_n == 0:
+                break  # same ids would come back; don't spin (see job-retention)
+            try:
+                await asyncio.sleep(0.5)
+            except asyncio.CancelledError:
+                raise
+            if len(ids) < _REVIEW_RETENTION_BATCH:
+                break
+    finally:
+        await _release_pass_lock(r, _REVIEW_RETENTION_LOCK_KEY, _RETENTION_COOLDOWN_S)
     out["candidates"] = deleted
     out["deleted"] = deleted
     _last_review_retention_run_at = datetime.utcnow()
