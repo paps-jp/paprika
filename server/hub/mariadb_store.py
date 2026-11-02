@@ -776,28 +776,51 @@ class MariaDBJobStore:
     async def list_deletable_job_ids(
         self, cutoff, status_in: list[str], limit: int
     ) -> list[str]:
-        """Oldest terminal-status jobs created before ``cutoff`` -- the GC
-        candidate batch for the auto-retention loop.
+        """Oldest terminal-status jobs that REACHED their terminal state before
+        ``cutoff`` -- the GC candidate batch for the auto-retention loop.
 
-        SQL-selected + LIMITed (uses idx_created_at) so it scales to 800k+
-        rows WITHOUT the O(N) full-table enumeration the manual /jobs/cleanup
-        does (that one loads every job + a per-job FS stat and times out at
-        this table size). Ascending by created_at so repeated calls drain the
-        backlog oldest-first. Terminal statuses only -- never running /
-        queued / downloading."""
+        Keyed on ``completed_at`` (the moment the row went terminal), not
+        ``created_at`` (2026-11-02). "Delete N days after it finished" is what
+        the retention setting means, and the difference bit hard: a job created
+        in June that a stray re-dispatch finished today was, by created_at,
+        already 4 months past the cutoff -- deleted on the next pass, re-queued,
+        re-inserted with its original created_at, deleted again. Measuring from
+        completion gives such a row the same N days as everything else instead
+        of feeding the cycle. completed_at is populated on 100% of terminal rows
+        (sampled across 08-29 / 10-15 / today) and ``idx_completed_at_status``
+        makes this a covering range scan, so it costs no more than before.
+
+        SQL-selected + LIMITed so it scales to 50M+ rows WITHOUT the O(N)
+        full-table enumeration the manual /jobs/cleanup does. Ascending by
+        completed_at so repeated calls drain the backlog oldest-first. Terminal
+        statuses only -- never running / queued / downloading.
+
+        Legacy safety net: a terminal row with NULL completed_at can never match
+        the primary query, so once it comes back EMPTY (backlog drained) a
+        second query sweeps those by created_at. It runs only on an empty
+        primary, so in steady state it is one cheap indexed probe per pass."""
         if not status_in or int(limit) <= 0:
             return []
         placeholders = ",".join(["%s"] * len(status_in))
         sql = (
             f"SELECT job_id FROM jobs "
-            f"WHERE created_at < %s AND status IN ({placeholders}) "
-            f"ORDER BY created_at ASC LIMIT %s"
+            f"WHERE completed_at < %s AND status IN ({placeholders}) "
+            f"ORDER BY completed_at ASC LIMIT %s"
         )
         args = [cutoff, *status_in, int(limit)]
         async with self._pool.acquire() as conn:
             async with conn.cursor() as cur:
                 await cur.execute(sql, args)
                 rows = await cur.fetchall()
+                if not rows:
+                    await cur.execute(
+                        f"SELECT job_id FROM jobs "
+                        f"WHERE created_at < %s AND completed_at IS NULL "
+                        f"AND status IN ({placeholders}) "
+                        f"ORDER BY created_at ASC LIMIT %s",
+                        args,
+                    )
+                    rows = await cur.fetchall()
         return [r[0] for r in rows]
 
     async def list_jobs_by_status_between(

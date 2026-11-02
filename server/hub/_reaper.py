@@ -1432,8 +1432,23 @@ async def _evict_from_pull_queue(jid: str, why: str) -> None:
         log.debug("%s: pull-list evict %s failed", why, jid, exc_info=True)
 
 
+async def _evict_many_from_pull_queue(ids: list[str], why: str) -> int:
+    """Batch form of :func:`_evict_from_pull_queue` for a retention batch: one
+    LRANGE for the whole batch instead of one LREM per job (see
+    ``_pull_queue.remove_many`` for the 2026-11-02 numbers). Best-effort."""
+    try:
+        from server.hub import _pull_queue
+
+        if _pull_queue.ENABLED and ids:
+            return int(await _pull_queue.remove_many(list(ids)))
+    except Exception:
+        log.debug("%s: batch pull-list evict failed", why, exc_info=True)
+    return 0
+
+
 async def _purge_job(
     store, jid: str, sem, minio_timeout: float, timings: dict | None = None,
+    *, evict: bool = True,
 ) -> bool:
     """Purge one job everywhere: MinIO/S3 prefix + DB row (+CASCADE) + local
     cache dir. Returns True on a successful DB-row delete. A MinIO / FS hiccup
@@ -1448,7 +1463,11 @@ async def _purge_job(
     ``db`` / ``evict`` / ``fs`` -- summed across every purge of a pass, so the
     pass summary can say WHERE a slow pass spent its time. Standalone probes
     (2026-11-02) put every phase at milliseconds while in-hub passes took
-    8-16 min for 20k jobs; without this the gap could only be guessed at."""
+    8-16 min for 20k jobs; without this the gap could only be guessed at.
+
+    ``evict=False`` skips the per-job pull-list LREM; the caller must then have
+    evicted the whole batch up front with :func:`_evict_many_from_pull_queue`
+    (the retention passes do). Single-job callers keep the default."""
     from server.hub import objstore
     from server.hub._state import get_storage_dir
     import shutil as _shutil
@@ -1481,9 +1500,10 @@ async def _purge_job(
             # reappearing at the head of the deletion frontier on 2026-08-30,
             # walking it backwards from 08-22 to 05-30. Deleting without this
             # is not a delete, it is a pause.
-            t0 = time.monotonic()
-            await _evict_from_pull_queue(jid, "retention")
-            _tick("evict", t0)
+            if evict:
+                t0 = time.monotonic()
+                await _evict_from_pull_queue(jid, "retention")
+                _tick("evict", t0)
             t0 = time.monotonic()
             try:
                 d = get_storage_dir() / jid
@@ -1554,7 +1574,8 @@ async def _run_job_retention_once() -> int:
 
     async def _del_one(jid: str) -> bool:
         return await _purge_job(
-            store, jid, _sem, _RETENTION_MINIO_TIMEOUT_S, timings=phases
+            store, jid, _sem, _RETENTION_MINIO_TIMEOUT_S, timings=phases,
+            evict=False,  # the batch was evicted below, in one LRANGE
         )
 
     try:
@@ -1568,6 +1589,11 @@ async def _run_job_retention_once() -> int:
                 break
             if not ids:
                 break
+            # Pull-list eviction for the WHOLE batch before the rows go: one
+            # LRANGE + LREM for the (rare) hits, instead of 500 blind LREMs.
+            te = time.monotonic()
+            await _evict_many_from_pull_queue(ids, "retention")
+            phases["evict"] = phases.get("evict", 0.0) + (time.monotonic() - te)
             # Delete the batch BOUNDED-PARALLEL (was strictly sequential -- the
             # per-job MinIO delete_prefix RTT made a full pass slower than the
             # job inflow, so the backlog never actually shrank). gather never
@@ -1744,8 +1770,14 @@ async def _run_review_retention_once() -> dict:
                 break
             if not ids:
                 break
+            await _evict_many_from_pull_queue(ids, "review-retention")
             results = await asyncio.gather(
-                *(_purge_job(store, j, _sem, _REVIEW_RETENTION_MINIO_TIMEOUT_S) for j in ids)
+                *(
+                    _purge_job(
+                        store, j, _sem, _REVIEW_RETENTION_MINIO_TIMEOUT_S, evict=False
+                    )
+                    for j in ids
+                )
             )
             ok_n = sum(1 for ok in results if ok)
             deleted += ok_n

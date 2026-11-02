@@ -109,6 +109,41 @@ async def is_full() -> bool:
     return d >= 0 and d >= MAX_DEPTH
 
 
+async def remove_many(job_ids: list[str]) -> int:
+    """Drop every copy of each id in ``job_ids`` from the list, in ONE read.
+
+    ``LREM`` walks the whole list, so evicting N ids one by one is O(N * len).
+    The retention pass learned this the hard way on 2026-11-02: with ~4,000
+    ids queued, 20,000 per-job LREMs took 3.0 s EACH behind the fleet's other
+    Redis traffic -- 96% of a 34-minute pass (phases: evict=60110 s vs
+    db=1145 / minio=1405). Retired jobs are almost never on the list, so read it
+    once (``LRANGE 0 -1``, a few thousand short strings), intersect, and issue
+    LREM only for the handful that are actually there. Same guarantee as calling
+    :func:`remove` per id; returns the number of entries removed."""
+    ids = [j for j in job_ids if j]
+    if not ids:
+        return 0
+    r = _redis()
+    if r is None:
+        return 0
+    try:
+        present = await r.lrange(QUEUE_KEY, 0, -1)
+    except Exception:
+        log.debug("[pull] remove_many: lrange failed", exc_info=True)
+        return 0
+    want = set(ids)
+    hits = {
+        (p.decode() if isinstance(p, (bytes, bytearray)) else p) for p in (present or [])
+    } & want
+    removed = 0
+    for jid in hits:
+        try:
+            removed += int(await r.lrem(QUEUE_KEY, 0, jid))
+        except Exception:
+            log.debug("[pull] remove_many: lrem %s failed", jid, exc_info=True)
+    return removed
+
+
 async def remove(job_id: str) -> int:
     """Drop every copy of a job id from the list.
 
