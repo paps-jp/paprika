@@ -1662,6 +1662,9 @@ async function clearVisitedAll() {
   const meta = document.getElementById('videoLeakMeta');
   const summ = document.getElementById('videoLeakSummary');
   let _busy = false;
+  let _pollTimer = null;
+  let _polls = 0;
+  const MAX_POLLS = 60;   // 60 x 5 s = 5 min, longer than the server's 240 s statement bound
   const VERDICT_STYLE = {
     decouplable: 'background:#e8f5e9; color:#1b5e20;',
     tokened:     'background:#fff8e1; color:#8a6d00;',
@@ -1680,13 +1683,34 @@ async function clearVisitedAll() {
       return `<span title="${esc(k)}: ${p[k]}" style="display:inline-block; margin:1px 4px 1px 0; padding:0 6px; border-radius:9px; font-size:.82em; ${VERDICT_STYLE[k] || VERDICT_STYLE.error}">${esc(k)} ${pct}%</span>`;
     }).join('');
   }
-  async function load(refresh) {
+  // The hub answers 202 while one hub runs the scan in the background
+  // (shared Redis result); keep polling until a result lands.
+  function schedulePoll() {
+    if (_polls >= MAX_POLLS) {
+      if (meta) meta.textContent = 'timeout';
+      return;
+    }
+    _polls += 1;
+    _pollTimer = setTimeout(() => { _pollTimer = null; load(false, true); }, 5000);
+  }
+  async function load(refresh, isPoll) {
     if (_busy) return;
+    if (!isPoll) {
+      if (_pollTimer) { clearTimeout(_pollTimer); _pollTimer = null; }
+      _polls = 0;
+    }
+    if (!det.open) return;
     _busy = true;
     const hours = daysSel ? daysSel.value : '1';
     if (meta) meta.textContent = i18n('hosts.leak.loading', '集計中…');
     try {
       const r = await fetch('/stats/video-leakage?hours=' + encodeURIComponent(hours) + '&limit=40' + (refresh ? '&refresh=1' : ''));
+      if (r.status === 202) {
+        if (meta) meta.textContent = i18n('hosts.leak.loading', '集計中…') + ` (${_polls * 5}s)`;
+        _busy = false;
+        schedulePoll();
+        return;
+      }
       if (!r.ok) {
         let msg = 'HTTP ' + r.status;
         try { msg = (await r.json()).detail || msg; } catch (_) {}
@@ -1694,6 +1718,11 @@ async function clearVisitedAll() {
         return;
       }
       const d = await r.json();
+      if (d.error) {
+        if (meta) meta.textContent = d.error;
+        tbody.innerHTML = `<tr><td colspan="7" class="empty" style="padding:10px; color:#b00020; text-align:center;">${esc(d.error)}</td></tr>`;
+        return;
+      }
       const tot = d.totals || {};
       const seen = (tot.with_video || 0) + (tot.missed || 0);
       const rate = Math.round(100 * (tot.miss_rate || 0));

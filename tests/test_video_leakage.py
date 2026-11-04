@@ -152,19 +152,22 @@ def test_hours_and_limit_are_clamped():
     assert out["hours"] == mariadb.VIDEO_LEAK_MAX_HOURS
 
 
-def test_route_caches_per_key_and_refresh_bypasses(monkeypatch):
-    from server.hub._state import state
-
-    calls = []
-
+def _fake_loader(calls):
     async def _fake(pool, hours=1, limit=40):
         calls.append((hours, limit))
         return {"hours": hours, "hosts": [], "host_count": 0,
                 "totals": {"jobs": 0, "with_video": 0, "missed": 0,
                            "no_stream": 0, "miss_rate": 0.0}}
+    return _fake
 
-    monkeypatch.setattr(mariadb, "load_video_leakage", _fake)
+
+def test_route_without_redis_computes_inline_and_caches(monkeypatch):
+    from server.hub._state import state
+
+    calls = []
+    monkeypatch.setattr(mariadb, "load_video_leakage", _fake_loader(calls))
     monkeypatch.setattr(state, "mariadb_pool", object(), raising=False)
+    monkeypatch.setattr(state, "store", None, raising=False)
     videostats._cache.clear()
 
     a = asyncio.run(videostats.get_video_leakage(hours=1, limit=40, refresh=0))
@@ -176,6 +179,83 @@ def test_route_caches_per_key_and_refresh_bypasses(monkeypatch):
     assert c["cached"] is False
     assert d["cached"] is False
     assert calls == [(1, 40), (6, 40), (1, 40)]
+
+
+class _FakeRedis:
+    """set(nx=True) / get / delete -- what the route uses."""
+
+    def __init__(self):
+        self.kv = {}
+
+    async def get(self, k):
+        return self.kv.get(k)
+
+    async def set(self, k, v, ex=None, nx=False):
+        if nx and k in self.kv:
+            return None
+        self.kv[k] = v
+        return True
+
+    async def delete(self, k):
+        self.kv.pop(k, None)
+
+
+class _Store:
+    def __init__(self, r):
+        self._r = r
+
+
+def test_route_with_redis_answers_202_and_computes_once_in_background(monkeypatch):
+    """The front cuts long responses at ~30 s and round-robins across ~20 hubs:
+    the scan must run off the request path, once, and land in shared Redis."""
+    from server.hub._state import state
+
+    calls = []
+    monkeypatch.setattr(mariadb, "load_video_leakage", _fake_loader(calls))
+    monkeypatch.setattr(state, "mariadb_pool", object(), raising=False)
+    r = _FakeRedis()
+    monkeypatch.setattr(state, "store", _Store(r), raising=False)
+    videostats._cache.clear()
+
+    async def scenario():
+        first = await videostats.get_video_leakage(hours=1, limit=40, refresh=0)
+        # A second hub (cold L1) asks while the scan is running: also 202,
+        # and it must NOT start a second scan (lock held).
+        videostats._cache.clear()
+        second = await videostats.get_video_leakage(hours=1, limit=40, refresh=0)
+        await asyncio.gather(*list(videostats._tasks))
+        videostats._cache.clear()           # a third hub, reading Redis only
+        third = await videostats.get_video_leakage(hours=1, limit=40, refresh=0)
+        # refresh drops the stored result and starts a new scan.
+        fourth = await videostats.get_video_leakage(hours=1, limit=40, refresh=1)
+        await asyncio.gather(*list(videostats._tasks))
+        fifth = await videostats.get_video_leakage(hours=1, limit=40, refresh=0)
+        return first, second, third, fourth, fifth
+
+    first, second, third, fourth, fifth = asyncio.run(scenario())
+    assert first.status_code == 202 and second.status_code == 202
+    assert first.headers["retry-after"] == "5"
+    assert third["cached"] is True and third["hours"] == 1
+    assert fourth.status_code == 202
+    assert fifth["cached"] is True
+    assert calls == [(1, 40), (1, 40)]
+    # The lock is released after each scan.
+    assert not any(k.startswith("paprika:video_leak:lock:") for k in r.kv)
+
+
+def test_query_failure_becomes_a_payload_not_a_hang(monkeypatch):
+    from server.hub._state import state
+
+    async def _boom(pool, hours=1, limit=40):
+        raise RuntimeError("table gone")
+
+    monkeypatch.setattr(mariadb, "load_video_leakage", _boom)
+    monkeypatch.setattr(state, "mariadb_pool", object(), raising=False)
+    monkeypatch.setattr(state, "store", None, raising=False)
+    videostats._cache.clear()
+    out = asyncio.run(videostats.get_video_leakage(hours=1, limit=40, refresh=0))
+    assert out["error"].startswith("query failed: RuntimeError")
+    assert out["hosts"] == []
 
 
 def test_route_503s_without_mariadb(monkeypatch):
