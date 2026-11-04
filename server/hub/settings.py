@@ -56,6 +56,20 @@ _SCHEMA: dict[str, tuple[Any, str]] = {
     # (capped per tick). See server/hub/_reaper.py:_job_retention_loop.
     "job_retention_enabled": (False, "bool"),
     "job_retention_days": (10, "int"),
+    # Retention の cutoff を下流消費者の watermark に連動させる (2026-11-04)。
+    # image-pull / video-pull / links-pull は pipeline 側 MariaDB の
+    # paprika_pull_watermark に「ここまで取り終わった completed_at」を書く。
+    # 消費者が止まったまま job_retention_days が過ぎると、取りに来る前に行と
+    # 資産が消えて **無音で失われる** (video-pull は 2026-10-13 に 13 日遅れていた)。
+    # cutoff = min(now - days, min(watermark) - margin_hours) にして、消費者が
+    # 止まれば削除も止まる (fail-closed: 表が読めない / slug が無いときは
+    # そのパスを削除 0 で抜ける)。これがあるので days を短くできる。
+    # table は "schema.table" (英数字・_・. のみ)。slugs は CSV、空なら無効。
+    "job_retention_watermark_enabled": (True, "bool"),
+    "job_retention_watermark_table": ("delian.paprika_pull_watermark", "str"),
+    "job_retention_watermark_slugs": (
+        "paprika-image-pull,paprika-video-pull,paprika-links-pull", "str"),
+    "job_retention_watermark_margin_hours": (6, "int"),
     # Review(課題)-specific expiry -- a SEPARATE, shorter-horizon GC just for
     # ``status=review`` jobs, decoupled from the general job_retention_days.
     # WHY: the general retention loop deletes strictly OLDEST-FIRST across ALL

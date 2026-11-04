@@ -1648,6 +1648,81 @@ async def _job_retention_loop() -> None:
             log.warning("job-retention pass failed", exc_info=True)
 
 
+# Watermark clamp (2026-11-04). The pull plugins on the pipeline side record
+# "everything completed before T has been fetched" per slug; deleting a job
+# that finished after that T throws away images/links nobody has read yet,
+# silently. The cutoff is therefore never allowed past min(watermark) - margin.
+# FAIL-CLOSED: if the table can't be read or a configured slug is missing, the
+# pass deletes nothing (and says so) -- a stopped consumer must stop the GC,
+# never the other way round. Code default OFF so the unit-test fakes (no DB)
+# keep working; the settings schema default is ON.
+_WATERMARK_TABLE_RE = re.compile(r"^[A-Za-z0-9_]+(\.[A-Za-z0-9_]+)?$")
+_watermark_last_warn_mono = 0.0
+
+
+def _watermark_warn(msg: str) -> None:
+    """Rate-limited WARNING (a stalled consumer would otherwise log every pass)."""
+    global _watermark_last_warn_mono
+    now = time.monotonic()
+    if now - _watermark_last_warn_mono >= 60.0:
+        _watermark_last_warn_mono = now
+        log.warning("%s", msg)
+
+
+async def _watermark_clamp_cutoff(cutoff: datetime, who: str) -> datetime | None:
+    """Return the cutoff clamped to the consumers' watermarks, or ``None`` when
+    the clamp cannot be evaluated (fail-closed: caller must delete nothing)."""
+    from datetime import timedelta as _td
+
+    s = state.settings
+    if s is None or not bool(s.get("job_retention_watermark_enabled", False)):
+        return cutoff
+    slugs = [x.strip() for x in str(s.get("job_retention_watermark_slugs", "") or "")
+             .split(",") if x.strip()]
+    if not slugs:
+        return cutoff
+    table = str(s.get("job_retention_watermark_table", "") or "").strip()
+    if not _WATERMARK_TABLE_RE.match(table):
+        _watermark_warn(f"{who}: watermark table name {table!r} is invalid -- "
+                        "deleting nothing (fail-closed)")
+        return None
+    try:
+        margin_h = int(s.get("job_retention_watermark_margin_hours", 6) or 0)
+    except (TypeError, ValueError):
+        margin_h = 6
+    pool = state.mariadb_pool
+    if pool is None:
+        _watermark_warn(f"{who}: no MariaDB pool to read {table} -- deleting nothing "
+                        "(fail-closed)")
+        return None
+    ph = ",".join(["%s"] * len(slugs))
+    try:
+        async with pool.acquire() as conn:
+            async with conn.cursor() as cur:
+                await cur.execute(
+                    f"SELECT slug, last_completed_at FROM {table} WHERE slug IN ({ph})",
+                    slugs,
+                )
+                rows = {r[0]: r[1] for r in await cur.fetchall()}
+    except Exception as e:  # noqa: BLE001
+        _watermark_warn(f"{who}: cannot read {table}: {e} -- deleting nothing "
+                        "(fail-closed)")
+        return None
+    missing = [x for x in slugs if rows.get(x) is None]
+    if missing:
+        _watermark_warn(f"{who}: watermark missing for {missing} in {table} -- "
+                        "deleting nothing (fail-closed)")
+        return None
+    floor = min(rows[x] for x in slugs) - _td(hours=max(0, margin_h))
+    if floor < cutoff:
+        log.info("%s: cutoff %s clamped to consumer watermark floor %s (%dh margin; "
+                 "oldest consumer %s)", who, cutoff.isoformat(timespec="seconds"),
+                 floor.isoformat(timespec="seconds"), margin_h,
+                 min(slugs, key=lambda x: rows[x]))
+        return floor
+    return cutoff
+
+
 async def _run_job_retention_once() -> int:
     """One retention pass. Returns #jobs deleted. Extracted for dry-run/test."""
     global _last_retention_run_at, _last_retention_deleted
@@ -1672,7 +1747,11 @@ async def _run_job_retention_once() -> int:
         return 0
     from datetime import timedelta as _td
 
-    cutoff = datetime.utcnow() - _td(days=days)
+    cutoff = await _watermark_clamp_cutoff(datetime.utcnow() - _td(days=days),
+                                           "job-retention")
+    if cutoff is None:
+        await _release_pass_lock(r, _RETENTION_LOCK_KEY, _RETENTION_COOLDOWN_S)
+        return 0
     deleted = 0
     attempted = 0
     t0 = time.monotonic()
@@ -1837,7 +1916,12 @@ async def _run_review_retention_once() -> dict:
 
     from datetime import timedelta as _td
 
-    cutoff = datetime.utcnow() - _td(days=days)
+    cutoff = await _watermark_clamp_cutoff(datetime.utcnow() - _td(days=days),
+                                           "review-retention")
+    if cutoff is None:
+        await _release_pass_lock(r, _REVIEW_RETENTION_LOCK_KEY, _RETENTION_COOLDOWN_S)
+        out["skipped"] = "watermark unreadable (fail-closed)"
+        return out
 
     try:
         # DRY-RUN: probe candidate volume without touching anything. One
