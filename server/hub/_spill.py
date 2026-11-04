@@ -157,6 +157,74 @@ def stale_after_s() -> int:
 
 
 # ---------------------------------------------------------------------------
+# RAM-tier admission back-pressure (RAM-only video: no spill target)
+#
+# Refuse work before .48 fills, instead of spilling. Uses the SAME capacity
+# sample the sampler already takes for a tier (measured whether or not the tier
+# has a spill target -- see the loop). Fail-closed: unmeasurable -> refuse.
+
+
+def admission_enabled() -> bool:
+    try:
+        return bool(_setting("asset_ram_admission_enabled", False))
+    except Exception:
+        return False
+
+
+def admission_pct() -> float:
+    """POST /jobs (download_video) refuses at/above this .48 usage %."""
+    try:
+        return max(1.0, min(100.0, float(_setting("asset_ram_admission_pct", 88.0))))
+    except Exception:
+        return 88.0
+
+
+def reject_pct() -> float:
+    """Video asset write/presign refuses at/above this .48 usage % -- the hard
+    floor that keeps the tmpfs off 100%. Forced >= admission_pct."""
+    try:
+        v = float(_setting("asset_ram_reject_pct", 92.0))
+    except Exception:
+        v = 92.0
+    return max(admission_pct(), min(100.0, v))
+
+
+def _fresh_pct(tier: str) -> float | None:
+    """Latest usage % for ``tier`` from the local snapshot, or None when
+    missing or stale (staleness => unmeasurable => caller fails closed)."""
+    rec = _LOCAL_STATE.get(tier)
+    if not rec:
+        return None
+    try:
+        if (time.time() - float(rec.get("ts") or 0)) > stale_after_s():
+            return None
+        p = rec.get("pct")
+        return float(p) if p is not None else None
+    except Exception:
+        return None
+
+
+def reject_new_jobs(tier: str = TIER_PRIMARY) -> bool:
+    """True => refuse a new (video) job (503). Fail-closed on unmeasurable."""
+    if not admission_enabled():
+        return False
+    p = _fresh_pct(tier)
+    if p is None:
+        return True
+    return p >= admission_pct()
+
+
+def reject_writes(tier: str = TIER_PRIMARY) -> bool:
+    """True => refuse a (video) asset write/presign (507). Fail-closed."""
+    if not admission_enabled():
+        return False
+    p = _fresh_pct(tier)
+    if p is None:
+        return True
+    return p >= reject_pct()
+
+
+# ---------------------------------------------------------------------------
 # Decision read path (SYNCHRONOUS -- safe to call from the executor thread)
 
 
@@ -196,10 +264,20 @@ def is_spilling(tier: str, job_id: str | None = None) -> bool:
 def snapshot() -> dict[str, Any]:
     """Current decision + measurement, for /health and the admin UI."""
     on = spill_enabled()
+    adm = admission_enabled()
+    measuring = on or adm  # the sampler runs (and pct is meaningful) if either
     out: dict[str, Any] = {
         "enabled": on,
         "high_pct": high_pct(),
         "low_pct": low_pct(),
+        "admission": {
+            "enabled": adm,
+            "admission_pct": admission_pct(),
+            "reject_pct": reject_pct(),
+            # Live back-pressure decisions for the video RAM tier (.48).
+            "reject_new_jobs": reject_new_jobs(TIER_PRIMARY),
+            "reject_writes": reject_writes(TIER_PRIMARY),
+        },
         "tiers": {},
     }
     now = time.time()
@@ -207,12 +285,12 @@ def snapshot() -> dict[str, Any]:
         rec = dict(_LOCAL_STATE.get(tier) or {})
         age = now - float(rec.get("ts") or 0) if rec else None
         out["tiers"][tier] = {
-            # Report the EFFECTIVE routing. With the feature off nothing ever
-            # diverts, so reporting the raw fail-safe "spill" here would claim
-            # a diversion that cannot happen.
+            # Report the EFFECTIVE routing. With spill off nothing diverts, so
+            # reporting the raw fail-safe "spill" would claim a diversion that
+            # cannot happen.
             "spill": bool(on and is_spilling(tier)),
-            "pct": rec.get("pct"),
-            "note": rec.get("note", "no sample yet") if on else "disabled",
+            "pct": rec.get("pct") if measuring else None,
+            "note": rec.get("note", "no sample yet") if measuring else "disabled",
             "age_s": round(age, 1) if age is not None else None,
             "stale": (age is None or age > stale_after_s()),
         }
@@ -344,12 +422,19 @@ def _tier_has_spill_target(tier: str) -> bool:
     )
 
 
+def _tier_endpoint_configured(tier: str) -> bool:
+    """The tier's RAM endpoint exists (so its capacity can be measured), even
+    when there is no spill target -- admission back-pressure needs the pct."""
+    return bool(_tier_probe_cfg(tier)[0])
+
+
 async def _sample_tier(tier: str, prev: dict[str, Any] | None) -> dict[str, Any]:
     """One capacity sample -> new decision record, applying hysteresis."""
     from server.hub._storage_metrics import fetch_minio_capacity
 
     was_spilling = bool(prev.get("spill")) if prev else False
     endpoint, access, secret, bucket = _tier_probe_cfg(tier)
+    has_target = _tier_has_spill_target(tier)
 
     if not endpoint:
         # Tier not configured -> nothing to protect, never spill.
@@ -357,7 +442,8 @@ async def _sample_tier(tier: str, prev: dict[str, Any] | None) -> dict[str, Any]
 
     # Persistence: the RAM store wipes its bucket on reboot. (Re)create it if
     # missing. If it's missing AND unrecoverable (endpoint wedged), the tier
-    # is not writable -> spill to the durable store, same as 'unmeasurable'.
+    # is not writable. spill only when a target exists; pct=None -> admission
+    # fails closed either way.
     try:
         from server.hub import objstore
 
@@ -366,10 +452,10 @@ async def _sample_tier(tier: str, prev: dict[str, Any] | None) -> dict[str, Any]
         writable = False
     if not writable:
         return {
-            "spill": True,
+            "spill": has_target,
             "pct": None,
             "ts": time.time(),
-            "note": "RAM bucket missing/unwritable -> spill",
+            "note": "RAM bucket missing/unwritable",
         }
 
     cap = await fetch_minio_capacity(
@@ -378,16 +464,19 @@ async def _sample_tier(tier: str, prev: dict[str, Any] | None) -> dict[str, Any]
 
     if not cap.healthy or not cap.total_bytes:
         # THE important branch: a wedged host answers slowly or not at all.
-        # Treat as over-threshold and get writes off it.
+        # spill (if a target exists) AND pct=None so admission fails closed --
+        # unmeasurable is exactly the 2026-07-20 freeze signature.
         return {
-            "spill": True,
+            "spill": has_target,
             "pct": None,
             "ts": time.time(),
-            "note": "unmeasurable (%s) -> spill" % (cap.note or "no data"),
+            "note": "unmeasurable (%s)" % (cap.note or "no data"),
         }
 
     pct = 100.0 * float(cap.used_bytes) / float(cap.total_bytes)
-    if was_spilling:
+    if not has_target:
+        spill = False                     # RAM-only: no spill, pct drives admission
+    elif was_spilling:
         spill = pct >= low_pct()          # stay spilled until we drop below low
     else:
         spill = pct >= high_pct()         # switch out at high
@@ -451,9 +540,10 @@ async def _tick() -> None:
     """One sampler pass: claim the lock and measure, or mirror the shared state."""
     from server.hub._state import state
 
-    if not spill_enabled():
-        # Keep the snapshot clean so a re-enable starts from a fresh
-        # sample rather than a stale (and therefore spill-forcing) one.
+    if not (spill_enabled() or admission_enabled()):
+        # Neither feature needs the sample. Keep the snapshot clean so a
+        # re-enable starts fresh rather than from a stale (spill/reject-forcing)
+        # record.
         _LOCAL_STATE.clear()
         return
 
@@ -478,14 +568,13 @@ async def _tick() -> None:
         shared = await _load_shared(redis) or {}
         fresh: dict[str, dict[str, Any]] = {}
         for tier in TIERS:
-            if not _tier_has_spill_target(tier):
-                # No spill store configured for this tier: never spill,
-                # and don't waste a probe on it.
+            if not _tier_endpoint_configured(tier):
+                # Tier's RAM store isn't configured -> nothing to measure.
                 fresh[tier] = {
                     "spill": False,
                     "pct": None,
                     "ts": time.time(),
-                    "note": "no spill target configured",
+                    "note": "tier not configured",
                 }
                 continue
             try:

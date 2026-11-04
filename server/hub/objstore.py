@@ -527,6 +527,18 @@ def _spilling(tier: str, key: str) -> bool:
         return False
 
 
+def reject_video_write() -> bool:
+    """True when the video RAM tier (.48) is over the admission reject
+    threshold (or unmeasurable) -- the asset-upload routes return 507 so the
+    tmpfs never fills to the freeze point. Off unless admission is enabled."""
+    try:
+        from server.hub import _spill
+
+        return _spill.reject_writes(_spill.TIER_PRIMARY)
+    except Exception:
+        return False
+
+
 def _write_cb(key: str):
     """(client, bucket) to WRITE ``key`` to: non-video -> hot tier when
     configured, else primary; video -> primary. Each tier diverts to its

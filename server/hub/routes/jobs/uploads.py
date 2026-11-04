@@ -455,6 +455,15 @@ async def upload_asset(job_id: str, request: Request) -> dict:
         name = _sanitise_asset_name(
             sink.fields.get("asset_name") or sink.filename or "unnamed"
         )
+        # RAM-tier back-pressure (2026-09-07): refuse a VIDEO asset write when
+        # the .48 tmpfs is near full (or unmeasurable) so it never reaches the
+        # freeze point. Raised BEFORE the rename/mirror; the .part is cleaned by
+        # the finally below. Worker retries with backoff. Non-video assets go to
+        # .47, not .48, so they are never gated here. No-op unless admission is on.
+        if objstore._is_video_key(name) and objstore.reject_video_write():
+            raise HTTPException(
+                507, "video RAM tier (.48) full; retry with backoff"
+            )
         target = target_dir / name
         if out is not None:
             out.close()
@@ -542,6 +551,12 @@ async def presign_asset_upload(job_id: str, body: dict) -> dict:
     import re
 
     name = re.sub(r'[<>:"/\\|?*]', "_", raw_name)[:180]
+    # RAM-tier back-pressure: don't hand out a presigned PUT for a VIDEO asset
+    # when .48 is near full (or unmeasurable) -- the worker's direct PUT would
+    # otherwise fill the tmpfs. Worker retries with backoff. (No-op unless
+    # admission is on; non-video assets are never gated.)
+    if objstore._is_video_key(name) and objstore.reject_video_write():
+        raise HTTPException(507, "video RAM tier (.48) full; retry with backoff")
     key = objstore.asset_key(job_id, name)
     try:
         expires = int(body.get("expires_in") or 7200)
@@ -672,6 +687,10 @@ async def save_asset_from_url(job_id: str, body: dict) -> dict:
     name = _re.sub(r'[<>:"/\\|?*]', "_", raw_name)[:180]
     if not name or name == ".":
         name = "resource"
+
+    # RAM-tier back-pressure: refuse a VIDEO asset when .48 is near full.
+    if objstore._is_video_key(name) and objstore.reject_video_write():
+        raise HTTPException(507, "video RAM tier (.48) full; retry with backoff")
 
     target_dir = get_storage_dir() / job_id / "assets"
     target_dir.mkdir(parents=True, exist_ok=True)

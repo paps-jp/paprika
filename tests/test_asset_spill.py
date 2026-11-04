@@ -74,8 +74,13 @@ def _cap(total, used, healthy=True, note=""):
     )
 
 
-def _sample(monkeypatch, pct, prev_spill, *, healthy=True, note="", bucket_ok=True):
-    """Run one _sample_tier pass at ``pct`` used, given the previous state."""
+def _sample(monkeypatch, pct, prev_spill, *, healthy=True, note="", bucket_ok=True, has_target=True):
+    """Run one _sample_tier pass at ``pct`` used, given the previous state.
+
+    ``has_target`` reflects whether a spill target is configured -- the spill
+    DECISION only fires when one exists (RAM-only tiers just report pct for
+    admission). These threshold tests assume a target unless told otherwise.
+    """
     total = 107_400_000_000  # .47 image RAM disk
     used = int(total * pct / 100.0)
 
@@ -86,6 +91,7 @@ def _sample(monkeypatch, pct, prev_spill, *, healthy=True, note="", bucket_ok=Tr
         return bucket_ok
 
     monkeypatch.setattr(_spill, "_tier_probe_cfg", lambda t: ("http://ram:9000", "a", "b", "paprika"))
+    monkeypatch.setattr(_spill, "_tier_has_spill_target", lambda t: has_target)
     monkeypatch.setattr("server.hub._storage_metrics.fetch_minio_capacity", _fake_fetch)
     monkeypatch.setattr(objstore, "ensure_ram_bucket", _fake_ensure)
     prev = {"spill": prev_spill}
@@ -257,6 +263,94 @@ def test_ensure_bucket_false_when_unrecoverable():
 
 def test_ensure_bucket_false_without_client():
     assert objstore.ensure_bucket(None, "paprika") is False
+
+
+# --- 3a. RAM-tier admission back-pressure (RAM-only video) -----------------
+
+
+def _set_admission(hi=88.0, rej=92.0, enabled=True):
+    from server.hub import _state
+
+    _state.state.settings.set("asset_ram_admission_enabled", enabled)
+    _state.state.settings.set("asset_ram_admission_pct", hi)
+    _state.state.settings.set("asset_ram_reject_pct", rej)
+
+
+def _set_primary_pct(pct, age_s=0.0):
+    import time as _t
+
+    _spill._LOCAL_STATE[_spill.TIER_PRIMARY] = {
+        "spill": False, "pct": pct, "ts": _t.time() - age_s, "note": "",
+    }
+
+
+def test_admission_off_never_rejects():
+    _set_admission(enabled=False)
+    _set_primary_pct(99.0)
+    assert _spill.reject_new_jobs("primary") is False
+    assert _spill.reject_writes("primary") is False
+
+
+def test_admission_below_thresholds_accepts():
+    _set_admission(88.0, 92.0)
+    _set_primary_pct(50.0)
+    assert _spill.reject_new_jobs("primary") is False
+    assert _spill.reject_writes("primary") is False
+
+
+def test_jobs_rejected_at_88_writes_still_ok():
+    """The 88% job gate trips before the 92% write gate -- new crawls throttle
+    first, in-flight writes keep landing in the 88-92% buffer."""
+    _set_admission(88.0, 92.0)
+    _set_primary_pct(89.0)
+    assert _spill.reject_new_jobs("primary") is True
+    assert _spill.reject_writes("primary") is False
+
+
+def test_writes_rejected_at_92():
+    _set_admission(88.0, 92.0)
+    _set_primary_pct(93.0)
+    assert _spill.reject_new_jobs("primary") is True
+    assert _spill.reject_writes("primary") is True
+
+
+def test_unmeasurable_fails_closed_both_gates():
+    """No sample -> refuse both (the 2026-07-20 wedged-host signature)."""
+    _set_admission(88.0, 92.0)
+    _spill._LOCAL_STATE.clear()
+    assert _spill.reject_new_jobs("primary") is True
+    assert _spill.reject_writes("primary") is True
+
+
+def test_stale_sample_fails_closed():
+    _set_admission(88.0, 92.0)
+    _set_primary_pct(10.0, age_s=100000)  # far older than stale_after_s
+    assert _spill.reject_new_jobs("primary") is True
+    assert _spill.reject_writes("primary") is True
+
+
+def test_reject_pct_forced_at_or_above_admission_pct():
+    _set_admission(88.0, 50.0)  # mis-set reject below admission
+    assert _spill.reject_pct() >= _spill.admission_pct()
+
+
+def test_ram_only_sample_reports_pct_but_never_spills(monkeypatch):
+    """With no spill target (RAM-only), _sample_tier measures pct for admission
+    but the spill decision stays False even above the old high threshold."""
+    rec = _sample(monkeypatch, 95.0, prev_spill=False, has_target=False)
+    assert rec["spill"] is False
+    assert rec["pct"] == 95.0
+
+
+def test_snapshot_surfaces_admission(monkeypatch):
+    _set_admission(88.0, 92.0)
+    _set_primary_pct(93.0)
+    snap = _spill.snapshot()
+    assert snap["admission"]["enabled"] is True
+    assert snap["admission"]["reject_writes"] is True
+    assert snap["admission"]["reject_new_jobs"] is True
+    # pct is surfaced even if spill itself is disabled
+    assert snap["tiers"]["primary"]["pct"] == 93.0
 
 
 # --- 3b. snapshot / loop tick ----------------------------------------------

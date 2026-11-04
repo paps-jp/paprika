@@ -446,6 +446,18 @@ _SCHEMA: dict[str, tuple[Any, str]] = {
     "maintenance_plugin_name": ("", "str"),          # e.g. "video-gc"
     "maintenance_plugin_interval_s": (300, "int"),
     "maintenance_plugin_params": ("{}", "str"),      # JSON
+    # ---- RAM-tier admission back-pressure (2026-09-07) ------------------
+    # RAM-only video (no spill target): instead of letting the .48 tmpfs fill
+    # to 100% and freeze the host, refuse work BEFORE it fills. Two gates off
+    # the same .48 capacity sample the spill sampler already takes:
+    #   * admission_pct: POST /jobs (download_video) -> 503 at/above this.
+    #   * reject_pct:    video asset write/presign -> 507 at/above this (the
+    #                    hard floor that keeps the tmpfs off 100%).
+    # Fail-closed: if .48 is unmeasurable (the 2026-07-20 wedged-host
+    # signature) both gates trip. Off by default. See server/hub/_spill.py.
+    "asset_ram_admission_enabled": (False, "bool"),
+    "asset_ram_admission_pct": (88.0, "float"),
+    "asset_ram_reject_pct": (92.0, "float"),
     # ---- Windows portable: Chrome headless ------------------------------
     # When True, the bundled Chromium starts with ``--headless=new`` so
     # the operator's physical desktop isn't taken over by paprika's job

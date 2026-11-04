@@ -2228,6 +2228,23 @@ async def create_job(req: JobRequest, request: Request) -> JobInfo:
         except Exception:
             pass
 
+    # RAM-tier admission back-pressure (2026-09-07): RAM-only video has no spill
+    # target, so refuse NEW video crawls when the .48 tmpfs is near full (or
+    # unmeasurable) -- stopping the source before it fills the RAM disk and
+    # freezes the host. Only gates download_video jobs (image/non-video assets
+    # go to .47, not .48). Off unless asset_ram_admission_enabled. See _spill.py.
+    if req.options.download_video:
+        try:
+            from server.hub import _spill as _spill_adm
+            _reject_job = _spill_adm.reject_new_jobs(_spill_adm.TIER_PRIMARY)
+        except Exception:
+            _reject_job = False
+        if _reject_job:
+            raise HTTPException(
+                503,
+                "video RAM tier (.48) near capacity; retry with backoff",
+            )
+
     # A (2026-07-06): clamp the fetch wait knobs to a fleet ceiling. The dominant
     # lane-hold was wait_seconds + the max_wait_seconds network-idle wait (up to
     # 80s), most of which is ad/tracker traffic never going idle -- not content
