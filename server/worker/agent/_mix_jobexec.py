@@ -208,6 +208,87 @@ def _emergency_disk_cleanup() -> None:
     )
 
 
+# ---- deferred video download: cookies for the browser-less yt-dlp -----------
+#
+# The deferred download runs after the lane's Chrome is gone, so the only
+# cookies it can carry are the ones dumped from the browser at the end of the
+# fetch (``FetchOptions.on_complete_dump_cookies``). That jar is the WHOLE
+# profile (page host, CDN hosts the player talked to, trackers); we hand
+# yt-dlp only the entries whose domain is related to a host the download will
+# actually contact, written as a Netscape cookies.txt.
+
+_DEFERRED_COOKIE_FILE_PREFIX = "ytdlp_cookies_deferred_"
+
+
+def _host_of(url: str | None) -> str:
+    try:
+        h = (urlsplit(url or "").hostname or "").lower()
+    except Exception:
+        return ""
+    return h[4:] if h.startswith("www.") else h
+
+
+def _deferred_cookie_hosts(targets: list[dict], page_url: str | None) -> list[str]:
+    """Hosts a deferred download may contact: each target's stream URL and
+    referer, plus the page itself. Deduplicated, order preserved, no www."""
+    out: list[str] = []
+    for u in [page_url] + [
+        v for t in (targets or []) for v in (t.get("url"), t.get("referer"))
+    ]:
+        h = _host_of(u)
+        if h and h not in out:
+            out.append(h)
+    return out
+
+
+def _cookie_domain_matches(domain: str, hosts: list[str]) -> bool:
+    d = (domain or "").lower().lstrip(".")
+    if d.startswith("www."):
+        d = d[4:]
+    if not d:
+        return False
+    for h in hosts:
+        if d == h or h.endswith("." + d) or d.endswith("." + h):
+            return True
+    return False
+
+
+def _netscape_cookies_for_hosts(jar: list[dict] | None, hosts: list[str]) -> tuple[str, int]:
+    """Render the CDP cookie dump (``Network.getAllCookies`` as dicts) as a
+    Netscape cookies.txt restricted to ``hosts`` (see
+    ``_cookie_domain_matches``). Returns ``(text, n_cookies)``; ``n_cookies``
+    is 0 when nothing matched (the caller then skips the file).
+
+    Netscape line: domain, include-subdomains flag, path, secure, expires
+    (unix seconds; 0 = session cookie -- CDP reports -1), name, value."""
+    lines = ["# Netscape HTTP Cookie File"]
+    n = 0
+    for c in jar or []:
+        if not isinstance(c, dict):
+            continue
+        domain = str(c.get("domain") or "")
+        if not _cookie_domain_matches(domain, hosts):
+            continue
+        name = str(c.get("name") or "")
+        if not name:
+            continue
+        flag = "TRUE" if domain.startswith(".") else "FALSE"
+        path = str(c.get("path") or "/")
+        secure = "TRUE" if c.get("secure") else "FALSE"
+        try:
+            exp = int(float(c.get("expires") or 0))
+        except (TypeError, ValueError):
+            exp = 0
+        if exp < 0:
+            exp = 0
+        value = str(c.get("value") or "")
+        # Tabs / newlines inside a value would break the line format.
+        value = value.replace("\t", " ").replace("\n", " ").replace("\r", " ")
+        lines.append(f"{domain}\t{flag}\t{path}\t{secure}\t{exp}\t{name}\t{value}")
+        n += 1
+    return "\n".join(lines) + "\n", n
+
+
 class _JobExecMixin:
     async def _run_assigned_job(self, assign: HubAssignJob) -> None:
         job_id = assign.job_id
@@ -445,6 +526,38 @@ class _JobExecMixin:
                         _log,
                     )
 
+                # Detach big-video downloads from the lane. When the
+                # operator asked for video AND this isn't a keep_session
+                # job, DETECT streams during capture but defer the
+                # (often 10+ min) yt-dlp download to a background task so
+                # the lane is freed immediately. The job sits in phase
+                # "downloading" until the background task uploads the
+                # video and sends the final WorkerJobComplete. keep_session
+                # is excluded -- there the operator drives download_video()
+                # interactively inside the live session.
+                # (keep_session itself is only read into its local further
+                # down, so test the option directly here.)
+                _defer_video = (
+                    bool(getattr(assign.options, "download_video", False))
+                    and not bool(getattr(assign.options, "keep_session", False))
+                )
+                # The deferred yt-dlp runs after this lane's Chrome is gone,
+                # so its only chance at the session's cookies (page host AND
+                # the CDN hosts the player authenticated against) is the
+                # end-of-fetch jar dump. Tee that dump into a holder; the
+                # host-registry save (save_cb) keeps running unchanged.
+                # Without this tee the dump only happens when the hub set
+                # save_cookies_host.
+                _deferred_jar: dict = {}
+                dump_cb = save_cb
+                if _defer_video:
+                    async def dump_cb(jar, _inner=save_cb):
+                        _deferred_jar["jar"] = [
+                            c for c in (jar or []) if isinstance(c, dict)
+                        ]
+                        if _inner is not None:
+                            await _inner(jar)
+
                 # Register this fetch as a read-only inspectable
                 # session so the admin UI can call /sessions/{id}/
                 # cookies / outline / screenshot / state while the
@@ -522,7 +635,7 @@ class _JobExecMixin:
                     _log,
                     lane=lane,
                     cookies_to_install=assign.cookies,
-                    on_complete_dump_cookies=save_cb,
+                    on_complete_dump_cookies=dump_cb,
                     on_browser_ready=ready_cb,
                     on_browser_closing=closing_cb,
                     on_after_navigate=_recipe_cb if _picked_recipe else None,
@@ -530,19 +643,6 @@ class _JobExecMixin:
                     # V: operator-managed URL deny list from Settings.
                     asset_url_blacklist=list(getattr(assign, "asset_url_blacklist", []) or []),
                     on_asset_saved=_on_asset_saved,
-                )
-                # Detach big-video downloads from the lane. When the
-                # operator asked for video AND this isn't a keep_session
-                # job, DETECT streams during capture but defer the
-                # (often 10+ min) yt-dlp download to a background task so
-                # the lane is freed immediately. The job sits in phase
-                # "downloading" until the background task uploads the
-                # video and sends the final WorkerJobComplete. keep_session
-                # is excluded -- there the operator drives download_video()
-                # interactively inside the live session.
-                _defer_video = (
-                    bool(getattr(assign.options, "download_video", False))
-                    and not keep_session
                 )
                 fetch_opts.defer_video_download = _defer_video
                 try:
@@ -701,6 +801,7 @@ class _JobExecMixin:
                         _deferred_targets,
                         job_result,
                         page_url_for_assets,
+                        cookie_jar=_deferred_jar.get("jar"),
                     )
                 else:
                     await self._send(
@@ -1049,12 +1150,70 @@ class _JobExecMixin:
 
         return _on_ready, _on_closing
 
+    async def _deferred_cookies_file(
+        self,
+        assign: HubAssignJob,
+        targets: list[dict],
+        page_url: str | None,
+        cookie_jar: list[dict] | None,
+    ) -> tuple[Path | None, str]:
+        """Pick the cookies.txt for a deferred download, or None.
+
+        1. the browser's end-of-fetch jar, cut down to the page / stream /
+           referer hosts (this is what carries per-play session cookies);
+        2. else the hub's per-host registry for the page host (operator
+           logins; what media.py and the download tier already use).
+
+        Returns ``(path_or_None, human note for the job log)``. Never raises:
+        a cookie problem must not cost the download."""
+        from types import SimpleNamespace
+
+        ref_url = page_url or getattr(assign, "url", None) or (
+            (targets[0].get("url") if targets else None)
+        )
+        hosts = _deferred_cookie_hosts(targets, ref_url)
+        jar_n = len(cookie_jar or [])
+        if cookie_jar:
+            text, n = _netscape_cookies_for_hosts(cookie_jar, hosts)
+            if n:
+                try:
+                    fd, p = tempfile.mkstemp(
+                        prefix=_DEFERRED_COOKIE_FILE_PREFIX, suffix=".txt",
+                    )
+                    with os.fdopen(fd, "w", encoding="utf-8") as f:
+                        f.write(text)
+                    return Path(p), (
+                        f"{n} browser cookie(s) for {len(hosts)} host(s) "
+                        f"({', '.join(hosts[:4])})"
+                    )
+                except OSError as e:
+                    return None, f"none (browser jar write failed: {e})"
+        # Fallback: the hub's host registry (operator-saved logins).
+        path = None
+        try:
+            ns = SimpleNamespace(
+                asset_upload_base=getattr(assign, "asset_upload_base", None),
+            )
+            path = await self._fetch_cookies_txt_for(ref_url, ns, None)
+        except Exception:
+            path = None
+        if path:
+            return path, (
+                f"host registry cookies.txt for {_host_of(ref_url)} "
+                f"(browser jar: {jar_n} cookie(s), none for {', '.join(hosts[:4]) or '-'})"
+            )
+        return None, (
+            f"none (browser jar: {jar_n} cookie(s), none for "
+            f"{', '.join(hosts[:4]) or '-'}; registry: empty)"
+        )
+
     def _spawn_deferred_video_download(
         self,
         assign: HubAssignJob,
         targets: list[dict],
         base_result,
         page_url: str | None,
+        cookie_jar: list[dict] | None = None,
     ) -> None:
         """Run a fetch job's deferred yt-dlp download(s) in a DETACHED
         background task, upload the resulting video(s) to the job's
@@ -1066,6 +1225,16 @@ class _JobExecMixin:
         OWN temp dir (not the job workdir, which the caller rmtree's) and
         a generous per-download timeout so big VODs aren't killed
         mid-stream (the old inline path capped at 600s and died ~50%).
+
+        ``cookie_jar`` is the browser's end-of-fetch cookie dump (CDP
+        ``Network.getAllCookies`` as dicts). The entries related to the
+        page / stream / referer hosts are written to a Netscape cookies.txt
+        and passed to yt-dlp (``--cookies``), so cookie-gated streams --
+        session cookies the player set on the CDN -- survive the handoff
+        to the browser-less download. ``None`` / no match falls back to
+        the hub's per-host registry (``/hosts/{host}/cookies.txt``), which
+        holds operator logins but not per-play session cookies. The file
+        is removed when the download finishes.
 
         That temp dir is taken from the shared node-tmpfs pool when one is
         mounted (server/worker/scratch_pool.py) -- this is the write that
@@ -1160,11 +1329,18 @@ class _JobExecMixin:
                 _emit_progress(JOB_PROGRESS_MARKER + json.dumps(_payload))
 
             added: list = []
+            cookies_file: Path | None = None
             try:
                 await self._send(WorkerJobLog(
                     job_id=job_id,
                     line=f"  [downloading] {len(targets)} video target(s) "
                          f"in background…",
+                ))
+                cookies_file, _ck_note = await self._deferred_cookies_file(
+                    assign, targets, page_url, cookie_jar,
+                )
+                await self._send(WorkerJobLog(
+                    job_id=job_id, line=f"  [downloading] cookies: {_ck_note}",
                 ))
                 for t in targets:
                     u = t.get("url")
@@ -1185,6 +1361,7 @@ class _JobExecMixin:
                     ok, msg = await asyncio.to_thread(
                         run_ytdlp, u, _dl_dirs[-1],
                         referer=ref, timeout=dl_timeout, log=_dl_log,
+                        cookies_file=cookies_file,
                     )
                     if not ok and _on_pool and _looks_like_enospc(msg):
                         # A neighbouring CT won the race between our
@@ -1204,6 +1381,7 @@ class _JobExecMixin:
                         ok, msg = await asyncio.to_thread(
                             run_ytdlp, u, _fb,
                             referer=ref, timeout=dl_timeout, log=_dl_log,
+                            cookies_file=cookies_file,
                         )
                     # Resolve this target's progress bar (success or fail)
                     # so it doesn't stick at the last %.
@@ -1264,6 +1442,13 @@ class _JobExecMixin:
                     line=f"  [downloading] error: {type(e).__name__}: {e}",
                 ))
             finally:
+                # The cookies.txt is plaintext session state -- drop it as
+                # soon as yt-dlp is done with it (same as media.py).
+                if cookies_file is not None:
+                    try:
+                        cookies_file.unlink()
+                    except OSError:
+                        pass
                 # Force-complete recovery: hub asked us to wrap up early
                 # (HubForceCompleteJob -> _force_complete_video_job set the
                 # flag + SIGTERM'd the in-flight yt-dlp). Salvage any
