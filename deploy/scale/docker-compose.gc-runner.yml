@@ -1,0 +1,41 @@
+# Resident jobs-table GC next to a hub (server/hub/tools/gc_runner.py).
+#
+# 2026-11-03: the in-hub retention loop (20k rows per 20-minute tick, sharing
+# the hub's event loop and S3 pool with asset uploads) drains ~2.4M rows/day,
+# about equal to the inflow, so the jobs table grew to 52.8M rows / 120 GB
+# before the admin UI started timing out. This runs the SAME purge code in its
+# own container: 1 shard ~ 10M rows/day, N shards scale linearly.
+#
+# Deploy (ON a hub host, same project "hub" as hub-a so nothing is recreated):
+#   cp deploy/scale/gc-runner.env.example /opt/paprika/gc-runner.env  # edit GC_SHARD
+#   docker compose -f docker-compose.hub-a.yml -f docker-compose.gc-runner.yml \
+#     -p hub up -d gc-runner
+#
+# Every shard host gets the SAME GC_SHARDS and a DIFFERENT GC_SHARD (0..N-1).
+# Shard 0 holds the fleet lock key, which demotes the in-hub loops to a
+# fallback that only resumes when no runner is alive -- no hub.env change,
+# no hub recreate. Changing N: stop all runners, edit every gc-runner.env,
+# start them again (each residue is then owned by exactly one process).
+#
+# `docker compose -f docker-compose.hub-a.yml up -d` WITHOUT this file still
+# works (compose only warns about an "orphan" gc-runner; it is not removed
+# unless --remove-orphans is passed -- don't).
+services:
+  gc-runner:
+    image: paprika-hub:latest
+    restart: unless-stopped
+    env_file:
+      - hub.env
+      - gc-runner.env
+    # host networking like hub-a: reaches Redis .34 / MariaDB .20 / MinIO
+    # directly, no docker network dependency.
+    network_mode: host
+    # SIGTERM cancels the in-flight pass and deletes our lock key; a pass is
+    # capped at GC_PASS_CAP rows so this completes in seconds.
+    stop_grace_period: 30s
+    command: python -m server.hub.tools.gc_runner
+    volumes:
+      - ./hub-data:/data/jobs
+      - ./server:/app/server
+      - ./core:/app/core
+      - ./VERSION:/app/VERSION:ro
