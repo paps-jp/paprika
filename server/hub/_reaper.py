@@ -1436,6 +1436,19 @@ async def _release_pass_lock(r, key: str, cooldown_s: float) -> None:
 
 _last_retention_run_at: datetime | None = None
 _last_retention_deleted = 0
+# Why the last pass deleted nothing, for an OUT-OF-PROCESS observer (the
+# gc_runner heartbeat, 2026-11-04). ``_run_job_retention_once`` returns a bare
+# int, and "0" is ambiguous: drained, lock held by someone else, retention
+# switched off, or the watermark clamp refusing to pick a cutoff (fail-closed).
+# Only the last one is an operator-visible condition ("GC paused: waiting for a
+# consumer"), and without this a runner that is alive but never deletes looks
+# exactly like one that has nothing to do. Reset to None at the start of every
+# pass; None after a pass means "ran normally" (deleted >= 0 rows).
+_last_retention_skip_reason: str | None = None   # "disabled"|"lock_held"|"fail_closed"
+# The cutoff the last pass actually used (post watermark clamp). When the clamp
+# pulled it back, this sits well behind now - retention_days, which is how a
+# reader tells "the runner is slow" from "the runner is being held back".
+_last_retention_cutoff: datetime | None = None
 
 
 async def _evict_from_pull_queue(jid: str, why: str) -> None:
@@ -1726,32 +1739,40 @@ async def _watermark_clamp_cutoff(cutoff: datetime, who: str) -> datetime | None
 async def _run_job_retention_once() -> int:
     """One retention pass. Returns #jobs deleted. Extracted for dry-run/test."""
     global _last_retention_run_at, _last_retention_deleted
+    global _last_retention_skip_reason, _last_retention_cutoff
+    _last_retention_skip_reason = None
     store = state.store
     if store is None or not hasattr(store, "list_deletable_job_ids"):
+        _last_retention_skip_reason = "disabled"
         return 0
     # Settings gate (cross-hub shared; OFF by default).
     if state.settings is None or not bool(
         state.settings.get("job_retention_enabled", False)
     ):
+        _last_retention_skip_reason = "disabled"
         return 0
     try:
         days = int(state.settings.get("job_retention_days", 10) or 10)
     except (TypeError, ValueError):
         days = 10
     if days <= 0:
+        _last_retention_skip_reason = "disabled"
         return 0
     # Elect ONE hub per tick. Delete is idempotent so a missing lock only costs
     # duplicate work, never correctness -> best-effort; proceed if redis absent.
     r = getattr(store, "_r", None)
     if not await _acquire_pass_lock(r, _RETENTION_LOCK_KEY, _RETENTION_LOCK_TTL_S):
+        _last_retention_skip_reason = "lock_held"
         return 0
     from datetime import timedelta as _td
 
     cutoff = await _watermark_clamp_cutoff(datetime.utcnow() - _td(days=days),
                                            "job-retention")
     if cutoff is None:
+        _last_retention_skip_reason = "fail_closed"
         await _release_pass_lock(r, _RETENTION_LOCK_KEY, _RETENTION_COOLDOWN_S)
         return 0
+    _last_retention_cutoff = cutoff
     deleted = 0
     attempted = 0
     t0 = time.monotonic()

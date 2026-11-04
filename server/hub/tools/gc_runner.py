@@ -29,6 +29,29 @@ resumes only when no runner holds the lock. Other shards hold
 our own key and exits within seconds; the stock release (which leaves a
 cooldown TTL that would block our own re-acquire) is replaced by a no-op.
 
+The TTL (``GC_LOCK_TTL_S``, default 600) is the crash safety net: if every
+runner dies without running its ``finally`` (host reset, OOM kill) the in-hub
+loops stay demoted until the key lapses. A pass is ~40 s, so 10 minutes is
+plenty of refresh margin while bounding the "nobody is deleting" window; the
+original 3600 would have blocked the fallback for an hour.
+
+Heartbeat (2026-11-04)
+----------------------
+``restart: unless-stopped`` restarts a runner that exits, but not one that is
+alive and deleting nothing: on 2026-11-04 a deploy rolled ``_reaper.py`` back
+and every pass died with AttributeError, and the only signal was the Flow
+retention-lag tank slowly turning red. Each shard therefore upserts ONE row
+into ``paprika.gc_runner_heartbeat`` (created on start if missing) at start
+(``starting``), after every pass that deleted rows (``pass``), on every idle
+tick (``idle``) and whenever the watermark clamp refused to pick a cutoff
+(``fail_closed``). ``beat_at`` moves on every write, ``last_pass_at`` only on
+progress, ``state_since`` only on a state change, ``cutoff_at`` is the cutoff
+the last pass actually used. The pipeline control plane (``pipeline/api/flow.py``
+``_gc_runner_alerts``) reads it and raises: beat older than 3 min = runner
+dead/hung; beat fresh but no pass for 15 min while the lag tank is > 60 min =
+alive-but-stuck; ``fail_closed`` for 10 min = GC paused waiting for a consumer.
+A write failure is a WARNING and never stops the GC.
+
 Config (env; all optional)
 --------------------------
 GC_SHARDS / GC_SHARD           partition count / this process's index
@@ -37,7 +60,8 @@ GC_PASS_CAP                    rows per pass (default 5000: a pass is ~40 s, so
                                per-pass log line is a usable rate meter)
 GC_DELETE_CONCURRENCY          parallel purges within a pass (default 48)
 GC_IDLE_S                      sleep when a pass finds nothing (default 30)
-GC_LOCK_TTL_S                  crash safety net on the lock (default 3600)
+GC_LOCK_TTL_S                  crash safety net on the lock (default 600; see
+                               "Lock" above)
 PAPRIKA_REDIS_URL              default redis://10.10.50.34:6379
 PAPRIKA_DATA_DIR               default /data/jobs (hub-data volume with
                                settings.json -> MariaDB credentials)
@@ -72,6 +96,47 @@ from server.hub.settings import SettingsRegistry  # noqa: E402
 from server.store import make_store  # noqa: E402
 
 FLEET_LOCK_KEY = "paprika:retention:lock"
+DEFAULT_LOCK_TTL_S = 600
+
+HEARTBEAT_TABLE = "gc_runner_heartbeat"
+# All timestamps are UTC (``UTC_TIMESTAMP()`` / ``datetime.utcnow()``): the
+# fleet's MariaDB runs with a JST session zone, so ``NOW()`` would be 9 h off
+# the UTC ``jobs.completed_at`` column this GC keys on. ``state_since`` is kept
+# server-side so "fail_closed for 10 minutes" needs no reader-side history.
+HEARTBEAT_DDL = f"""
+CREATE TABLE IF NOT EXISTS {HEARTBEAT_TABLE} (
+  shard        TINYINT NOT NULL,
+  shards_total TINYINT NOT NULL,
+  hub_id       VARCHAR(32) NOT NULL,
+  state        ENUM('starting','pass','idle','fail_closed') NOT NULL,
+  state_since  DATETIME NOT NULL,
+  last_pass_at DATETIME NULL,
+  beat_at      DATETIME NOT NULL,
+  rows_total   BIGINT NOT NULL DEFAULT 0,
+  rate_per_min INT NOT NULL DEFAULT 0,
+  cutoff_at    DATETIME NULL,
+  PRIMARY KEY (shard)
+) ENGINE=InnoDB
+"""
+# ``state_since`` is assigned BEFORE ``state`` on purpose: ON DUPLICATE KEY
+# UPDATE evaluates left to right, so the comparison still sees the OLD state.
+HEARTBEAT_UPSERT = f"""
+INSERT INTO {HEARTBEAT_TABLE}
+  (shard, shards_total, hub_id, state, state_since, last_pass_at, beat_at,
+   rows_total, rate_per_min, cutoff_at)
+VALUES (%s, %s, %s, %s, UTC_TIMESTAMP(), %s, UTC_TIMESTAMP(), %s, %s, %s)
+ON DUPLICATE KEY UPDATE
+  state_since  = IF(state <> VALUES(state), UTC_TIMESTAMP(), state_since),
+  state        = VALUES(state),
+  shards_total = VALUES(shards_total),
+  hub_id       = VALUES(hub_id),
+  last_pass_at = VALUES(last_pass_at),
+  beat_at      = UTC_TIMESTAMP(),
+  rows_total   = VALUES(rows_total),
+  rate_per_min = VALUES(rate_per_min),
+  cutoff_at    = VALUES(cutoff_at)
+"""
+HEARTBEAT_STATES = ("starting", "pass", "idle", "fail_closed")
 
 
 def _env_int(name: str, default: int) -> int:
@@ -169,6 +234,93 @@ async def release_own_lock(r, key: str, hub_id: str) -> bool:
     return False
 
 
+async def ensure_heartbeat_table(pool) -> bool:
+    """``CREATE TABLE IF NOT EXISTS`` for the heartbeat row. The paprika DB
+    user owns the schema, so this is the whole migration; the control plane
+    reads via the ``delian`` user, which needs a one-off
+    ``GRANT SELECT ON paprika.gc_runner_heartbeat TO 'delian'@'%'``
+    (deploy/scale/gc_runner_heartbeat.sql)."""
+    try:
+        async with pool.acquire() as conn:
+            async with conn.cursor() as cur:
+                await cur.execute(HEARTBEAT_DDL)
+        return True
+    except Exception:
+        log.warning("heartbeat table could not be created; GC continues", exc_info=True)
+        return False
+
+
+class Heartbeat:
+    """Per-shard liveness row writer. Tracks what the row needs between
+    writes (total rows, last progress time) so ``main()`` only says WHICH
+    state it is in. Never raises: a heartbeat failure must not stop the GC."""
+
+    def __init__(self, pool, shard: int, n_shards: int, hub_id: str):
+        self.pool = pool
+        self.shard, self.n_shards, self.hub_id = shard, n_shards, hub_id
+        self.total = 0
+        self.t0 = time.monotonic()
+        self.last_pass_at: datetime | None = None
+        self.last_state: str | None = None
+        self.writes = 0
+        self.failures = 0
+
+    def progressed(self, n: int) -> None:
+        """Account for a pass that deleted ``n`` rows (n > 0)."""
+        self.total += n
+        self.last_pass_at = datetime.utcnow()
+
+    def rate_per_min(self) -> int:
+        el = time.monotonic() - self.t0
+        return int(self.total / el * 60) if el > 0 else 0
+
+    def params(self, state: str) -> list:
+        if state not in HEARTBEAT_STATES:
+            raise ValueError(f"unknown heartbeat state {state!r}")
+        return [
+            self.shard,
+            self.n_shards,
+            self.hub_id,
+            state,
+            self.last_pass_at,
+            self.total,
+            self.rate_per_min(),
+            _reaper._last_retention_cutoff,
+        ]
+
+    async def beat(self, state: str) -> bool:
+        try:
+            params = self.params(state)
+            async with self.pool.acquire() as conn:
+                async with conn.cursor() as cur:
+                    await cur.execute(HEARTBEAT_UPSERT, params)
+                    # aiomysql pools are autocommit=False by default.
+                    await conn.commit()
+            self.writes += 1
+            self.last_state = state
+            return True
+        except Exception:
+            self.failures += 1
+            # WARNING, not debug: a silent heartbeat failure is itself the
+            # blind spot this exists to remove (the reader sees "no beat" and
+            # raises crit, which is the right outcome -- but say why here).
+            log.warning("heartbeat write failed (state=%s)", state, exc_info=True)
+            return False
+
+
+def state_after_pass(n: int) -> str:
+    """Heartbeat state for a finished pass: progress is ``pass``; a 0 that the
+    watermark clamp caused is ``fail_closed`` (operator-visible: GC paused
+    waiting for a consumer); any other 0 (drained, lock held by a hub loop,
+    retention switched off, pass raised) is ``idle`` -- those are told apart
+    by the reader via ``last_pass_at`` going stale while the lag tank grows."""
+    if n > 0:
+        return "pass"
+    if _reaper._last_retention_skip_reason == "fail_closed":
+        return "fail_closed"
+    return "idle"
+
+
 async def retention_lag_s(pool, days: int) -> float | None:
     """How far the oldest terminal row sits PAST the cutoff, in seconds.
 
@@ -219,7 +371,9 @@ async def bootstrap(n_shards: int, shard: int):
     _reaper._RETENTION_LOCK_KEY = lock_key_for(shard)
     _reaper._RETENTION_MAX_PER_TICK = max(500, _env_int("GC_PASS_CAP", 5000))
     _reaper._RETENTION_DELETE_CONCURRENCY = max(1, _env_int("GC_DELETE_CONCURRENCY", 48))
-    _reaper._RETENTION_LOCK_TTL_S = max(60, _env_int("GC_LOCK_TTL_S", 3600))
+    _reaper._RETENTION_LOCK_TTL_S = max(
+        60, _env_int("GC_LOCK_TTL_S", DEFAULT_LOCK_TTL_S)
+    )
     install_lock_hold(config.hub_id)
     return store, pool
 
@@ -247,6 +401,9 @@ async def main() -> int:
         loop.add_signal_handler(sig, stop.set)
 
     r = getattr(store, "_r", None)
+    hb = Heartbeat(pool, shard, n_shards, config.hub_id)
+    await ensure_heartbeat_table(pool)
+    await hb.beat("starting")
     total, t0 = 0, time.monotonic()
     last_lag_log = 0.0
     rc = 0
@@ -274,6 +431,8 @@ async def main() -> int:
             total += n
             el = time.monotonic() - t0
             if n:
+                hb.progressed(n)
+                await hb.beat("pass")
                 log.info(
                     "pass: %d in %.0fs | total %d in %.0fs = %.0f/min",
                     n,
@@ -307,9 +466,11 @@ async def main() -> int:
                 # (a MIN() range scan, ~2 s on a 10M-row table) every 2 s.
                 if time.monotonic() - last_lag_log >= idle_s:
                     last_lag_log = time.monotonic()
+                    await hb.beat(state_after_pass(0))
                     log.info("idle: total %d | waiting for lock holder %s", total, holder)
                 wait = 2
             else:
+                await hb.beat(state_after_pass(0))
                 days = int(s.get("job_retention_days", 10) or 10)
                 lag = await retention_lag_s(pool, days)
                 last_lag_log = time.monotonic()
@@ -329,7 +490,8 @@ async def main() -> int:
         rc = 1
     finally:
         released = await release_own_lock(r, _reaper._RETENTION_LOCK_KEY, config.hub_id)
-        log.info("stopped: total %d, lock released=%s", total, released)
+        log.info("stopped: total %d, lock released=%s, heartbeats=%d (failed %d)",
+                 total, released, hb.writes, hb.failures)
         try:
             pool.close()
             await pool.wait_closed()
