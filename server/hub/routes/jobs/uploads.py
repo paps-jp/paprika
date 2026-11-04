@@ -25,6 +25,7 @@ from fastapi import APIRouter, File, Form, HTTPException, Request, UploadFile
 from fastapi.responses import FileResponse, HTMLResponse, StreamingResponse
 from server.hub._state import config, get_storage_dir, state
 from server.hub import objstore
+from server.hub import wallfeed
 from server.hub._helpers import _safe_job_file
 from server.hub.routes.novnc import _proxy_session_dict
 from server.hub.routes.sessions import (
@@ -764,7 +765,7 @@ async def upload_special(
         raise HTTPException(401, "bad secret")
     if kind not in ("page.html", "log.txt", "meta.json", "final.jpg"):
         raise HTTPException(400, "kind must be 'page.html', 'log.txt', 'meta.json' or 'final.jpg'")
-    await _require_job_info(job_id)
+    info = await _require_job_info(job_id)
     target = get_storage_dir() / job_id / kind
     target.parent.mkdir(parents=True, exist_ok=True)
     # Stream chunked (1 MiB) instead of buffering the whole body in
@@ -780,6 +781,18 @@ async def upload_special(
             total += len(chunk)
     # Mirror to shared object storage (dormant unless PAPRIKA_S3_ENABLED).
     await objstore.mirror_file(target, job_id=job_id)
+    # 取得結果の滝 (/wall): offer the end-of-fetch screenshot to the visitor
+    # wall. Fire-and-forget and rate-gated fleet-wide, so the upload path is
+    # unaffected -- see server/hub/wallfeed.py.
+    if kind == "final.jpg":
+        wallfeed.spawn_offer_file(
+            job_id,
+            target,
+            url=getattr(info, "url", None),
+            worker_id=getattr(info, "worker_id", None),
+            lane_idx=getattr(info, "lane_idx", None),
+            started_at=getattr(info, "started_at", None),
+        )
     # str(target) not .resolve(): avoid the per-upload realpath on the loop.
     return {"saved": str(target), "size": total}
 

@@ -1819,6 +1819,11 @@ from server.hub.routes.system import router as _system_router
 
 app.include_router(_system_router)
 
+# ---- /wall -- 取得結果の滝 (visitor-facing results waterfall) -------------
+from server.hub.routes.wall import router as _wall_router
+
+app.include_router(_wall_router)
+
 # ---- Auth: login + API-key / user management (LAN-trust → multi-user) -----
 from server.hub.routes.auth import router as _auth_router
 

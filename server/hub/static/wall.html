@@ -1,0 +1,506 @@
+<!doctype html>
+<html lang="ja">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>paprika — 取得ページ</title>
+<link rel="icon" type="image/svg+xml" href="/icon.svg">
+<style>
+  /* Visitor-facing wall: dark room, bright pages. Everything is sized in
+     viewport units so the same page fills a laptop or a projector without
+     a per-display config. */
+  :root {
+    --bg: #0b0d10;
+    --panel: #14181d;
+    --line: #232a32;
+    --fg: #e8edf3;
+    --dim: #8b97a6;
+    --accent: #f5b800;   /* paprika yellow */
+    --live: #3ddc84;
+    --card-min: 240px;
+    --gap: 14px;
+    /* Thumbnail box ratio -- must match PAPRIKA_WALL_THUMB_RATIO (0.78) so a
+       card is a crop of the page, never a letterboxed or stretched one. */
+    --thumb-ratio: 78.1%;
+  }
+  * { box-sizing: border-box; }
+  html, body {
+    margin: 0; height: 100%;
+    background: var(--bg); color: var(--fg);
+    font-family: system-ui, -apple-system, "Segoe UI", "Hiragino Kaku Gothic ProN",
+                 "Noto Sans JP", Meiryo, sans-serif;
+    overflow: hidden;
+  }
+  body { display: flex; flex-direction: column; }
+
+  /* ---- header -------------------------------------------------------- */
+  header {
+    flex: 0 0 auto;
+    display: flex; align-items: center; gap: 28px;
+    padding: 14px 22px;
+    background: linear-gradient(180deg, #171c22 0%, #10141a 100%);
+    border-bottom: 1px solid var(--line);
+  }
+  .brand {
+    display: flex; align-items: center; gap: 12px;
+    min-width: 0; flex: 0 1 auto; overflow: hidden;
+  }
+  .brand img { width: 34px; height: 34px; flex: 0 0 auto; }
+  /* Without this the brand column is allowed to shrink to its narrowest word
+     and the title sets one character per line -- flex items default to
+     min-width:auto, which for text means "as narrow as the longest word". */
+  .brand > div { min-width: 0; white-space: nowrap; }
+  .brand b { font-size: 20px; letter-spacing: .04em; }
+  .brand span { color: var(--dim); font-size: 13px; }
+
+  /* Everything in the header is nowrap + non-shrinking: these are short
+     labels whose whole job is to be read at a glance from across a room, and
+     a flex row will happily break "15.8 ページ/秒" over two lines (or set a
+     button's label one word per line) long before it runs out of width. The
+     brand block is the one part allowed to give up its space. */
+  .metrics {
+    display: flex; align-items: flex-end; gap: 26px;
+    margin-left: auto; flex: 0 0 auto;
+  }
+  .metric { text-align: right; line-height: 1.1; white-space: nowrap; }
+  .metric .v {
+    font-size: 34px; font-weight: 700;
+    font-variant-numeric: tabular-nums; letter-spacing: -.01em;
+  }
+  .metric .v.big { font-size: 52px; color: var(--accent); }
+  .metric .u { color: var(--dim); font-size: 12px; margin-left: 4px; font-weight: 400; }
+  .metric .k { color: var(--dim); font-size: 11px; letter-spacing: .1em; margin-top: 3px; }
+  #spark { display: block; width: 260px; height: 46px; }
+
+  .pill {
+    display: inline-flex; align-items: center; gap: 6px;
+    font-size: 12px; color: var(--dim);
+  }
+  .pill .dot {
+    width: 8px; height: 8px; border-radius: 50%;
+    background: var(--live); box-shadow: 0 0 10px var(--live);
+    animation: pulse 1.6s ease-in-out infinite;
+  }
+  @keyframes pulse { 0%,100% { opacity: 1 } 50% { opacity: .25 } }
+  body.paused .pill .dot { animation: none; background: var(--dim); box-shadow: none; }
+
+  .tools {
+    display: flex; gap: 8px; align-items: center;
+    margin-left: 22px; flex: 0 0 auto;
+  }
+  .tools button {
+    background: #1d232b; color: var(--dim); border: 1px solid var(--line);
+    border-radius: 7px; padding: 6px 11px; font-size: 12px; cursor: pointer;
+    font-family: inherit; white-space: nowrap;
+  }
+  .tools button:hover { color: var(--fg); border-color: #3a444f; }
+  .tools button.on { color: #111; background: var(--accent); border-color: var(--accent); }
+
+  /* ---- grid ---------------------------------------------------------- */
+  main {
+    flex: 1 1 auto; overflow: hidden; padding: var(--gap);
+    display: grid; align-content: start;
+    grid-template-columns: repeat(auto-fill, minmax(var(--card-min), 1fr));
+    grid-auto-rows: max-content;
+    gap: var(--gap);
+  }
+  .card {
+    position: relative; overflow: hidden;
+    border-radius: 11px; background: var(--panel);
+    border: 1px solid var(--line);
+    box-shadow: 0 8px 22px rgba(0,0,0,.45);
+    animation: land .55s cubic-bezier(.2,.9,.25,1) both;
+  }
+  @keyframes land {
+    from { opacity: 0; transform: translateY(-26px) scale(.965); }
+    to   { opacity: 1; transform: none; }
+  }
+  /* Padding-box ratio, not `aspect-ratio`: inside a CSS grid Chrome sizes an
+     aspect-ratio image as ~0 during row layout, which collapsed every row to
+     the caption height and clipped the page away. This is definite. */
+  .thumb {
+    position: relative; width: 100%; padding-top: var(--thumb-ratio);
+    overflow: hidden; background: #0f1216;
+  }
+  .thumb img {
+    position: absolute; inset: 0; width: 100%; height: 100%;
+    object-fit: cover; object-position: top center;
+  }
+  /* Safe mode: for showing the wall to visitors when the corpus in flight
+     isn't something you want legible over someone's shoulder. Blurs the
+     hostname too -- blurring only the picture would leave the site names
+     spelled out under it, which defeats the point. */
+  body.safe .thumb img { filter: blur(14px); }
+  body.safe .host { filter: blur(4px); }
+  /* The freshest card gets a ring that decays -- the eye tracks arrival
+     order without anything moving. */
+  .card.fresh::after {
+    content: ""; position: absolute; inset: 0; border-radius: 11px;
+    border: 2px solid var(--accent); pointer-events: none;
+    animation: fade 1.6s ease forwards;
+  }
+  @keyframes fade { to { opacity: 0; } }
+
+  .meta {
+    display: flex; align-items: center; gap: 8px;
+    padding: 7px 10px 8px; font-size: 12px;
+  }
+  .host {
+    flex: 1 1 auto; min-width: 0; color: var(--fg);
+    white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
+  }
+  .ms {
+    flex: 0 0 auto; color: var(--accent);
+    font-variant-numeric: tabular-nums; font-weight: 600;
+  }
+  .lane {
+    flex: 0 0 auto; color: var(--dim); font-size: 10.5px;
+    font-variant-numeric: tabular-nums;
+  }
+
+  .empty {
+    grid-column: 1 / -1; text-align: center; color: var(--dim);
+    padding: 80px 0; font-size: 15px;
+  }
+
+  /* The wall's home is a wide display, but it also gets opened on a laptop
+     half-screen to check on it. Shed the header's least important parts
+     rather than letting them wrap into a second row that eats the grid. */
+  @media (max-width: 1180px) {
+    header { gap: 14px; padding: 10px 14px; }
+    .brand span, #spark { display: none; }
+    .metrics { gap: 16px; }
+    .metric .v { font-size: 26px; }
+    .metric .v.big { font-size: 36px; }
+  }
+  @media (max-width: 800px) {
+    .tools { display: none; }
+    .metrics .metric:not(:last-child) { display: none; }
+  }
+</style>
+</head>
+<body>
+
+<header>
+  <div class="brand">
+    <img src="/icon.svg" alt="">
+    <div>
+      <b>取得ページ</b><br>
+      <span id="sub">ブラウザが取得したページが、届いた順に流れます</span>
+    </div>
+  </div>
+
+  <div class="tools">
+    <span class="pill"><span class="dot"></span><span id="live">LIVE</span></span>
+    <button id="btnSafe" title="サムネイルをぼかす">ぼかし</button>
+    <button id="btnPause" title="流れを止める (Space)">一時停止</button>
+    <button id="btnFull" title="全画面 (F)">全画面</button>
+  </div>
+
+  <div class="metrics">
+    <canvas id="spark" width="520" height="92" title="直近90秒の取得レート"></canvas>
+    <div class="metric">
+      <div class="v" id="mTotal">0</div>
+      <div class="k">この画面の累計</div>
+    </div>
+    <div class="metric">
+      <div class="v" id="mMin">0<span class="u">/分</span></div>
+      <div class="k">直近1分</div>
+    </div>
+    <div class="metric">
+      <div class="v big" id="mSec">0.0<span class="u">ページ/秒</span></div>
+      <div class="k" id="mFleet">フリート</div>
+    </div>
+  </div>
+</header>
+
+<main id="grid">
+  <div class="empty" id="empty">最初のページを待っています…</div>
+</main>
+
+<script>
+(() => {
+  "use strict";
+
+  const qs = new URLSearchParams(location.search);
+  const grid = document.getElementById('grid');
+  const spark = document.getElementById('spark');
+  const sctx = spark.getContext('2d');
+
+  const POLL_MS = Math.max(400, parseInt(qs.get('poll') || '', 10) || 1000);
+  const colsParam = parseInt(qs.get('cols') || '', 10);
+  if (colsParam > 0) {
+    grid.style.gridTemplateColumns = 'repeat(' + colsParam + ', 1fr)';
+  }
+
+  // How many cards stay on the wall = exactly how many FIT. Anything beyond
+  // that would be downloaded, decoded and then clipped by `overflow:hidden`
+  // -- invisible cost on a page meant to run for hours -- and it would leave
+  // a half-cut row along the bottom edge, which reads as broken on a
+  // projector. Recomputed on resize / fullscreen.
+  let MAX_CARDS = 24;
+  function fitCards() {
+    const cs = getComputedStyle(grid);
+    const cols = cs.gridTemplateColumns.split(' ').filter(Boolean).length || 1;
+    const gap = parseFloat(cs.gap) || 14;
+    const colW = (grid.clientWidth - (cols + 1) * gap) / cols;
+    const ratio = parseFloat(
+      getComputedStyle(document.documentElement).getPropertyValue('--thumb-ratio')) / 100;
+    const captionH = 30;
+    const cardH = colW * (ratio || 0.781) + captionH;
+    // clientHeight includes the grid's own padding (one gap top + bottom);
+    // n rows need n*cardH + (n-1)*gap inside that.
+    const avail = grid.clientHeight - 2 * gap;
+    const rows = Math.max(1, Math.floor((avail + gap) / (cardH + gap)));
+    MAX_CARDS = Math.max(4, cols * rows);
+  }
+
+  let cursor = 0;         // highest seq rendered
+  let total = 0;          // cards shown since this page opened
+  let paused = false;
+  let inFlight = false;
+  let queue = [];         // admitted-but-not-yet-shown cards (stagger buffer)
+  let releaseTimer = null;
+  const live = [];        // on-wall cards, newest first (excludes fading-out)
+
+  // ---- safe mode (blur) ---------------------------------------------
+  const btnSafe = document.getElementById('btnSafe');
+  function setSafe(on) {
+    document.body.classList.toggle('safe', on);
+    btnSafe.classList.toggle('on', on);
+    try { localStorage.setItem('wallSafe', on ? '1' : '0'); } catch (_) {}
+  }
+  // `?safe=1` only ever turns blur ON, and is re-checked shortly after load:
+  // some hosts (kiosk shells, the in-app preview pane) run the document with a
+  // bare URL and only then rewrite the address bar to the requested one, so a
+  // single read at script time can miss the parameter and store "off" -- the
+  // opposite of what someone opening that URL in front of visitors wanted.
+  function applyUrlSafe() {
+    if (new URLSearchParams(location.search).get('safe') === '1'
+        && !document.body.classList.contains('safe')) {
+      setSafe(true);
+    }
+  }
+  let safe0 = qs.get('safe') === '1';
+  try { if (localStorage.getItem('wallSafe') === '1') safe0 = true; } catch (_) {}
+  setSafe(safe0);
+  applyUrlSafe();
+  setTimeout(applyUrlSafe, 400);
+  addEventListener('popstate', applyUrlSafe);
+  btnSafe.onclick = () => setSafe(!document.body.classList.contains('safe'));
+
+  // ---- pause / fullscreen -------------------------------------------
+  const btnPause = document.getElementById('btnPause');
+  function setPaused(on) {
+    paused = on;
+    document.body.classList.toggle('paused', on);
+    btnPause.classList.toggle('on', on);
+    btnPause.textContent = on ? '再開' : '一時停止';
+    document.getElementById('live').textContent = on ? 'PAUSED' : 'LIVE';
+  }
+  btnPause.onclick = () => setPaused(!paused);
+  document.getElementById('btnFull').onclick = () => {
+    if (document.fullscreenElement) document.exitFullscreen();
+    else document.documentElement.requestFullscreen().catch(() => {});
+  };
+  addEventListener('keydown', (e) => {
+    if (e.code === 'Space') { e.preventDefault(); setPaused(!paused); }
+    else if (e.key === 'f' || e.key === 'F') document.getElementById('btnFull').click();
+    else if (e.key === 'b' || e.key === 'B') btnSafe.click();
+  });
+
+  // ---- rendering ------------------------------------------------------
+  function fmtMs(ms) {
+    if (ms == null) return '';
+    return ms < 10000 ? (ms / 1000).toFixed(1) + 's' : Math.round(ms / 1000) + 's';
+  }
+
+  // `entry` comes off the jitter buffer with its image ALREADY loaded and
+  // decoded (see enqueue): the element is adopted as-is, so a card is never
+  // on the wall as an empty black box waiting for pixels.
+  function addCard(entry) {
+    const item = entry.item;
+    const el = document.createElement('div');
+    el.className = 'card fresh';
+    const thumb = document.createElement('div');
+    thumb.className = 'thumb';
+    const img = entry.img;
+    img.alt = '';
+    thumb.appendChild(img);
+    const meta = document.createElement('div');
+    meta.className = 'meta';
+    const host = document.createElement('span');
+    host.className = 'host';
+    host.textContent = item.host || item.url || item.job_id;
+    host.title = item.url || '';
+    const ms = document.createElement('span');
+    ms.className = 'ms';
+    ms.textContent = fmtMs(item.elapsed_ms);
+    const lane = document.createElement('span');
+    lane.className = 'lane';
+    lane.textContent = item.worker_id ? (item.worker_id + '#' + item.lane_idx) : '';
+    meta.append(host, ms, lane);
+    el.append(thumb, meta);
+
+    const empty = document.getElementById('empty');
+    if (empty) empty.remove();
+    grid.prepend(el);
+    live.unshift(el);
+    setTimeout(() => el.classList.remove('fresh'), 1700);
+
+    total += 1;
+    document.getElementById('mTotal').textContent = total.toLocaleString();
+
+    // Evict synchronously rather than fading out: a card animating away is
+    // still laid out, so it spills into a partial extra row along the bottom
+    // edge for the length of the animation. Nothing is lost visually --
+    // prepending reflows every card anyway, so the tail simply isn't there
+    // after the shift.
+    while (live.length > MAX_CARDS) live.pop().remove();
+  }
+
+  // ---- jitter buffer: decode first, then play out at a steady rate -----
+  //
+  // Two problems this solves, both of which showed up as the wall stuttering:
+  //
+  //   1. The poll is not punctual. Measured on prod, /wall/feed normally
+  //      answers in ~300 ms but the shared Redis behind it stalls for seconds
+  //      under crawl load. Drawing each batch as it lands gave dead air
+  //      followed by a clump.
+  //   2. A card inserted with a fresh <img> is a BLACK RECTANGLE until the
+  //      thumbnail arrives -- the wall filled with holes that patched
+  //      themselves a moment later.
+  //
+  // So the queue holds *decoded* cards, exactly like a video player's frame
+  // buffer: the image is fetched and decoded while the entry waits its turn,
+  // and only entries that finished are ever inserted.
+  //
+  // Playout rate is computed FROM THE THROUGHPUT the server reports
+  // (`stats.card_rate` = fleet rate clipped by the admission cap), not from
+  // how many cards a given poll happened to return -- the poll is jittery,
+  // the supply rate is not. Buffer depth only applies a gentle correction so
+  // the two can't drift apart over a long run.
+  const RELEASE_MIN_MS = 110;
+  const RELEASE_MAX_MS = 1400;
+  const TARGET_BUFFER = 6;      // cards to keep decoded and waiting
+  const LOAD_TIMEOUT_MS = 8000;
+  let supplyRate = 3;           // cards/sec the server says it can feed us
+
+  function enqueue(item) {
+    const entry = { item: item, img: null, state: 'loading' };
+    queue.push(entry);
+    const img = new Image();
+    const fail = () => { if (entry.state === 'loading') entry.state = 'failed'; };
+    const done = () => {
+      if (entry.state !== 'loading') return;
+      entry.img = img;
+      entry.state = 'ready';
+    };
+    img.onload = () => {
+      // decode() moves the bitmap work off the insertion frame; without it a
+      // loaded-but-undecoded image still hitches when it hits the DOM.
+      if (img.decode) img.decode().then(done, done); else done();
+    };
+    img.onerror = fail;         // thumbnail aged out of Redis, or a blip
+    setTimeout(fail, LOAD_TIMEOUT_MS);
+    img.src = '/wall/thumb/' + item.seq + '.jpg';
+  }
+
+  function releaseTick() {
+    // Drop anything that failed, then take the OLDEST decoded entry. A slow
+    // image holds its own place rather than the whole queue's: entries behind
+    // it that finished first are still free to play.
+    while (queue.length && queue[0].state === 'failed') queue.shift();
+    if (!paused) {
+      const i = queue.findIndex((e) => e.state === 'ready');
+      if (i >= 0) addCard(queue.splice(i, 1)[0]);
+    }
+    const ready = queue.reduce((n, e) => n + (e.state === 'ready' ? 1 : 0), 0);
+    // Play at the supply rate when the buffer sits at its target; ±50% at the
+    // extremes, which drains a backlog without a visible rush and stretches
+    // the last few cards over a stalled poll instead of running dry.
+    const correction = 1 + 0.5 * Math.max(-1, Math.min(1,
+      (ready - TARGET_BUFFER) / TARGET_BUFFER));
+    const rate = Math.max(0.7, supplyRate * correction);
+    const ms = ready
+      ? Math.max(RELEASE_MIN_MS, Math.min(RELEASE_MAX_MS, 1000 / rate))
+      : RELEASE_MAX_MS;
+    releaseTimer = setTimeout(releaseTick, ms);
+  }
+
+  // ---- sparkline ------------------------------------------------------
+  function drawSpark(series) {
+    const W = spark.width, H = spark.height;
+    sctx.clearRect(0, 0, W, H);
+    if (!series || !series.length) return;
+    const max = Math.max(1, ...series);
+    const bw = W / series.length;
+    for (let i = 0; i < series.length; i++) {
+      const h = Math.max(1, (series[i] / max) * (H - 6));
+      // Newest bars (right side) brighten so the eye finds "now".
+      const t = i / series.length;
+      sctx.fillStyle = `rgba(245,184,0,${0.25 + 0.75 * t})`;
+      sctx.fillRect(i * bw, H - h, Math.max(1, bw - 1), h);
+    }
+  }
+
+  function applyStats(s) {
+    if (!s) return;
+    // Playout pace comes from here -- see releaseTick.
+    if (typeof s.card_rate === 'number' && s.card_rate > 0) supplyRate = s.card_rate;
+    else if (s.card_cap) supplyRate = Math.min(supplyRate, s.card_cap);
+    document.getElementById('mSec').innerHTML =
+      (s.per_sec || 0).toFixed(1) + '<span class="u">ページ/秒</span>';
+    document.getElementById('mMin').innerHTML =
+      (s.per_min || 0).toLocaleString() + '<span class="u">/分</span>';
+    document.getElementById('mFleet').textContent =
+      s.workers ? (s.workers.toLocaleString() + ' ワーカー稼働中') : 'フリート';
+    drawSpark(s.series);
+  }
+
+  // ---- polling --------------------------------------------------------
+  async function tick() {
+    if (inFlight || document.hidden) return;   // Page Visibility: a hidden
+    inFlight = true;                           // wall costs nothing.
+    // Give up on a stalled poll instead of holding the only in-flight slot:
+    // nginx round-robins each request, so a retry usually lands on a hub that
+    // answers immediately. Without this a single stuck hub freezes the feed
+    // for as long as it takes to time out.
+    const ac = new AbortController();
+    const killer = setTimeout(() => ac.abort(), POLL_MS * 4);
+    try {
+      const r = await fetch('/wall/feed?after=' + cursor + '&limit=' + MAX_CARDS,
+                            { cache: 'no-store', signal: ac.signal });
+      if (!r.ok) return;
+      const d = await r.json();
+      applyStats(d.stats);
+      if (d.seq > cursor) cursor = d.seq;
+      if (paused) return;                      // keep the cursor moving so
+      const items = d.items || [];             // resuming shows NOW, not a
+      if (!items.length) return;               // stale backlog.
+      // A long stall (laptop asleep, tab in the background) can hand back a
+      // full ring; keep the newest screenful and drop the rest, so resuming
+      // shows NOW instead of dumping 160 stale cards.
+      for (const it of items.slice(-MAX_CARDS)) enqueue(it);
+      if (queue.length > MAX_CARDS) queue.splice(0, queue.length - MAX_CARDS);
+    } catch (_) {
+      /* abort or transient network blip: the next tick retries */
+    } finally {
+      clearTimeout(killer);
+      inFlight = false;
+    }
+  }
+
+  fitCards();
+  releaseTick();
+  addEventListener('resize', () => {
+    fitCards();
+    while (live.length > MAX_CARDS) live.pop().remove();
+  });
+  setInterval(tick, POLL_MS);
+  document.addEventListener('visibilitychange', () => { if (!document.hidden) tick(); });
+  tick();
+})();
+</script>
+</body>
+</html>

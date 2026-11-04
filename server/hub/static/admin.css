@@ -1494,3 +1494,85 @@
   padding: 4px 8px;
   box-sizing: border-box;
 }
+
+/* ============================================================
+   取得ページ (#pages) -- the fetched-page wall, embedded in the admin.
+   A dark board inside the light admin: page thumbnails are themselves
+   bright documents, and on a light surface the grid read as page
+   furniture rather than as screens. Mirrors the standalone /wall page.
+   ============================================================ */
+#pgBoard {
+  --pg-line: #232a32;
+  --pg-dim: #8b97a6;
+  --pg-accent: #f5b800;
+  --pg-gap: 12px;
+  --pg-card-min: 220px;
+  --pg-thumb-ratio: 78.1%;
+  background: #0b0d10;
+  border: 1px solid var(--pg-line);
+  border-radius: 10px;
+  color: #e8edf3;
+  overflow: hidden;
+}
+#pgHead {
+  display: flex; align-items: flex-end; gap: 22px;
+  padding: 10px 16px;
+  border-bottom: 1px solid var(--pg-line);
+  background: linear-gradient(180deg, #171c22 0%, #10141a 100%);
+}
+#pgSparkWrap { flex: 1 1 auto; min-width: 0; }
+#pgSpark { display: block; width: 100%; max-width: 420px; height: 42px; }
+.pg-metric { text-align: right; line-height: 1.1; white-space: nowrap; flex: 0 0 auto; }
+.pg-metric .v {
+  font-size: 26px; font-weight: 700;
+  font-variant-numeric: tabular-nums; letter-spacing: -.01em;
+}
+.pg-metric .v.big { font-size: 38px; color: var(--pg-accent); }
+.pg-metric .u { color: var(--pg-dim); font-size: 11px; margin-left: 3px; font-weight: 400; }
+.pg-metric .k { color: var(--pg-dim); font-size: 10.5px; letter-spacing: .08em; margin-top: 2px; }
+
+#pgGrid {
+  display: grid; align-content: start;
+  grid-template-columns: repeat(auto-fill, minmax(var(--pg-card-min), 1fr));
+  grid-auto-rows: max-content;
+  gap: var(--pg-gap);
+  padding: var(--pg-gap);
+  /* Fixed height so the board is a *window* on the flow: the card count is
+     computed from this box, and the page below it never jumps as cards land. */
+  height: 62vh; min-height: 320px; overflow: hidden;
+}
+.pg-card {
+  position: relative; overflow: hidden;
+  border-radius: 9px; background: #14181d;
+  border: 1px solid var(--pg-line);
+  box-shadow: 0 6px 16px rgba(0,0,0,.4);
+  animation: pgLand .55s cubic-bezier(.2,.9,.25,1) both;
+}
+@keyframes pgLand {
+  from { opacity: 0; transform: translateY(-22px) scale(.965); }
+  to   { opacity: 1; transform: none; }
+}
+/* Padding-box ratio, not aspect-ratio: inside a CSS grid Chrome sizes an
+   aspect-ratio image as ~0 while laying rows out, collapsing every row to
+   the caption height. */
+.pg-thumb {
+  position: relative; width: 100%; padding-top: var(--pg-thumb-ratio);
+  overflow: hidden; background: #0f1216;
+}
+.pg-thumb img {
+  position: absolute; inset: 0; width: 100%; height: 100%;
+  object-fit: cover; object-position: top center;
+}
+#pgBoard.safe .pg-thumb img { filter: blur(14px); }
+#pgBoard.safe .pg-host { filter: blur(4px); }
+.pg-card.fresh::after {
+  content: ""; position: absolute; inset: 0; border-radius: 9px;
+  border: 2px solid var(--pg-accent); pointer-events: none;
+  animation: pgFade 1.6s ease forwards;
+}
+@keyframes pgFade { to { opacity: 0; } }
+.pg-meta { display: flex; align-items: center; gap: 7px; padding: 6px 9px 7px; font-size: 11.5px; }
+.pg-host { flex: 1 1 auto; min-width: 0; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.pg-ms { flex: 0 0 auto; color: var(--pg-accent); font-variant-numeric: tabular-nums; font-weight: 600; }
+.pg-lane { flex: 0 0 auto; color: var(--pg-dim); font-size: 10px; font-variant-numeric: tabular-nums; }
+.pg-empty { grid-column: 1 / -1; text-align: center; color: var(--pg-dim); padding: 60px 0; }

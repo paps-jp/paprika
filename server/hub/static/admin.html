@@ -73,13 +73,14 @@
   <button class="tab" data-tab="workers"><iconify-icon icon="lucide:cpu"></iconify-icon> <span data-i18n="tab.workers">Workers</span> <span class="count" id="cntWorkers">0</span></button>
   <button class="tab" data-tab="jobs"><iconify-icon icon="lucide:list-checks"></iconify-icon> <span data-i18n="tab.jobs">Recent jobs</span> <span class="count" id="cntJobs">0</span></button>
   <button class="tab" data-tab="ai"><iconify-icon icon="lucide:sparkles"></iconify-icon> <span data-i18n="tab.ai">AI 学習機能</span></button>
-  <button class="tab" data-tab="screens"><iconify-icon icon="lucide:monitor"></iconify-icon> <span data-i18n="tab.screens">Live preview</span></button>
+  <button class="tab" data-tab="pages"><iconify-icon icon="lucide:layout-grid"></iconify-icon> <span data-i18n="tab.pages">Fetched pages</span></button>
   <div class="tab-dropdown" id="moreTabWrap">
     <button type="button" class="tab tab-dropdown-trigger" id="moreTabBtn"
             aria-haspopup="true" aria-expanded="false">
       <iconify-icon icon="lucide:more-horizontal"></iconify-icon> <span data-i18n="tab.more">More</span> <iconify-icon icon="lucide:chevron-down" class="caret-down"></iconify-icon>
     </button>
     <div class="tab-dropdown-menu" id="moreTabMenu" role="menu">
+      <button class="tab" data-tab="screens" role="menuitem"><iconify-icon icon="lucide:monitor"></iconify-icon> <span data-i18n="tab.screens">Live preview</span></button>
       <button class="tab" data-tab="sessions" role="menuitem"><iconify-icon icon="lucide:plug-2"></iconify-icon> <span data-i18n="tab.sessions">Sessions</span> <span class="count" id="cntSessions">0</span></button>
       <button class="tab" data-tab="hosts" role="menuitem"><iconify-icon icon="lucide:cookie"></iconify-icon> <span data-i18n="tab.hosts">Hosts</span> <span class="count" id="cntHosts">0</span></button>
       <button class="tab" data-tab="profiles" role="menuitem"><iconify-icon icon="lucide:user-cog"></iconify-icon> <span data-i18n="tab.profiles">Profiles</span> <span class="count" id="cntProfiles">0</span></button>
@@ -3830,6 +3831,40 @@ table.aitbl code { font-size:0.95em; }
   </section>
 </div>
 
+<!-- 取得ページ: the fetched-page wall, embedded. Same feed as the standalone
+     /wall kiosk page (server/hub/wallfeed.py); the board is deliberately dark
+     inside the light admin so the page thumbnails read as screens rather than
+     as page furniture. Driven by admin-pages.js, which polls ONLY while this
+     panel is active. -->
+<div class="panel" data-panel="pages">
+  <section>
+    <h2><span data-i18n="pages.heading">Fetched pages</span>
+      <span class="hctrl">
+        <a href="/wall" target="_blank" data-i18n="pages.open">↗ 全画面で開く</a>
+        <button id="pgSafe" class="pill" data-i18n-title="pages.safe.title"
+                title="サムネイルをぼかす" style="--la-bg:#eee; --la-bd:#ccc; --la-fg:#444;">
+          <iconify-icon icon="lucide:eye-off"></iconify-icon> <span data-i18n="pages.safe">ぼかし</span>
+        </button>
+        <button id="pgPause" class="pill" style="--la-bg:#eef0ff; --la-bd:#6a8ec7; --la-fg:#3a5ca8;">
+          <iconify-icon icon="lucide:pause"></iconify-icon> <span data-i18n="pages.pause">一時停止</span>
+        </button>
+      </span>
+    </h2>
+    <div id="pgBoard">
+      <div id="pgHead">
+        <div id="pgSparkWrap"><canvas id="pgSpark" width="520" height="80"></canvas></div>
+        <div class="pg-metric"><div class="v" id="pgTotal">0</div>
+          <div class="k" data-i18n="pages.metric.total">この画面の累計</div></div>
+        <div class="pg-metric"><div class="v" id="pgMin">0</div>
+          <div class="k" data-i18n="pages.metric.min">直近1分</div></div>
+        <div class="pg-metric"><div class="v big" id="pgSec">0.0</div>
+          <div class="k" id="pgFleet" data-i18n="pages.metric.fleet">フリート</div></div>
+      </div>
+      <div id="pgGrid"><div class="pg-empty" id="pgEmpty" data-i18n="pages.waiting">最初のページを待っています…</div></div>
+    </div>
+  </section>
+</div>
+
 <div class="panel" data-panel="screens">
   <section>
     <h2><span data-i18n="screens.heading">Live preview</span>
@@ -3919,5 +3954,6 @@ table.aitbl code { font-size:0.95em; }
 <script src="/static/admin-settings.js?v=@@PAPRIKA_VERSION@@" defer></script>
 <script src="/static/admin-storage.js?v=@@PAPRIKA_VERSION@@" defer></script>
 <script src="/static/admin-jobsconsole.js?v=@@PAPRIKA_VERSION@@" defer></script>
+<script src="/static/admin-pages.js?v=@@PAPRIKA_VERSION@@" defer></script>
 </body>
 </html>
