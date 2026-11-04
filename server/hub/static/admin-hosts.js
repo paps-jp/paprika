@@ -1651,6 +1651,96 @@ async function clearVisitedAll() {
   }
 })();
 
+// ---- video leakage (download_video jobs completed with 0 video assets) ----
+// Fed by GET /stats/video-leakage (server-cached 5 min). Loaded only when the
+// <details> is opened: the query scans every completed job in the window.
+(function () {
+  const det = document.getElementById('videoLeakage');
+  if (!det) return;
+  const tbody = det.querySelector('#videoLeakTable tbody');
+  const daysSel = document.getElementById('videoLeakHours');
+  const meta = document.getElementById('videoLeakMeta');
+  const summ = document.getElementById('videoLeakSummary');
+  let _busy = false;
+  const VERDICT_STYLE = {
+    decouplable: 'background:#e8f5e9; color:#1b5e20;',
+    tokened:     'background:#fff8e1; color:#8a6d00;',
+    gated:       'background:#fdecea; color:#b00020;',
+    drm:         'background:#eceff1; color:#37474f;',
+    error:       'background:#f5f5f5; color:#888;',
+  };
+  const i18n = (k, fb) => (typeof tt === 'function' ? tt(k, fb) : fb);
+  function probeChips(h) {
+    const p = h.probe || {};
+    const keys = Object.keys(p).sort((a, b) => p[b] - p[a]);
+    if (!keys.length) return '<span style="color:#aaa;">—</span>';
+    const tot = h.probe_total || keys.reduce((s, k) => s + p[k], 0) || 1;
+    return keys.map(k => {
+      const pct = Math.round(100 * p[k] / tot);
+      return `<span title="${esc(k)}: ${p[k]}" style="display:inline-block; margin:1px 4px 1px 0; padding:0 6px; border-radius:9px; font-size:.82em; ${VERDICT_STYLE[k] || VERDICT_STYLE.error}">${esc(k)} ${pct}%</span>`;
+    }).join('');
+  }
+  async function load(refresh) {
+    if (_busy) return;
+    _busy = true;
+    const hours = daysSel ? daysSel.value : '1';
+    if (meta) meta.textContent = i18n('hosts.leak.loading', '集計中…');
+    try {
+      const r = await fetch('/stats/video-leakage?hours=' + encodeURIComponent(hours) + '&limit=40' + (refresh ? '&refresh=1' : ''));
+      if (!r.ok) {
+        let msg = 'HTTP ' + r.status;
+        try { msg = (await r.json()).detail || msg; } catch (_) {}
+        if (meta) meta.textContent = msg;
+        return;
+      }
+      const d = await r.json();
+      const tot = d.totals || {};
+      const seen = (tot.with_video || 0) + (tot.missed || 0);
+      const rate = Math.round(100 * (tot.miss_rate || 0));
+      if (summ) summ.textContent = tot.jobs ? `${tot.missed} / ${seen} (${rate}%) · ${d.hours || 1}h` : '';
+      if (meta) {
+        const when = d.generated_at ? new Date(d.generated_at * 1000) : null;
+        const pad = n => String(n).padStart(2, '0');
+        meta.textContent = (d.host_count || 0) + ' hosts'
+          + (when ? ` · ${pad(when.getHours())}:${pad(when.getMinutes())}` : '')
+          + (d.cached ? ' (cache)' : (d.query_ms != null ? ` · ${d.query_ms} ms` : ''));
+      }
+      const hosts = d.hosts || [];
+      if (!hosts.length) {
+        tbody.innerHTML = `<tr><td colspan="7" class="empty" style="padding:10px; color:#888; text-align:center;">${esc(i18n('hosts.leak.empty', 'no data'))}</td></tr>`;
+        return;
+      }
+      tbody.innerHTML = hosts.map(h => {
+        const pct = Math.round(100 * (h.miss_rate || 0));
+        const warn = (h.missed > 0 && pct >= 50) ? 'color:#b00020; font-weight:600;' : '';
+        return `<tr>
+          <td style="padding:4px 8px; border-bottom:1px solid #eef0f4; font-family:ui-monospace,Consolas,monospace; font-size:.9em;"><a href="#" data-leak-host="${esc(h.host)}" style="color:#1f2328; text-decoration:none;">${esc(h.host)}</a></td>
+          <td style="padding:4px 8px; border-bottom:1px solid #eef0f4; text-align:right;">${h.jobs}</td>
+          <td style="padding:4px 8px; border-bottom:1px solid #eef0f4; text-align:right; color:#1b5e20;">${h.with_video}</td>
+          <td style="padding:4px 8px; border-bottom:1px solid #eef0f4; text-align:right; ${warn}">${h.missed}</td>
+          <td style="padding:4px 8px; border-bottom:1px solid #eef0f4; text-align:right; color:#888;">${h.no_stream}</td>
+          <td style="padding:4px 8px; border-bottom:1px solid #eef0f4; text-align:right; ${warn}">${(h.with_video + h.missed) ? pct + '%' : '—'}</td>
+          <td style="padding:4px 8px; border-bottom:1px solid #eef0f4;">${probeChips(h)}</td>
+        </tr>`;
+      }).join('');
+      tbody.querySelectorAll('a[data-leak-host]').forEach(a => {
+        a.addEventListener('click', (e) => {
+          e.preventDefault();
+          if (typeof openHostModal === 'function') openHostModal(a.dataset.leakHost);
+        });
+      });
+    } catch (e) {
+      if (meta) meta.textContent = String(e);
+    } finally {
+      _busy = false;
+    }
+  }
+  det.addEventListener('toggle', () => { if (det.open) load(false); });
+  if (daysSel) daysSel.addEventListener('change', () => load(false));
+  const rb = document.getElementById('videoLeakRefresh');
+  if (rb) rb.addEventListener('click', () => load(true));
+})();
+
 // Initial render so the tab badge has the right count even before
 // the user clicks into it.
 renderHosts();

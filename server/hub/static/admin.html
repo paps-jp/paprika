@@ -1457,6 +1457,40 @@ asyncio.run(main())"
         <div id="hostDetailMount" style="display:none; flex:1; min-height:0; flex-direction:column;"></div>
       </div>
     </div>
+    <!-- Video leakage: download_video=true jobs that reached "completed" with
+         no video asset, per host, next to the host's no-browser delivery
+         verdicts (video_probe_stats). Collapsed by default -- the query scans
+         the whole window and is only fetched when opened (admin-hosts.js). -->
+    <details id="videoLeakage" style="margin-top:12px; border:1px solid #d5dade; border-radius:8px; background:#fff;">
+      <summary style="cursor:pointer; padding:8px 12px; font-weight:600; color:#333; user-select:none;">
+        <iconify-icon icon="lucide:film"></iconify-icon> <span data-i18n="hosts.leak.title">動画の取りこぼし (ストリームを検出したのに動画 0 本で完了)</span>
+        <span id="videoLeakSummary" style="font-weight:400; color:#777; margin-left:8px;"></span>
+      </summary>
+      <div style="padding:4px 12px 12px;">
+        <div style="display:flex; gap:8px; align-items:center; margin-bottom:8px; font-size:.9em; color:#555; flex-wrap:wrap;">
+          <span data-i18n="hosts.leak.days">期間</span>
+          <select id="videoLeakHours" style="padding:2px 4px;">
+            <option value="1" selected>1h</option>
+            <option value="3">3h</option>
+            <option value="6">6h</option>
+          </select>
+          <button id="videoLeakRefresh" class="pill" style="background:#f5f5fa; border-color:#bbc; color:#444;"><iconify-icon icon="lucide:refresh-cw"></iconify-icon> <span data-i18n="hosts.leak.refresh">再集計</span></button>
+          <span id="videoLeakMeta" style="margin-left:auto; color:#888;"></span>
+        </div>
+        <table id="videoLeakTable" style="width:100%; border-collapse:collapse; font-size:.9em;">
+          <thead><tr style="color:#666; font-size:.85em;">
+            <th data-i18n="hosts.leak.th.host" style="text-align:left; padding:4px 8px; border-bottom:1px solid #e2e6ea;">host</th>
+            <th data-i18n="hosts.leak.th.jobs" style="text-align:right; padding:4px 8px; border-bottom:1px solid #e2e6ea;">ジョブ</th>
+            <th data-i18n="hosts.leak.th.with" style="text-align:right; padding:4px 8px; border-bottom:1px solid #e2e6ea;">動画あり</th>
+            <th data-i18n="hosts.leak.th.missed" style="text-align:right; padding:4px 8px; border-bottom:1px solid #e2e6ea;">検出したが取れず</th>
+            <th data-i18n="hosts.leak.th.nostream" style="text-align:right; padding:4px 8px; border-bottom:1px solid #e2e6ea;">検出なし</th>
+            <th data-i18n="hosts.leak.th.rate" style="text-align:right; padding:4px 8px; border-bottom:1px solid #e2e6ea;">取りこぼし率</th>
+            <th data-i18n="hosts.leak.th.probe" style="text-align:left; padding:4px 8px; border-bottom:1px solid #e2e6ea;">配信方式 (probe 累計)</th>
+          </tr></thead>
+          <tbody><tr><td colspan="7" class="empty" style="padding:10px; color:#888; text-align:center;">—</td></tr></tbody>
+        </table>
+      </div>
+    </details>
   </section>
 </div>
 

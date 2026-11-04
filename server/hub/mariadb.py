@@ -2963,6 +2963,154 @@ async def video_probe_record(pool: Any, host: str, verdict: str, enc_method: str
         pass
 
 
+def _strip_www(host: str) -> str:
+    h = (host or "").strip().lower()
+    return h[4:] if h.startswith("www.") else h
+
+
+# A job's assets JSON (list of AssetInfo dumps, json.dumps spacing) holds a
+# video when any entry has a video/* mime or a video file name. The deferred
+# download path stamps ``video/mp4``; the inline/legacy paths sometimes leave
+# mime NULL, so the name is checked too. Plain LIKE on the JSON text, not
+# JSON_SEARCH: measured 2026-11-04 on prod (MariaDB 11.8), the JSON functions
+# over one hour of rows (~21 k download_video jobs) cost tens of seconds.
+_VIDEO_LEAK_HAS_VIDEO_SQL = (
+    "(r.assets LIKE '%%\"mime\": \"video/%%'"
+    " OR r.assets LIKE '%%.mp4\"%%'"
+    " OR r.assets LIKE '%%.webm\"%%'"
+    " OR r.assets LIKE '%%.mkv\"%%'"
+    " OR r.assets LIKE '%%.m4v\"%%'"
+    " OR r.assets LIKE '%%.mov\"%%')"
+)
+
+# host = the URL's authority without scheme / port / leading www.
+_VIDEO_LEAK_HOST_SQL = (
+    "TRIM(LEADING 'www.' FROM LOWER(SUBSTRING_INDEX("
+    "SUBSTRING_INDEX(SUBSTRING_INDEX(j.url, '/', 3), '/', -1), ':', 1)))"
+)
+
+# download_video=true: a cheap text pre-filter, then the exact JSON check on
+# what survives. NOT ``JSON_VALUE(...) = 'true'``: MariaDB's JSON_VALUE renders
+# a JSON boolean as '1' / '0' (prod check 2026-11-04 -- that predicate matched
+# zero rows). JSON_EXTRACT keeps the JSON literal, which compares as 'true'.
+_VIDEO_LEAK_DV_SQL = (
+    "j.options LIKE '%%\"download_video\": true%%'"
+    " AND JSON_EXTRACT(j.options, '$.download_video') = 'true'"
+)
+
+# "a stream was seen": the deferred download's targets come from
+# pick_stream_urls(result.video_urls_seen), so an empty list means there was
+# nothing to download (index / gallery page) -- not a loss. video_detection is
+# useless as a flag (always ``{"videos": [], "iframes": []}`` at minimum) and
+# ytdlp_results is never filled by the deferred path.
+_VIDEO_LEAK_SEEN_SQL = (
+    "(r.video_urls_seen IS NOT NULL AND r.video_urls_seen NOT IN ('[]', 'null'))"
+)
+
+# Bounded server-side (MariaDB SET STATEMENT): 1 h ~ 25 s, 6 h ~ 105 s on prod
+# 2026-11-04; a runaway window must not sit on the shared DB for minutes.
+VIDEO_LEAK_MAX_STATEMENT_S = 240
+
+VIDEO_LEAK_SQL = (
+    f"SET STATEMENT max_statement_time={VIDEO_LEAK_MAX_STATEMENT_S} FOR "
+    "SELECT host, COUNT(*) AS jobs, COALESCE(SUM(has_video), 0) AS with_video, "
+    "COALESCE(SUM(NOT has_video AND seen), 0) AS missed "
+    "FROM ("
+    f"  SELECT {_VIDEO_LEAK_HOST_SQL} AS host, {_VIDEO_LEAK_HAS_VIDEO_SQL} AS has_video,"
+    f"         {_VIDEO_LEAK_SEEN_SQL} AS seen"
+    "   FROM jobs j JOIN job_results r ON r.job_id = j.job_id"
+    "   WHERE j.status = 'completed'"
+    "     AND j.created_at >= (UTC_TIMESTAMP(3) - INTERVAL %s HOUR)"
+    f"     AND {_VIDEO_LEAK_DV_SQL}"
+    ") t GROUP BY host"
+)
+
+VIDEO_LEAK_MAX_HOURS = 6
+
+
+async def load_video_leakage(pool: Any, hours: int = 1, limit: int = 40) -> dict:
+    """How many ``download_video=true`` jobs completed WITHOUT a video asset,
+    per host, joined with the host's no-browser reachability verdicts from
+    ``video_probe_stats``.
+
+    This is the measurement behind the video-download design work (see
+    internal/design/design-video-download-paths-2026-11-04.html, option 0):
+    a job counts as "completed" even when yt-dlp got nothing, so the leakage
+    is invisible in the job list. Per host, the jobs in the window split
+    three ways:
+
+      with_video  a video asset was uploaded
+      missed      a stream URL was seen (video_urls_seen) but no video asset:
+                  the loss this measures
+      no_stream   nothing was seen -- index / gallery pages; not a loss
+
+    ``miss_rate`` = missed / (with_video + missed). The window is on
+    ``created_at`` (the composite ``(status, created_at)`` index covers it;
+    ``completed_at`` has none). ``probe`` is the host's all-time verdict
+    histogram from video_probe_stats (fleet total, not windowed). Hosts are
+    ordered by ``missed`` desc and cut at ``limit``; ``totals`` covers every
+    host, not just the listed ones.
+
+    The window is in HOURS (1..VIDEO_LEAK_MAX_HOURS): prod completes ~20 k
+    download_video jobs an hour and the scan is linear in that (1 h ~ 25 s,
+    6 h ~ 105 s, measured 2026-11-04). One scan of the window plus one small
+    read of video_probe_stats; the caller caches."""
+    hours = max(1, min(int(hours or 1), VIDEO_LEAK_MAX_HOURS))
+    limit = max(1, min(int(limit or 40), 500))
+    rows: list[tuple] = []
+    probe: dict[str, dict[str, int]] = {}
+    async with pool.acquire() as conn:
+        async with conn.cursor() as cur:
+            await cur.execute(VIDEO_LEAK_SQL, (hours,))
+            rows = list(await cur.fetchall() or [])
+            await cur.execute(_VIDEO_PROBE_DDL)
+            await cur.execute(
+                "SELECT host, verdict, SUM(n) FROM video_probe_stats GROUP BY host, verdict"
+            )
+            for h, v, n in await cur.fetchall() or []:
+                probe.setdefault(_strip_www(str(h)), {})[str(v)] = int(n or 0)
+
+    hosts: list[dict] = []
+    tot_jobs = tot_with = tot_missed = 0
+    for host, jobs, with_video, missed in rows:
+        jobs = int(jobs or 0)
+        with_video = int(with_video or 0)
+        missed = int(missed or 0)
+        no_stream = max(0, jobs - with_video - missed)
+        tot_jobs += jobs
+        tot_with += with_video
+        tot_missed += missed
+        pv = probe.get(_strip_www(str(host or "")), {})
+        pv_total = sum(pv.values())
+        dominant = max(pv.items(), key=lambda kv: kv[1])[0] if pv else None
+        seen = with_video + missed
+        hosts.append({
+            "host": str(host or ""),
+            "jobs": jobs,
+            "with_video": with_video,
+            "missed": missed,
+            "no_stream": no_stream,
+            "miss_rate": round(missed / seen, 3) if seen else 0.0,
+            "probe": pv,
+            "probe_total": pv_total,
+            "probe_verdict": dominant,
+        })
+    hosts.sort(key=lambda h: (-h["missed"], -h["jobs"], h["host"]))
+    tot_seen = tot_with + tot_missed
+    return {
+        "hours": hours,
+        "hosts": hosts[:limit],
+        "host_count": len(hosts),
+        "totals": {
+            "jobs": tot_jobs,
+            "with_video": tot_with,
+            "missed": tot_missed,
+            "no_stream": max(0, tot_jobs - tot_seen),
+            "miss_rate": round(tot_missed / tot_seen, 3) if tot_seen else 0.0,
+        },
+    }
+
+
 async def load_engine_usage(pool: Any, days: int = 14) -> dict:
     """Return the shared per-day, per-slug counters for the last ``days``
     days as ``{date_str: {slug: {prompt, completion, requests}}}``.

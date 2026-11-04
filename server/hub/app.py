@@ -1824,6 +1824,11 @@ from server.hub.routes.wall import router as _wall_router
 
 app.include_router(_wall_router)
 
+# ---- /stats/video-leakage -- download_video jobs that completed with no video
+from server.hub.routes.videostats import router as _videostats_router
+
+app.include_router(_videostats_router)
+
 # ---- Auth: login + API-key / user management (LAN-trust → multi-user) -----
 from server.hub.routes.auth import router as _auth_router
 
