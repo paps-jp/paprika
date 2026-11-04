@@ -2001,6 +2001,7 @@ async def claim_job(job_id: str, body: dict, request: Request) -> JobInfo:
     worker = state.registry.connections.get(worker_id)
     if worker is None:
         # Only the hub holding this worker's WS can deliver the assignment.
+        log.info("[claim] %s by %s -> 409 worker not connected here", job_id, worker_id)
         raise HTTPException(
             409, f"worker '{worker_id}' is not connected to this hub"
         )
@@ -2012,6 +2013,7 @@ async def claim_job(job_id: str, body: dict, request: Request) -> JobInfo:
         raise HTTPException(404, "job no longer exists")
     _st = info.status.value if hasattr(info.status, "value") else str(info.status)
     if info.status != JobStatus.queued:
+        log.info("[claim] %s by %s -> 409 already %s", job_id, worker_id, _st)
         raise HTTPException(409, f"job is already {_st}")
 
     # Resolve the per-host material (cookies, login refresh, fetch recipe) HERE

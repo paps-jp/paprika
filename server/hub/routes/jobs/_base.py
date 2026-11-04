@@ -798,6 +798,15 @@ async def _queued_timeout_guard(job_id: str, deadline_s: float) -> None:
             f"(no worker/lane available)"
         )
         await state.store.save_job_info(jinfo)
+        # A terminal job must not stay on the pull list: a worker would pop the
+        # dead id and burn a claim on it (409 "already failed").
+        try:
+            from server.hub import _pull_queue
+
+            if _pull_queue.ENABLED:
+                await _pull_queue.remove(job_id)
+        except Exception:
+            pass
         try:
             await state.store.publish_log(job_id, "  !! " + jinfo.error)
             await state.store.publish_log(job_id, DONE_SENTINEL)

@@ -39,7 +39,7 @@ QUEUE_KEY = os.environ.get("PAPRIKA_PULL_QUEUE_KEY") or "paprika:jobq"
 #: Submissions are rejected with 503 past this depth. Replaces the fleet-wide
 #: capacity aggregation, which cost 1.5s at 152 workers and grows with the
 #: fleet; ``LLEN`` is O(1) at any size.
-MAX_DEPTH = int(os.environ.get("PAPRIKA_PULL_QUEUE_MAX") or 5000)
+MAX_DEPTH = int(os.environ.get("PAPRIKA_PULL_QUEUE_MAX") or 1500)
 
 
 #: Imported at module level so tests can patch ``_pull_queue.state.redis``
@@ -89,6 +89,44 @@ async def push(job_id: str) -> bool:
     except Exception:
         log.warning("[pull] push failed for %s", job_id, exc_info=True)
         return False
+
+
+#: Shortest gap between two redrive re-pushes of the SAME id. Every hub runs a
+#: redrive loop, so without a shared guard one stranded job is re-pushed by up
+#: to seven hubs every few seconds.
+REPUSH_COOLDOWN_S = int(os.environ.get("PAPRIKA_PULL_REPUSH_COOLDOWN_S") or 60)
+
+
+async def repush_if_absent(job_id: str) -> str:
+    """Put a stranded id back WITHOUT disturbing its place in line.
+
+    Returns ``"present"`` (still on the list -- left alone), ``"cooldown"``
+    (another hub re-pushed it recently), ``"pushed"`` or ``"error"``.
+
+    The old redrive did ``remove`` + ``RPUSH`` every pass, which moved every
+    waiting job to the back each time (2026-11-03: c893ef0e489a was re-queued
+    ~20 times in 3 minutes and never reached the front) and, racing a worker's
+    BLPOP, left copies of already-running ids behind. A re-pushed id is a job
+    that was LOST (popped by a worker that died before claiming), so it goes to
+    the front: it has already waited longer than anything behind it.
+    """
+    if not job_id:
+        return "error"
+    r = _redis()
+    if r is None:
+        return "error"
+    try:
+        if (await r.lpos(QUEUE_KEY, job_id)) is not None:
+            return "present"
+        if not await r.set(
+            f"{QUEUE_KEY}:repush:{job_id}", "1", nx=True, ex=REPUSH_COOLDOWN_S,
+        ):
+            return "cooldown"
+        await r.lpush(QUEUE_KEY, job_id)
+        return "pushed"
+    except Exception:
+        log.warning("[pull] repush failed for %s", job_id, exc_info=True)
+        return "error"
 
 
 async def depth() -> int:

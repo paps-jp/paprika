@@ -325,16 +325,20 @@ async def _redrive_dispatch_one(info) -> bool:
     # popping and claiming takes the id with it while the row stays queued.
     # This loop is what notices.
     #
-    # remove-then-push keeps it idempotent: a job that is still sitting in the
-    # list (queued but simply not popped yet) must not accumulate a copy every
-    # pass, or one worker death would leave the same URL crawled twice.
+    # Only re-push an id that is NOT on the list, at most once per cooldown
+    # across all hubs (2026-11-04). The old remove-then-push moved every waiting
+    # job to the back on every pass of every hub, so old jobs starved and ids of
+    # already-running jobs piled up on the list. See _pull_queue.repush_if_absent.
     from server.hub import _pull_queue
     if _pull_queue.ENABLED:
         try:
-            await _pull_queue.remove(info.job_id)
-            if await _pull_queue.push(info.job_id):
+            res = await _pull_queue.repush_if_absent(info.job_id)
+            if res == "pushed":
                 log.info("redrive: re-queued %s onto the pull list", info.job_id)
                 return True
+            if res in ("present", "cooldown"):
+                return False  # still waiting its turn -- leave it alone
+            # "error": Redis unusable -> fall through to inline dispatch
         except Exception:
             log.warning(
                 "redrive: pull re-queue failed for %s; falling back to inline "

@@ -31,15 +31,58 @@ def test_redrive_requeues_under_pull():
     src = inspect.getsource(_redrive._redrive_dispatch_one)
     head = src[:src.index("pick_worker")]
     assert "_pull_queue.ENABLED" in head, "the pull branch must come first"
-    assert "_pull_queue.push" in head
+    assert "_pull_queue.repush_if_absent" in head
 
 
-def test_requeue_removes_before_pushing():
-    """A queued job may still be sitting in the list unpopped. Pushing again
-    without removing would give it two entries, and two workers would crawl
-    the same URL."""
+def test_requeue_never_reorders_or_duplicates():
+    """A queued job may still be sitting in the list unpopped. The redrive must
+    not move it (remove+RPUSH sent every waiting job to the back on every pass
+    of every hub -- 2026-11-03) nor stack a second copy: it only re-pushes an
+    id that is absent, once per cooldown."""
     src = inspect.getsource(_redrive._redrive_dispatch_one)
-    assert src.index("_pull_queue.remove") < src.index("_pull_queue.push")
+    assert "_pull_queue.remove" not in src
+    assert "_pull_queue.push(" not in src
+
+
+class _FakeRedis:
+    def __init__(self, items=()):
+        self.items = list(items)
+        self.keys = set()
+
+    async def lpos(self, _k, v):
+        return self.items.index(v) if v in self.items else None
+
+    async def set(self, k, _v, nx=False, ex=None):
+        if nx and k in self.keys:
+            return None
+        self.keys.add(k)
+        return True
+
+    async def lpush(self, _k, v):
+        self.items.insert(0, v)
+
+
+def _repush(fake, job_id):
+    import asyncio
+    from unittest import mock
+
+    with mock.patch.object(_pull_queue, "_redis", return_value=fake):
+        return asyncio.run(_pull_queue.repush_if_absent(job_id))
+
+
+def test_repush_leaves_a_waiting_id_where_it_is():
+    fake = _FakeRedis(["a", "b", "c"])
+    assert _repush(fake, "b") == "present"
+    assert fake.items == ["a", "b", "c"]
+
+
+def test_repush_once_per_cooldown_and_to_the_front():
+    fake = _FakeRedis(["a", "b"])
+    assert _repush(fake, "z") == "pushed"
+    assert fake.items == ["z", "a", "b"]
+    fake.items.remove("z")  # popped again and lost
+    assert _repush(fake, "z") == "cooldown"  # another hub just did it
+    assert fake.items == ["a", "b"]
 
 
 def test_redrive_falls_back_to_inline_dispatch_on_redis_failure():
