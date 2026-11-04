@@ -180,6 +180,7 @@ async def list_jobs(
     status: str | None = None,
     mode: str | None = None,
     q: str | None = None,
+    count: int = 1,
 ) -> dict:
     """List jobs with optional server-side pagination and filtering.
 
@@ -188,6 +189,8 @@ async def list_jobs(
       * ``limit``  -- max entries to return. **Default 20, hard cap 500.**
                       ``limit<=0`` is treated as the default (NOT "all").
                       Page through more via ``offset``.
+      * ``count``  -- ``0`` skips the exact-total COUNT(*) and returns
+                      ``total: null``. Default ``1`` (compat).
       * ``status`` -- filter by status (``running``, ``completed``,
                       ``failed``, ``cancelled``, ``queued``).
                       Comma-separated for multiple: ``status=completed,failed``.
@@ -197,6 +200,15 @@ async def list_jobs(
     Returns a paginated envelope::
 
         {total, count, offset, limit, jobs: [...]}
+
+    .. versionchanged:: 2026-09-11
+       Added ``count=0``. The exact total is a ``SELECT COUNT(*) FROM jobs``
+       that walks the whole index when unfiltered -- **3.4 s at 16.4 M rows**,
+       and it is FIXED cost (``limit=1`` measured the same as ``limit=500``).
+       The admin UI polls this list every 2 s and then DISCARDS the number in
+       favour of the Redis-cached per-status counts from ``/jobs/summary``, so
+       it now passes ``count=0`` and the response drops to ~30 ms. External
+       callers that want the total keep the default.
 
     .. versionchanged:: 2026-06-05
        ``limit`` now DEFAULTS TO 20 (was 0 = unbounded) and is hard-capped at
@@ -242,8 +254,9 @@ async def list_jobs(
         # above). Cache HIT skips the MariaDB query + row deser entirely.
         # _proxy_info below still runs per request -- it model_copy's, never
         # mutates the cached JobInfos -- so each response stays request-correct.
+        want_total = bool(count)
         _ck = (off, lim, tuple(status_list or ()), tuple(mode_list or ()),
-               q or "", own or "")
+               q or "", own or "", want_total)
         _now = time.time()
         _hit = _JOBS_LIST_CACHE.get(_ck)
         if _hit is not None and (_now - _hit[0]) < _JOBS_LIST_CACHE_TTL_S:
@@ -252,14 +265,27 @@ async def list_jobs(
             # downloading は SQL レベルで status='downloading' 絞り込みできる
             # ので、 旧 virtual filter (full-running scan + python post-filter)
             # は廃止。 通常パスと同じ paging で OK。
-            infos, filtered_total = await fast(
-                offset=off,
-                limit=lim,
-                status=status_list,
-                mode=mode_list,
-                url_substr=q,
-                owner_id=own,
-            )
+            try:
+                infos, filtered_total = await fast(
+                    offset=off,
+                    limit=lim,
+                    status=status_list,
+                    mode=mode_list,
+                    url_substr=q,
+                    owner_id=own,
+                    with_total=want_total,
+                )
+            except TypeError:
+                # Store predating the with_total kwarg (or a test double):
+                # fall back to the counted call rather than 500ing.
+                infos, filtered_total = await fast(
+                    offset=off,
+                    limit=lim,
+                    status=status_list,
+                    mode=mode_list,
+                    url_substr=q,
+                    owner_id=own,
+                )
             # page_roles depends only on each job's id + url (stable across the
             # cache TTL), so memoise it WITH the infos. It was re-running
             # role_for_url for every job on EVERY request -- even cache hits,
@@ -350,12 +376,45 @@ async def list_jobs(
     }
 
 
+def _slim_feed_row(info: JobInfo) -> dict:
+    """Project a JobInfo down to what an append-only console line shows.
+
+    Deliberately NOT ``_proxy_info``: that rewrites artifact hrefs for the
+    proxy, which a feed row never renders. ``error`` is clipped -- a stack
+    trace or a multi-KB upstream body would dwarf every other field, and the
+    row is a one-liner; the full text is one click away on GET /jobs/{id}.
+    """
+    def _iso(v):
+        return v.isoformat() if hasattr(v, "isoformat") else (v or None)
+
+    err = getattr(info, "error", None)
+    _st = getattr(info, "status", "")
+    return {
+        "job_id": getattr(info, "job_id", ""),
+        # ``.value``, not ``str()``: JobStatus is an (str, Enum), and since
+        # 3.11 str() on one renders "JobStatus.completed".
+        "status": str(getattr(_st, "value", _st) or ""),
+        "url": getattr(info, "url", "") or "",
+        "mode": ((getattr(info, "options", None) or {}).get("mode")
+                 if isinstance(getattr(info, "options", None), dict)
+                 else getattr(getattr(info, "options", None), "mode", None))
+                or "fetch",
+        "worker_id": getattr(info, "worker_id", None) or "",
+        "lane_idx": getattr(info, "lane_idx", None),
+        "created_at": _iso(getattr(info, "created_at", None)),
+        "started_at": _iso(getattr(info, "started_at", None)),
+        "completed_at": _iso(getattr(info, "completed_at", None)),
+        "error": (str(err)[:200] if err else ""),
+    }
+
+
 @router.get("/jobs/completes")
 async def list_completed_jobs(
     request: Request,
     completed_after: str,
     limit: int = 100,
     status: str = "completed,review",
+    slim: int = 0,
 ) -> dict:
     """Cursor (keyset) pagination for stream consumers (pipeline-oss pull).
 
@@ -369,6 +428,11 @@ async def list_completed_jobs(
         naive timestamps are accepted (naive is treated as UTC).
       * ``limit`` -- default 100, hard cap 500.
       * ``status`` -- CSV IN-filter, default ``"completed,review"``.
+      * ``slim`` -- ``1`` returns a COMPACT row (the ten fields a live feed
+        renders) instead of the full JobInfo. The full row carries goal /
+        options / progress / hrefs and runs ~1.2 KB; a batch of 500 is
+        ~600 KB, most of which a console view throws away. Slim rows are
+        ~150 B, so the same batch is ~75 KB.
 
     Unlike ``GET /jobs`` (offset-based, O(N) at deep pages), this is
     O(log N + limit) at any table size via the
@@ -409,7 +473,10 @@ async def list_completed_jobs(
     infos = await lister(ts, limit=lim, status=status_list)
     if _own is not None:
         infos = [i for i in infos if getattr(i, "owner_id", "default") == _own]
-    page = [_proxy_info(i, request) for i in infos]
+    if slim:
+        page = [_slim_feed_row(i) for i in infos]
+    else:
+        page = [_proxy_info(i, request) for i in infos]
     next_cursor = None
     if infos:
         last_dt = getattr(infos[-1], "completed_at", None)

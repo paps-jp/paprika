@@ -467,13 +467,23 @@ class MariaDBJobStore:
         url_substr: str | None = None,
         url_exact: str | None = None,
         owner_id: str | None = None,
-    ) -> tuple[list[Any], int]:
+        with_total: bool = True,
+    ) -> tuple[list[Any], int | None]:
         """Return (infos, total_matching) in a single hydration query.
 
         * ``status`` / ``mode`` — case-insensitive IN-filter lists.
           Empty/None means no filter on that column.
         * ``url_substr`` — case-insensitive substring match on url.
         * ``limit=0`` — return everything matching.
+        * ``with_total=False`` — skip the COUNT(*) entirely and return
+          ``None`` as the total. **This is the difference between a 30 ms
+          and a 3.5 s response.** An UNFILTERED ``SELECT COUNT(*) FROM jobs``
+          has to walk the whole index: measured 3.4 s at 16.4 M rows on prod
+          (2026-09-11), and it is FIXED cost -- ``limit=1`` paid it just the
+          same as ``limit=500``. The admin jobs list doesn't even use the
+          number (it prefers the Redis-cached per-status badge count from
+          ``/jobs/summary``), so it asks for ``count=0``. Callers that
+          genuinely need an exact total keep the default.
 
         Result rows are sorted ``created_at DESC`` (newest first), which
         matches the admin UI's expectation.
@@ -512,11 +522,16 @@ class MariaDBJobStore:
             async with conn.cursor() as cur:
                 # Total count for the matching set (separate query so the
                 # paged SELECT only carries `limit` rows back over the
-                # wire instead of the entire match set).
-                count_sql = f"SELECT COUNT(*) FROM jobs {where_sql}"
-                await cur.execute(count_sql, tuple(params))
-                row = await cur.fetchone()
-                total = row[0] if row else 0
+                # wire instead of the entire match set). Skipped entirely
+                # when the caller passed with_total=False -- see the
+                # docstring: unfiltered this is a whole-index walk and was
+                # the single biggest cost of the admin #jobs tab.
+                total: int | None = None
+                if with_total:
+                    count_sql = f"SELECT COUNT(*) FROM jobs {where_sql}"
+                    await cur.execute(count_sql, tuple(params))
+                    row = await cur.fetchone()
+                    total = row[0] if row else 0
 
                 # Paged SELECT.
                 select_cols = (

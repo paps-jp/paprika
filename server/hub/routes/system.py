@@ -629,13 +629,20 @@ async def _cached_jobs_total() -> int:
 
 
 @router.get("/overview")
-async def overview() -> dict:
+async def overview(slim: int = 0) -> dict:
     """Aggregated admin-poll snapshot in ONE response: health + workers +
     sessions + job COUNT. The admin header polls this every ~2s instead of
     hitting /health + /workers + /sessions + /jobs separately (4 requests
     -> 1). Returns the job *count* only -- the Jobs tab fetches the
     paginated /jobs itself when it's open, so this stays cheap (no
     per-job hydration).
+
+    ``slim=1`` drops the per-worker and per-session ARRAYS and keeps only
+    their counts (plus ``workers.lanes``). The full payload is ~240 KB at
+    253 workers and the admin re-fetches it every 2 s from whichever tab is
+    open -- but only the Workers table and the Live-preview grid ever read
+    the arrays. Every other tab was paying 240 KB of JSON encode (on the hub
+    event loop) + transfer + parse, twice a second, to use three integers.
     """
     h = await health()
     # Lazy imports: these handlers live in sibling route modules; importing
@@ -654,6 +661,18 @@ async def overview() -> dict:
         sessions = await list_sessions()
     except Exception:
         sessions = {"count": 0, "sessions": []}
+    if slim:
+        workers = {
+            "count": workers.get("count", 0),
+            "lanes": workers.get("lanes", 0),
+            "workers": [],
+            "slim": True,
+        }
+        sessions = {
+            "count": sessions.get("count", 0),
+            "sessions": [],
+            "slim": True,
+        }
     return {
         "health": h,
         "workers": workers,

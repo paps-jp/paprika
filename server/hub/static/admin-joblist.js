@@ -1291,9 +1291,31 @@ document.getElementById('submit').addEventListener('submit', async e => {
 // catch-up refresh — the moment the tab becomes visible again.
 const REFRESH_INTERVAL_MS = 2000;
 let _refreshTimer = null;
+// In-flight guard. refresh() is async and setInterval does NOT wait for it,
+// so whenever a poll took longer than the interval the ticks stacked: the
+// /jobs page ran 3.5s against a 2s timer (2026-09-11), the queue grew without
+// bound, and once the browser's 6-connections-per-host limit filled, EVERY
+// request behind it -- /overview, /static, the other tabs -- waited too. The
+// same endpoint that answered in 3.5s from curl was measured at ~61s from
+// inside the page. One tick at a time; a skipped tick costs nothing because
+// the next one reads the same live state.
+let _refreshInFlight = false;
+let _refreshSkipped = 0;
+async function _refreshTick() {
+  if (_refreshInFlight) { _refreshSkipped++; return; }
+  _refreshInFlight = true;
+  try {
+    await refresh();
+  } catch (_) {
+    // refresh() already swallows per-endpoint failures; this is the
+    // last-resort guard so a throw can't wedge the flag forever.
+  } finally {
+    _refreshInFlight = false;
+  }
+}
 function _startRefreshLoop() {
   if (_refreshTimer !== null) return;   // already running
-  _refreshTimer = setInterval(refresh, REFRESH_INTERVAL_MS);
+  _refreshTimer = setInterval(_refreshTick, REFRESH_INTERVAL_MS);
 }
 function _stopRefreshLoop() {
   if (_refreshTimer === null) return;

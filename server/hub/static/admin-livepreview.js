@@ -745,6 +745,11 @@ document.querySelectorAll('#jobsStatusTabs [data-jobs-status]').forEach(btn => {
     // filter is part of visSig (different value -> sig mismatch ->
     // rebuild).
     _jobsLastSig = '';
+    // ライブ is not a filter of the table -- it swaps in the append-only
+    // console pane, which owns its own feed. Don't paint a loading row into
+    // (or force a poll for) a table that's about to be hidden.
+    if (typeof jcSyncRunning === 'function') jcSyncRunning();
+    if (val === 'live') return;
     const jt = document.getElementById('jobsTable');
     const tb = jt && jt.querySelector('tbody');
     if (tb) {

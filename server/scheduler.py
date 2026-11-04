@@ -323,6 +323,24 @@ WorkerStatus = str  # "active" | "drain" | "standby"
 ALLOWED_STATUSES = {"active", "drain", "standby"}
 
 
+def _sum_lanes(workers: list[dict]) -> int:
+    """Total Chrome lanes across ``workers`` (one lane == one Chrome).
+
+    Summed over EVERY listed row, not just ``alive`` ones, so it shares a
+    denominator with the ``count`` beside it: ``alive`` flaps a few percent
+    on every poll (see the ``_alive`` note in ``_fetch_known_workers``) and a
+    lane total gated on it would jitter for no real reason. A row with no
+    capability row yet contributes 0 rather than a guessed 1.
+    """
+    total = 0
+    for w in workers:
+        try:
+            total += int(w.get("capacity") or 0)
+        except (TypeError, ValueError):
+            continue
+    return total
+
+
 def _rewrite_lane_urls_if_stale(
     lane_urls: list[str],
     client_address: str | None,
@@ -1718,7 +1736,15 @@ class WorkerRegistry:
         # only returns the live in-memory connections. The /workers route
         # uses ``stats_async`` so the UI sees the full set including
         # disconnected-but-remembered workers.
-        return {"count": len(workers), "workers": workers}
+        # ``lanes`` = the fleet's Chrome-browser count (one lane == one
+        # Chrome). Summed HERE so a caller that only wants the number -- the
+        # admin header, /overview?slim=1 -- never has to receive the whole
+        # worker array to add it up itself.
+        return {
+            "count": len(workers),
+            "lanes": _sum_lanes(workers),
+            "workers": workers,
+        }
 
     async def _fetch_known_workers(
         self, exclude_ids: set[str],
@@ -2117,6 +2143,7 @@ class WorkerRegistry:
                     pass
         snap["workers"].extend(self._known_extra_for(seen))
         snap["count"] = len(snap["workers"])
+        snap["lanes"] = _sum_lanes(snap["workers"])
         # Age of the cross-hub half, so an operator (and /health) can tell a
         # degraded view from a healthy one instead of guessing from the count.
         snap["aggregate_stale_s"] = (

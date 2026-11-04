@@ -83,6 +83,77 @@
   .panel { display: none; }
   .panel.active { display: block; }
 
+  /* ---- #jobs ライブ console -----------------------------------------
+     A scrollback pane, not a page of results: fixed viewport, monospace,
+     dense rows, and NO per-row controls (the eager actions dropdown is
+     what made the old 1000-row table unusable). */
+  #jobsConsoleWrap {
+    height: 62vh; min-height: 320px; overflow-y: auto; overflow-x: hidden;
+    border: 1px solid #e5ded6; border-radius: 6px; background: #fcfaf7;
+    /* NO content-visibility here. Tried it 2026-09-11: on the SCROLL
+       CONTAINER (with no contain-intrinsic-size) it made scrollTop
+       unwritable -- assigning it was silently ignored and no scroll event
+       fired -- which broke the scroll-to-release-follow behaviour. The DOM
+       is capped at JC.max rows anyway, so there is nothing to save here. */
+  }
+  #jobsConsoleTable { width: 100%; border-collapse: collapse; table-layout: fixed;
+    font: 12px/1.45 ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; }
+  #jobsConsoleTable thead th {
+    position: sticky; top: 0; z-index: 1; background: #f2ede7;
+    text-align: left; font-weight: 600; padding: 5px 8px;
+    border-bottom: 1px solid #e0d8ce; white-space: nowrap;
+    overflow: hidden; text-overflow: ellipsis;
+  }
+  #jobsConsoleTable td { padding: 2px 8px; border-bottom: 1px solid #f2eee9;
+    white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+  /* Time must fit "09/11 10:38:52" whole -- the seconds are the point of a
+     console line at ~24 completions/second. Status must fit the widest badge
+     ("completed") without clipping. Both were a few px short. */
+  #jobsConsoleTable .jc-c-t { width: 126px; }
+  #jobsConsoleTable .jc-c-s { width: 122px; }
+  #jobsConsoleTable .jc-c-d { width: 74px; }   /* fits the EN "duration" header */
+  #jobsConsoleTable .jc-c-w { width: 118px; }
+  #jobsConsoleTable .jc-c-m { width: 62px; }
+  #jobsConsoleTable .jc-c-n { width: 260px; }
+  #jobsConsoleTable .jc-t { color: #8a7f74; overflow: visible; }
+  #jobsConsoleTable .jc-d { text-align: right; color: #666; }
+  #jobsConsoleTable .jc-m { color: #666; }
+  /* note = clipped error text + the job-id affordance, on ONE line. A float
+     here wraps the button onto a second line and the row heights go ragged. */
+  #jobsConsoleTable .jc-n { display: flex; gap: 6px; align-items: baseline; }
+  #jobsConsoleTable .jc-n .jc-errtext {
+    flex: 1 1 auto; overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+  }
+  #jobsConsoleTable .jc-u a { color: #3a5ca8; text-decoration: none; }
+  #jobsConsoleTable .jc-u a:hover { text-decoration: underline; }
+  #jobsConsoleTable tr.jc-failed .jc-u a { color: #a23c2a; }
+  #jobsConsoleTable tr:hover { background: #f6f1ea; }
+  #jobsConsoleTable .jc-err { color: #a23c2a; }
+  #jobsConsoleTable .jc-open {
+    flex: 0 0 auto; border: 1px solid #ddd4c9; background: #fff; cursor: pointer;
+    border-radius: 4px; padding: 0 5px; font: inherit; color: #8a7f74;
+  }
+  #jobsConsoleTable .jc-open:hover { background: #f2ede7; color: #333; }
+  #jobsConsoleFoot {
+    margin-top: 6px; font-size: .8rem; color: #8a7f74;
+    font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+  }
+  #jobsConsoleFoot .jc-live   { color: #196b2c; }
+  #jobsConsoleFoot .jc-held   { color: #a07000; }
+  #jobsConsoleFoot .jc-paused { color: #a23c2a; }
+  #jobsConsoleStatus .jc-chk { font-size: .82rem; color: #555; white-space: nowrap; }
+  #jobsConsoleStatus .jc-chk input { vertical-align: -1px; }
+
+  /* Workers heading: "Workers (253)  Chrome browser : 506".
+     Secondary weight/size so the lane total reads as a qualifier on
+     the worker count rather than a second heading. */
+  .lanecount {
+    margin-left: 10px; font-size: .78rem; font-weight: 600; color: #8a7f74;
+    padding: 2px 10px; border-radius: 999px; background: #f2ede7;
+    vertical-align: middle; white-space: nowrap;
+  }
+  .lanecount #laneCount { color: #c0392b; }
+
   /* "More" dropdown -- collapses Hosts / Skills / Conventions into one
      tab so the nav bar doesn't overflow. The trigger looks like a
      normal tab; the menu is absolutely positioned right below it. */

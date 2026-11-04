@@ -180,13 +180,22 @@ document.addEventListener('click', e => {
 // non-2xx status (an HTML error page would otherwise blow up r.json()).
 // Used by refresh() so a single flaky endpoint can't reject the whole
 // Promise.all and freeze every table for the rest of the session.
+const _REFRESH_TIMEOUT_MS = 15000;
 async function _refreshJson(url, fallback) {
+  // Bounded: without a timeout a single wedged hub holds the poll loop's
+  // in-flight flag (and a browser connection) for minutes, which is exactly
+  // the pile-up the guard exists to prevent. A dropped tick is free -- the
+  // next one re-reads the same live state.
+  const ctl = new AbortController();
+  const kill = setTimeout(() => ctl.abort(), _REFRESH_TIMEOUT_MS);
   try {
-    const r = await fetch(url);
+    const r = await fetch(url, { signal: ctl.signal });
     if (!r.ok) return fallback;
     return await r.json();
   } catch (_) {
     return fallback;
+  } finally {
+    clearTimeout(kill);
   }
 }
 
@@ -194,11 +203,22 @@ async function refresh() {
   try {
     const _tab = (location.hash || '').replace(/^#/, '').split('/')[0];
     const jobsTabActive = (_tab === '' || _tab === 'jobs');
+    // The ライブ console owns its own feed (admin-jobsconsole.js) and must NOT
+    // drag the paginated /jobs page along with it -- that page is the whole
+    // reason the tab was slow.
+    const jobsConsoleActive = jobsTabActive && _jobsStatusFilter === 'live';
+    // Only three views read the per-worker / per-session ARRAYS out of
+    // /overview. Everywhere else was pulling ~240KB of worker JSON twice a
+    // second to render three integers from it (253 workers on prod). ?slim=1
+    // keeps the counts (incl. workers.lanes, summed server-side) and drops
+    // the arrays.
+    const needFullOverview =
+      (_tab === 'workers' || _tab === 'screens' || _tab === 'sessions');
     // ONE consolidated poll (/overview) instead of 4 separate requests
     // (/health + /workers + /jobs + /sessions) every ~2s. /overview returns
     // the job COUNT only (no per-job hydration); the Jobs tab fetches the
     // full paginated /jobs itself when it's open.
-    const ov = await _refreshJson('/overview', {
+    const ov = await _refreshJson(needFullOverview ? '/overview' : '/overview?slim=1', {
       health: { store: '?', workers: '?' },
       workers: { count: 0, workers: [] },
       jobs: { total: 0 },
@@ -215,7 +235,7 @@ async function refresh() {
     // Hoisted so the render block below can fall back on the per-status badge
     // count when `jobs.total` is racing (e.g. just after a sub-tab change).
     let _summaryRes = null;
-    if (jobsTabActive) {
+    if (jobsTabActive && !jobsConsoleActive) {
       // "最近のジョブ" = Recent Jobs. Server-side filter + pagination so
       // each status sub-tab can show ALL matching jobs (not just the
       // 300-newest window the table used to cap at). Counts come from
@@ -228,7 +248,10 @@ async function refresh() {
       const _reqPage = _jobsPage || 0;
       const _off = _reqPage * _ps;
       const _mySeq = ++_jobsReqSeq;
-      let _q = `?limit=${_ps}&offset=${_off}`;
+      // count=0: skip the server's exact COUNT(*). It was ~3.4s of FIXED
+      // cost per call at 16.4M rows (measured 2026-09-11 -- limit=1 paid it
+      // too), and the badge counts below come from /jobs/summary anyway.
+      let _q = `?limit=${_ps}&offset=${_off}&count=0`;
       if (_f === 'running') {
         // "実行中" tab folds queued + running so the operator sees both
         // pre-dispatch and in-flight jobs together. Server accepts a
@@ -268,25 +291,13 @@ async function refresh() {
         || (_jobsPageSize() !== _ps)
         || (_mySeq < _jobsAppliedSeq);
       if (!_jobsPageStale) _jobsAppliedSeq = _mySeq;
-      if (summaryRes && summaryRes.by_status) {
-        const _bs = summaryRes.by_status;
-        const _setCnt = (id, n) => {
-          const el = document.getElementById(id);
-          if (el) el.textContent = n;
-        };
-        _setCnt('jobsCntAll',     summaryRes.total ?? 0);
-        _setCnt('jobsCntSuccess', _bs.completed ?? 0);
-        _setCnt('jobsCntError',   _bs.failed ?? 0);
-        // "実行中" folds queued + running to match the sub-tab filter.
-        _setCnt('jobsCntRunning', (_bs.running ?? 0) + (_bs.queued ?? 0));
-        // 課題(review): completed-but-content-blocked (full-screen auth/modal
-        // wall). A distinct terminal status, so it's NOT folded into 成功.
-        _setCnt('jobsCntReview',  _bs.review ?? 0);
-        // 動画DL中: virtual sub-status synthesised by /jobs/summary from the
-        // running set's JobInfo.progress.download_pct field. NOT a real
-        // JobStatus -- pure UI badge for the matching sub-tab.
-        _setCnt('jobsCntDownloading', _bs.downloading ?? 0);
-      }
+      _applyJobsSummaryBadges(summaryRes);
+    } else if (jobsConsoleActive) {
+      // ライブ console: skip the paginated /jobs page entirely (the console
+      // pulls its own keyset feed) but keep the sub-tab badges live -- they
+      // come from /jobs/summary, which is Redis-backed and cheap.
+      _summaryRes = await _refreshJson('/jobs/summary', null);
+      _applyJobsSummaryBadges(_summaryRes);
     }
     const wcount = workers.count || 0;
     const jcount = jobs.total ?? (jobs.jobs || jobs).length;
@@ -301,18 +312,44 @@ async function refresh() {
     document.getElementById('cntJobs').textContent = jcount;
     document.getElementById('cntSessions').textContent = scount;
     document.getElementById('workerCount').textContent = wcount;
+    // Lane total ("Chrome browser : N"). One lane == one Chrome browser, and a
+    // worker runs several (``capacity`` = its max_concurrent), so the worker
+    // count above is hosts, not browsers -- the number the operator actually
+    // wants when sizing the fleet. Summed over the SAME rows that produce
+    // wcount (not just alive ones) so the two numbers always agree on their
+    // denominator: `alive` flaps by a few percent every poll and a lane total
+    // gated on it would jitter for no real reason. Legacy rows without a
+    // capacity field contribute 0 rather than a guessed 1.
+    const _laneEl = document.getElementById('laneCount');
+    if (_laneEl) {
+      // Server-summed (scheduler._sum_lanes) so a ?slim=1 poll -- which
+      // carries no worker array at all -- still shows the number.
+      const _lanes = (workers.lanes !== undefined && workers.lanes !== null)
+        ? workers.lanes
+        : (workers.workers || []).reduce((n, w) => n + (Number(w.capacity) || 0), 0);
+      _laneEl.textContent = _lanes;
+    }
     document.getElementById('sessionCount').textContent = scount;
 
     // Cache the latest workers list so the per-row "..." menu can
     // render its info block without a second round-trip when it opens.
-    try { window._lastWorkersPayload = workers.workers || []; } catch (_) {}
+    // A ?slim=1 payload has no array -- keep the last full one so the
+    // per-row "..." menu can still render from cache after a tab switch.
+    if (!workers.slim) {
+      try { window._lastWorkersPayload = workers.workers || []; } catch (_) {}
+    }
 
     // workers table -- skip rebuild while any row's "..." menu is open,
     // matches the Jobs-tab behaviour: a 2-second refresh would otherwise
     // close the menu under the operator the moment a heartbeat fires.
     const ntbody = document.querySelector('#workersTable tbody');
     const wmenuOpen = !!document.querySelector('#workersTable .menu.open');
-    if (wmenuOpen) {
+    if (workers.slim) {
+      // No array in this payload by design (we're not on a tab that shows
+      // one). Leave the rows alone rather than painting "no workers
+      // connected" into a table nobody is looking at -- switching to
+      // #workers re-polls in full on the same tick.
+    } else if (wmenuOpen) {
       // leave rendered rows alone this tick (counts in the tab header
       // still update via cntWorkers / workerCount above)
     } else if (!workers.workers || workers.workers.length === 0) {
@@ -588,15 +625,17 @@ async function refresh() {
         </tr>`;
       }).join('');
     }
-    // sessions table
-    renderSessions(sessions.sessions || []);
+    // sessions table (skipped on a slim poll: no array, see above)
+    if (!sessions.slim) renderSessions(sessions.sessions || []);
 
     // screenshot grid follows the worker set -- but only ALIVE workers.
     // The /workers payload now includes historical (alive=false) workers
     // so the Workers tab can show them dimmed; without this filter the
     // Live Preview grid would render dead tiles for each disconnected
     // worker (they 404 on screenshot polls and look broken).
-    syncScreenshotGrid((workers.workers || []).filter(w => w.alive));
+    if (!workers.slim) {
+      syncScreenshotGrid((workers.workers || []).filter(w => w.alive));
+    }
     // Flip the RUNNING / IDLE indicator on each tile based on the
     // current jobs list AND active sessions. Done every refresh()
     // tick so a freshly started job lights up its lane within 2
@@ -627,8 +666,10 @@ async function refresh() {
         jobList = Array.isArray(rj) ? rj : (rj.jobs || []);
       } catch (_) { jobList = []; }
     }
-    syncScreenshotBusyState(jobList, sessions.sessions || []);
-    sortScreenshotGrid();
+    if (!workers.slim) {
+      syncScreenshotBusyState(jobList, sessions.sessions || []);
+      sortScreenshotGrid();
+    }
 
     // Out-of-order guard (race fix): a /jobs page that resolved for a view the
     // operator already left must NOT repaint the table the current sub-tab
@@ -641,7 +682,7 @@ async function refresh() {
     // (which carries the UNFILTERED total of 87k+), so the next time the
     // operator opened the エラー sub-tab they saw "1-0 / 87637" before the
     // first real fetch landed -- the stale paint outlived the page change.
-    if (!jobsTabActive || _jobsPageStale) {
+    if (!jobsTabActive || jobsConsoleActive || _jobsPageStale) {
       // leave the jobs table + pager exactly as they are this tick
     } else {
 
@@ -1135,6 +1176,31 @@ function renderJobColsMenu() {
 
 // Format a job's elapsed/total duration. running -> started→now (live),
 // finished -> started→completed. Returns a dash when no start time yet.
+// Sub-tab badge counts (全部 / 成功 / エラー / 実行中 / 課題 / 動画DL中).
+// Sourced from /jobs/summary -- Redis-cached and shared across hubs -- NOT
+// from the paginated /jobs response, so it stays correct (and cheap) on the
+// ライブ console where no page is fetched at all.
+function _applyJobsSummaryBadges(summaryRes) {
+  if (!summaryRes || !summaryRes.by_status) return;
+  const _bs = summaryRes.by_status;
+  const _setCnt = (id, n) => {
+    const el = document.getElementById(id);
+    if (el) el.textContent = n;
+  };
+  _setCnt('jobsCntAll',     summaryRes.total ?? 0);
+  _setCnt('jobsCntSuccess', _bs.completed ?? 0);
+  _setCnt('jobsCntError',   _bs.failed ?? 0);
+  // "実行中" folds queued + running to match the sub-tab filter.
+  _setCnt('jobsCntRunning', (_bs.running ?? 0) + (_bs.queued ?? 0));
+  // 課題(review): completed-but-content-blocked (full-screen auth/modal
+  // wall). A distinct terminal status, so it's NOT folded into 成功.
+  _setCnt('jobsCntReview',  _bs.review ?? 0);
+  // 動画DL中: virtual sub-status synthesised by /jobs/summary from the
+  // running set's JobInfo.progress.download_pct field. NOT a real
+  // JobStatus -- pure UI badge for the matching sub-tab.
+  _setCnt('jobsCntDownloading', _bs.downloading ?? 0);
+}
+
 function fmtJobDuration(j) {
   const start = j.started_at ? parseServerTime(j.started_at) : NaN;
   if (isNaN(start)) return '<span class="empty">—</span>';

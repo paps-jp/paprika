@@ -1092,7 +1092,14 @@ asyncio.run(main())"
 
     <!-- Workers sub-pane: existing table (unchanged behaviour). -->
     <div class="workers-subpane" data-workers-subpane="workers">
-      <h2 style="margin-top:0;"><span data-i18n="tab.workers">Workers</span> (<span id="workerCount">0</span>)</h2>
+      <h2 style="margin-top:0;"><span data-i18n="tab.workers">Workers</span> (<span id="workerCount">0</span>)
+        <!-- Lane total = sum of every listed worker's lane count
+             (``capacity`` = max_concurrent). One lane == one Chrome
+             browser, so this is the fleet's real browser count -- the
+             worker count above is hosts, not browsers. -->
+        <span class="lanecount" id="laneCountWrap"
+              title="全ワーカーのレーン合計 (1 レーン = Chrome 1 個)"><span
+              data-i18n="workers.lanes">Chrome browser</span> : <span id="laneCount">0</span></span></h2>
       <table id="workersTable"><thead>
         <tr>
           <th data-i18n="workers.th.id">worker_id</th>
@@ -1274,6 +1281,16 @@ asyncio.run(main())"
          as the Workers panel). The ``.jobs-subpane`` below provides the
          single white card the tabs visually merge into. -->
     <div id="jobsStatusTabs" class="ai-subtabs" role="tablist" style="margin-bottom:0;">
+      <!-- ライブ: append-only feed (tail -f), NOT another filter of the
+           table. The other sub-tabs page + sort + count a 16M-row table;
+           at ~24 completions/second that view is re-sorted out from under
+           the operator every poll. This one only ever appends what finished
+           since its watermark. See admin-jobsconsole.js for the numbers. -->
+      <button type="button" class="ai-subtab" data-jobs-status="live" role="tab" aria-selected="false"
+        title="完了したジョブを流れるログとして表示します (追記のみ・再描画なし)">
+        <iconify-icon icon="lucide:terminal" style="color:#196b2c;"></iconify-icon>
+        <span data-i18n="jobs.tab.live">ライブ</span>
+      </button>
       <button type="button" class="ai-subtab active" data-jobs-status="all" role="tab" aria-selected="true">
         <iconify-icon icon="lucide:list"></iconify-icon>
         <span data-i18n="jobs.tab.all">全部</span>
@@ -1307,7 +1324,51 @@ asyncio.run(main())"
         <span class="count" id="jobsCntDownloading">0</span>
       </button>
     </div>
-    <div class="jobs-subpane">
+
+    <!-- Live console sub-pane. Hidden unless the ライブ sub-tab is active
+         (jcSyncRunning swaps it with #jobsTablePane). -->
+    <div class="jobs-subpane" id="jobsConsolePane" style="display:none;">
+      <h2 style="margin-top:0;"><span data-i18n="jobs.console.heading">ライブ</span>
+        <span class="hctrl flat-actions" id="jobsConsoleStatus">
+          <label class="jc-chk"><input type="checkbox" data-jc-status="completed" checked> <span data-i18n="jobs.tab.success">成功</span></label>
+          <label class="jc-chk"><input type="checkbox" data-jc-status="failed" checked> <span data-i18n="jobs.tab.error">エラー</span></label>
+          <label class="jc-chk"><input type="checkbox" data-jc-status="review" checked> <span data-i18n="jobs.tab.review">課題</span></label>
+          <input id="jcGrep" type="search" placeholder="grep (URL / worker / error)" style="width:230px;">
+          <select id="jcBuffer" title="保持する行数 (超えたら上から捨てる)">
+            <option value="500">500</option>
+            <option value="1000">1000</option>
+            <option value="2000">2000</option>
+            <option value="5000">5000</option>
+          </select>
+          <button id="jcPause" class="pill" style="--la-bg:#eef0ff; --la-bd:#6a8ec7; --la-fg:#3a5ca8;"><iconify-icon icon="lucide:pause"></iconify-icon> <span data-i18n="jobs.console.pause">停止</span></button>
+          <button id="jcClear" class="pill" style="--la-bg:#fff5e6; --la-bd:#e0a060; --la-fg:#7a4500;"><iconify-icon icon="lucide:eraser"></iconify-icon> <span data-i18n="jobs.console.clear">クリア</span></button>
+        </span>
+      </h2>
+      <div id="jobsConsoleWrap">
+        <table id="jobsConsoleTable">
+        <!-- table-layout:fixed takes its widths from the FIRST row only, so
+             they live here rather than on the <td> classes. URL is the one
+             column with no width: it absorbs whatever is left. -->
+        <colgroup>
+          <col class="jc-c-t"><col class="jc-c-s"><col class="jc-c-d">
+          <col class="jc-c-w"><col class="jc-c-m"><col><col class="jc-c-n">
+        </colgroup>
+        <thead>
+          <tr>
+            <th data-i18n="jobs.console.th.time">時刻</th>
+            <th data-i18n="jobs.th.status">状態</th>
+            <th data-i18n="jobs.th.duration">所要</th>
+            <th data-i18n="jobs.th.worker">worker</th>
+            <th data-i18n="jobs.th.mode">種別</th>
+            <th>URL</th>
+            <th data-i18n="jobs.console.th.note">備考</th>
+          </tr>
+        </thead><tbody></tbody></table>
+      </div>
+      <div id="jobsConsoleFoot"></div>
+    </div>
+
+    <div class="jobs-subpane" id="jobsTablePane">
     <h2 style="margin-top:0;"><span data-i18n="tab.jobs">Recent jobs</span>
       <span class="hctrl flat-actions">
         <span class="menu-wrap" style="display:inline-block; position:relative;">
@@ -3857,5 +3918,6 @@ table.aitbl code { font-size:0.95em; }
 <script src="/static/admin-presets-engines.js?v=@@PAPRIKA_VERSION@@" defer></script>
 <script src="/static/admin-settings.js?v=@@PAPRIKA_VERSION@@" defer></script>
 <script src="/static/admin-storage.js?v=@@PAPRIKA_VERSION@@" defer></script>
+<script src="/static/admin-jobsconsole.js?v=@@PAPRIKA_VERSION@@" defer></script>
 </body>
 </html>
