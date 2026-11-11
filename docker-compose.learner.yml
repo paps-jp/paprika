@@ -1,0 +1,42 @@
+# paprika learner -- the out-of-process learning system (outcome consumer).
+#
+# Reads the hub's per-job FACTS from the Redis Stream `paprika:learn:outcomes`
+# (hub side: server/hub/_outcome_stream.py, Settings `outcome_stream_enabled`),
+# judges each one with learner/verify.py and writes the outcome ledger
+# (learn_template_stats_daily / learn_outcome_events) to MariaDB.
+#
+# It is NOT part of the hub: restarting or redeploying it never touches a hub
+# or a worker, and the hub keeps running if it is down (events buffer in the
+# capped stream; overflow drops the oldest).
+#
+#   cp learner/learner.env.example .env.learner   # fill in, keep out of git
+#   docker compose -p learner -f docker-compose.learner.yml --env-file .env.learner up -d
+#   docker compose -p learner -f docker-compose.learner.yml logs -f
+#
+# Reuses the paprika-hub image (python + redis-py + aiomysql already inside).
+# `./server` is mounted read-only only for the pure URL-template function
+# (server/hub/_page_role.templatize) so hub and learner share one key scheme.
+services:
+  learner:
+    image: paprika-hub:latest
+    restart: unless-stopped
+    working_dir: /app
+    command: ["python", "-m", "learner"]
+    environment:
+      - PYTHONUNBUFFERED=1
+      - LEARNER_REDIS_URL=${LEARNER_REDIS_URL:?set LEARNER_REDIS_URL}
+      - LEARNER_MARIADB_HOST=${LEARNER_MARIADB_HOST:?set LEARNER_MARIADB_HOST}
+      - LEARNER_MARIADB_PORT=${LEARNER_MARIADB_PORT:-3306}
+      - LEARNER_MARIADB_USER=${LEARNER_MARIADB_USER:?set LEARNER_MARIADB_USER}
+      - LEARNER_MARIADB_PASSWORD=${LEARNER_MARIADB_PASSWORD:?set LEARNER_MARIADB_PASSWORD}
+      - LEARNER_MARIADB_DATABASE=${LEARNER_MARIADB_DATABASE:?set LEARNER_MARIADB_DATABASE}
+      - LEARNER_MIN_VIDEO_S=${LEARNER_MIN_VIDEO_S:-60}
+      - LEARNER_LOG_LEVEL=${LEARNER_LOG_LEVEL:-INFO}
+    volumes:
+      - ./learner:/app/learner:ro
+      - ./server:/app/server:ro
+    logging:
+      driver: json-file
+      options:
+        max-size: "20m"
+        max-file: "3"

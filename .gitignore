@@ -51,6 +51,7 @@ log.txt
 .env
 .env.local
 .env.agent
+.env.learner
 *.local
 scripts/workers.env
 scripts/extra-hosts.env
