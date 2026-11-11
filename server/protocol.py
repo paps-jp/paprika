@@ -203,6 +203,18 @@ class JobOptions(BaseModel):
             '{"pattern": "...", "actions": [...], "description": "..."}.'
         ),
     )
+    # Hub-stamped experiment bookkeeping for the learning system
+    # (server/hub/_learn_arm.py). Free-form on purpose so new arms /
+    # playbook ids never need another protocol change. The worker ignores
+    # it; it rides along to the learner in the outcome event. Known shape:
+    #   {"arm": "recipe" | "holdout", "pattern": "...", "pct": 20}
+    learn: dict | None = Field(
+        default=None,
+        description=(
+            "Hub-injected learning-experiment arm for this job. API callers "
+            "should NOT set this."
+        ),
+    )
     keep_session: bool = Field(
         False,
         description="Fetch mode only. When true, the browser and "

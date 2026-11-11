@@ -156,6 +156,11 @@ _SCHEMA: dict[str, tuple[Any, str]] = {
     # loop-2026-11-12.html). The hub does no judging or learning itself.
     # Off by default so the code ships dark; flip live to start observing.
     "outcome_stream_enabled": (False, "bool"),
+    # Recipe holdout: percent (0-100) of the fetch jobs that MATCH a host
+    # recipe which run WITHOUT it, chosen deterministically from the job id
+    # (server/hub/_learn_arm.py). The learner compares the two arms to tell
+    # which recipes help. 0 = off = every matching job gets its recipe.
+    "learn_recipe_holdout_pct": (0, "int"),
     # Which engine the worker's page.agent (vision-agent /act loop) uses as
     # its backend AI. Set by the Engines tab "page.agent でこの engine を使う"
     # checkbox. Empty = NO engine selected = page.agent is DISABLED. Shared

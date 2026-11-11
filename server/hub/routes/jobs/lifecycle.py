@@ -1955,12 +1955,17 @@ async def _resolve_host_material(
                         try:
                             picked = rec.pick_recipe(req.url)
                             if picked is not None:
-                                req.options.fetch_recipe = picked.to_json()
+                                # Stamp the recipe, or withhold it for the
+                                # deterministic holdout slice so the learner
+                                # can measure whether the recipe helps
+                                # (server/hub/_learn_arm.py; 0% = always stamp).
+                                from server.hub._learn_arm import apply_recipe_arm
+                                _arm = apply_recipe_arm(req.options, job_id, picked)
                                 log.info(
                                     f"[hub] job {job_id}: matched "
                                     f"fetch_recipe pattern="
                                     f"{picked.pattern!r} for "
-                                    f"host={auto_host!r}"
+                                    f"host={auto_host!r} arm={_arm}"
                                 )
                         except Exception as e:
                             log.info(

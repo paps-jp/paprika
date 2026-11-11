@@ -186,7 +186,10 @@ async def _assign_worker_job(info, worker, base: str, started) -> bool:
                         try:
                             picked = rec.pick_recipe(info.url)
                             if picked is not None:
-                                opts.fetch_recipe = picked.to_json()
+                                # Same deterministic arm as the first
+                                # dispatch (server/hub/_learn_arm.py).
+                                from server.hub._learn_arm import apply_recipe_arm
+                                apply_recipe_arm(opts, info.job_id, picked)
                         except Exception:
                             pass
         except Exception:
