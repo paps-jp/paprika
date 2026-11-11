@@ -446,6 +446,12 @@ class JobResult(BaseModel):
     # rather than waiting for the full HLS stream to finish. Lets the UI /
     # operators tell "100% complete" apart from "best effort cut-off".
     partial: bool = False
+    # Objective facts the worker MEASURED for the outcome verifier. Never a
+    # verdict -- the learner's verify() decides. Optional + free-form so old
+    # hubs/workers interoperate (missing == "not measured"). Known keys:
+    #   media:  [ffprobe facts per video file] (server/worker/media_facts.py)
+    #   recipe: {pattern, description, created_by, ran, ok, errors}
+    facts: dict[str, Any] = Field(default_factory=dict)
 
 
 # ----------------------------------------------------------------------------

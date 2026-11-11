@@ -591,9 +591,28 @@ class _JobExecMixin:
                 # right after the initial Page.navigate(). Best-effort:
                 # recipe failures are logged but don't fail the fetch.
                 _picked_recipe = getattr(assign.options, "fetch_recipe", None)
+                # What the recipe replay actually did. Reported back in
+                # JobResult.facts["recipe"] -- until 2026-11 this return
+                # value was dropped, so nobody could tell whether a recipe
+                # ran, let alone whether it helped.
+                _recipe_report: dict = {}
                 async def _recipe_cb(tab):
                     if _picked_recipe:
-                        await _apply_fetch_recipe(tab, _picked_recipe, _log)
+                        _rep = await _apply_fetch_recipe(tab, _picked_recipe, _log)
+                        try:
+                            _errs = list((_rep or {}).get("errors") or [])
+                            _recipe_report.update({
+                                "pattern": str(_picked_recipe.get("pattern") or "")[:300],
+                                "description": str(_picked_recipe.get("description") or "")[:120],
+                                "created_by": str(_picked_recipe.get("created_by") or ""),
+                                "created_from_job": str(_picked_recipe.get("created_from_job") or ""),
+                                "ran": int((_rep or {}).get("ran") or 0),
+                                "ok": int((_rep or {}).get("ok") or 0),
+                                "n_errors": len(_errs),
+                                "errors": [str(e)[:160] for e in _errs[:3]],
+                            })
+                        except Exception:
+                            pass
 
                 # Incremental asset upload (resilience). The fetcher fires
                 # this once per asset right after it's written to
@@ -777,6 +796,26 @@ class _JobExecMixin:
                     # (server/hub/_review.py).
                     occlusion=dict(getattr(result, "occlusion", {}) or {}),
                 )
+                # Objective facts for the outcome verifier (measure only).
+                # Any video the capture itself saved is still on disk here;
+                # videos from the deferred download are probed over there.
+                try:
+                    _facts: dict = {}
+                    if _recipe_report:
+                        _facts["recipe"] = dict(_recipe_report)
+                    from server.worker import media_facts as _mf
+                    _vid_paths = [
+                        assets_dir / a["name"] for a in result.assets_saved
+                        if _mf.is_video_name(a.get("name") or "")
+                    ]
+                    if _vid_paths:
+                        _media = await _mf.probe_paths(_vid_paths)
+                        if _media:
+                            _facts["media"] = _media
+                    if _facts:
+                        job_result.facts = _facts
+                except Exception:
+                    _logger.debug("[%s] facts build failed", job_id, exc_info=True)
                 # Deferred video download: capture is done and the
                 # image assets are uploaded, but a (big) video was
                 # detected. Mark the job "downloading", then run yt-dlp
@@ -1329,6 +1368,8 @@ class _JobExecMixin:
                 _emit_progress(JOB_PROGRESS_MARKER + json.dumps(_payload))
 
             added: list = []
+            # ffprobe facts for each uploaded video (outcome verifier input).
+            _media_facts: list = []
             cookies_file: Path | None = None
             try:
                 await self._send(WorkerJobLog(
@@ -1425,6 +1466,19 @@ class _JobExecMixin:
                         url=None, page_url=page_url,
                         href=f"/jobs/{job_id}/assets/{p.name}",
                     ))
+                    # Measure the file while it is still on local disk
+                    # (facts for the outcome verifier; never a verdict).
+                    try:
+                        from server.worker import media_facts as _mf
+                        if (
+                            _mf.enabled() and _mf.is_video_name(p.name)
+                            and len(_media_facts) < _mf.MAX_FILES
+                        ):
+                            _media_facts.append(
+                                await asyncio.to_thread(_mf.probe_file, p)
+                            )
+                    except Exception:
+                        pass
                 await self._send(WorkerJobLog(
                     job_id=job_id,
                     line=f"  [downloading] done: {len(added)} video asset(s) "
@@ -1525,6 +1579,19 @@ class _JobExecMixin:
                     # "downloading" -- include whatever video assets landed.
                     try:
                         base_result.assets = list(base_result.assets) + added
+                    except Exception:
+                        pass
+                    # Report what was measured. ``deferred`` records that a
+                    # download WAS attempted, so "tried and got nothing" is
+                    # distinguishable from "the page had no video".
+                    try:
+                        _f = dict(getattr(base_result, "facts", None) or {})
+                        _f["media"] = list(_f.get("media") or []) + _media_facts
+                        _f["deferred"] = {
+                            "targets": len(targets or []),
+                            "files": len(added),
+                        }
+                        base_result.facts = _f
                     except Exception:
                         pass
                     if _is_force:
