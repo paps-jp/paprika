@@ -3057,6 +3057,16 @@ async def _handle_worker_message(worker, msg) -> None:
             info.progress.assets_failed = msg.result.assets_failed
             await state.store.save_job_info(info)
         await state.store.save_job_result(msg.result)
+        # Learner coupling: one compact outcome event per finished job
+        # (server/hub/_outcome_stream.py -> Redis Stream -> learner/). The hub
+        # only reports facts; judging and learning happen out of process.
+        # Fire-and-forget, gated (Settings outcome_stream_enabled, default off).
+        if info is not None and not keep_session_active:
+            try:
+                from server.hub._outcome_stream import emit_job_terminal
+                emit_job_terminal(info, msg.result)
+            except Exception:
+                pass
         # v2 Phase 1: end-of-job perception observation (fire-and-forget).
         # Runs the eye (Qwen3 / vision LLM) on the captured page artifacts
         # and saves PerceptionResult to data/jobs/{id}/perception.json.
@@ -3370,6 +3380,14 @@ async def _handle_worker_message(worker, msg) -> None:
             pass
         _drop_fetch_session_if_any(info)
         await state.store.publish_log(msg.job_id, DONE_SENTINEL)
+        # Learner coupling (see the WorkerJobComplete branch): report the
+        # failure as facts. Requeued no-free-lane rejections returned above
+        # and never reach here, so only real terminal failures are emitted.
+        try:
+            from server.hub._outcome_stream import emit_job_terminal
+            emit_job_terminal(info, None, error=msg.error)
+        except Exception:
+            pass
         # v2 Phase 5: distiller-light also fires on failures so
         # success_rate trends downward when a host starts breaking.
         # Backgrounded; never blocks the WS handler.

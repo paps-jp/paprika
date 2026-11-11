@@ -149,6 +149,13 @@ _SCHEMA: dict[str, tuple[Any, str]] = {
     # default with a conservative threshold (see server/hub/_review.py). Env
     # kill-switch: PAPRIKA_REVIEW_DISABLE=1.
     "review_flag_enabled": (True, "bool"),
+    # Learner coupling: when on, every finished job's FACTS (status, asset
+    # counts, ffprobe results, occlusion, which recipe was replayed) are
+    # appended to the Redis Stream `paprika:learn:outcomes` for the
+    # out-of-process learner (learner/, internal/design/autonomous-learning-
+    # loop-2026-11-12.html). The hub does no judging or learning itself.
+    # Off by default so the code ships dark; flip live to start observing.
+    "outcome_stream_enabled": (False, "bool"),
     # Which engine the worker's page.agent (vision-agent /act loop) uses as
     # its backend AI. Set by the Engines tab "page.agent でこの engine を使う"
     # checkbox. Empty = NO engine selected = page.agent is DISABLED. Shared
