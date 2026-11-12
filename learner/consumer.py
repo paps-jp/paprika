@@ -86,10 +86,14 @@ class Consumer:
         if not self._unacked:
             return
         daily, detail = self._agg.drain()
+        playbooks = self._agg.drain_playbooks()
         ids = self._unacked
         self._unacked = []
         try:
-            await self._ledger.write(daily, detail)
+            if playbooks:
+                await self._ledger.write(daily, detail, playbooks)
+            else:
+                await self._ledger.write(daily, detail)
         except Exception:
             # Not durable -> do NOT ack. The entries stay pending in the
             # group and are re-read via the claim path; the in-memory deltas

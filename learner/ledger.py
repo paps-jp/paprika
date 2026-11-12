@@ -88,6 +88,27 @@ SCHEMA = (
         KEY idx_outcome_ts (outcome, ts)
     ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_bin
     """,
+    # Per-playbook, per-arm, per-day counts: what the trial -> active ->
+    # retired decisions are made from (learner/playbook.py). Daily so a
+    # "recent window" is a SUM over a few rows.
+    """
+    CREATE TABLE IF NOT EXISTS learn_playbook_stats (
+        pb_id BIGINT NOT NULL,
+        arm VARCHAR(16) NOT NULL,
+        day DATE NOT NULL,
+        n INT NOT NULL DEFAULT 0,
+        n_success INT NOT NULL DEFAULT 0,
+        n_partial INT NOT NULL DEFAULT 0,
+        n_fail INT NOT NULL DEFAULT 0,
+        n_blocked INT NOT NULL DEFAULT 0,
+        n_dead INT NOT NULL DEFAULT 0,
+        n_infra INT NOT NULL DEFAULT 0,
+        n_na INT NOT NULL DEFAULT 0,
+        n_unknown INT NOT NULL DEFAULT 0,
+        updated_at DATETIME NOT NULL,
+        PRIMARY KEY (pb_id, arm, day)
+    ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_bin
+    """,
 )
 
 
@@ -111,29 +132,60 @@ def in_sample(job_id: str, pct: int = SAMPLE_PCT) -> bool:
     return (zlib.crc32((job_id or "").encode("utf-8")) % 100) < pct
 
 
-ARMS = ("control", "recipe", "holdout", "solver")
+#: Playbook experiment arms, stamped by server/hub/_playbooks.py.
+PB_ARMS = ("trial", "pb_control", "active", "pb_holdout")
+ARMS = ("control", "recipe", "holdout", "solver") + PB_ARMS
 
 
 def arm_of(ev: dict) -> str:
     """Which experimental group the job ran in.
 
-    control   no recipe matched this URL
-    recipe    a host recipe was replayed
-    holdout   a recipe matched but was deliberately withheld
-              (server/hub/_learn_arm.py) -- the comparison group for ``recipe``
-    solver    an escalated / solver job
+    control     no recipe matched this URL
+    recipe      a legacy host recipe was replayed
+    holdout     a legacy recipe matched but was deliberately withheld
+                (server/hub/_learn_arm.py) -- the comparison group for ``recipe``
+    solver      a job the learner itself submitted (replay / generalisation
+                test), or a legacy escalated job
+    trial       a trial playbook was replayed
+    pb_control  a trial playbook matched and was withheld
+    active      an active playbook was replayed
+    pb_holdout  an active playbook matched and was withheld
     """
-    if ev.get("escalated_from"):
-        return "solver"
     arm = str(ev.get("arm") or "")
+    if ev.get("escalated_from") or arm == "solver":
+        return "solver"
+    if arm in PB_ARMS and ev.get("pb") is not None:
+        return arm
     if arm == "holdout" and not ev.get("recipe_applied"):
         return "holdout"
     return "recipe" if ev.get("recipe_applied") else "control"
 
 
+def pb_credits(ev: dict, arm: str) -> list[tuple[int, str]]:
+    """Which (playbook, arm) counters one job feeds.
+
+    A job belongs to the playbook it was assigned to. An ``active`` job on
+    a key that also has a trial is, in addition, that trial's comparison
+    group (the event names it in ``pb_vs``).
+    """
+    if arm not in PB_ARMS:
+        return []
+    try:
+        out = [(int(ev["pb"]), arm)]
+        if arm == "active" and ev.get("pb_vs") is not None:
+            out.append((int(ev["pb_vs"]), "pb_control"))
+        return out
+    except (KeyError, TypeError, ValueError):
+        return []
+
+
 def keep_detail(ev: dict, verdict: Verdict, arm: str) -> bool:
     job_id = str(ev.get("job_id") or "")
     if arm == "solver":
+        return True
+    if arm in PB_ARMS:
+        # Every job of a playbook experiment: the lifecycle decisions made
+        # from them must be auditable job by job.
         return True
     if arm == "holdout" and verdict.scored:
         return True
@@ -158,6 +210,7 @@ class DailyAggregator:
 
     def __init__(self) -> None:
         self._c: dict[Key, dict[str, int]] = defaultdict(lambda: defaultdict(int))
+        self._pb: dict[tuple[int, str, str], dict[str, int]] = defaultdict(lambda: defaultdict(int))
         self._detail: list[dict] = []
         self.seen = 0
 
@@ -175,6 +228,10 @@ class DailyAggregator:
             c["n_recipe"] += 1
             if verdict.outcome == SUCCESS:
                 c["n_recipe_success"] += 1
+        for pb_id, pb_arm in pb_credits(ev, arm):
+            p = self._pb[(pb_id, pb_arm, key.day)]
+            p["n"] += 1
+            p["n_" + verdict.outcome] += 1
         self.seen += 1
         if keep_detail(ev, verdict, arm):
             self._detail.append({
@@ -189,7 +246,14 @@ class DailyAggregator:
             })
 
     def pending(self) -> int:
-        return len(self._c) + len(self._detail)
+        return len(self._c) + len(self._detail) + len(self._pb)
+
+    def drain_playbooks(self) -> list[tuple[tuple[int, str, str], dict]]:
+        """Per-playbook deltas: [((pb_id, arm, day), counts)]. Drained by
+        the same flush as ``drain`` so both land in one transaction."""
+        out = [(k, dict(v)) for k, v in self._pb.items()]
+        self._pb = defaultdict(lambda: defaultdict(int))
+        return out
 
     def drain(self) -> tuple[list[tuple[Key, dict]], list[dict]]:
         daily = [(k, dict(v)) for k, v in self._c.items()]
@@ -200,6 +264,22 @@ class DailyAggregator:
 
 
 _COUNT_COLS = ["n"] + ["n_" + o for o in OUTCOMES] + ["n_recipe", "n_recipe_success"]
+_PB_COUNT_COLS = ["n"] + ["n_" + o for o in OUTCOMES]
+
+
+def pb_upsert_sql() -> str:
+    cols = ["pb_id", "arm", "day"] + _PB_COUNT_COLS + ["updated_at"]
+    ph = ", ".join(["%s"] * len(cols))
+    upd = ", ".join(f"{c} = {c} + VALUES({c})" for c in _PB_COUNT_COLS)
+    return (
+        f"INSERT INTO learn_playbook_stats ({', '.join(cols)}) VALUES ({ph}) "
+        f"ON DUPLICATE KEY UPDATE {upd}, updated_at = VALUES(updated_at)"
+    )
+
+
+def pb_params(key: tuple[int, str, str], counts: dict, now: _dt.datetime) -> tuple:
+    pb_id, arm, day = key
+    return (pb_id, arm, day, *[int(counts.get(c, 0)) for c in _PB_COUNT_COLS], now)
 
 
 def daily_upsert_sql() -> str:
@@ -254,7 +334,7 @@ class MariaLedger:
 
         pool = await aiomysql.create_pool(
             host=host, port=port, user=user, password=password, db=db,
-            minsize=1, maxsize=3, autocommit=False, charset="utf8mb4",
+            minsize=1, maxsize=5, autocommit=False, charset="utf8mb4",
             connect_timeout=10,
         )
         return cls(pool)
@@ -283,8 +363,9 @@ class MariaLedger:
                     )
             await conn.commit()
 
-    async def write(self, daily: list[tuple[Key, dict]], detail: list[dict]) -> None:
-        if not daily and not detail:
+    async def write(self, daily: list[tuple[Key, dict]], detail: list[dict],
+                    playbooks: list | None = None) -> None:
+        if not daily and not detail and not playbooks:
             return
         now = _dt.datetime.now(_dt.timezone.utc).replace(tzinfo=None)
         async with self._pool.acquire() as conn:
@@ -298,6 +379,10 @@ class MariaLedger:
                     if detail:
                         await cur.executemany(
                             DETAIL_UPSERT_SQL, [detail_params(r) for r in detail],
+                        )
+                    if playbooks:
+                        await cur.executemany(
+                            pb_upsert_sql(), [pb_params(k, c, now) for k, c in playbooks],
                         )
                 await conn.commit()
             except Exception:
@@ -314,6 +399,10 @@ class MariaLedger:
                 await cur.execute(
                     "DELETE FROM learn_outcome_events WHERE ts < UTC_TIMESTAMP() - INTERVAL %s DAY LIMIT 50000",
                     (detail_days,),
+                )
+                await cur.execute(
+                    "DELETE FROM learn_playbook_stats WHERE day < CURDATE() - INTERVAL %s DAY",
+                    (daily_days,),
                 )
             await conn.commit()
 
