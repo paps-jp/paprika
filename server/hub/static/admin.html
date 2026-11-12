@@ -1619,27 +1619,6 @@ asyncio.run(main())"
   </div>
 </div>
 
-<!-- Skill code viewer: a skill's code_template + llm_instructions (read-only) -->
-<div id="skillCodeModal" style="display:none; position:fixed; inset:0; background:rgba(0,0,0,0.6); z-index:1002; align-items:center; justify-content:center; padding:20px;">
-  <div style="background:#fff; max-width:980px; width:100%; max-height:90vh; border-radius:9px; overflow:hidden; display:flex; flex-direction:column;">
-    <div style="display:flex; align-items:center; gap:10px; padding:11px 15px; border-bottom:1px solid #eee; background:#fafafa;">
-      <iconify-icon icon="lucide:code-2" style="color:#2d6e8e;"></iconify-icon>
-      <strong id="skillCodeTitle" style="flex:1; min-width:0; overflow:hidden; text-overflow:ellipsis; white-space:nowrap;">skill</strong>
-      <span id="skillCodeMeta" style="font-size:.82em; color:#777; white-space:nowrap;"></span>
-      <button id="skillCodeCopy" class="pill" style="--la-bg:#eef8ff; --la-bd:#9bf; --la-fg:#16608f; font-size:.82em;"><iconify-icon icon="lucide:copy"></iconify-icon> copy</button>
-      <button id="skillCodeClose" style="background:transparent; border:none; cursor:pointer; font-size:1.3em; color:#666; padding:0 4px;" title="close">&#10005;</button>
-    </div>
-    <div style="overflow:auto; padding:14px 16px;">
-      <div id="skillCodeDesc" style="margin-bottom:10px; font-size:.92em;"></div>
-      <div style="font-weight:600; font-size:.86em; color:#444; margin:4px 0 4px;"><span data-i18n="skills.code.codetemplate">code_template</span> <span style="font-weight:normal; color:#999;">— <span data-i18n="skills.code.codetemplate.hint">再利用される Python（codegen に注入される本体）</span></span></div>
-      <pre id="skillCodeBody" style="background:#0d1117; color:#e6edf3; padding:12px 14px; border-radius:6px; overflow:auto; font-family:ui-monospace,Consolas,monospace; font-size:12.5px; line-height:1.55; white-space:pre; max-height:44vh; margin:0;"></pre>
-      <div style="font-weight:600; font-size:.86em; color:#444; margin:12px 0 4px;"><span data-i18n="skills.code.llminstructions">llm_instructions</span> <span style="font-weight:normal; color:#999;">— <span data-i18n="skills.code.llminstructions.hint">プロンプト用の指示文（散文）</span></span></div>
-      <pre id="skillCodeInstr" style="background:#f6f8fa; border:1px solid #eaecef; padding:10px 12px; border-radius:6px; white-space:pre-wrap; word-break:break-word; font-size:13px; line-height:1.5; margin:0;"></pre>
-      <div id="skillCodeProv" style="font-size:.8em; color:#999; margin-top:10px;"></div>
-    </div>
-  </div>
-</div>
-
 <!-- ページ種別 訂正モーダル: Live ジョブパネル / #jobs から呼び出される。
      ジョブ単発の訂正 (job_role_overrides) と、同テンプレ全ジョブへの学習
      (host_url_role_overrides) を1つの UI でまとめて行える。 -->
@@ -1671,40 +1650,6 @@ asyncio.run(main())"
         <button id="pageRoleEditSave" class="aibtn" style="background:#196b2c; color:#fff; border-color:#196b2c;"><iconify-icon icon="lucide:save"></iconify-icon> 保存</button>
       </div>
       <div id="pageRoleEditMsg" style="margin-top:10px; font-size:.85em; min-height:18px;"></div>
-    </div>
-  </div>
-</div>
-
-<!-- Convention 詳細モーダル: skills の openSkillCode と同じ目的 (蒸留結果を
-     見て評価できる)。advice / rationale / good_example / bad_example /
-     applicable_when / extracted_from を一画面に集約。 -->
-<div id="convDetailModal" style="display:none; position:fixed; inset:0; background:rgba(0,0,0,0.6); z-index:1002; align-items:center; justify-content:center; padding:20px;">
-  <div style="background:#fff; max-width:980px; width:100%; max-height:90vh; border-radius:9px; overflow:hidden; display:flex; flex-direction:column;">
-    <div style="display:flex; align-items:center; gap:10px; padding:11px 15px; border-bottom:1px solid #eee; background:#fafafa;">
-      <iconify-icon icon="lucide:scroll-text" style="color:#5b3aa6;"></iconify-icon>
-      <strong id="convDetailTitle" style="flex:1; min-width:0; overflow:hidden; text-overflow:ellipsis; white-space:nowrap;">convention</strong>
-      <span id="convDetailMeta" style="font-size:.82em; color:#777; white-space:nowrap;"></span>
-      <button id="convDetailTranslate" class="pill" style="--la-bg:#eef8ff; --la-bd:#9bf; --la-fg:#16608f; font-size:.82em;" title="ハブ側 LLM (chat Promoted エンジン) で advice / rationale / 適用条件 を現在の表示言語へ翻訳。MariaDB に sha256(text)+lang でキャッシュされるので 2 回目以降は瞬時。コードブロック (bad/good example) はそのまま。"><iconify-icon icon="lucide:languages"></iconify-icon> <span id="convDetailTranslateLabel">翻訳</span></button>
-      <button id="convDetailClose" style="background:transparent; border:none; cursor:pointer; font-size:1.3em; color:#666; padding:0 4px;" title="close">&#10005;</button>
-    </div>
-    <div style="overflow:auto; padding:14px 16px;">
-      <div id="convDetailAdvice" style="background:#f0f7ff; border-left:3px solid #2c6e8e; padding:10px 14px; border-radius:0 6px 6px 0; font-size:.95em; line-height:1.55; margin-bottom:10px;"></div>
-      <div style="font-weight:600; font-size:.86em; color:#444; margin:8px 0 4px;">なぜ <span style="font-weight:normal; color:#999;">— rationale (背景・根拠)</span></div>
-      <div id="convDetailRationale" style="background:#fafafa; border:1px solid #eaecef; padding:8px 12px; border-radius:6px; font-size:.92em; line-height:1.55; white-space:pre-wrap; word-break:break-word;"></div>
-      <div style="font-weight:600; font-size:.86em; color:#444; margin:12px 0 4px;">適用条件 <span style="font-weight:normal; color:#999;">— applicable_when</span></div>
-      <div id="convDetailWhen" style="font-size:.9em;"></div>
-      <div style="display:grid; grid-template-columns:1fr 1fr; gap:12px; margin-top:12px;">
-        <div>
-          <div style="font-weight:600; font-size:.86em; color:#933; margin-bottom:4px;"><iconify-icon icon="lucide:x-circle"></iconify-icon> 悪い例 <span style="font-weight:normal; color:#999;">— bad_example</span></div>
-          <pre id="convDetailBad" style="background:#fff5f3; border:1px solid #f0c8c0; color:#3a1e1a; padding:9px 11px; border-radius:6px; overflow:auto; font-family:ui-monospace,Consolas,monospace; font-size:11.5px; line-height:1.5; white-space:pre; max-height:30vh; margin:0;"></pre>
-        </div>
-        <div>
-          <div style="font-weight:600; font-size:.86em; color:#196b2c; margin-bottom:4px;"><iconify-icon icon="lucide:check-circle"></iconify-icon> 良い例 <span style="font-weight:normal; color:#999;">— good_example</span></div>
-          <pre id="convDetailGood" style="background:#f3faf5; border:1px solid #c8e0c8; color:#1a3a20; padding:9px 11px; border-radius:6px; overflow:auto; font-family:ui-monospace,Consolas,monospace; font-size:11.5px; line-height:1.5; white-space:pre; max-height:30vh; margin:0;"></pre>
-        </div>
-      </div>
-      <div id="convDetailTags" style="margin-top:10px; font-size:.85em;"></div>
-      <div id="convDetailProv" style="font-size:.8em; color:#999; margin-top:10px;"></div>
     </div>
   </div>
 </div>
@@ -2463,12 +2408,7 @@ curl 'http://paprika.lan/extensions/ublock-lite/download' --output ublock-lite.t
       <button type="button" class="ai-subtab" data-ai-subtab="roles" role="tab" aria-selected="false"><iconify-icon icon="lucide:sliders-horizontal"></iconify-icon> <span data-i18n="ai.subtab.roles">役割</span></button>
       <button type="button" class="ai-subtab" data-ai-subtab="engines" role="tab" aria-selected="false"><iconify-icon icon="lucide:wand-sparkles"></iconify-icon> <span data-i18n="ai.subtab.engines">エンジン</span> <span class="count" id="cntEngines">0</span></button>
       <button type="button" class="ai-subtab" data-ai-subtab="knowledge" role="tab" aria-selected="false"><iconify-icon icon="lucide:brain"></iconify-icon> <span data-i18n="ai.subtab.knowledge">ホスト知識</span> <span class="count" id="cntKnowledge">0</span></button>
-      <button type="button" class="ai-subtab" data-ai-subtab="skills" role="tab" aria-selected="false"><iconify-icon icon="lucide:wand-sparkles"></iconify-icon> <span data-i18n="ai.subtab.skills">スキル</span> <span class="count" id="cntSkills">0</span></button>
-      <button type="button" class="ai-subtab" data-ai-subtab="conventions" role="tab" aria-selected="false"><iconify-icon icon="lucide:scroll-text"></iconify-icon> <span data-i18n="ai.subtab.conventions">作法</span> <span class="count" id="cntConventions">0</span></button>
-      <button type="button" class="ai-subtab" data-ai-subtab="grooming" role="tab" aria-selected="false"><iconify-icon icon="lucide:brush-cleaning"></iconify-icon> <span data-i18n="ai.subtab.grooming">整理</span> <span class="count" id="cntGroom">0</span></button>
-      <button type="button" class="ai-subtab" data-ai-subtab="oracle" role="tab" aria-selected="false"><iconify-icon icon="lucide:scan-eye"></iconify-icon> <span data-i18n="ai.subtab.oracle">オラクル</span> <span class="count" id="cntOracle">0</span></button>
       <button type="button" class="ai-subtab" data-ai-subtab="aiio" role="tab" aria-selected="false" data-i18n-title="ai.subtab.aiio.title" title="各 LLM 呼び出しの入出力ログ (planner/codegen/judge/skill 蒸留/conv 蒸留/r1 distiller/perception)"><iconify-icon icon="lucide:logs"></iconify-icon> <span data-i18n="ai.subtab.aiio">入出力</span> <span class="count" id="cntAiIo">0</span></button>
-      <button type="button" class="ai-subtab" data-ai-subtab="audit" role="tab" aria-selected="false" data-i18n-title="ai.subtab.audit.title" title="VisionAI で完了ジョブをサンプリング監査 (本当に正しい動画を取れたか)"><iconify-icon icon="lucide:eye"></iconify-icon> <span data-i18n="ai.subtab.audit">成功監査</span> <span class="count" id="cntAudit">0</span></button>
     </div>
     <div class="ai-subpane" data-ai-subpane="live">
   <section>
@@ -2600,89 +2540,6 @@ curl 'http://paprika.lan/extensions/ublock-lite/download' --output ublock-lite.t
     </div>
   </section>
     </div>
-    <div class="ai-subpane" data-ai-subpane="skills" style="display:none;">
-      <details style="margin:0 0 8px; font-size:0.85em; color:#555;">
-        <summary style="cursor:pointer; color:#7a4a14;"><iconify-icon icon="lucide:shield-alert" style="color:#d6a13a;"></iconify-icon> <strong>監査ポリシー</strong>（クリックで展開）</summary>
-        <div style="margin-top:6px; padding:8px 10px; background:#fff8e6; border-left:3px solid #d6a13a; line-height:1.55;">
-          スキルは codegen-loop の system prompt に注入される<strong>コード断片</strong>で、ページ出力経由で間接的なプロンプト注入経路になり得ます。<code>auto</code> 段階のスキルが頻繁に使われている場合、内容を確認（<strong>コード</strong>ボタン → 内容を読む → 不安なら <strong>delete</strong>、安全なら <strong>promote</strong> = curated）してください。閾値超過のものには <span style="background:#fff4d6; color:#7a4a14; border:1px solid #d6a13a; padding:1px 6px; border-radius:4px; font-size:.9em;">⚠ 監査要</span> バッジが付きます（しきい値=<code>skill_audit_warn_threshold</code>）。
-        </div>
-      </details>
-      <table id="skTable" class="aitbl" style="width:100%;">
-        <thead><tr><th>slug</th><th>tier</th><th class="num">use</th><th class="num">success</th><th>success_rate</th><th style="width:150px;">actions</th></tr></thead>
-        <tbody><tr><td colspan=6 class="empty">loading…</td></tr></tbody>
-      </table>
-      <div class="ai-pager" id="pager-skills"></div>
-    </div>
-    <div class="ai-subpane" data-ai-subpane="conventions" style="display:none;">
-      <p style="font-size:0.85em; color:#999; margin:0 0 8px;">※ convention は毎ジョブ注入されるため success_rate は全体成功率＝個別の優劣ではありません。</p>
-      <details style="margin:0 0 8px; font-size:0.85em; color:#555;">
-        <summary style="cursor:pointer; color:#7a4a14;"><iconify-icon icon="lucide:shield-alert" style="color:#d6a13a;"></iconify-icon> <strong>監査ポリシー</strong>（クリックで展開）</summary>
-        <div style="margin-top:6px; padding:8px 10px; background:#fff8e6; border-left:3px solid #d6a13a; line-height:1.55;">
-          convention は codegen system prompt に<strong>毎ジョブ注入</strong>される作法文で、ページ出力由来の文字列が混入していると間接プロンプト注入の経路になり得ます。<code>auto</code> のまま頻繁に注入されているものは <strong>内容</strong> ボタンで蒸留元 (extracted_from) を確認し、不審なら <strong>delete</strong>、確認できれば <strong>promote</strong>（curated = 操作者監査済み）。閾値超過には <span style="background:#fff4d6; color:#7a4a14; border:1px solid #d6a13a; padding:1px 6px; border-radius:4px; font-size:.9em;">⚠ 監査要</span> が付きます。
-        </div>
-      </details>
-      <table id="cvTable" class="aitbl" style="width:100%;">
-        <thead><tr><th>slug</th><th>tier</th><th class="num">use</th><th class="num">success</th><th>success_rate</th><th style="width:150px;">actions</th></tr></thead>
-        <tbody><tr><td colspan=6 class="empty">loading…</td></tr></tbody>
-      </table>
-      <div class="ai-pager" id="pager-conventions"></div>
-    </div>
-    <div class="ai-subpane" data-ai-subpane="grooming" style="display:none;">
-      <div style="display:flex; gap:18px; align-items:center; margin-bottom:14px; padding:10px 14px; background:#fff8e6; border:1px solid #f5d77a; border-radius:8px; font-size:.9em; flex-wrap:wrap;">
-        <span style="font-weight:600;"><iconify-icon icon="lucide:bot"></iconify-icon> 自動グルーミング（毎時 reaper）:</span>
-        <label style="display:inline-flex; gap:6px; align-items:center; cursor:pointer;"><input type="checkbox" id="tglAutoRetire"> auto retire</label>
-        <label style="display:inline-flex; gap:6px; align-items:center; cursor:pointer;"><input type="checkbox" id="tglAutoDedup"> auto dedup</label>
-        <span style="color:#888; font-size:.82em;">※ 既定 OFF（候補表示のみ）。ON で auto-tier を自動処理（curated は対象外・手動のみ）。</span>
-        <span id="groomState" style="color:#777; font-size:.85em;">— 未取得</span>
-        <button id="groomTranslateBtn" class="aibtn" title="reason 列を表示言語に翻訳 (ハブ側 LLM)"><iconify-icon icon="lucide:languages"></iconify-icon> 翻訳</button>
-        <button id="groomRefreshBtn" class="aibtn"><iconify-icon icon="lucide:refresh-cw"></iconify-icon> 再読込</button>
-      </div>
-      <div style="font-weight:600; margin:10px 0 4px;"><iconify-icon icon="lucide:trash-2"></iconify-icon> Retire 候補 <span class="count" id="cntGroomRetire">0</span> <span style="font-size:.8em; color:#999; font-weight:normal;">（dud=高use低成功率 / zombie=未使用かつ古い・auto のみ削除可）</span></div>
-      <table id="grTable" class="aitbl" style="width:100%;">
-        <thead><tr><th>kind</th><th>slug</th><th>tier</th><th>reason</th><th class="num">use</th><th class="num">success</th><th style="width:90px;">action</th></tr></thead>
-        <tbody><tr><td colspan=7 class="empty">loading…</td></tr></tbody>
-      </table>
-      <div class="ai-pager" id="pager-groom-retire"></div>
-      <div style="font-weight:600; margin:18px 0 4px;"><iconify-icon icon="lucide:combine"></iconify-icon> Dedup 候補 <span class="count" id="cntGroomDedup">0</span> <span style="font-size:.8em; color:#999; font-weight:normal;">（類似 auto を survivor へ統合）</span></div>
-      <table id="gdTable" class="aitbl" style="width:100%;">
-        <thead><tr><th>kind</th><th>keep (survivor)</th><th>merge in (drops)</th><th style="width:90px;">action</th></tr></thead>
-        <tbody><tr><td colspan=4 class="empty">loading…</td></tr></tbody>
-      </table>
-      <div class="ai-pager" id="pager-groom-dedup"></div>
-    </div>
-    <div class="ai-subpane" data-ai-subpane="oracle" style="display:none;">
-      <div style="display:flex; gap:10px; margin-bottom:12px; flex-wrap:wrap; align-items:flex-end;">
-        <div class="ai-tile">
-          <div class="ai-tile-label">Total videos</div>
-          <div class="ai-tile-value" id="oracleTotal">—</div>
-        </div>
-        <div class="ai-tile">
-          <div class="ai-tile-label">Valid (L1 ✓)</div>
-          <div class="ai-tile-value" id="oracleValid" style="color:#196b2c;">—</div>
-        </div>
-        <div class="ai-tile">
-          <div class="ai-tile-label">Invalid</div>
-          <div class="ai-tile-value" id="oracleInvalid" style="color:#933;">—</div>
-        </div>
-        <div class="ai-tile">
-          <div class="ai-tile-label">Valid %</div>
-          <div class="ai-tile-value" id="oracleValidPct">—</div>
-        </div>
-        <button id="oracleTranslateBtn" class="aibtn" style="margin-left:auto; align-self:center;" title="reason 列を表示言語に翻訳 (ハブ側 LLM)"><iconify-icon icon="lucide:languages"></iconify-icon> 翻訳</button>
-        <button id="oracleRefreshBtn" class="aibtn" style="align-self:center;"><iconify-icon icon="lucide:refresh-cw"></iconify-icon> 再読込</button>
-      </div>
-      <div style="font-size:.82em; color:#888; margin-bottom:8px;">
-        ※ L1 oracle（hub 側 ffprobe で再検証）。直近 200 件の動画アセットを走査。
-        <span id="oracleByReason" style="margin-left:8px; color:#666;"></span>
-        <span id="oracleState" style="margin-left:8px; color:#777;"></span>
-      </div>
-      <table id="oracleTable" class="aitbl" style="width:100%;">
-        <thead><tr><th>job</th><th>file</th><th style="width:46px; text-align:center;">L1</th><th class="num">duration</th><th>codec</th><th class="num">dims</th><th class="num">size</th><th>reason</th></tr></thead>
-        <tbody><tr><td colspan=8 class="empty">loading…</td></tr></tbody>
-      </table>
-      <div class="ai-pager" id="pager-oracle"></div>
-    </div>
-
     <!-- AI I/O log sub-pane: per-LLM-call (purpose, engine, prompt, response,
          latency) capture for end-to-end loop observation. Backed by
          GET /ai/io (server/hub/routes/skills.py) reading from the MariaDB
@@ -2753,105 +2610,6 @@ curl 'http://paprika.lan/extensions/ublock-lite/download' --output ublock-lite.t
       </section>
     </div>
 
-    <!-- Success Audit sub-pane: periodic VisionAI sampling of completed
-         video-download jobs to detect "objective-OK but actually wrong
-         video" (preview/ad/mismatched). Backed by GET /ai/audit-stats +
-         GET /ai/audit-recent (server/hub/routes/skills.py) reading from
-         the MariaDB audit_results table. Click a row to expand. -->
-    <div class="ai-subpane" data-ai-subpane="audit" style="display:none;">
-      <section>
-        <h2 style="margin-top:0;"><iconify-icon icon="lucide:eye"></iconify-icon>
-          <span data-i18n="audit.heading">成功監査</span>
-          <span style="font-size:0.68em; color:#888; font-weight:normal; margin-left:8px;" data-i18n="audit.heading.hint">
-            完了ジョブを定期サンプリング → VisionAI で「本当に正しい動画?」を判定 (60s 更新)
-          </span>
-        </h2>
-        <!-- 4-quadrant KPI tiles: report vs reality -->
-        <div id="auditKpi" style="display:flex; gap:12px; margin:8px 0 14px; flex-wrap:wrap;">
-          <div style="flex:0 0 auto; padding:10px 16px; background:#fff; border:1px solid #d4cfca; border-radius:8px; min-width:130px;">
-            <div style="font-size:.78em; color:#888;" data-i18n="audit.kpi.audited">監査済み</div>
-            <div id="auditCntAudited" style="font-size:1.6em; font-weight:700; color:#16608f;">—</div>
-          </div>
-          <div style="flex:0 0 auto; padding:10px 16px; background:#fff; border:1px solid #7ab68a; border-radius:8px; min-width:130px;" data-i18n-title="audit.kpi.trueOk.title" title="報告も実態も成功">
-            <div style="font-size:.78em; color:#196b2c;" data-i18n="audit.kpi.trueOk">✓ 真の成功</div>
-            <div id="auditCntTrueOk" style="font-size:1.6em; font-weight:700; color:#196b2c;">—</div>
-          </div>
-          <div style="flex:0 0 auto; padding:10px 16px; background:#fff; border:1px solid #e0a99a; border-radius:8px; min-width:130px;" data-i18n-title="audit.kpi.falsePos.title" title="報告では成功だが実態は失敗 (誤った動画など)">
-            <div style="font-size:.78em; color:#a23c2a;" data-i18n="audit.kpi.falsePos">✗ 偽陽性</div>
-            <div id="auditCntFalsePos" style="font-size:1.6em; font-weight:700; color:#a23c2a;">—</div>
-          </div>
-          <div style="flex:0 0 auto; padding:10px 16px; background:#fff; border:1px solid #b07ac6; border-radius:8px; min-width:130px;" data-i18n-title="audit.kpi.falseNeg.title" title="報告では失敗だが実態は成功 (隠れた成功)">
-            <div style="font-size:.78em; color:#6a3ea6;" data-i18n="audit.kpi.falseNeg">🎯 偽陰性</div>
-            <div id="auditCntFalseNeg" style="font-size:1.6em; font-weight:700; color:#6a3ea6;">—</div>
-          </div>
-          <div style="flex:0 0 auto; padding:10px 16px; background:#fff; border:1px solid #888; border-radius:8px; min-width:130px;" data-i18n-title="audit.kpi.trueFail.title" title="報告も実態も失敗">
-            <div style="font-size:.78em; color:#444;" data-i18n="audit.kpi.trueFail">— 真の失敗</div>
-            <div id="auditCntTrueFail" style="font-size:1.6em; font-weight:700; color:#444;">—</div>
-          </div>
-          <div style="flex:0 0 auto; padding:10px 16px; background:#fff; border:1px solid #d4cfca; border-radius:8px; min-width:140px;" data-i18n-title="audit.kpi.agreeRate.title" title="(真の成功 + 真の失敗) / 全判定 = 報告と実態が一致した率">
-            <div style="font-size:.78em; color:#888;" data-i18n="audit.kpi.agreeRate">報告一致率</div>
-            <div id="auditAgreeRate" style="font-size:1.6em; font-weight:700; color:#3a5ca8;">—</div>
-          </div>
-          <div style="flex:0 0 auto; padding:10px 16px; background:#fff; border:1px solid #d4cfca; border-radius:8px; min-width:140px;" data-i18n-title="audit.kpi.trueRate.title" title="(真の成功 + 偽陰性) / 全判定 = 実態としての本当の成功率">
-            <div style="font-size:.78em; color:#888;" data-i18n="audit.kpi.trueRate">真の成功率</div>
-            <div id="auditTrueRate" style="font-size:1.6em; font-weight:700; color:#3a5ca8;">—</div>
-          </div>
-          <div style="flex:1 1 auto; padding:10px 16px; background:#fff; border:1px solid #d4cfca; border-radius:8px; min-width:240px;">
-            <div style="font-size:.78em; color:#888;" data-i18n="audit.kpi.topFp">偽陽性 top ホスト (download_video 見直し候補)</div>
-            <div id="auditTopFpHosts" style="font-size:.85em; color:#a23c2a; max-height:54px; overflow:auto;">—</div>
-          </div>
-          <div style="flex:1 1 auto; padding:10px 16px; background:#fff; border:1px solid #d4cfca; border-radius:8px; min-width:240px;">
-            <div style="font-size:.78em; color:#888;" data-i18n="audit.kpi.topFn">偽陰性 top ホスト (judge/escalation 見直し候補)</div>
-            <div id="auditTopFnHosts" style="font-size:.85em; color:#6a3ea6; max-height:54px; overflow:auto;">—</div>
-          </div>
-        </div>
-        <div style="display:flex; align-items:center; gap:10px; margin:8px 0; flex-wrap:wrap; font-size:.88em;">
-          <label style="display:flex; align-items:center; gap:4px;">
-            <span data-i18n="audit.filter.since">時間範囲</span>:
-            <select id="auditSince" style="padding:3px 6px;">
-              <option value="3600">過去 1時間</option>
-              <option value="14400">過去 4時間</option>
-              <option value="86400" selected>過去 24時間</option>
-              <option value="604800">過去 7日</option>
-            </select>
-          </label>
-          <label style="display:flex; align-items:center; gap:4px;">
-            <span data-i18n="audit.filter.verdict">判定</span>:
-            <select id="auditVerdictKind" style="padding:3px 6px;">
-              <option value="">すべて</option>
-              <option value="false_positive">偽陽性のみ</option>
-              <option value="false_negative">偽陰性のみ</option>
-              <option value="true_ok">真の成功のみ</option>
-              <option value="true_failure">真の失敗のみ</option>
-              <option value="unparsed">未判定のみ</option>
-            </select>
-          </label>
-          <label style="display:flex; align-items:center; gap:4px;" data-i18n-title="audit.filter.disagreeOnly.title" title="偽陽性 OR 偽陰性 (報告と実態の不一致)">
-            <input type="checkbox" id="auditFailsOnly"> <span data-i18n="audit.filter.disagreeOnly">報告不一致のみ</span>
-          </label>
-          <button id="auditRefresh" class="pill" style="--la-bg:#f5f5fa; --la-bd:#bbc; --la-fg:#444; font-size:.82em;"><iconify-icon icon="lucide:refresh-cw"></iconify-icon> <span data-i18n="aiio.refresh">再取得</span></button>
-          <button id="auditRunNow" class="pill" style="--la-bg:#eef8ee; --la-bd:#7ab68a; --la-fg:#196b2c; font-size:.82em;" data-i18n-title="audit.run.btn.title" title="次の定期サンプリングを待たずに即時 1 パス実行"><iconify-icon icon="lucide:play"></iconify-icon> <span data-i18n="audit.run.btn">即時実行</span></button>
-          <span id="auditStatus" style="color:#888;"></span>
-        </div>
-        <div style="overflow:auto; max-height:calc(100vh - 430px);">
-          <table id="auditTable" style="width:100%; border-collapse:collapse; font-size:.86em;">
-            <thead style="position:sticky; top:0; background:#f5f5f5; z-index:1;">
-              <tr>
-                <th style="text-align:left; padding:6px 8px; border-bottom:1px solid #d0d0d0; white-space:nowrap;" data-i18n="audit.th.time">時刻</th>
-                <th style="text-align:left; padding:6px 8px; border-bottom:1px solid #d0d0d0; white-space:nowrap;" data-i18n="audit.th.reported">報告</th>
-                <th style="text-align:left; padding:6px 8px; border-bottom:1px solid #d0d0d0; white-space:nowrap;" data-i18n="audit.th.actual">実態</th>
-                <th style="text-align:right; padding:6px 8px; border-bottom:1px solid #d0d0d0; white-space:nowrap;" data-i18n="audit.th.conf">conf</th>
-                <th style="text-align:left; padding:6px 8px; border-bottom:1px solid #d0d0d0; white-space:nowrap;" data-i18n="audit.th.job">job_id</th>
-                <th style="text-align:left; padding:6px 8px; border-bottom:1px solid #d0d0d0;" data-i18n="audit.th.url">URL</th>
-                <th style="text-align:left; padding:6px 8px; border-bottom:1px solid #d0d0d0;" data-i18n="audit.th.video">video</th>
-                <th style="text-align:left; padding:6px 8px; border-bottom:1px solid #d0d0d0;" data-i18n="audit.th.reason">理由</th>
-              </tr>
-            </thead>
-            <tbody><tr><td colspan="8" class="empty" style="padding:20px; text-align:center; color:#888;">loading…</td></tr></tbody>
-          </table>
-        </div>
-      </section>
-    </div>
 </div>
 
 <!-- AI I/O detail modal: full prompt + response of one ai_io_log row -->

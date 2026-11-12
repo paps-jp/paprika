@@ -98,93 +98,6 @@
         : _tt3('knowledge.ai.distilled.none', '直近 24 時間以内の更新なし');
   }
 
-  // ---- AI self-improvement loop: skills & conventions (paged) ----
-  const _AI_PAGE = 15;
-  const _aiState = {
-    skills:         { items: [], page: 0, tableId: 'skTable',      cntId: 'cntSkills',      cols: 6 },
-    conventions:    { items: [], page: 0, tableId: 'cvTable',      cntId: 'cntConventions', cols: 6 },
-    'groom-retire': { items: [], page: 0, tableId: 'grTable',      cntId: 'cntGroomRetire', cols: 7, rowFn: (x) => _groomRetireRow(x) },
-    'groom-dedup':  { items: [], page: 0, tableId: 'gdTable',      cntId: 'cntGroomDedup',  cols: 4, rowFn: (x) => _groomDedupRow(x) },
-    'oracle':       { items: [], page: 0, tableId: 'oracleTable',  cntId: 'cntOracle',      cols: 8, rowFn: (x) => _oracleRow(x) },
-  };
-
-  async function loadSkillsConventions() {
-    // _rolesSettings.skill_audit_warn_threshold drives the 監査要 badge
-    // in _aiRow. loadRoles() also populates it, but the operator may
-    // jump straight to the skills/conventions sub-tab without visiting
-    // 役割 first -- prime the settings cache here so the warning shows.
-    if (!_rolesSettings || Object.keys(_rolesSettings).length === 0) {
-      try {
-        const sr = await fetch('/settings');
-        if (sr.ok) _rolesSettings = ((await sr.json()).values) || {};
-      } catch (_e) { /* transient */ }
-    }
-    await _loadAiTable('/skills', 'skills');
-    await _loadAiTable('/conventions', 'conventions');
-  }
-
-  async function _loadAiTable(url, kind) {
-    const st = _aiState[kind];
-    const tbody = document.querySelector('#' + st.tableId + ' tbody');
-    let items;
-    try {
-      const r = await fetch(url);
-      if (!r.ok) { tbody.innerHTML = '<tr><td colspan=6 class="empty">error: HTTP ' + r.status + '</td></tr>'; return; }
-      const j = await r.json();
-      items = j.skills || j.conventions || j.items || (Array.isArray(j) ? j : []);
-    } catch (e) {
-      tbody.innerHTML = '<tr><td colspan=6 class="empty">error: ' + e + '</td></tr>'; return;
-    }
-    // Proven first: success_rate desc (untried/null last), then use_count desc.
-    items.sort((a, b) => {
-      const ra = a.success_rate, rb = b.success_rate;
-      if (ra == null && rb == null) return (b.use_count || 0) - (a.use_count || 0);
-      if (ra == null) return 1;
-      if (rb == null) return -1;
-      return (rb - ra) || ((b.use_count || 0) - (a.use_count || 0));
-    });
-    st.items = items;
-    st.page = 0;
-    _renderAiPage(kind);
-  }
-
-  function _renderAiPage(kind) {
-    const st = _aiState[kind];
-    const cols = st.cols || 6;
-    const tbody = document.querySelector('#' + st.tableId + ' tbody');
-    const cnt = document.getElementById(st.cntId); if (cnt) cnt.textContent = st.items.length;
-    if (!st.items.length) { tbody.innerHTML = '<tr><td colspan=' + cols + ' class="empty">none</td></tr>'; _renderAiPager(kind); return; }
-    const pages = Math.max(1, Math.ceil(st.items.length / _AI_PAGE));
-    if (st.page >= pages) st.page = pages - 1;
-    if (st.page < 0) st.page = 0;
-    const start = st.page * _AI_PAGE;
-    const rf = st.rowFn || ((x) => _aiRow(x, kind));
-    tbody.innerHTML = st.items.slice(start, start + _AI_PAGE).map(rf).join('');
-    _renderAiPager(kind);
-  }
-
-  function _renderAiPager(kind) {
-    const st = _aiState[kind];
-    const el = document.getElementById('pager-' + kind);
-    if (!el) return;
-    const n = st.items.length;
-    if (n <= _AI_PAGE) { el.innerHTML = ''; return; }
-    const pages = Math.ceil(n / _AI_PAGE);
-    const from = st.page * _AI_PAGE + 1;
-    const to = Math.min(n, (st.page + 1) * _AI_PAGE);
-    el.innerHTML =
-      '<button class="aipg" data-aipg="prev" data-kind="' + kind + '"' + (st.page <= 0 ? ' disabled' : '') + '>‹ prev</button>' +
-      '<span class="aipg-info">' + from + '–' + to + ' / ' + n + '（' + (st.page + 1) + ' / ' + pages + '）</span>' +
-      '<button class="aipg" data-aipg="next" data-kind="' + kind + '"' + (st.page >= pages - 1 ? ' disabled' : '') + '>next ›</button>';
-  }
-
-  function _aiPagerClick(kind, dir) {
-    const st = _aiState[kind];
-    if (!st) return;
-    st.page += (dir === 'next' ? 1 : -1);
-    _renderAiPage(kind);
-  }
-
   function setAiSubtab(name) {
     // Scope to elements that actually carry data-ai-subtab. The same
     // .ai-subtab class is shared with the Jobs panel's status-filter
@@ -194,6 +107,10 @@
     // undefined (or the same kind of stray comparison when name is a
     // real string), flipping their .active state in lockstep — hence
     // the "click エラー and all four jobs tabs light up" bug.
+    //
+    // A name with no button (a sub-tab that was removed, reached through
+    // an old bookmark) falls back to 稼働中 instead of a blank panel.
+    if (!document.querySelector('.ai-subtab[data-ai-subtab="' + name + '"]')) name = 'live';
     document.querySelectorAll('.ai-subtab[data-ai-subtab]').forEach(t => {
       const on = t.dataset.aiSubtab === name;
       t.classList.toggle('active', on);
@@ -220,163 +137,11 @@
     }
     if (name === 'knowledge') {
       if (typeof loadKnowledge === 'function') loadKnowledge();
-    } else if (name === 'grooming') {
-      loadGrooming();
-    } else if (name === 'oracle') {
-      loadOracle();
     } else if (name === 'aiio') {
       _aiIoStart();
-    } else if (name === 'audit') {
-      _auditStart();
-    } else {
-      loadSkillsConventions();
     }
     if (name !== 'aiio') _aiIoStop();
-    if (name !== 'audit') _auditStop();
   }
-
-  // ===== Success Audit sub-tab ============================================
-  // VisionAI-sampled audit of completed video-download jobs. Backed by
-  // GET /ai/audit-stats (KPIs) + GET /ai/audit-recent (table) +
-  // POST /ai/audit-now (operator-triggered immediate run).
-  let _auditPollTimer = null;
-  function _auditStop() { if (_auditPollTimer) { clearInterval(_auditPollTimer); _auditPollTimer = null; } }
-  function _auditStart() {
-    _auditStop();
-    try { refreshAuditPanel(); } catch (_) {}
-    _auditPollTimer = setInterval(() => {
-      if (document.hidden) return;
-      const a = document.querySelector('.ai-subpane[data-ai-subpane="audit"]');
-      if (!a || a.style.display === 'none') { _auditStop(); return; }
-      try { refreshAuditPanel(); } catch (_) {}
-    }, 60000);
-  }
-  function _fmtAuditTs(ts) {
-    if (!ts) return '—';
-    const d = new Date(ts * 1000);
-    return d.getHours().toString().padStart(2,'0') + ':' +
-           d.getMinutes().toString().padStart(2,'0') + ':' +
-           d.getSeconds().toString().padStart(2,'0');
-  }
-  function _auditVerdictBadge(ts) {
-    // ts here is the actually_succeeded value (1 / 0 / null).
-    if (ts === 1 || ts === true)  return '<span style="display:inline-block; padding:1px 8px; border-radius:10px; font-size:.78em; font-weight:600; background:#ecf7e9; color:#196b2c; border:1px solid #7ab68a;">✓ OK</span>';
-    if (ts === 0 || ts === false) return '<span style="display:inline-block; padding:1px 8px; border-radius:10px; font-size:.78em; font-weight:600; background:#fdecec; color:#a23c2a; border:1px solid #e0a99a;">✗ NG</span>';
-    return '<span style="display:inline-block; padding:1px 8px; border-radius:10px; font-size:.78em; font-weight:600; background:#f5f5fa; color:#555; border:1px solid #bbc;">?? 不明</span>';
-  }
-  function _reportedStatusBadge(rs) {
-    const colors = {
-      completed: { bg: '#ecf7e9', fg: '#196b2c', bd: '#7ab68a' },
-      failed:    { bg: '#fdecec', fg: '#a23c2a', bd: '#e0a99a' },
-      review:    { bg: '#fff3e6', fg: '#b8860b', bd: '#e0b48a' },
-    };
-    const c = colors[rs] || { bg: '#f5f5fa', fg: '#555', bd: '#bbc' };
-    return `<span style="display:inline-block; padding:1px 8px; border-radius:10px; font-size:.78em; font-weight:600; background:${c.bg}; color:${c.fg}; border:1px solid ${c.bd};">${_esc(rs || '?')}</span>`;
-  }
-  function _verdictRowFlag(vk) {
-    // Highlight disagreement rows so the eye catches them.
-    if (vk === 'false_positive') return 'background:#fffaf0;';
-    if (vk === 'false_negative') return 'background:#faf5ff;';
-    return '';
-  }
-  async function refreshAuditPanel() {
-    const since = parseInt(document.getElementById('auditSince')?.value || '86400', 10);
-    const failsOnly = !!document.getElementById('auditFailsOnly')?.checked;
-    const vk = (document.getElementById('auditVerdictKind')?.value || '').trim();
-    const statusEl = document.getElementById('auditStatus');
-    if (statusEl) statusEl.textContent = '取得中…';
-    // 1) KPI tiles (4-quadrant)
-    try {
-      const r = await fetch('/ai/audit-stats?since_s=' + since);
-      if (r.ok) {
-        const d = await r.json();
-        const set = (id, v) => { const el = document.getElementById(id); if (el) el.textContent = v; };
-        set('auditCntAudited', d.audited ?? 0);
-        set('auditCntTrueOk', d.true_ok ?? 0);
-        set('auditCntFalsePos', d.false_positive ?? 0);
-        set('auditCntFalseNeg', d.false_negative ?? 0);
-        set('auditCntTrueFail', d.true_failure ?? 0);
-        const ar = d.report_agreement_rate;
-        set('auditAgreeRate', (ar == null) ? '—' : Math.round(ar * 100) + '%');
-        const tr = d.true_success_rate;
-        set('auditTrueRate', (tr == null) ? '—' : Math.round(tr * 100) + '%');
-        const renderHosts = (id, list) => {
-          const el = document.getElementById(id);
-          if (!el) return;
-          el.innerHTML = (list && list.length)
-            ? list.map(h => `<div><code>${_esc(h[0])}</code> ×${h[1]}</div>`).join('')
-            : '<span style="color:#999;">(なし)</span>';
-        };
-        renderHosts('auditTopFpHosts', d.top_false_positive_hosts || []);
-        renderHosts('auditTopFnHosts', d.top_false_negative_hosts || []);
-        const badge = document.getElementById('cntAudit');
-        if (badge) badge.textContent = (d.false_positive ?? 0) + (d.false_negative ?? 0);
-      }
-    } catch (_) {}
-    // 2) Table
-    const tbody = document.querySelector('#auditTable tbody');
-    if (!tbody) return;
-    try {
-      const params = new URLSearchParams({ limit: '200' });
-      if (failsOnly) params.set('only_failures', '1');
-      if (vk) params.set('verdict_kind', vk);
-      const r = await fetch('/ai/audit-recent?' + params.toString());
-      if (!r.ok) { tbody.innerHTML = `<tr><td colspan="8" class="empty" style="padding:20px; text-align:center; color:#a00;">取得失敗 (HTTP ${r.status})</td></tr>`; return; }
-      const d = await r.json();
-      const rows = d.rows || [];
-      if (statusEl) statusEl.textContent = `${rows.length} 件表示`;
-      if (!rows.length) {
-        tbody.innerHTML = '<tr><td colspan="8" class="empty" style="padding:20px; text-align:center; color:#888;">監査結果なし — 「即時実行」で開始するか、Settings で success_audit_enabled を true に</td></tr>';
-        return;
-      }
-      tbody.innerHTML = rows.map(e => `
-        <tr style="${_verdictRowFlag(e.verdict_kind)}">
-          <td style="padding:4px 8px; border-bottom:1px solid #eee; white-space:nowrap;">${_fmtAuditTs(e.ts)}</td>
-          <td style="padding:4px 8px; border-bottom:1px solid #eee;">${_reportedStatusBadge(e.reported_status)}</td>
-          <td style="padding:4px 8px; border-bottom:1px solid #eee;">${_auditVerdictBadge(e.truly_succeeded)}</td>
-          <td style="padding:4px 8px; border-bottom:1px solid #eee; text-align:right; font-variant-numeric:tabular-nums;">${e.confidence == null ? '—' : (Math.round(e.confidence*100)+'%')}</td>
-          <td style="padding:4px 8px; border-bottom:1px solid #eee; white-space:nowrap;"><code style="font-size:.83em;">${_esc((e.job_id || '').slice(0,12))}</code></td>
-          <td style="padding:4px 8px; border-bottom:1px solid #eee; max-width:240px; overflow:hidden; text-overflow:ellipsis; white-space:nowrap;"><a href="${_esc(e.url || '#')}" target="_blank" rel="noopener" style="font-size:.85em;">${_esc((e.url || '').slice(0, 60))}</a></td>
-          <td style="padding:4px 8px; border-bottom:1px solid #eee; font-family:ui-monospace,Consolas,monospace; font-size:.82em; max-width:140px; overflow:hidden; text-overflow:ellipsis; white-space:nowrap;">${_esc(e.video_file || '—')}</td>
-          <td style="padding:4px 8px; border-bottom:1px solid #eee; font-size:.85em; max-width:380px; word-break:break-word;">${_esc(e.reason || '')}</td>
-        </tr>`).join('');
-    } catch (e) {
-      tbody.innerHTML = `<tr><td colspan="8" class="empty" style="padding:20px; text-align:center; color:#a00;">取得失敗: ${_esc(e.message || e)}</td></tr>`;
-    }
-    if (statusEl && (statusEl.textContent || '').endsWith('取得中…')) statusEl.textContent = '';
-  }
-  (function wireAudit() {
-    document.addEventListener('DOMContentLoaded', () => {
-      ['auditSince','auditFailsOnly','auditVerdictKind'].forEach(id => {
-        const el = document.getElementById(id);
-        if (!el) return;
-        const ev = el.type === 'checkbox' ? 'change' : 'change';
-        el.addEventListener(ev, () => { try { refreshAuditPanel(); } catch (_) {} });
-      });
-      const r = document.getElementById('auditRefresh');
-      if (r) r.addEventListener('click', () => { try { refreshAuditPanel(); } catch (_) {} });
-      const run = document.getElementById('auditRunNow');
-      if (run) run.addEventListener('click', async () => {
-        run.disabled = true;
-        const status = document.getElementById('auditStatus');
-        if (status) status.textContent = '実行中…';
-        try {
-          const resp = await fetch('/ai/audit-now', { method: 'POST' });
-          if (resp.ok) {
-            const d = await resp.json();
-            if (status) status.textContent = `audited=${d.audited||0} ok=${d.ok||0} ng=${d.ng||0}`;
-          } else {
-            if (status) status.textContent = `失敗 (HTTP ${resp.status})`;
-          }
-        } catch (e) {
-          if (status) status.textContent = '失敗: ' + (e.message || e);
-        } finally {
-          run.disabled = false;
-          try { refreshAuditPanel(); } catch (_) {}
-        }
-      });
-    });
-  })();
 
   // ===== AI I/O log sub-tab =================================================
   // Lists every LLM call (planner / skill_retrieval / codegen / judge /
@@ -732,7 +497,7 @@
       { key: 'judge_blind_mode', label: 'blind', tip: 'judge にはスクリプト本体・stdout/stderr を見せない（asset 数・終了コード・スクショ・perception だけで判定 = "evaluator-optimizer" 原則）' },
     ]},
     { key: 'distiller', setting: 'distiller_engine_order', icon: 'lucide:brain', name: '推論蒸留', code: 'distiller', desc: '失敗から壁・ホスト知識を学習', mode: 'reasoning_distiller_mode', modes: ['off', 'on', 'new'] },
-    { key: 'translate', setting: 'translate_engine_order', icon: 'lucide:languages', name: '翻訳', code: 'POST /translate', desc: '#ai 作法モーダルの「翻訳」用。空ならチャット既定にフォールバック' },
+    { key: 'translate', setting: 'translate_engine_order', icon: 'lucide:languages', name: '翻訳', code: 'POST /translate', desc: 'POST /translate API 用（管理画面からは未使用）。空ならチャット既定にフォールバック' },
   ];
   const _ROLE_BY_KEY = {}; _ROLE_DEFS.forEach(d => { _ROLE_BY_KEY[d.key] = d; });
 
@@ -907,229 +672,18 @@
 
   function _esc(s) { return (s == null ? '' : ('' + s)).replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/"/g, '&quot;'); }
 
-  function _aiRow(x, kind) {
-    const pct = x.success_rate == null ? null : Math.round(x.success_rate * 100);
-    const bar = pct == null
-      ? '<span style="color:#aaa;">— untried</span>'
-      : '<div class="airate"><div class="airate-fill" style="width:' + pct + '%; background:' +
-        (pct >= 50 ? '#4a9d6a' : (pct >= 20 ? '#d6a13a' : '#d65a5a')) + ';"></div><span>' +
-        pct + '% (' + (x.success_count || 0) + '/' + (x.use_count || 0) + ')</span></div>';
-    const tierBadge = '<span class="aibadge ' + (x.tier === 'curated' ? 'tier-cur' : 'tier-auto') + '">' + _esc(x.tier || 'auto') + '</span>';
-    // Audit warning: an `auto`-tier skill/convention that has been used
-    // a lot WITHOUT operator promotion is a prompt-injection-style
-    // concern (0xCodez 14-step Tier 3 — "audit skill sources, skills
-    // are prompt-injection vectors"). Surface a warning badge so the
-    // operator notices and either promotes (curated = reviewed) or
-    // deletes. Threshold = Settings.skill_audit_warn_threshold.
-    const _auditThr = Number(_rolesSettings && _rolesSettings.skill_audit_warn_threshold);
-    const auditBadge = (x.tier !== 'curated' && _auditThr > 0 && Number(x.use_count || 0) >= _auditThr)
-      ? '<span class="aibadge" style="background:#fff4d6; color:#7a4a14; border:1px solid #d6a13a; margin-left:4px;" title="auto-tier のまま ' + _auditThr + ' 回以上使われています。注入経路として安全か内容を確認(promote)してください">⚠ 監査要</span>'
-      : '';
-    const slug = _esc(x.slug);
-    const desc = _esc((x.description || x.advice || '').slice(0, 100));
-    const tierBtn = x.tier === 'curated'
-      ? '<button class="aibtn" data-act="demote" data-kind="' + kind + '" data-slug="' + slug + '">demote</button>'
-      : '<button class="aibtn" data-act="promote" data-kind="' + kind + '" data-slug="' + slug + '">promote</button>';
-    const delBtn = '<button class="aibtn del" data-act="delete" data-kind="' + kind + '" data-slug="' + slug + '">delete</button>';
-    // Skills ARE code -- give each one a button to view its code_template.
-    // Conventions ARE prose advice + good/bad examples -- give each one a
-    // matching button so the operator can read the distilled content and
-    // judge whether it's worth promoting / keeping.
-    const codeBtn = kind === 'skills'
-      ? '<button class="aibtn" data-act="code" data-kind="skills" data-slug="' + slug + '" title="このスキルのコード(code_template)を表示"><iconify-icon icon="lucide:code-2"></iconify-icon> コード</button>'
-      : kind === 'conventions'
-      ? '<button class="aibtn" data-act="detail" data-kind="conventions" data-slug="' + slug + '" title="この作法の蒸留内容 (advice / good/bad example / 由来) を表示"><iconify-icon icon="lucide:scroll-text"></iconify-icon> 内容</button>'
-      : '';
-    return '<tr title="' + desc + '"><td><code>' + slug + '</code></td><td>' + tierBadge + auditBadge + '</td>' +
-      '<td class="num">' + (x.use_count || 0) + '</td><td class="num">' + (x.success_count || 0) + '</td>' +
-      '<td>' + bar + '</td><td>' + codeBtn + tierBtn + delBtn + '</td></tr>';
-  }
-
-  async function aiAction(kind, slug, act) {
-    if (act === 'code') { openSkillCode(slug); return; }
-    if (act === 'detail') { openConventionDetail(slug); return; }
-    if (act === 'delete' && !confirm('Delete ' + kind + ' "' + slug + '"?')) return;
-    const enc = encodeURIComponent(slug);
-    const method = act === 'delete' ? 'DELETE' : 'POST';
-    const path = act === 'delete' ? '/' + kind + '/' + enc : '/' + kind + '/' + enc + '/' + act;
-    try {
-      const r = await fetch(path, { method });
-      if (!r.ok) { alert(act + ' failed: HTTP ' + r.status); return; }
-    } catch (e) { alert(act + ' failed: ' + e); return; }
-    loadSkillsConventions();
-  }
-
-  // ---- Skill code viewer (a skill = reusable code_template) -----------
-  let _skillCodeCurrent = '';
-  async function openSkillCode(slug) {
-    const modal = document.getElementById('skillCodeModal');
-    if (!modal) return;
-    const $ = (id) => document.getElementById(id);
-    $('skillCodeTitle').textContent = slug;
-    $('skillCodeMeta').textContent = '';
-    $('skillCodeDesc').innerHTML = '';
-    $('skillCodeBody').textContent = '読み込み中…';
-    $('skillCodeInstr').textContent = '';
-    $('skillCodeProv').textContent = '';
-    _skillCodeCurrent = '';
-    modal.style.display = 'flex';
-    // Reflect the open skill in the address bar so #ai/skill/<slug> is
-    // shareable / survives reload (no-op when opened via that deep-link).
-    try { if (typeof _entityHashSync === 'function') _entityHashSync('ai', 'skill/' + slug); } catch (_e) {}
-    try {
-      const r = await fetch('/skills/' + encodeURIComponent(slug));
-      if (!r.ok) { $('skillCodeBody').textContent = '取得失敗 (HTTP ' + r.status + ')'; return; }
-      const s = await r.json();
-      $('skillCodeTitle').textContent = (s.name || s.slug || slug);
-      const p = s.success_rate == null ? '—' : Math.round(s.success_rate * 100) + '%';
-      $('skillCodeMeta').textContent = (s.tier || 'auto') + ' · fitness ' + p +
-        ' (' + (s.success_count || 0) + '/' + (s.use_count || 0) + ')';
-      let dh = '';
-      if (s.description) dh += '<div style="margin-bottom:6px; color:#333;">' + _esc(s.description) + '</div>';
-      if ((s.applicable_when || []).length) dh += '<div style="font-size:.85em; color:#555;"><b>使う条件:</b> ' + s.applicable_when.map(_esc).join(' ／ ') + '</div>';
-      if ((s.tags || []).length) dh += '<div style="margin-top:5px;">' + s.tags.map(function (t) { return '<span class="aibadge tier-auto" style="margin-right:4px;">' + _esc(t) + '</span>'; }).join('') + '</div>';
-      $('skillCodeDesc').innerHTML = dh;
-      _skillCodeCurrent = s.code_template || '';
-      $('skillCodeBody').textContent = _skillCodeCurrent || '(コードなし)';
-      $('skillCodeInstr').textContent = s.llm_instructions || '(指示文なし)';
-      const prov = (s.extracted_from || []);
-      if (prov.length) $('skillCodeProv').textContent = '由来ジョブ (' + prov.length + '): ' + prov.slice(0, 8).map(_esc).join(', ') + (prov.length > 8 ? ' …' : '');
-    } catch (e) {
-      $('skillCodeBody').textContent = '取得失敗: ' + (e && e.message ? e.message : e);
-    }
-  }
-
-  // ---- Convention detail viewer (operator-readable distillation) ----------
-  // Conventions are prose advice + bad/good code snippets distilled by the
-  // codegen-loop. Surfacing them in a modal lets the operator actually read
-  // and rate them (same goal as openSkillCode for skills).
-  let _convTranslated = false;  // toggle state for the current modal session
-  async function openConventionDetail(slug) {
-    const modal = document.getElementById('convDetailModal');
-    if (!modal) return;
-    const $ = (id) => document.getElementById(id);
-    // Reset translation toggle state when re-opening on a different row.
-    _convTranslated = false;
-    _convResetTranslateBtn();
-    $('convDetailTitle').textContent = slug;
-    $('convDetailMeta').textContent = '';
-    $('convDetailAdvice').textContent = '読み込み中…';
-    $('convDetailRationale').textContent = '';
-    $('convDetailWhen').innerHTML = '';
-    $('convDetailBad').textContent = '';
-    $('convDetailGood').textContent = '';
-    $('convDetailTags').innerHTML = '';
-    $('convDetailProv').textContent = '';
-    modal.style.display = 'flex';
-    try {
-      const r = await fetch('/conventions/' + encodeURIComponent(slug));
-      if (!r.ok) { $('convDetailAdvice').textContent = '取得失敗 (HTTP ' + r.status + ')'; return; }
-      const c = await r.json();
-      $('convDetailTitle').textContent = c.name || c.slug || slug;
-      const p = c.success_rate == null ? '—' : Math.round(c.success_rate * 100) + '%';
-      $('convDetailMeta').textContent = (c.tier || 'auto') + ' · fitness ' + p +
-        ' (' + (c.success_count || 0) + '/' + (c.use_count || 0) + ')';
-      $('convDetailAdvice').textContent = c.advice || '(advice なし)';
-      $('convDetailRationale').textContent = c.rationale || '(rationale なし)';
-      const when = c.applicable_when || [];
-      $('convDetailWhen').innerHTML = when.length
-        ? when.map(function (w) { return '<span class="aibadge tier-auto" style="margin:2px 4px 2px 0;">' + _esc(w) + '</span>'; }).join('')
-        : '<span style="color:#999;">—</span>';
-      $('convDetailBad').textContent = c.bad_example || '(bad_example なし)';
-      $('convDetailGood').textContent = c.good_example || '(good_example なし)';
-      const tags = c.tags || [];
-      if (tags.length) $('convDetailTags').innerHTML = '<b style="color:#666;">tags:</b> ' +
-        tags.map(function (t) { return '<span class="aibadge tier-auto" style="margin:0 4px;">' + _esc(t) + '</span>'; }).join('');
-      const prov = c.extracted_from || [];
-      if (prov.length) $('convDetailProv').textContent = '由来ジョブ (' + prov.length + '): ' + prov.slice(0, 8).map(_esc).join(', ') + (prov.length > 8 ? ' …' : '');
-    } catch (e) {
-      $('convDetailAdvice').textContent = '取得失敗: ' + (e && e.message ? e.message : e);
-    }
-  }
-
-  // ---- Convention 翻訳 (hub-side LLM + cross-hub MariaDB cache) -----------
-  // Translates advice / rationale / applicable_when via POST /translate
-  // (chat Promoted engine, thermal/stop failover, sha256(text)+lang cache).
-  // Bad/good_example stay verbatim — they're Python code; identifier
-  // translation would break the example. Re-opens hit the cache instantly.
-  function _convResetTranslateBtn() {
-    const lbl = document.getElementById('convDetailTranslateLabel');
-    if (lbl) lbl.textContent = '翻訳';
-  }
-  function _convTargetLang() {
-    try {
-      const il = window.i18next && window.i18next.language;
-      if (il) return String(il).split('-')[0];
-    } catch (_) {}
-    return (navigator.language || 'en').split('-')[0];
-  }
-  async function _convTranslateModal() {
-    const $ = (id) => document.getElementById(id);
-    const lblEl = $('convDetailTranslateLabel');
-    const adv = $('convDetailAdvice');
-    const rat = $('convDetailRationale');
-    const whn = $('convDetailWhen');
-    if (!adv || !rat || !whn) return;
-    // Toggle back to the originals -- they were stashed on first translate.
-    if (_convTranslated) {
-      if (adv.dataset.orig != null) adv.textContent = adv.dataset.orig;
-      if (rat.dataset.orig != null) rat.textContent = rat.dataset.orig;
-      if (whn.dataset.orig != null) whn.innerHTML = whn.dataset.orig;
-      _convTranslated = false;
-      if (lblEl) lblEl.textContent = '翻訳';
-      return;
-    }
-    const tgt = _convTargetLang();
-    if (tgt === 'en') { alert('表示言語が英語のため、翻訳は不要です。'); return; }
-    if (lblEl) lblEl.textContent = '翻訳中…';
-    // Stash originals so the toggle can restore them.
-    adv.dataset.orig = adv.textContent;
-    rat.dataset.orig = rat.textContent;
-    whn.dataset.orig = whn.innerHTML;
-    const badges = Array.from(whn.querySelectorAll('.aibadge'));
-    const badgeTexts = badges.map(b => b.textContent || '');
-    const texts = [adv.textContent, rat.textContent, ...badgeTexts];
-    try {
-      const r = await fetch('/translate', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ texts, target_lang: tgt }),
-      });
-      if (!r.ok) {
-        const msg = r.status === 503 ? '翻訳機能が無効か、利用可能な chat エンジンがありません (HTTP 503)' : '翻訳に失敗 (HTTP ' + r.status + ')';
-        throw new Error(msg);
-      }
-      const d = await r.json();
-      const out = d.translated || [];
-      adv.textContent = out[0] || adv.textContent;
-      rat.textContent = out[1] || rat.textContent;
-      badges.forEach((b, i) => { b.textContent = out[2 + i] || badgeTexts[i]; });
-      _convTranslated = true;
-      if (lblEl) lblEl.textContent = '原文に戻す';
-      // Soft hint when most cells came from cache (re-open).
-      const hits = (d.cache_hits || []).filter(Boolean).length;
-      if (hits === texts.length && lblEl) lblEl.title = 'cache hit · 0 LLM call';
-    } catch (e) {
-      // Roll back the originals so the operator isn't left with empty cells.
-      if (adv.dataset.orig != null) adv.textContent = adv.dataset.orig;
-      if (rat.dataset.orig != null) rat.textContent = rat.dataset.orig;
-      if (whn.dataset.orig != null) whn.innerHTML = whn.dataset.orig;
-      if (lblEl) lblEl.textContent = '翻訳';
-      alert('翻訳に失敗しました: ' + (e && e.message ? e.message : e));
-    }
-  }
-
   // ---- Deep-link entry point: #ai/<kind>/<slug> -> open that entity ----
   // Registered with the core router via window.aiOpenEntity (admin-core.js
   // _entityDeepLinkOpeners), so a pasted / shared / reloaded
-  //   #ai/skill/<slug>        -> Skills sub-tab + code modal
+  //   #ai/engine/<slug>       -> Engines sub-tab + that engine
   //   #ai/host/<host>         -> Knowledge sub-tab + host-knowledge modal
-  //   #ai/convention/<slug>   -> Conventions sub-tab
   // lands directly on the entity. ``entityId`` is everything after "#ai/".
+  // (#ai/skill/... and #ai/convention/... went away with those sub-tabs;
+  // an old link of that kind lands on 稼働中.)
   function aiOpenEntity(entityId) {
     const s = String(entityId == null ? '' : entityId);
     const i = s.indexOf('/');
-    const kind = (i >= 0 ? s.slice(0, i) : 'skill').toLowerCase();
+    const kind = (i >= 0 ? s.slice(0, i) : '').toLowerCase();
     const id = i >= 0 ? s.slice(i + 1) : s;
     if (!id) return;
     if (kind === 'engines' || s === 'engines') {
@@ -1160,280 +714,11 @@
         if (--tries > 0) setTimeout(open, 400);
       };
       open();
-    } else if (kind === 'convention' || kind === 'conventions') {
-      setAiSubtab('conventions');
     } else {
-      // skill (default): openSkillCode fetches /skills/{slug} directly, so
-      // this works cold without the list having rendered first.
-      setAiSubtab('skills');
-      openSkillCode(id);
+      setAiSubtab('live');
     }
   }
   try { window.aiOpenEntity = aiOpenEntity; } catch (_e) {}
-
-  // ---- Grooming sub-tab: retire + dedup candidates + auto toggles ----
-  // Open the kind-appropriate detail modal so the operator can see the
-  // distilled content (skill code or convention prose) before deciding
-  // whether to keep/delete/merge a grooming candidate.
-  function _aiOpenItemDetail(kind, slug) {
-    if (!slug) return;
-    if (kind === 'skills' || kind === 'skill') { openSkillCode(slug); return; }
-    if (kind === 'conventions' || kind === 'convention') { openConventionDetail(slug); return; }
-  }
-  function _groomDetailBtn(kind, slug) {
-    const label = (kind === 'skills' || kind === 'skill') ? 'コード' : '内容';
-    const icon = (kind === 'skills' || kind === 'skill') ? 'lucide:code-2' : 'lucide:scroll-text';
-    return '<button class="aibtn gr-view" data-act="view" data-kind="' + _esc(kind) + '" data-slug="' + _esc(slug) +
-      '" title="この ' + label + ' の蒸留結果を表示"><iconify-icon icon="' + icon + '"></iconify-icon> ' + label + '</button>';
-  }
-  function _groomSlugLink(kind, slug) {
-    return '<code class="gr-slug" data-kind="' + _esc(kind) + '" data-slug="' + _esc(slug) +
-      '" style="cursor:pointer; text-decoration:underline dotted;" title="蒸留結果を表示">' + _esc(slug) + '</code>';
-  }
-
-  function _groomRetireRow(x) {
-    const slug = _esc(x.slug);
-    const auto = (x.tier === 'auto');
-    const tierBadge = '<span class="aibadge ' + (auto ? 'tier-auto' : 'tier-cur') + '">' + _esc(x.tier) + '</span>';
-    const viewBtn = _groomDetailBtn(x.kind, x.slug);
-    const delOrLock = auto
-      ? '<button class="aibtn del" data-act="delete" data-kind="' + _esc(x.kind) + '" data-slug="' + slug + '">delete</button>'
-      : '<span style="color:#999; font-size:.82em;">curated — 手動</span>';
-    return '<tr><td>' + _esc(x.kind) + '</td><td>' + _groomSlugLink(x.kind, x.slug) + '</td><td>' + tierBadge + '</td>' +
-      '<td class="gr-reason-cell">' + _esc(x.reason) + '</td><td class="num">' + (x.use_count || 0) + '</td>' +
-      '<td class="num">' + (x.success_count || 0) + '</td><td style="white-space:nowrap;">' + viewBtn + ' ' + delOrLock + '</td></tr>';
-  }
-
-  function _groomDedupRow(x) {
-    const dropLinks = (x.drops || []).map(d => _groomSlugLink(x.kind, d)).join(', ');
-    const act = '<button class="aibtn" data-act="merge" data-kind="' + _esc(x.kind) +
-      '" data-keep="' + _esc(x.keep) + '" data-drops="' + _esc((x.drops || []).join(',')) + '">merge</button>';
-    return '<tr><td>' + _esc(x.kind) + '</td><td>' + _groomSlugLink(x.kind, x.keep) + '</td>' +
-      '<td style="color:#933;">' + dropLinks + '</td><td>' + act + '</td></tr>';
-  }
-
-  async function loadGrooming() {
-    const retire = [], dedup = [];
-    try {
-      const r = await fetch('/ai/groom-candidates');
-      const j = await r.json();
-      for (const [sing, plural] of [['skill', 'skills'], ['convention', 'conventions']]) {
-        const sec = j[sing] || { retire: [], dedup: [] };
-        (sec.retire || []).forEach(x => retire.push(Object.assign({ kind: plural }, x)));
-        (sec.dedup || []).forEach(x => dedup.push(Object.assign({ kind: plural }, x)));
-      }
-    } catch (e) { /* leave empty */ }
-    _aiState['groom-retire'].items = retire; _aiState['groom-retire'].page = 0; _renderAiPage('groom-retire');
-    _aiState['groom-dedup'].items = dedup;   _aiState['groom-dedup'].page = 0;   _renderAiPage('groom-dedup');
-    const gc = document.getElementById('cntGroom'); if (gc) gc.textContent = retire.length + dedup.length;
-    // Surface a 1-line state so the operator can tell at-a-glance the panel
-    // IS live + the reaper IS scanning.
-    // Build a rich state line so the operator can SEE the reaper is alive,
-    // when it last ran, when it'll run next, and (importantly) why the
-    // candidate list might be 0 even though everything is healthy.
-    try {
-      const gs = document.getElementById('groomState');
-      if (gs) {
-        let st = null;
-        try { st = await (await fetch('/ai/grooming-status')).json(); } catch (_e) { st = null; }
-        const lines = [];
-        // Line 1: liveness.
-        const livePart = (st && st.last_run_at)
-          ? '<span title="' + _esc(st.last_run_at) + '"><iconify-icon icon="lucide:radio-tower" style="color:#196b2c; vertical-align:-2px;"></iconify-icon> reaper 稼働中 · 最終 ' + _aiAgoUtc(st.last_run_at) + '前</span>'
-          : '<span style="color:#a06000;"><iconify-icon icon="lucide:loader-circle" style="vertical-align:-2px;"></iconify-icon> 起動直後 — 最初のスキャン待ち</span>';
-        let nextPart = '';
-        if (st && st.next_run_at) nextPart = ' · 次回 ' + _aiAgoUtc(st.next_run_at, true);
-        const autoR = st && st.auto_retire_enabled ? '<b style="color:#196b2c;">ON</b>' : '<b style="color:#933;">OFF</b>';
-        const autoD = st && st.auto_dedup_enabled  ? '<b style="color:#196b2c;">ON</b>' : '<b style="color:#933;">OFF</b>';
-        lines.push(livePart + nextPart + ' · auto-retire ' + autoR + ' · auto-dedup ' + autoD);
-        // Line 2: candidate counts.
-        lines.push('retire 候補 <b>' + retire.length + '</b> · dedup 候補 <b>' + dedup.length + '</b>');
-        // Line 3: explain WHY the count might be 0.
-        if (st && st.last_pass && st.last_pass.by_kind) {
-          const sk = st.last_pass.by_kind.skill || {};
-          const cv = st.last_pass.by_kind.convention || {};
-          const guards = [];
-          if (sk.cold_start_skip_reason) guards.push('skill: ' + sk.cold_start_skip_reason);
-          if (cv.cold_start_skip_reason) guards.push('convention: ' + cv.cold_start_skip_reason);
-          if (retire.length === 0 && dedup.length === 0 && guards.length) {
-            lines.push('<span style="color:#a06000;"><iconify-icon icon="lucide:shield-alert" style="vertical-align:-2px;"></iconify-icon> 候補ゼロの理由: ' + guards.map(_esc).join(' / ') + '</span>');
-          }
-          // Always show what the last pass scanned (records / dud-allow).
-          const scan = (sk.records != null) ? 'skill ' + sk.records + ' 件 (累計成功 ' + (sk.total_success || 0) + ', dud判定=' + (sk.allow_dud ? 'ON' : 'OFF') + ')' : '';
-          const scan2 = (cv.records != null) ? ' / convention ' + cv.records + ' 件 (累計成功 ' + (cv.total_success || 0) + ', dud判定=' + (cv.allow_dud ? 'ON' : 'OFF') + ')' : '';
-          if (scan || scan2) lines.push('<span style="color:#666;">前回スキャン対象: ' + scan + scan2 + '</span>');
-        }
-        gs.innerHTML = lines.join('<br>');
-        gs.style.display = 'block';
-        gs.style.width = '100%';
-        gs.style.marginTop = '6px';
-        gs.style.lineHeight = '1.6';
-      }
-    } catch (_e) {}
-    // Reflect the auto-* toggles from hub settings.
-    try {
-      const s = await (await fetch('/settings')).json();
-      const v = s.values || {};
-      const tr = document.getElementById('tglAutoRetire'); if (tr) tr.checked = !!v.auto_retire_enabled;
-      const td = document.getElementById('tglAutoDedup');  if (td) td.checked = !!v.auto_dedup_enabled;
-    } catch (e) { /* ignore */ }
-  }
-
-  async function _groomMerge(kind, keep, dropsCsv) {
-    const drops = (dropsCsv || '').split(',').filter(Boolean);
-    if (!drops.length) return;
-    if (!confirm('Merge ' + drops.length + ' ' + kind + ' into "' + keep + '"?')) return;
-    try {
-      const r = await fetch('/' + kind + '/merge', {
-        method: 'POST', headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ keep: keep, drops: drops }),
-      });
-      if (!r.ok) { alert('merge failed: HTTP ' + r.status); return; }
-    } catch (e) { alert('merge failed: ' + e); return; }
-    loadGrooming();
-  }
-
-  async function _setAutoToggle(key, on) {
-    try {
-      const body = {}; body[key] = on;
-      await fetch('/settings', { method: 'PUT', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body) });
-    } catch (e) { alert('toggle failed: ' + e); }
-  }
-
-  // ---- Oracle sub-tab: L1 ffprobe re-probe of stored video assets ----
-  function _humanBytes(b) {
-    if (b == null) return '—';
-    if (b < 1024) return b + ' B';
-    if (b < 1048576) return (b / 1024).toFixed(1) + ' KB';
-    if (b < 1073741824) return (b / 1048576).toFixed(1) + ' MB';
-    return (b / 1073741824).toFixed(2) + ' GB';
-  }
-
-  function _oracleRow(x) {
-    const ok = x.valid;
-    const validMark = ok
-      ? '<span style="color:#196b2c; font-weight:700; font-size:1.05em;">✓</span>'
-      : '<span style="color:#c0392b; font-weight:700; font-size:1.05em;">✗</span>';
-    const dur = x.duration_s != null ? x.duration_s + 's' : '—';
-    const dims = (x.width && x.height) ? x.width + '×' + x.height : '—';
-    const jid = _esc(x.job_id || '');
-    const short = jid.slice(0, 8);
-    const name = _esc(x.name || '');
-    const reason = _esc(x.reason || '');
-    return '<tr>' +
-      '<td><a href="#live/' + jid + '" style="font-family:monospace;font-size:.83em;" title="このジョブの Live パネル (Log+noVNC+Code+Gallery) を開く  job_id=' + jid + '">' + short + '…</a></td>' +
-      '<td style="font-size:.83em;font-family:monospace;max-width:220px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;" title="' + name + ' — クリックで /jobs/' + jid + '/result.json (アセット+raw 蒸留結果) を新タブで開く">' +
-        '<a href="/jobs/' + jid + '/result" target="_blank" style="color:inherit;text-decoration:none;">' + name + '</a></td>' +
-      '<td style="text-align:center;">' + validMark + '</td>' +
-      '<td class="num">' + dur + '</td>' +
-      '<td>' + _esc(x.codec || '—') + '</td>' +
-      '<td class="num">' + dims + '</td>' +
-      '<td class="num">' + _humanBytes(x.bytes) + '</td>' +
-      '<td class="orc-reason-cell" style="font-size:.82em;color:' + (ok ? '#196b2c' : '#933') + ';" title="' + reason + '">' + reason + '</td>' +
-      '</tr>';
-  }
-
-  // Common: translate every cell matching ``selector`` via /translate, stash
-  // the original on ``dataset.orig`` so a second click can restore. Used by
-  // both grooming (reason col) and oracle (reason col).
-  async function _translateTableCells(rootSelector, btnId, targetLang) {
-    const cells = Array.from(document.querySelectorAll(rootSelector));
-    if (!cells.length) return;
-    const btn = document.getElementById(btnId);
-    const lblEl = btn ? btn.querySelector('span') : null;
-    // Toggle back to originals.
-    const allHaveOrig = cells.every(c => c.dataset.orig != null);
-    const anyTranslated = cells.some(c => c.dataset.translated === '1');
-    if (anyTranslated && allHaveOrig) {
-      cells.forEach(c => {
-        c.textContent = c.dataset.orig;
-        c.removeAttribute('data-translated');
-      });
-      if (btn) btn.title = btn.dataset.titleOrig || btn.title;
-      return;
-    }
-    const texts = cells.map(c => c.textContent || '');
-    if (btn) { btn.disabled = true; if (lblEl) lblEl.textContent = '翻訳中…'; }
-    try {
-      const r = await fetch('/translate', {
-        method: 'POST', headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ texts, target_lang: targetLang || _convTargetLang() }),
-      });
-      if (!r.ok) throw new Error('HTTP ' + r.status);
-      const d = await r.json();
-      const out = d.translated || [];
-      cells.forEach((c, i) => {
-        if (c.dataset.orig == null) c.dataset.orig = c.textContent;
-        c.textContent = out[i] || c.textContent;
-        c.dataset.translated = '1';
-      });
-      if (btn) {
-        btn.dataset.titleOrig = btn.title || '';
-        const hits = (d.cache_hits || []).filter(Boolean).length;
-        btn.title = '翻訳済み (' + hits + '/' + texts.length + ' cache hit) — engine: ' + (d.engine_slug || '?');
-      }
-    } catch (e) {
-      alert('翻訳に失敗: ' + (e && e.message ? e.message : e));
-    } finally {
-      if (btn) { btn.disabled = false; if (lblEl) lblEl.textContent = '翻訳'; }
-    }
-  }
-
-  let _oracleLoading = false;
-  async function loadOracle() {
-    if (_oracleLoading) return;
-    _oracleLoading = true;
-    const tbody = document.querySelector('#oracleTable tbody');
-    if (tbody) tbody.innerHTML = '<tr><td colspan=8 class="empty">scanning… (ffprobe 実行中)</td></tr>';
-    try {
-      const r = await fetch('/ai/oracle-stats?limit=200');
-      if (!r.ok) {
-        if (tbody) tbody.innerHTML = '<tr><td colspan=8 class="empty">error: HTTP ' + r.status + '</td></tr>';
-        return;
-      }
-      const j = await r.json();
-      const set = (id, v) => { const el = document.getElementById(id); if (el) el.textContent = (v != null ? v : '—'); };
-      set('oracleTotal',    j.total);
-      set('oracleValid',    j.valid);
-      set('oracleInvalid',  j.invalid);
-      set('oracleValidPct', j.valid_pct != null ? Math.round(j.valid_pct * 100) + '%' : '—');
-      const cnt = document.getElementById('cntOracle'); if (cnt) cnt.textContent = j.total;
-      // By-reason summary chip row
-      const br = document.getElementById('oracleByReason');
-      if (br && j.by_reason) {
-        br.innerHTML = Object.entries(j.by_reason)
-          .sort((a, b) => b[1] - a[1])
-          .map(([k, v]) => '<span style="display:inline-block;margin:0 3px;padding:1px 7px;border-radius:10px;font-size:.82em;background:' +
-            (k === 'ok' ? '#eef8ee' : '#fdecea') + ';color:' + (k === 'ok' ? '#196b2c' : '#933') + ';border:1px solid ' +
-            (k === 'ok' ? '#7ab68a' : '#e8b4b0') + ';">' + _esc(k) + ':' + v + '</span>')
-          .join('');
-      }
-      _aiState['oracle'].items = j.files || [];
-      _aiState['oracle'].page  = 0;
-      _renderAiPage('oracle');
-      try {
-        const os = document.getElementById('oracleState');
-        if (os) {
-          const total = j.total || 0, valid = j.valid || 0, invalid = j.invalid || 0;
-          const pct = j.valid_pct != null ? Math.round(j.valid_pct * 100) : null;
-          const ico = invalid === 0
-            ? '<iconify-icon icon="lucide:shield-check" style="color:#196b2c; vertical-align:-2px;"></iconify-icon>'
-            : '<iconify-icon icon="lucide:alert-triangle" style="color:#b35900; vertical-align:-2px;"></iconify-icon>';
-          const healthMsg = invalid === 0 && total > 0
-            ? '<span style="color:#196b2c;">健全 (invalid 0/' + total + ')</span>'
-            : (total === 0
-                ? '<span style="color:#a06000;">直近に動画アセット無し</span>'
-                : '<span style="color:#b35900;">invalid ' + invalid + '/' + total + ' を検出 (要調査)</span>');
-          os.innerHTML = ico + ' ffprobe 稼働中 · 最終スキャン ' + new Date().toLocaleTimeString()
-            + ' · ' + healthMsg + (pct != null ? ' · valid ' + pct + '%' : '');
-        }
-      } catch (_e) {}
-    } catch (e) {
-      if (tbody) tbody.innerHTML = '<tr><td colspan=8 class="empty">error: ' + _esc('' + e) + '</td></tr>';
-    } finally {
-      _oracleLoading = false;
-    }
-  }
 
   function renderSummary() {
     const tiers = { high:0, medium:0, low:0, stale:0 };
@@ -1671,42 +956,6 @@
       _hkPage = Math.max(0, Math.ceil(total / ps) - 1);
       renderTable();
     });
-    // Delegated handler for the skills/conventions action buttons (works
-    // regardless of script scope -- no global onclick needed).
-    ['skTable', 'cvTable'].forEach(id => {
-      const t = document.getElementById(id);
-      if (t) t.addEventListener('click', (ev) => {
-        const b = ev.target.closest('button.aibtn');
-        if (!b) return;
-        aiAction(b.dataset.kind, b.dataset.slug, b.dataset.act);
-      });
-    });
-    // Skill code viewer modal: close / copy / click-outside.
-    const _scm = document.getElementById('skillCodeModal');
-    const _scClose = document.getElementById('skillCodeClose');
-    const _scCopy = document.getElementById('skillCodeCopy');
-    const _scHide = () => {
-      _scm.style.display = 'none';
-      try { if (typeof _entityHashClear === 'function') _entityHashClear('ai'); } catch (_e) {}
-    };
-    if (_scClose && _scm) _scClose.addEventListener('click', _scHide);
-    if (_scm) _scm.addEventListener('click', (e) => { if (e.target === _scm) _scHide(); });
-    // Convention detail modal: same close behaviour as the skill modal.
-    const _cdm = document.getElementById('convDetailModal');
-    const _cdClose = document.getElementById('convDetailClose');
-    const _cdHide = () => { if (_cdm) _cdm.style.display = 'none'; };
-    if (_cdClose && _cdm) _cdClose.addEventListener('click', _cdHide);
-    if (_cdm) _cdm.addEventListener('click', (e) => { if (e.target === _cdm) _cdHide(); });
-    // Built-in translator button.
-    const _cdTr = document.getElementById('convDetailTranslate');
-    if (_cdTr) _cdTr.addEventListener('click', _convTranslateModal);
-    if (_scCopy) _scCopy.addEventListener('click', async () => {
-      try {
-        await navigator.clipboard.writeText(_skillCodeCurrent || '');
-        const old = _scCopy.innerHTML; _scCopy.textContent = '✓ copied';
-        setTimeout(() => { _scCopy.innerHTML = old; }, 1200);
-      } catch (e) {}
-    });
     // AI tab: load the currently-active sub-tab's data on activation.
     document.querySelectorAll('[data-tab="ai"]').forEach(btn => {
       btn.addEventListener('click', () => {
@@ -1717,7 +966,7 @@
         setAiSubtab(active ? active.dataset.aiSubtab : 'knowledge');
       });
     });
-    // AI sub-tabs (Skills / Conventions) -- same design as the Submit tab.
+    // AI sub-tabs -- same design as the Submit tab.
     // Scope to [data-ai-subtab] so this listener is NOT installed on the
     // Jobs panel's status-filter tabs (which share class .ai-subtab but
     // use data-jobs-status instead). Without the scope, clicking a Jobs
@@ -1726,45 +975,6 @@
     document.querySelectorAll('.ai-subtab[data-ai-subtab]').forEach(btn => {
       btn.addEventListener('click', () => setAiSubtab(btn.dataset.aiSubtab));
     });
-    // Pager prev/next (delegated, per feature -- incl. grooming + oracle).
-    ['pager-skills', 'pager-conventions', 'pager-groom-retire', 'pager-groom-dedup', 'pager-oracle'].forEach(id => {
-      const el = document.getElementById(id);
-      if (el) el.addEventListener('click', (ev) => {
-        const b = ev.target.closest('button.aipg');
-        if (!b || b.disabled) return;
-        _aiPagerClick(b.dataset.kind, b.dataset.aipg);
-      });
-    });
-    // Grooming: retire-table delete, dedup-table merge, refresh, toggles.
-    // Translate buttons on grooming / oracle: shared helper.
-    const _gT = document.getElementById('groomTranslateBtn');
-    if (_gT) _gT.addEventListener('click', () => _translateTableCells('#grTable .gr-reason-cell', 'groomTranslateBtn'));
-    const _oT = document.getElementById('oracleTranslateBtn');
-    if (_oT) _oT.addEventListener('click', () => _translateTableCells('#oracleTable .orc-reason-cell', 'oracleTranslateBtn'));
-    const grT = document.getElementById('grTable');
-    if (grT) grT.addEventListener('click', (ev) => {
-      const sl = ev.target.closest('code.gr-slug');
-      if (sl) { _aiOpenItemDetail(sl.dataset.kind, sl.dataset.slug); return; }
-      const v = ev.target.closest('button.gr-view');
-      if (v) { _aiOpenItemDetail(v.dataset.kind, v.dataset.slug); return; }
-      const b = ev.target.closest('button.aibtn');
-      if (b && b.dataset.act === 'delete') aiAction(b.dataset.kind, b.dataset.slug, 'delete').then(loadGrooming);
-    });
-    const gdT = document.getElementById('gdTable');
-    if (gdT) gdT.addEventListener('click', (ev) => {
-      const sl = ev.target.closest('code.gr-slug');
-      if (sl) { _aiOpenItemDetail(sl.dataset.kind, sl.dataset.slug); return; }
-      const b = ev.target.closest('button.aibtn');
-      if (b && b.dataset.act === 'merge') _groomMerge(b.dataset.kind, b.dataset.keep, b.dataset.drops);
-    });
-    const grefresh = document.getElementById('groomRefreshBtn');
-    if (grefresh) grefresh.addEventListener('click', loadGrooming);
-    const tr = document.getElementById('tglAutoRetire');
-    if (tr) tr.addEventListener('change', () => _setAutoToggle('auto_retire_enabled', tr.checked));
-    const td = document.getElementById('tglAutoDedup');
-    if (td) td.addEventListener('change', () => _setAutoToggle('auto_dedup_enabled', td.checked));
-    const oref = document.getElementById('oracleRefreshBtn');
-    if (oref) oref.addEventListener('click', loadOracle);
     const _hkHide = () => {
       document.getElementById('hkModal').style.display = 'none';
       try { if (typeof _entityHashClear === 'function') _entityHashClear('ai'); } catch (_e) {}
@@ -1917,7 +1127,7 @@ try {
       "ページを画像で見る（画像対応エンジンのみ）": "View pages as images (vision-capable engines only)",
       "codegen がゴール達成か採点": "Score whether codegen reached the goal",
       "失敗から壁・ホスト知識を学習": "Learn barriers and host knowledge from failures",
-      "#ai 作法モーダルの「翻訳」用。空ならチャット既定にフォールバック": "For the #ai conventions modal Translate button. Falls back to chat default when empty.",
+      "POST /translate API 用（管理画面からは未使用）。空ならチャット既定にフォールバック": "For the POST /translate API (not used by the admin UI). Falls back to chat default when empty.",
       // --- engines table on #ai / #engines ---
       "状態": "Status",
       "操作": "Actions",
