@@ -220,7 +220,7 @@
     const pbOn = !!hub.playbooks_enabled;
     if (!d.available) {
       banner.innerHTML = _learnBanner('#c62828', '#fdecea', 'lucide:circle-alert',
-        '<strong>learner の状態が届いていません。</strong> learner が止まっているか、状態を書き出す版になっていません。');
+        '<strong>learner の状態が届いていません。</strong> 3 回取り直しても読めませんでした。learner が 1 時間以上止まっているか、Redis を読めていません。');
       ['aiLearnTiles', 'aiLearnPlaybooks', 'aiLearnSolverDays', 'aiLearnSolverRecent', 'aiLearnOutcomes', 'aiLearnReasons']
         .forEach(id => { const el = $(id); if (el) el.innerHTML = ''; });
       return;
@@ -325,22 +325,47 @@
       : '';
   }
 
+  // The last status document this page rendered: {ts: the document's own
+  // timestamp (s), at: when we fetched it (ms)}.
+  let _aiLearnLast = null;
+  // learner/status.py TTL_S: a document lives this long after it is written.
+  const _LEARN_DOC_TTL_S = 3600;
+
+  async function _aiLearnFetch() {
+    const r = await fetch('/learn/status');
+    if (!r.ok) throw new Error('HTTP ' + r.status);
+    return await r.json();
+  }
+
   async function loadAiLearn() {
-    try {
-      const r = await fetch('/learn/status');
-      if (!r.ok) throw new Error('HTTP ' + r.status);
-      _renderAiLearn(await r.json());
-    } catch (e) {
-      const banner = document.getElementById('aiLearnBanner');
-      // Keep the last good numbers on screen; only say the refresh failed.
-      if (banner && !banner.dataset.loaded) {
-        banner.innerHTML = _learnBanner('#c62828', '#fdecea', 'lucide:circle-alert',
-          '<strong>学習ループの状態を取得できませんでした。</strong> ' + _esc(e && e.message || ''));
-      }
+    const banner = document.getElementById('aiLearnBanner');
+    let d = null, err = null;
+    // "available: false" from ONE hub is not evidence that the learner is
+    // down: a hub whose Redis read timed out answers the same way. Ask again
+    // (the front door hands the retry to another hub) before believing it.
+    for (let i = 0; i < 3; i++) {
+      try { d = await _aiLearnFetch(); err = null; } catch (e) { err = e; d = null; }
+      if (d && d.available) break;
+      if (i < 2) await new Promise(res => setTimeout(res, 500));
+    }
+    if (d && d.available) {
+      _renderAiLearn(d);
+      _aiLearnLast = { ts: (d.status || {}).ts || 0, at: Date.now() };
       return;
     }
-    const banner = document.getElementById('aiLearnBanner');
-    if (banner) banner.dataset.loaded = '1';
+    // A document we showed less than its TTL ago still exists in Redis, so
+    // this is a failed read, not a stopped learner: keep the numbers.
+    if (banner && _aiLearnLast && (Date.now() / 1000 - _aiLearnLast.ts) < _LEARN_DOC_TTL_S) {
+      banner.innerHTML = _learnBanner('#b26a00', '#fff6e5', 'lucide:triangle-alert',
+        '<strong>今回はハブが状態を読めませんでした。</strong> 下の数字は ' +
+        _learnDur((Date.now() - _aiLearnLast.at) / 1000) + '前に取得したものです。30 秒後に取り直します。');
+      return;
+    }
+    if (d) { _renderAiLearn(d); return; }
+    if (banner) {
+      banner.innerHTML = _learnBanner('#c62828', '#fdecea', 'lucide:circle-alert',
+        '<strong>学習ループの状態を取得できませんでした。</strong> ' + _esc(err && err.message || ''));
+    }
   }
 
   // ===== AI I/O log sub-tab =================================================
