@@ -29,7 +29,7 @@ import random
 import time
 from dataclasses import dataclass
 
-from learner import compiler, playbook as P, scheduler as S, solver as V
+from learner import compiler, playbook as P, scheduler as S, solver as V, status as ST
 from learner.hubapi import HubError, HubUnavailable
 from learner.verify import SUCCESS
 from learner.verify import VERSION as VERIFIER_VERSION
@@ -75,6 +75,10 @@ class Autopilot:
         self.rng = rng or random.Random()
         self._sleep = sleep
         self._rev = int(time.time())
+        self._started = time.time()
+        #: Set by the entry point: a callable returning the consumer's
+        #: counters, shown in the status document next to our own.
+        self.consumer_stats = None
         self.stats = {"lifecycle_ticks": 0, "transitions": 0, "published": 0,
                       "runs": 0, "solved": 0, "infra": 0}
 
@@ -141,6 +145,42 @@ class Autopilot:
         doc = P.published_doc(pbs, now_ts=time.time(), rev=self._rev)
         await self.redis.set(P.REDIS_KEY, json.dumps(doc, ensure_ascii=False, separators=(",", ":")))
         self.stats["published"] = len(doc["items"])
+        return doc
+
+    # ---- status ----------------------------------------------------------
+
+    async def status_doc(self) -> dict:
+        """What the learner is doing, for a person (``learner/status.py``)."""
+        pbs = await self.store.load_playbooks(include_retired=True)
+        counts = await self.store.playbook_counts([p.id for p in pbs])
+        c = self.sched_cfg
+        return ST.build(
+            now_ts=time.time(), started_ts=self._started, manifest=self.manifest(),
+            config={
+                "solver_enabled": self.cfg.solver_enabled,
+                "target_reasons": list(c.target_reasons),
+                "daily_runs": c.daily_runs, "daily_tokens": c.daily_tokens,
+                "trial_pct": self.life_cfg.trial_pct, "holdout_pct": self.life_cfg.holdout_pct,
+                "min_n": self.life_cfg.min_n,
+            },
+            consumer=self.consumer_stats() if callable(self.consumer_stats) else None,
+            autopilot=self.stats,
+            playbooks=ST.playbooks_section(pbs, counts),
+            solver=ST.solver_section(
+                await self.store.solver_days(), await self.store.recent_runs(limit=ST.MAX_RECENT_RUNS),
+                today=_utcnow().date(), daily_runs=c.daily_runs, daily_tokens=c.daily_tokens,
+                enabled=self.cfg.solver_enabled,
+            ),
+            keys=ST.keys_section(await self.store.key_summary()),
+            outcomes=ST.outcomes_section(await self.store.outcome_days(), await self.store.fail_reasons()),
+        )
+
+    async def publish_status(self) -> dict:
+        doc = await self.status_doc()
+        await self.redis.set(
+            ST.REDIS_KEY, json.dumps(doc, ensure_ascii=False, separators=(",", ":"), default=str),
+            ex=ST.TTL_S,
+        )
         return doc
 
     # ---- solving ---------------------------------------------------------
@@ -265,6 +305,14 @@ class Autopilot:
                 raise
             except Exception:
                 log.warning("lifecycle tick failed", exc_info=True)
+            # After the tick, and on its own: the status is for people, so
+            # failing to write it must never cost a transition or a publish.
+            try:
+                await self.publish_status()
+            except asyncio.CancelledError:
+                raise
+            except Exception:
+                log.warning("status publish failed", exc_info=True)
             await _wait(stop, self.cfg.lifecycle_interval_s)
 
     async def _solver_loop(self, stop: asyncio.Event) -> None:

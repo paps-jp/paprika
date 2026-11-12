@@ -166,6 +166,7 @@ async def main() -> None:
         asyncio.create_task(_stats_loop(consumer, stop, autopilot)),
     ]
     if autopilot is not None:
+        autopilot.consumer_stats = lambda: consumer.stats
         await autopilot.store.ensure_schema()
         log.info("autopilot on: solver=%s", autopilot.cfg.solver_enabled)
         tasks.append(asyncio.create_task(autopilot.run(stop)))

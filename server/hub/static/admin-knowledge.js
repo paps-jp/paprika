@@ -122,10 +122,16 @@
     // Lazy-load the activated sub-tab's data. The 稼働中 tab starts a light
     // poller; every OTHER sub-tab stops it, so it only polls while visible.
     if (name === 'live') {
+      _aiLearnStop();
       _aiLiveStart();
       return;
     }
     _aiLiveStop();
+    if (name === 'learn') {
+      _aiLearnStart();
+      return;
+    }
+    _aiLearnStop();
     if (name === 'roles') {
       loadRoles();
       return;
@@ -141,6 +147,200 @@
       _aiIoStart();
     }
     if (name !== 'aiio') _aiIoStop();
+  }
+
+  // ===== 学習ループ sub-tab ==================================================
+  // What the out-of-process learner is doing: GET /learn/status returns the
+  // one status document the learner publishes to Redis (learner/status.py),
+  // plus this hub's own view of the playbook mechanism. Read-only. Polled
+  // every 30 s, and only while the pane is on screen.
+  let _aiLearnTimer = null;
+  const _LEARN_RESULT = {
+    solved: '解けた', trace: 'クリックまで', no_action: '打つ手なし', gave_up: '断念',
+    exhausted: '手数切れ', infra: '基盤エラー', llm_bad_output: 'AI 出力不正',
+    uncompilable: '手順化できず', replay_fail: '再生で失敗', generalize_fail: '他の URL で失敗',
+  };
+  const _LEARN_STATE = { active: '適用中', trial: '試行中', candidate: '候補', retired: '引退' };
+  const _LEARN_STATE_COLOR = { active: '#2e7d32', trial: '#1a6a8b', candidate: '#7a6a2a', retired: '#999' };
+  const _LEARN_PB_REASON = {
+    compiled: '作成直後', trial_started: '試行開始', trial_beats_control: '比較群を上回った',
+    trial_worse_than_control: '比較群を下回った', trial_no_gain: '効果なし', trial_no_traffic: '該当ジョブなし',
+    active_decayed: '効かなくなった', active_unused: '使われていない',
+  };
+  const _LEARN_INTENT = { video: '動画', page: 'ページ' };
+
+  function _aiLearnStop() {
+    if (_aiLearnTimer) { clearInterval(_aiLearnTimer); _aiLearnTimer = null; }
+  }
+  function _aiLearnVisible() {
+    if (document.hidden) return false;
+    const pane = document.querySelector('.ai-subpane[data-ai-subpane="learn"]');
+    return !!(pane && pane.offsetParent !== null);
+  }
+  function _aiLearnStart() {
+    _aiLearnStop();
+    loadAiLearn();
+    _aiLearnTimer = setInterval(() => { if (_aiLearnVisible()) loadAiLearn(); }, 30000);
+  }
+  function _learnAgo(iso) { const a = _aiAgoUtc(iso); return a === '—' ? a : a + '前'; }
+  function _learnShort(t, max) { t = '' + (t || ''); return t.length > max ? t.slice(0, max - 1) + '…' : t; }
+  function _learnNum(n) { return (n == null ? 0 : n).toLocaleString('en-US'); }
+  function _learnPct(x) { return (x == null) ? '—' : (x * 100).toFixed(1) + '%'; }
+  function _learnDur(sec) {
+    sec = Math.max(0, Math.round(sec || 0));
+    if (sec < 90) return sec + '秒';
+    if (sec < 5400) return Math.round(sec / 60) + '分';
+    if (sec < 172800) return Math.round(sec / 3600) + '時間';
+    return Math.round(sec / 86400) + '日';
+  }
+  function _learnTable(head, rows, empty) {
+    if (!rows.length) return '<div class="empty">' + empty + '</div>';
+    return '<table style="width:100%;border-collapse:collapse;font-size:.9em;">' +
+      '<thead><tr style="border-bottom:2px solid #e2e6ea;text-align:left;color:#666;">' +
+      head.map(h => '<th style="padding:4px 6px;' + (h[1] ? 'text-align:right;' : '') + 'white-space:nowrap;">' + h[0] + '</th>').join('') +
+      '</tr></thead><tbody>' + rows.join('') + '</tbody></table>';
+  }
+  function _learnTd(html, right, extra) {
+    return '<td style="padding:4px 6px;' + (right ? 'text-align:right;white-space:nowrap;' : '') + (extra || '') + '">' + html + '</td>';
+  }
+  function _learnBanner(color, bg, icon, html) {
+    return '<div style="border:1px solid ' + color + ';background:' + bg + ';border-radius:8px;padding:8px 12px;font-size:.9em;">' +
+      '<iconify-icon icon="' + icon + '" style="color:' + color + ';"></iconify-icon> ' + html + '</div>';
+  }
+  // "30 / 40 (4.5k–...)" style cell for one experiment arm.
+  function _learnArm(a) {
+    if (!a || !a.scored) return '<span style="color:#aaa;">まだ 0 件</span>';
+    return '<strong>' + _learnPct(a.rate) + '</strong> <span style="color:#888;">(' + _learnNum(a.success) + ' / ' + _learnNum(a.scored) + ')</span>';
+  }
+
+  function _renderAiLearn(d) {
+    const $ = id => document.getElementById(id);
+    const banner = $('aiLearnBanner'); if (!banner) return;
+    const hub = d.hub || {};
+    const pbOn = !!hub.playbooks_enabled;
+    if (!d.available) {
+      banner.innerHTML = _learnBanner('#c62828', '#fdecea', 'lucide:circle-alert',
+        '<strong>learner の状態が届いていません。</strong> learner が止まっているか、状態を書き出す版になっていません。');
+      ['aiLearnTiles', 'aiLearnPlaybooks', 'aiLearnSolverDays', 'aiLearnSolverRecent', 'aiLearnOutcomes', 'aiLearnReasons']
+        .forEach(id => { const el = $(id); if (el) el.innerHTML = ''; });
+      return;
+    }
+    const s = d.status || {}, cfg = s.config || {}, mf = s.manifest || {};
+    const pbs = s.playbooks || {}, cnt = pbs.counts || {}, solver = s.solver || {}, today = solver.today || {};
+    const keys = s.keys || {}, con = s.consumer || {};
+    const bits = [
+      '最終更新 ' + _learnDur(d.age_s) + '前',
+      '起動から ' + _learnDur((s.ts || 0) - (s.started_ts || 0)),
+      'Solver ' + (cfg.solver_enabled ? 'ON' : 'OFF') + (mf.model ? '（' + _esc(mf.model) + '）' : ''),
+      'ハブでの Playbook 適用 ' + (pbOn ? 'ON' : 'OFF'),
+      '起動後に読んだ完了ジョブ ' + _learnNum(con.read) + ' 件' + ((con.flush_errors || 0) > 0 ? '（書込エラー ' + _learnNum(con.flush_errors) + '）' : ''),
+    ].join(' ・ ');
+    if (d.stale) {
+      banner.innerHTML = _learnBanner('#c62828', '#fdecea', 'lucide:circle-alert',
+        '<strong>learner の更新が止まっています。</strong> 下の数字は ' + _learnDur(d.age_s) + '前のものです。 <span style="color:#666;">' + bits + '</span>');
+    } else if (!pbOn) {
+      banner.innerHTML = _learnBanner('#b26a00', '#fff6e5', 'lucide:triangle-alert',
+        '<strong>learner は動いていますが、ハブは Playbook を適用していません</strong>（設定 learn_playbooks_enabled が OFF）。 <span style="color:#666;">' + bits + '</span>');
+    } else {
+      banner.innerHTML = _learnBanner('#2e7d32', '#eef7f0', 'lucide:circle-check', '<strong>learner は動いています。</strong> <span style="color:#666;">' + bits + '</span>');
+    }
+
+    const runs = today.runs || 0, budget = today.budget_runs || 0;
+    const tok = today.tokens || 0, tokBudget = today.budget_tokens || 0;
+    $('aiLearnTiles').innerHTML =
+      _aiCard('lucide:circle-check', 'Playbook 適用中', cnt.active, '比較群を上回り、全体に適用', '#2e7d32') +
+      _aiCard('lucide:flask-conical', 'Playbook 試行中', cnt.trial, '一部のジョブで効果を測定中', '#1a6a8b') +
+      _aiCard('lucide:archive', 'Playbook 引退', cnt.retired, '効果なし・効かなくなった', '#666') +
+      _aiCard('lucide:bot', 'Solver 本日の実行', runs, '上限 ' + _learnNum(budget) + ' 回' + (budget && runs >= budget ? '（使い切り）' : ''), '#66558c') +
+      _aiCard('lucide:coins', '本日のトークン', _learnNum(tok), '上限 ' + _learnNum(tokBudget), '#7a6a2a') +
+      _aiCard('lucide:key-round', '解けたキー', keys.solved, '試したキー ' + _learnNum(keys.keys) + ' ・ 休眠中 ' + _learnNum(keys.dormant), '#2e7d32');
+
+    // ---- playbooks
+    const pbRows = (pbs.items || []).map(p => {
+      const a = p.applied || {}, c = p.compare || {};
+      const diff = (a.rate != null && c.rate != null) ? (a.rate - c.rate) : null;
+      const diffHtml = diff == null ? '—' :
+        '<span style="color:' + (diff > 0 ? '#2e7d32' : (diff < 0 ? '#c62828' : '#666')) + ';font-weight:600;">' +
+        (diff > 0 ? '+' : '') + (diff * 100).toFixed(1) + 'pt</span>';
+      const share = p.state === 'trial' ? p.apply_pct + '% に適用'
+        : (p.state === 'active' ? (100 - p.holdout_pct) + '% に適用' : '');
+      return '<tr style="border-bottom:1px solid #eef0f2;' + (p.state === 'retired' ? 'color:#888;' : '') + '">' +
+        _learnTd('#' + p.id, true) +
+        _learnTd('<div style="font-weight:600;">' + _esc(p.host) + '</div><div style="font-size:.85em;color:#888;word-break:break-all;">' +
+          _esc(p.template) + ' ・ ' + (_LEARN_INTENT[p.intent] || _esc(p.intent)) + ' ・ ' + p.n_actions + ' 手</div>') +
+        _learnTd('<span style="color:' + (_LEARN_STATE_COLOR[p.state] || '#666') + ';font-weight:600;white-space:nowrap;">' +
+          (_LEARN_STATE[p.state] || _esc(p.state)) + '</span>' + (share ? '<div style="font-size:.8em;color:#888;white-space:nowrap;">' + share + '</div>' : '')) +
+        _learnTd(_learnArm(a), true) + _learnTd(_learnArm(c), true) + _learnTd(diffHtml, true) +
+        _learnTd(_esc(_LEARN_PB_REASON[p.reason] || p.reason || '')) +
+        _learnTd(_learnAgo(p.state_changed_at), true, 'color:#888;') + '</tr>';
+    });
+    $('aiLearnPlaybooks').innerHTML = _learnTable(
+      [['#', 1], ['対象（ホスト / URL の型）'], ['状態'], ['適用した群の成功率', 1], ['比較群の成功率', 1], ['差', 1], ['理由'], ['状態変更', 1]],
+      pbRows, 'まだ Playbook はありません。Solver が手順を見つけ、再生で確かめられると、ここに候補として現れます。');
+
+    // ---- solver: per day
+    const dayRows = (solver.days || []).map(day => {
+      const br = day.by_result || {};
+      const chips = Object.keys(br).sort((x, y) => br[y] - br[x]).map(k =>
+        '<span style="display:inline-block;border:1px solid #dde2e7;border-radius:10px;padding:0 7px;margin:1px 3px 1px 0;font-size:.85em;' +
+        (k === 'solved' ? 'background:#eef7f0;border-color:#a5d6a7;' : '') + '">' + _esc(_LEARN_RESULT[k] || k) + ' ' + br[k] + '</span>').join('');
+      return '<tr style="border-bottom:1px solid #eef0f2;">' + _learnTd(_esc(day.day), false, 'white-space:nowrap;') +
+        _learnTd(_learnNum(day.runs), true) + _learnTd(_learnNum(br.solved || 0), true) + _learnTd(chips) + _learnTd(_learnNum(day.tokens), true) + '</tr>';
+    });
+    $('aiLearnSolverDays').innerHTML = _learnTable(
+      [['日 (UTC)'], ['実行', 1], ['解けた', 1], ['結果の内訳'], ['トークン', 1]], dayRows,
+      cfg.solver_enabled ? 'この 7 日間、Solver はまだ実行していません。' : 'Solver は OFF です。');
+
+    // ---- solver: recent runs
+    const runRows = (solver.recent || []).slice(0, 15).map(r => {
+      const ok = r.result === 'solved';
+      return '<tr style="border-bottom:1px solid #eef0f2;">' + _learnTd(_learnAgo(r.ts), true, 'color:#888;') +
+        _learnTd('<div>' + _esc(r.host) + '</div><div style="font-size:.85em;color:#888;word-break:break-all;" title="' + _esc(r.url || '') + '">' +
+          _esc(_learnShort(r.url || r.template, 72)) + '</div>') +
+        _learnTd('<span style="font-weight:600;white-space:nowrap;color:' + (ok ? '#2e7d32' : (r.result === 'infra' ? '#b26a00' : '#555')) + ';">' +
+          _esc(_LEARN_RESULT[r.result] || r.result) + '</span>') +
+        _learnTd(_esc(r.reason || ''), false, 'font-size:.9em;color:#555;') +
+        _learnTd(r.steps, true) + _learnTd(_learnNum(r.tokens), true) + _learnTd(_learnDur(r.duration_s), true) + '</tr>';
+    });
+    $('aiLearnSolverRecent').innerHTML = runRows.length ? _learnTable(
+      [['いつ', 1], ['対象'], ['結果'], ['理由（AI の説明・判定）'], ['手数', 1], ['トークン', 1], ['所要', 1]], runRows, '') : '';
+
+    // ---- verifier outcomes
+    const out = s.outcomes || {};
+    const outRows = (out.days || []).map(o =>
+      '<tr style="border-bottom:1px solid #eef0f2;">' + _learnTd(_esc(o.day), false, 'white-space:nowrap;') +
+      _learnTd(_LEARN_INTENT[o.intent] || _esc(o.intent)) + _learnTd(_learnNum(o.n), true) + _learnTd(_learnNum(o.scored), true) +
+      _learnTd('<strong>' + _learnPct(o.rate) + '</strong>', true) + _learnTd(_learnNum(o.success), true) + _learnTd(_learnNum(o.partial), true) +
+      _learnTd(_learnNum(o.fail), true) + _learnTd(_learnNum(o.blocked), true) + _learnTd(_learnNum(o.na), true, 'color:#888;') + '</tr>');
+    $('aiLearnOutcomes').innerHTML = _learnTable(
+      [['日 (UTC)'], ['目的'], ['ジョブ', 1], ['判定できた', 1], ['成功率', 1], ['成功', 1], ['部分成功', 1], ['失敗', 1], ['ブロック', 1], ['対象外', 1]],
+      outRows, 'まだ判定結果がありません。');
+    const reasons = out.fail_reasons_24h || [];
+    $('aiLearnReasons').innerHTML = reasons.length
+      ? '<div style="font-size:.85em;color:#666;">直近 24 時間の失敗理由（抜き取り記録での件数）: ' + reasons.map(x =>
+          '<span style="display:inline-block;border:1px solid #dde2e7;border-radius:10px;padding:0 7px;margin:1px 3px 1px 0;' +
+          ((cfg.target_reasons || []).indexOf(x.reason) >= 0 && x.intent === 'video' ? 'background:#eef4fb;border-color:#9ec5e8;' : '') + '">' +
+          (_LEARN_INTENT[x.intent] || _esc(x.intent)) + ' / ' + _esc(x.reason) + ' ' + _learnNum(x.n) + '</span>').join('') +
+        ' <span style="color:#999;">青＝Solver が今ねらっている種類</span></div>'
+      : '';
+  }
+
+  async function loadAiLearn() {
+    try {
+      const r = await fetch('/learn/status');
+      if (!r.ok) throw new Error('HTTP ' + r.status);
+      _renderAiLearn(await r.json());
+    } catch (e) {
+      const banner = document.getElementById('aiLearnBanner');
+      // Keep the last good numbers on screen; only say the refresh failed.
+      if (banner && !banner.dataset.loaded) {
+        banner.innerHTML = _learnBanner('#c62828', '#fdecea', 'lucide:circle-alert',
+          '<strong>学習ループの状態を取得できませんでした。</strong> ' + _esc(e && e.message || ''));
+      }
+      return;
+    }
+    const banner = document.getElementById('aiLearnBanner');
+    if (banner) banner.dataset.loaded = '1';
   }
 
   // ===== AI I/O log sub-tab =================================================
@@ -686,6 +886,7 @@
     const kind = (i >= 0 ? s.slice(0, i) : '').toLowerCase();
     const id = i >= 0 ? s.slice(i + 1) : s;
     if (!id) return;
+    _aiEntityOpenedAt = Date.now();   // this call picks the sub-tab; see aiPanelActivated()
     if (kind === 'engines' || s === 'engines') {
       setAiSubtab('engines');
       return;
@@ -719,6 +920,21 @@
     }
   }
   try { window.aiOpenEntity = aiOpenEntity; } catch (_e) {}
+
+  // Called by setTab() (admin-core.js) every time the AI tab becomes the
+  // visible one -- by a click, a reload on #ai, a bookmark or a link -- so
+  // the active sub-tab loads its data and starts its poller. An entity
+  // deep link (#ai/host/...) has just chosen and loaded its own sub-tab in
+  // aiOpenEntity(); that one activation is skipped so nothing loads twice.
+  let _aiEntityOpenedAt = 0;
+  function aiPanelActivated() {
+    if (Date.now() - _aiEntityOpenedAt < 500) return;
+    // Scope to AI subtabs only -- the .ai-subtab class is also used by
+    // the Jobs panel's status filter.
+    const active = document.querySelector('.ai-subtab[data-ai-subtab].active');
+    setAiSubtab(active ? active.dataset.aiSubtab : 'live');
+  }
+  try { window.aiPanelActivated = aiPanelActivated; } catch (_e) {}
 
   function renderSummary() {
     const tiers = { high:0, medium:0, low:0, stale:0 };
@@ -955,16 +1171,6 @@
       const ps = _hkPageSize();
       _hkPage = Math.max(0, Math.ceil(total / ps) - 1);
       renderTable();
-    });
-    // AI tab: load the currently-active sub-tab's data on activation.
-    document.querySelectorAll('[data-tab="ai"]').forEach(btn => {
-      btn.addEventListener('click', () => {
-        // Scope to AI subtabs only — the .ai-subtab class is also used
-        // by the Jobs panel's status filter, which can be .active when
-        // the AI tab is opened.
-        const active = document.querySelector('.ai-subtab[data-ai-subtab].active');
-        setAiSubtab(active ? active.dataset.aiSubtab : 'knowledge');
-      });
     });
     // AI sub-tabs -- same design as the Submit tab.
     // Scope to [data-ai-subtab] so this listener is NOT installed on the

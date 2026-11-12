@@ -2405,6 +2405,7 @@ curl 'http://paprika.lan/extensions/ublock-lite/download' --output ublock-lite.t
 <div class="panel" data-panel="ai">
     <div class="ai-subtabs" role="tablist">
       <button type="button" class="ai-subtab active" data-ai-subtab="live" role="tab" aria-selected="true"><iconify-icon icon="lucide:activity"></iconify-icon> <span data-i18n="ai.subtab.live">稼働中</span></button>
+      <button type="button" class="ai-subtab" data-ai-subtab="learn" role="tab" aria-selected="false" data-i18n-title="ai.subtab.learn.title" title="ハブの外で動く学習系 (learner) の状態"><iconify-icon icon="lucide:refresh-ccw-dot"></iconify-icon> <span data-i18n="ai.subtab.learn">学習ループ</span></button>
       <button type="button" class="ai-subtab" data-ai-subtab="roles" role="tab" aria-selected="false"><iconify-icon icon="lucide:sliders-horizontal"></iconify-icon> <span data-i18n="ai.subtab.roles">役割</span></button>
       <button type="button" class="ai-subtab" data-ai-subtab="engines" role="tab" aria-selected="false"><iconify-icon icon="lucide:wand-sparkles"></iconify-icon> <span data-i18n="ai.subtab.engines">エンジン</span> <span class="count" id="cntEngines">0</span></button>
       <button type="button" class="ai-subtab" data-ai-subtab="knowledge" role="tab" aria-selected="false"><iconify-icon icon="lucide:brain"></iconify-icon> <span data-i18n="ai.subtab.knowledge">ホスト知識</span> <span class="count" id="cntKnowledge">0</span></button>
@@ -2429,6 +2430,26 @@ curl 'http://paprika.lan/extensions/ublock-lite/download' --output ublock-lite.t
     </table>
     <h3 style="margin:6px 0;font-size:1em;"><iconify-icon icon="lucide:history"></iconify-icon> 直近のAIイベント <span style="font-size:.72em;color:#999;font-weight:normal;">(蒸留 / 視覚 / エスカレ / recipe)</span></h3>
     <div id="aiLiveRecent"></div>
+  </section>
+    </div>
+    <div class="ai-subpane" data-ai-subpane="learn" style="display:none;">
+  <section>
+    <h2><iconify-icon icon="lucide:refresh-ccw-dot"></iconify-icon> <span data-i18n="ai.subtab.learn">学習ループ</span>
+      <span style="font-size:0.7em; color:#888; font-weight:normal; margin-left:8px;" data-i18n="learn.subtitle">ハブの外で動く learner の状態（30秒ごと自動更新・表示中のみ）</span>
+    </h2>
+    <div id="aiLearnBanner" style="margin:10px 0 12px;"><div class="empty" data-i18n="learn.loading">読み込み中…</div></div>
+    <div id="aiLearnTiles" style="display:flex;gap:10px;flex-wrap:wrap;margin-bottom:18px;"></div>
+    <h3 style="margin:6px 0;font-size:1em;"><iconify-icon icon="lucide:list-checks"></iconify-icon> <span data-i18n="learn.h.playbooks">Playbook（検証済みの手順）</span>
+      <span style="font-size:.72em;color:#999;font-weight:normal;" data-i18n="learn.h.playbooks.sub">適用した群と、適用しなかった比較群の成功率</span></h3>
+    <div id="aiLearnPlaybooks" style="margin-bottom:18px;overflow-x:auto;"></div>
+    <h3 style="margin:6px 0;font-size:1em;"><iconify-icon icon="lucide:bot"></iconify-icon> <span data-i18n="learn.h.solver">Solver（手順を探す AI）の実行</span>
+      <span style="font-size:.72em;color:#999;font-weight:normal;" data-i18n="learn.h.solver.sub">日別の結果と直近の実行（日付は UTC）</span></h3>
+    <div id="aiLearnSolverDays" style="margin-bottom:10px;overflow-x:auto;"></div>
+    <div id="aiLearnSolverRecent" style="margin-bottom:18px;overflow-x:auto;"></div>
+    <h3 style="margin:6px 0;font-size:1em;"><iconify-icon icon="lucide:scale"></iconify-icon> <span data-i18n="learn.h.outcomes">実ジョブの判定（Verifier）</span>
+      <span style="font-size:.72em;color:#999;font-weight:normal;" data-i18n="learn.h.outcomes.sub">全ジョブを機械的に判定した結果。成功率は判定できたジョブが分母</span></h3>
+    <div id="aiLearnOutcomes" style="margin-bottom:10px;overflow-x:auto;"></div>
+    <div id="aiLearnReasons" style="margin-bottom:6px;"></div>
   </section>
     </div>
     <div class="ai-subpane" data-ai-subpane="roles" style="display:none;">

@@ -969,13 +969,15 @@
 
   /* AI tab sub-tabs: same look as the Submit tab's sub-tabs (separate
      classes so the Submit sub-tab JS wiring doesn't grab them). */
-  .ai-subtabs { display: flex; gap: 4px; padding: 0; margin: 0; border-bottom: 1px solid #d4cfca; }
+  /* Wrap to a second row on a narrow window instead of squeezing each
+     label into a one-character-wide column. */
+  .ai-subtabs { display: flex; flex-wrap: wrap; gap: 4px; padding: 0; margin: 0; border-bottom: 1px solid #d4cfca; }
   .ai-subtab {
     padding: .55rem 1.1rem .6rem; font: 600 .9rem/1 inherit;
     border: 1px solid #d4cfca; border-bottom: none; border-radius: 7px 7px 0 0;
     background: #f3f0ec; color: #777; cursor: pointer; display: inline-flex;
     align-items: center; gap: 6px; position: relative; top: 1px;
-    transition: background .15s, color .15s;
+    transition: background .15s, color .15s; white-space: nowrap;
   }
   .ai-subtab:hover:not(.active) { background: #f7f4f0; color: #444; }
   .ai-subtab.active {

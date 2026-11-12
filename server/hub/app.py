@@ -1824,6 +1824,11 @@ from server.hub.routes.wall import router as _wall_router
 
 app.include_router(_wall_router)
 
+# ---- /learn/status -- what the out-of-process learner is doing (read-only)
+from server.hub.routes.learn import router as _learn_router
+
+app.include_router(_learn_router)
+
 # ---- /stats/video-leakage -- download_video jobs that completed with no video
 from server.hub.routes.videostats import router as _videostats_router
 

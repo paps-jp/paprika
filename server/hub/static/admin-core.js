@@ -440,6 +440,16 @@ const I18N_RESOURCES = {
     "knowledge.pager.size":         "表示件数",
     // AI tab common (sub-tabs, ticker, GPU gauge)
     "ai.subtab.live":               "稼働中",
+    "ai.subtab.learn":              "学習ループ",
+    "ai.subtab.learn.title":        "ハブの外で動く学習系 (learner) の状態",
+    "learn.subtitle":               "ハブの外で動く learner の状態（30秒ごと自動更新・表示中のみ）",
+    "learn.loading":                "読み込み中…",
+    "learn.h.playbooks":            "Playbook（検証済みの手順）",
+    "learn.h.playbooks.sub":        "適用した群と、適用しなかった比較群の成功率",
+    "learn.h.solver":               "Solver（手順を探す AI）の実行",
+    "learn.h.solver.sub":           "日別の結果と直近の実行（日付は UTC）",
+    "learn.h.outcomes":             "実ジョブの判定（Verifier）",
+    "learn.h.outcomes.sub":         "全ジョブを機械的に判定した結果。成功率は判定できたジョブが分母",
     "ai.subtab.roles":              "役割",
     "ai.subtab.engines":            "エンジン",
     "ai.subtab.knowledge":          "ホスト知識",
@@ -1014,6 +1024,16 @@ const I18N_RESOURCES = {
     "knowledge.pager.size":         "rows per page",
     // AI tab common
     "ai.subtab.live":               "Live",
+    "ai.subtab.learn":              "Learning loop",
+    "ai.subtab.learn.title":        "State of the out-of-process learner",
+    "learn.subtitle":               "State of the learner running outside the hubs (refreshes every 30 s while visible)",
+    "learn.loading":                "Loading…",
+    "learn.h.playbooks":            "Playbooks (verified steps)",
+    "learn.h.playbooks.sub":        "Success rate of the applied group vs. the comparison group",
+    "learn.h.solver":               "Solver runs (the AI that looks for steps)",
+    "learn.h.solver.sub":           "Results per day and the latest runs (dates are UTC)",
+    "learn.h.outcomes":             "How real jobs are judged (Verifier)",
+    "learn.h.outcomes.sub":         "Every job, judged mechanically. The rate is over the jobs that could be scored",
     "ai.subtab.roles":              "Roles",
     "ai.subtab.engines":            "Engines",
     "ai.subtab.knowledge":          "Host Knowledge",
@@ -1358,6 +1378,14 @@ function setTab(name, { updateHash = true } = {}) {
   // after the full script has executed, so all constants are initialised.
   if (name === 'settings' && typeof loadSettingsPanel === 'function') {
     setTimeout(loadSettingsPanel, 0);
+  }
+  // AI tab: load the active sub-tab's data on EVERY activation -- a click
+  // on the tab, a reload on #ai, a bookmark, a link. (It used to hang off
+  // the tab button's click only, so opening #ai directly left 稼働中 on
+  // "読み込み中…" until the tab was clicked.) Deferred for the same
+  // load-order reason as the settings panel above.
+  if (name === 'ai') {
+    setTimeout(() => { if (typeof aiPanelActivated === 'function') aiPanelActivated(); }, 0);
   }
   // Highlight the "More" dropdown when one of its children is active.
   const moreWrap = document.getElementById('moreTabWrap');

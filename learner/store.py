@@ -226,6 +226,49 @@ class Store:
         r = rows[0] if rows else (0, 0)
         return int(r[0] or 0), int(r[1] or 0)
 
+    # ---- status (read-only; feeds learner/status.py) ---------------------
+
+    async def solver_days(self, *, days: int = 7) -> list[tuple]:
+        """(day, result, runs, tokens) per UTC day."""
+        return await self._fetch(
+            "SELECT DATE(ts), result, COUNT(*), SUM(tokens) FROM learn_solver_runs "
+            "WHERE ts >= UTC_DATE() - INTERVAL %s DAY GROUP BY DATE(ts), result",
+            (max(int(days) - 1, 0),),
+        )
+
+    async def recent_runs(self, *, limit: int = 30) -> list[tuple]:
+        return await self._fetch(
+            "SELECT ts, host, template, klass, url, result, reason, steps, tokens, duration_s, pb_id "
+            "FROM learn_solver_runs ORDER BY id DESC LIMIT %s", (int(limit),),
+        )
+
+    async def key_summary(self) -> list[tuple]:
+        """(klass, keys, runs, solved, keys dormant right now)."""
+        return await self._fetch(
+            "SELECT klass, COUNT(*), SUM(runs), SUM(solved), "
+            "SUM(dormant_until IS NOT NULL AND dormant_until > UTC_TIMESTAMP()) "
+            "FROM learn_key_state GROUP BY klass"
+        )
+
+    async def outcome_days(self, *, days: int = 7) -> list[tuple]:
+        """(day, intent, n, one sum per verify.OUTCOMES) over every arm."""
+        from learner.verify import OUTCOMES
+        sums = ", ".join(f"SUM(n_{o})" for o in OUTCOMES)
+        return await self._fetch(
+            f"SELECT day, intent, SUM(n), {sums} FROM learn_template_stats_daily "
+            "WHERE day >= UTC_DATE() - INTERVAL %s DAY GROUP BY day, intent",
+            (max(int(days) - 1, 0),),
+        )
+
+    async def fail_reasons(self, *, hours: int = 24, limit: int = 12) -> list[tuple]:
+        """(intent, reason, n) of jobs judged ``fail`` in the last hours.
+        Counted on the sampled detail events, so the numbers are a sample."""
+        return await self._fetch(
+            "SELECT intent, reason, COUNT(*) FROM learn_outcome_events WHERE outcome = 'fail' "
+            "AND ts > UTC_TIMESTAMP() - INTERVAL %s HOUR GROUP BY intent, reason "
+            "ORDER BY COUNT(*) DESC LIMIT %s", (int(hours), int(limit)),
+        )
+
     # ---- Solver outputs --------------------------------------------------
 
     async def record_run(self, *, host: str, template: str, intent: str, klass: str, url: str,
