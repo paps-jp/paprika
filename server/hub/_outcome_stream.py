@@ -87,6 +87,13 @@ def _host(url: str | None) -> str:
         return ""
 
 
+def _int_or_none(v: Any) -> int | None:
+    try:
+        return int(v) if v is not None and v != "" else None
+    except (TypeError, ValueError):
+        return None
+
+
 def _get(obj: Any, name: str, default: Any = None) -> Any:
     if obj is None:
         return default
@@ -181,6 +188,12 @@ def build_event(info, result=None, *, error: str | None = None) -> dict:
         # Experiment arm stamped at dispatch (server/hub/_learn_arm.py):
         # "recipe" | "holdout" (a recipe matched but was withheld) | "".
         "arm": str(learn.get("arm") or "")[:16],
+        # Playbook experiment ids (server/hub/_playbooks.py): the playbook
+        # this job was assigned to, its version, and -- for an ``active``
+        # job that doubles as a trial's comparison group -- that trial.
+        "pb": _int_or_none(learn.get("pb")),
+        "pb_ver": _int_or_none(learn.get("ver")),
+        "pb_vs": _int_or_none(learn.get("vs")),
         "error": (str(error if error is not None else _get(info, "error", "") or ""))[:300],
         "assets": summarize_assets(_get(result, "assets", [])),
         "assets_failed": int(_get(result, "assets_failed", 0) or 0),

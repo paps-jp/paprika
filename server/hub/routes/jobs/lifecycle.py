@@ -1922,6 +1922,20 @@ async def _resolve_host_material(
                             f"[hub] job {job_id}: pre-fetch auto-login "
                             f"{auto_host} crashed: {type(e).__name__}: {e}",
                         )
+                # Learned playbook (server/hub/_playbooks.py, dark unless
+                # Settings learn_playbooks_enabled): when one covers this
+                # URL the job gets an experiment arm -- the playbook's
+                # actions, or deliberately nothing -- and the legacy host
+                # recipe below is skipped either way.
+                _pb_arm = None
+                if req.options.mode == "fetch":
+                    from server.hub._playbooks import apply_playbook_arm
+                    _pb_arm = apply_playbook_arm(req.options, job_id, req.url)
+                    if _pb_arm is not None:
+                        log.info(
+                            f"[hub] job {job_id}: playbook arm={_pb_arm} "
+                            f"learn={req.options.learn}"
+                        )
                 rec = state.hosts.get(auto_host)
                 if rec:
                     auto_popup_policy = rec.popup_policy or "kill"
@@ -1947,7 +1961,7 @@ async def _resolve_host_material(
                     # run it right after navigation. Only for Fetch
                     # mode -- vision-agent / codegen-loop have their
                     # own LLM-driven flow and don't need the recipe.
-                    if _host_usable and (
+                    if _host_usable and _pb_arm is None and (
                         req.options.mode == "fetch"
                         and not req.options.fetch_recipe
                         and getattr(req.options, "fetch_strategy", "recipe") != "normal"

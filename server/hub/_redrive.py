@@ -162,6 +162,12 @@ async def _assign_worker_job(info, worker, base: str, started) -> bool:
         try:
             host_raw = urlparse(info.url).hostname or ""
             host = _normalise_host(host_raw)
+            # Same deterministic playbook arm as the first dispatch
+            # (server/hub/_playbooks.py); skips the legacy recipe below.
+            _pb_arm = None
+            if mode == "fetch" and opts is not None:
+                from server.hub._playbooks import apply_playbook_arm
+                _pb_arm = apply_playbook_arm(opts, info.job_id, info.url)
             rec = state.hosts.get(host) if host else None
             if rec:
                 auto_popup_policy = rec.popup_policy or "kill"
@@ -180,7 +186,8 @@ async def _assign_worker_job(info, worker, base: str, started) -> bool:
                         auto_cookies = cookies_for_cdp(rec.cookies)
                     # pre-baked fetch recipe (pure function, no network)
                     if (
-                        not opts.fetch_recipe
+                        _pb_arm is None
+                        and not opts.fetch_recipe
                         and getattr(opts, "fetch_strategy", "recipe") != "normal"
                     ):
                         try:

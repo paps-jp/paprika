@@ -161,6 +161,11 @@ _SCHEMA: dict[str, tuple[Any, str]] = {
     # (server/hub/_learn_arm.py). The learner compares the two arms to tell
     # which recipes help. 0 = off = every matching job gets its recipe.
     "learn_recipe_holdout_pct": (0, "int"),
+    # Apply the learner's published playbooks at dispatch
+    # (server/hub/_playbooks.py): trial / active playbooks are replayed on
+    # a deterministic slice of the matching jobs, the rest is the
+    # comparison group. Off by default = dispatch is unchanged.
+    "learn_playbooks_enabled": (False, "bool"),
     # Which engine the worker's page.agent (vision-agent /act loop) uses as
     # its backend AI. Set by the Engines tab "page.agent でこの engine を使う"
     # checkbox. Empty = NO engine selected = page.agent is DISABLED. Shared
