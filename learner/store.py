@@ -10,9 +10,11 @@ from __future__ import annotations
 import datetime as _dt
 import json
 from collections import defaultdict
+from urllib.parse import urlsplit
 
 from learner import playbook as P
-from learner.scheduler import TARGET_INTENT, TARGET_REASONS, KeyCandidate, KeyState
+from learner.ledger import template_of
+from learner.scheduler import REASON_COUNT, TARGET_INTENT, TARGET_REASONS, KeyCandidate, KeyState
 
 #: Arms whose jobs ran WITHOUT learned steps of any kind being new: the
 #: population a key's "how often does plain fetching fail" is measured on.
@@ -158,46 +160,77 @@ class Store:
 
     async def candidates(self, *, hours: int = 48, limit: int = 150,
                          reasons: tuple = TARGET_REASONS) -> list[KeyCandidate]:
-        """Keys with recent failures of the target class, with their 7-day
-        counts and a few of the failing URLs."""
+        """Keys with recent jobs of a target reason, with their 7-day counts
+        and a few of the URLs concerned. Up to ``limit`` keys PER REASON, so
+        the most common reason does not crowd the others out."""
         reasons = tuple(reasons)
         if not reasons:
             return []
         rows = await self._fetch(
             "SELECT host, template, reason, COUNT(*), COUNT(DISTINCT url) "
-            "FROM learn_outcome_events WHERE intent = %s AND outcome = 'fail' "
+            "FROM learn_outcome_events WHERE intent = %s "
             f"AND reason IN ({_in(len(reasons))}) AND arm IN ({_in(len(_BASE_ARMS))}) "
             "AND ts > UTC_TIMESTAMP() - INTERVAL %s HOUR GROUP BY host, template, reason",
             (TARGET_INTENT, *reasons, *_BASE_ARMS, int(hours)),
         )
-        per_key: dict = defaultdict(lambda: {"reasons": defaultdict(int), "urls": 0})
+        # A key is worked on for its most common target reason.
+        best: dict = {}
         for host, template, reason, n, urls in rows:
-            d = per_key[(host, template)]
-            d["reasons"][reason] += int(n)
-            d["urls"] = max(d["urls"], int(urls))
-        keys = sorted(
-            (k for k, d in per_key.items() if d["urls"] >= 3),
-            key=lambda k: -sum(per_key[k]["reasons"].values()),
-        )[:limit]
+            if int(urls) < 3:
+                continue
+            cur = best.get((host, template))
+            if cur is None or int(n) > cur[1]:
+                best[(host, template)] = (reason, int(n))
+        by_reason: dict = defaultdict(list)
+        for key, (reason, n) in best.items():
+            by_reason[reason].append((n, key))
         out: list[KeyCandidate] = []
-        for host, template in keys:
-            d = per_key[(host, template)]
-            klass = max(d["reasons"].items(), key=lambda kv: kv[1])[0]
-            base = await self.key_base_counts(host, template, TARGET_INTENT)
-            urls = await self._fetch(
-                "SELECT url FROM learn_outcome_events WHERE host = %s AND template = %s "
-                "AND intent = %s AND outcome = 'fail' "
-                f"AND reason IN ({_in(len(reasons))}) AND arm IN ({_in(len(_BASE_ARMS))}) "
-                "AND ts > UTC_TIMESTAMP() - INTERVAL %s HOUR ORDER BY ts DESC LIMIT 12",
-                (host, template, TARGET_INTENT, *reasons, *_BASE_ARMS, int(hours)),
-            )
-            out.append(KeyCandidate(
-                host=host, template=template, intent=TARGET_INTENT, klass=klass,
-                fails_7d=base["n_fail"],
-                scored_7d=sum(base.values()), success_7d=base["n_success"],
-                urls=[u[0] for u in urls if u[0]],
-            ))
+        for reason, keys in by_reason.items():
+            keys.sort(key=lambda t: (-t[0], t[1]))
+            for _n, (host, template) in keys[:limit]:
+                base = await self.key_base_counts(host, template, TARGET_INTENT)
+                urls = await self._fetch(
+                    "SELECT url FROM learn_outcome_events WHERE host = %s AND template = %s "
+                    f"AND intent = %s AND reason = %s AND arm IN ({_in(len(_BASE_ARMS))}) "
+                    "AND ts > UTC_TIMESTAMP() - INTERVAL %s HOUR ORDER BY ts DESC LIMIT 12",
+                    (host, template, TARGET_INTENT, reason, *_BASE_ARMS, int(hours)),
+                )
+                out.append(KeyCandidate(
+                    host=host, template=template, intent=TARGET_INTENT, klass=reason,
+                    fails_7d=base[REASON_COUNT.get(reason, "n_fail")],
+                    scored_7d=sum(base.values()), success_7d=base["n_success"],
+                    video_7d=base["n_success"] + base["n_partial"],
+                    urls=[u[0] for u in urls if u[0]],
+                ))
         return out
+
+    async def candidate_for_url(self, url: str, klass: str = "", *, hours: int = 48) -> KeyCandidate:
+        """The key a URL belongs to, as a candidate: for a run a person
+        asked for. ``url`` comes first; the other URLs are recent ones of the
+        same key (any outcome), for the replay on other URLs."""
+        host = (urlsplit(url).hostname or "").lower()
+        template = template_of(url)
+        rows = await self._fetch(
+            "SELECT reason, COUNT(*) FROM learn_outcome_events WHERE host = %s AND template = %s "
+            "AND intent = %s AND ts > UTC_TIMESTAMP() - INTERVAL %s HOUR GROUP BY reason ORDER BY 2 DESC",
+            (host, template, TARGET_INTENT, int(hours)),
+        )
+        if not klass:
+            klass = next((r[0] for r in rows if r[0] in REASON_COUNT or r[0] in TARGET_REASONS), "manual")
+        others = await self._fetch(
+            "SELECT url FROM learn_outcome_events WHERE host = %s AND template = %s AND intent = %s "
+            f"AND arm IN ({_in(len(_BASE_ARMS))}) AND ts > UTC_TIMESTAMP() - INTERVAL %s HOUR "
+            "ORDER BY ts DESC LIMIT 12",
+            (host, template, TARGET_INTENT, *_BASE_ARMS, int(hours)),
+        )
+        base = await self.key_base_counts(host, template, TARGET_INTENT)
+        return KeyCandidate(
+            host=host, template=template, intent=TARGET_INTENT, klass=klass,
+            fails_7d=base[REASON_COUNT.get(klass, "n_fail")],
+            scored_7d=sum(base.values()), success_7d=base["n_success"],
+            video_7d=base["n_success"] + base["n_partial"],
+            urls=[url] + [u[0] for u in others if u[0] and u[0] != url],
+        )
 
     async def key_states(self) -> dict:
         rows = await self._fetch(
@@ -240,6 +273,13 @@ class Store:
         return await self._fetch(
             "SELECT ts, host, template, klass, url, result, reason, steps, tokens, duration_s, pb_id "
             "FROM learn_solver_runs ORDER BY id DESC LIMIT %s", (int(limit),),
+        )
+
+    async def key_labels(self) -> list[tuple]:
+        """(last result of the key, keys): what the Solver concluded about
+        the keys it looked at ("gave_up:not_video", "gave_up:login", ...)."""
+        return await self._fetch(
+            "SELECT last_result, COUNT(*) FROM learn_key_state GROUP BY last_result ORDER BY 2 DESC"
         )
 
     async def key_summary(self) -> list[tuple]:

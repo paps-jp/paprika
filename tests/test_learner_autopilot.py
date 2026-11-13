@@ -12,12 +12,13 @@ import random
 import re
 
 from learner import autopilot as A
+from learner import request as R
 from learner import compiler as C
 from learner import playbook as P
 from learner import scheduler as S
 from learner import solver as V
 from learner.hubapi import HubError, HubUnavailable
-from learner.llm import LLMBadOutput, LLMUnavailable, chat_url, parse_json_object
+from learner.llm import LLMBadOutput, LLMUnavailable, chat_url, count, parse_json_object
 
 NOW = dt.datetime(2026, 11, 20, 12, 0, 0)
 
@@ -87,12 +88,18 @@ class FakeHub:
             return self.page.elements.get(int(m.group(1)))
         if m:                                            # gone_js: did the clicked element vanish?
             return int(m.group(1)) == 2 and not self.page.gate
+        if "document.querySelectorAll('video')" in expr and "data-pb-t" in expr:
+            return getattr(self.page, "player", {"found": False})
         assert "password_field" in expr
         return self.page.probe()
 
     async def click(self, sid, selector):
         if self.click_error:
             raise self.click_error
+        if "data-pb-t" in selector:                      # the video player
+            self.clicked.append("player")
+            self.page.player_clicked()
+            return {}
         ref = int(re.search(r'data-paprika-id="(\d+)"', selector).group(1))
         self.clicked.append(ref)
         if ref == 2:
@@ -125,6 +132,7 @@ class FakeLLM:
     async def chat_json(self, system, user, **_kw):
         self.calls += 1
         self.tokens += 100
+        count(calls=1, tokens=100)      # what the real client does
         self.prompts.append(user)
         r = self.replies.pop(0) if self.replies else {"action": "done"}
         if isinstance(r, Exception):
@@ -134,10 +142,20 @@ class FakeLLM:
 
 class FakeRedis:
     def __init__(self):
-        self.kv = {}
+        self.kv, self.lists = {}, {}
 
-    async def set(self, k, v):
+    async def set(self, k, v, ex=None):
         self.kv[k] = v
+
+    async def get(self, k):
+        return self.kv.get(k)
+
+    async def rpush(self, k, v):
+        self.lists.setdefault(k, []).append(v)
+
+    async def lpop(self, k):
+        q = self.lists.get(k) or []
+        return q.pop(0) if q else None
 
 
 class FakeStore:
@@ -163,6 +181,13 @@ class FakeStore:
 
     async def key_states(self):
         return self.states
+
+    async def candidate_for_url(self, url, klass=""):
+        self.asked_url = (url, klass)
+        return _cand(klass=klass or "video_short", video_7d=0, fails_7d=0,
+                     urls=[url] + [u for u in self.manual_others if u != url])
+
+    manual_others = [f"https://x.example/v/{i}/" for i in range(1, 6)]
 
     async def class_stats(self):
         return {}
@@ -204,7 +229,7 @@ class FakeStore:
 
 def _cand(**kw):
     base = dict(host="x.example", template="/v/{int}/", intent="video", klass="overlay_wall",
-                fails_7d=200, scored_7d=220, success_7d=5,
+                fails_7d=200, scored_7d=220, success_7d=5, video_7d=8,
                 urls=["https://x.example/v/1/", "https://x.example/v/2/", "https://x.example/v/3/"])
     base.update(kw)
     return S.KeyCandidate(**base)
@@ -313,6 +338,8 @@ def test_gateway_treats_engine_trouble_as_infrastructure():
 def test_parse_decision_allows_only_the_closed_action_set():
     assert V.parse_decision({"action": "CLICK", "ref": "@7"}) == {"action": "click", "ref": 7, "why": ""}
     assert V.parse_decision({"action": "give_up", "barrier": "nonsense"})["barrier"] == "other"
+    assert V.parse_decision({"action": "give_up", "barrier": "Gone"})["barrier"] == "gone"
+    assert "gone" in V.URL_BARRIERS and "gone" not in V.HARD_BARRIERS
     for bad in ({"action": "type", "text": "x"}, {"action": "click"}, {"action": "click", "ref": 0}, {}, "x"):
         try:
             V.parse_decision(bad)
@@ -442,6 +469,119 @@ def test_solver_give_up_names_the_barrier():
     assert (res.result, res.barrier) == (V.GAVE_UP, "login")
 
 
+def test_a_page_that_redirected_elsewhere_on_load_is_not_judged_as_the_key():
+    page = FakePage()
+    page.url = "https://ads.other-site.test/landing"    # an advertising redirect before any click
+    res = asyncio.run(V.solve(FakeHub(page), FakeLLM([{"action": "give_up", "barrier": "no_video", "why": "An ad page."}]),
+                              "https://x.example/v/1/", sleep=_nosleep))
+    assert (res.result, res.barrier) == (V.GAVE_UP, "redirected") and "other-site.test" in res.reason
+    assert "redirected" in V.URL_BARRIERS                # the autopilot moves on to another URL
+    # A login wall on the OTHER site is not the key's login wall either.
+    res = asyncio.run(V.solve(FakeHub(page), FakeLLM([{"action": "give_up", "barrier": "login"}]),
+                              "https://x.example/v/1/", sleep=_nosleep))
+    assert res.barrier == "redirected"
+
+
+class AdPage(FakePage):
+    """A player that shows a 30-second advertisement before the main video,
+    and may start only after several clicks (the first opens an advertisement)."""
+
+    def __init__(self, *, needs_clicks=0):
+        super().__init__()
+        self.gate = False
+        self.waited = 0.0
+        self.needs_clicks, self.clicks = needs_clicks, 0
+        self.player = {"found": True, "external": False, "tag": "div", "text": "", "w": 800, "h": 450}
+
+    def player_clicked(self):
+        self.clicks += 1
+
+    def started(self):
+        return self.clicks >= self.needs_clicks
+
+    def probe(self):
+        main = self.started() and self.waited >= 30
+        vid = {"src": "https://cdn.x.example/main.mp4" if main else "https://ads.example/creative.mp4",
+               "dur": 1800 if main else 30, "paused": not self.started()}
+        return {"url": self.url, "title": "A video", "videos": [vid], "iframes": 0,
+                "overlay": {"cover": 0.0, "text": ""}, "password_field": False}
+
+
+def _sleep_on(page):
+    async def sleep(seconds):
+        if page.started():
+            page.waited += seconds
+    return sleep
+
+
+WAIT40 = {"action": "wait", "seconds": 40, "why": "the advertisement"}
+PLAYER = {"action": "click_player", "why": "start the video"}
+
+
+def test_waiting_out_an_advertisement_is_a_trace_and_is_replayed_as_a_wait():
+    page = AdPage()
+    res = asyncio.run(V.solve(FakeHub(page), FakeLLM([WAIT40, DONE]), "https://x.example/v/1/", sleep=_sleep_on(page)))
+    assert res.result == V.TRACE and res.clicks == 0 and res.replayable == 1
+    assert res.trace[0]["seconds"] == 40 and "longest video 30s -> 1800s" in res.trace[0]["effect"]
+    actions, why = C.compile_trace(res.trace)
+    assert why == "ok" and [a["kind"] for a in actions] == ["wait", "wait"] and actions[1]["seconds"] == 40
+    assert C.summarize(actions) == [{"wait_s": 40}]
+
+
+def test_a_wait_that_changed_nothing_or_a_short_pause_is_not_replayed():
+    assert C.compile_trace([{"action": "wait", "seconds": 40, "ok": False}])[0] is None
+    assert C.compile_trace([{"action": "wait", "seconds": 2, "ok": True}])[0] is None
+    assert V.parse_decision({"action": "wait"})["seconds"] == 2
+    assert V.parse_decision({"action": "wait", "seconds": 900})["seconds"] == 60       # clamped
+    assert V.parse_decision({"action": "wait", "seconds": "x"})["seconds"] == 2
+
+
+def test_waiting_is_bounded_per_run():
+    page = AdPage(needs_clicks=9)                         # never starts: waiting is useless
+    cfg = V.SolverConfig(max_wait_total_s=70)
+    slept = []
+
+    async def sleep(seconds):
+        slept.append(seconds)
+
+    res = asyncio.run(V.solve(FakeHub(page), FakeLLM([WAIT40] * 9), "https://x.example/v/1/", cfg=cfg, sleep=sleep))
+    assert res.result == V.EXHAUSTED and sum(x for x in slept if x >= 5) <= 70
+
+
+def test_the_player_may_be_clicked_again_when_the_first_click_only_opened_an_advert():
+    page = AdPage(needs_clicks=2)
+    hub = FakeHub(page)
+    res = asyncio.run(V.solve(hub, FakeLLM([PLAYER, PLAYER, WAIT40, DONE]), "https://x.example/v/1/",
+                              sleep=_sleep_on(page)))
+    assert hub.clicked == ["player", "player"] and res.result == V.TRACE
+    assert [s.get("ok") for s in res.trace[:3]] == [False, True, True]     # 1st click: nothing visible
+    actions, _ = C.compile_trace(res.trace)
+    # Both player clicks are replayed (the first may be the necessary one), then the wait.
+    assert [a["kind"] for a in actions] == ["wait", "evaluate", "click", "wait", "evaluate", "click", "wait", "wait"]
+    assert actions[2]["selector"] == '[data-pb-t="p1"]' and actions[5]["selector"] == '[data-pb-t="p2"]'
+    assert C.summarize(actions) == [{"find": "the video player"}, {"click": '[data-pb-t="p1"]'},
+                                    {"find": "the video player"}, {"click": '[data-pb-t="p2"]'}, {"wait_s": 40}]
+
+
+def test_player_clicks_that_led_nowhere_are_not_replayed_and_are_limited():
+    page = AdPage(needs_clicks=99)
+    hub = FakeHub(page)
+    res = asyncio.run(V.solve(hub, FakeLLM([PLAYER] * 9), "https://x.example/v/1/", sleep=_nosleep))
+    assert res.result == V.EXHAUSTED and len(hub.clicked) <= C.MAX_PLAYER_CLICKS
+    assert C.compile_trace(res.trace)[0] is None
+
+
+def test_a_player_covered_by_a_link_to_another_site_is_not_clicked():
+    page = AdPage()
+    page.player = {"found": True, "external": True, "tag": "a", "text": "Visit sponsor", "w": 800, "h": 450}
+    hub = FakeHub(page)
+    res = asyncio.run(V.solve(hub, FakeLLM([PLAYER, DONE]), "https://x.example/v/1/", sleep=_nosleep))
+    assert hub.clicked == [] and res.trace[0]["refused"] == "covered"
+    page.player = {"found": False}
+    res = asyncio.run(V.solve(hub, FakeLLM([PLAYER, DONE]), "https://x.example/v/1/", sleep=_nosleep))
+    assert hub.clicked == [] and res.trace[0]["refused"] == "no_player"
+
+
 def test_solver_without_a_click_is_not_a_trace():
     res = asyncio.run(V.solve(FakeHub(), FakeLLM([DONE]), "u", sleep=_nosleep))
     assert res.result == V.NO_ACTION
@@ -517,6 +657,20 @@ def test_rank_prefers_traffic_and_skips_ineligible_keys():
     assert wins >= 36          # 30x the failures: almost always first, never excluded outright
 
 
+def test_a_key_that_never_produced_a_video_is_not_worked_on():
+    # A shop item page a client asks a video of: thousands of "wall" failures,
+    # never one playable video. However much traffic, no click makes it a video page.
+    shop = _cand(host="shop.example", template="/item/{id}/", fails_7d=5000, video_7d=0)
+    once = _cand(host="tube.example", fails_7d=40, video_7d=1)      # one short clip counts
+    assert S.eligible(shop, None, set(), NOW, S.SchedulerConfig()) == (False, "no_video_seen")
+    assert S.eligible(once, None, set(), NOW, S.SchedulerConfig()) == (True, "")
+    ranked = S.rank([shop, once], {}, {}, set(), now=NOW, rng=random.Random(1))
+    assert [c.host for _v, c in ranked] == ["tube.example"]
+    # 0 turns the check off (the behaviour before it existed).
+    off = S.SchedulerConfig(min_video_7d=0)
+    assert S.eligible(shop, None, set(), NOW, off) == (True, "")
+
+
 def test_keys_that_keep_failing_lose_priority():
     fresh = _cand(host="fresh.example", fails_7d=100)
     worn = _cand(host="worn.example", fails_7d=100)
@@ -537,9 +691,11 @@ def test_class_prior_follows_measured_solver_results():
 
 
 def test_dormancy_grows_and_hard_barriers_wait_a_month():
-    assert [S.dormancy(n).days for n in (1, 2, 3, 4, 9)] == [1, 3, 7, 30, 30]
+    assert [S.dormancy(n).total_seconds() / 86400 for n in (1, 2, 3, 4, 9)] == [0.25, 1, 3, 7, 7]
     assert S.dormancy(1, "login").days == 30 and S.dormancy(1, "captcha").days == 30
-    assert S.dormancy(1, "no_video").days == 1
+    assert S.dormancy(1, "no_video") == S.dormancy(1)   # one sighting: maybe just that URL
+    assert S.dormancy(1, "not_video").days == 30        # seen on two URLs: a verdict on the key
+    assert S.dormancy(1, "gone") == S.dormancy(1)
 
 
 def test_budget_and_url_picking():
@@ -605,13 +761,292 @@ def test_a_one_url_trick_is_rejected_and_the_key_backs_off():
 
 
 def test_a_login_wall_puts_the_key_to_sleep_for_a_month():
-    store = FakeStore(cands=[_cand()])
+    login = {"action": "give_up", "barrier": "login"}
+    store = FakeStore(cands=[_cand(success_7d=0)])
     hub = FakeHub()
-    ap = _pilot(store, hub, FakeLLM([{"action": "give_up", "barrier": "login"}]))
+    ap = _pilot(store, hub, FakeLLM([login, login]))
     assert asyncio.run(ap.solver_tick()) == V.GAVE_UP
     assert hub.submitted == []                           # nothing to replay
+    assert len(store.runs) == 2                          # checked on a second URL first
     (ku,) = store.key_updates
     assert 28 <= (ku["dormant_until"] - _utc()).days <= 30
+
+
+def test_one_login_sighting_or_a_key_that_yields_videos_is_not_shelved_for_a_month():
+    login = {"action": "give_up", "barrier": "login"}
+    # Named on one URL only: the second URL had an ordinary wall.
+    store = FakeStore(cands=[_cand(success_7d=0)], outcomes={"job1": ("fail", "overlay_wall")})
+    ap = _pilot(store, FakeHub(), FakeLLM([login, CLICK2, DONE]))
+    asyncio.run(ap.solver_tick())
+    assert (store.key_updates[0]["dormant_until"] - _utc()).days < 1
+    # Named twice, but the ledger shows whole videos from this key.
+    store = FakeStore(cands=[_cand(success_7d=12)])
+    ap = _pilot(store, FakeHub(), FakeLLM([login, login]))
+    asyncio.run(ap.solver_tick())
+    (ku,) = store.key_updates
+    assert (ku["dormant_until"] - _utc()).days < 1 and ku["result"] == "gave_up:login"
+
+
+# ---- the loop: one URL is not the key ----------------------------------------------
+
+FIVE = [f"https://x.example/v/{i}/" for i in range(1, 6)]
+GONE = {"action": "give_up", "barrier": "gone", "why": "This video was deleted."}
+NO_VIDEO = {"action": "give_up", "barrier": "no_video", "why": "A shop item page."}
+
+
+def test_a_deleted_video_sends_the_solver_to_the_next_url():
+    # The newest failing URL is a deleted video: that is about the URL. The
+    # next one has the age gate the key is really failing on.
+    store = FakeStore(cands=[_cand(urls=FIVE)], outcomes={
+        "job1": ("success", "video_ok"), "job2": ("success", "video_ok"), "job3": ("success", "video_ok")})
+    hub = FakeHub()
+    ap = _pilot(store, hub, FakeLLM([GONE, CLICK2, DONE]))
+    assert asyncio.run(ap.solver_tick()) == A.SOLVED
+    # Every session is on record, and the give-up carries the barrier it named.
+    assert [(r["url"][-3:], r["result"]) for r in store.runs] == [("/1/", V.GAVE_UP), ("/2/", A.SOLVED)]
+    assert store.runs[0]["reason"] == "[gone] This video was deleted."
+    # The steps are replayed on the URL they were found on and on two others -- never on the dead one.
+    assert [s["url"][-3:] for s in hub.submitted] == ["/2/", "/3/", "/4/"]
+    assert store.playbooks[0].provenance["explore_url"] == FIVE[1]
+    (ku,) = store.key_updates                            # the key is charged once, not per URL
+    assert ku["solved"] is True
+
+
+def test_a_key_of_deleted_videos_backs_off_like_any_failure():
+    store = FakeStore(cands=[_cand(urls=FIVE)])
+    ap = _pilot(store, FakeHub(), FakeLLM([GONE] * 9))
+    assert asyncio.run(ap.solver_tick()) == V.GAVE_UP
+    assert len(store.runs) == 4                          # max_explore_urls, not the whole list
+    (ku,) = store.key_updates
+    assert (ku["dormant_until"] - _utc()).days <= 1      # the next failing URLs may be alive
+
+
+def test_a_page_with_no_video_is_checked_on_a_second_url_before_the_key_is_shelved():
+    store = FakeStore(cands=[_cand(urls=FIVE, success_7d=0)])
+    ap = _pilot(store, FakeHub(), FakeLLM([NO_VIDEO, NO_VIDEO, CLICK2]))
+    assert asyncio.run(ap.solver_tick()) == V.GAVE_UP
+    assert [r["url"][-3:] for r in store.runs] == ["/1/", "/2/"]     # two sightings are enough
+    (ku,) = store.key_updates
+    assert 28 <= (ku["dormant_until"] - _utc()).days <= 30
+    # A key the ledger shows whole videos for is never shelved on the model's word.
+    store = FakeStore(cands=[_cand(urls=FIVE, success_7d=40)])
+    ap = _pilot(store, FakeHub(), FakeLLM([NO_VIDEO, NO_VIDEO]))
+    assert asyncio.run(ap.solver_tick()) == V.GAVE_UP
+    (ku,) = store.key_updates
+    assert (ku["dormant_until"] - _utc()).days < 1 and ku["result"] == "gave_up:no_video"
+    # One odd page among video pages does not shelve the key.
+    store = FakeStore(cands=[_cand(urls=FIVE)], outcomes={
+        "job1": ("success", "video_ok"), "job2": ("success", "video_ok"), "job3": ("success", "video_ok")})
+    hub = FakeHub()
+    ap = _pilot(store, hub, FakeLLM([NO_VIDEO, CLICK2, DONE]))
+    assert asyncio.run(ap.solver_tick()) == A.SOLVED
+    assert [s["url"][-3:] for s in hub.submitted] == ["/2/", "/3/", "/4/"]
+
+
+def test_nothing_to_click_on_one_url_is_tried_on_the_others():
+    # The wall is not shown on every visit: "nothing to click" on one URL
+    # says little. The model gets the other URLs before the key is charged.
+    store = FakeStore(cands=[_cand(urls=FIVE)])
+    ap = _pilot(store, FakeHub(), FakeLLM([DONE, DONE, DONE, DONE, DONE]))
+    assert asyncio.run(ap.solver_tick()) == V.NO_ACTION
+    assert [r["url"][-3:] for r in store.runs] == ["/1/", "/2/", "/3/", "/4/"]
+    assert len(store.key_updates) == 1
+
+
+def test_steps_are_not_kept_when_too_few_live_urls_remain_to_test_them():
+    store = FakeStore(cands=[_cand()])                   # three URLs, and the first is dead
+    hub = FakeHub()
+    ap = _pilot(store, hub, FakeLLM([GONE, CLICK2, DONE]))
+    assert asyncio.run(ap.solver_tick()) == A.REPLAY_FAIL
+    assert hub.submitted == [] and store.playbooks == []
+    assert store.runs[-1]["reason"] == "too few live URLs to test the steps on"
+
+
+def test_infra_on_a_later_url_still_charges_nothing_to_the_key():
+    store = FakeStore(cands=[_cand(urls=FIVE)])
+    ap = _pilot(store, FakeHub(), FakeLLM([GONE, LLMUnavailable("engine down")]))
+    assert asyncio.run(ap.solver_tick()) == V.INFRA
+    assert [r["result"] for r in store.runs] == [V.GAVE_UP, V.INFRA] and store.key_updates == []
+
+
+def test_the_model_is_told_what_the_fetches_of_the_key_ran_into():
+    store = FakeStore(cands=[_cand(klass="video_short", urls=FIVE)])
+    llm = FakeLLM([NO_VIDEO, NO_VIDEO])
+    asyncio.run(_pilot(store, FakeHub(), llm).solver_tick())
+    assert "advertisement" in llm.prompts[0] and "WHAT IS KNOWN" in llm.prompts[0]
+    assert set(A.KLASS_NOTES) == set(S.KNOWN_REASONS)     # every target reason has its note
+
+
+def test_what_the_solver_concluded_about_the_key_is_kept():
+    store = FakeStore(cands=[_cand(urls=FIVE, success_7d=0)])
+    ap = _pilot(store, FakeHub(), FakeLLM([NO_VIDEO, NO_VIDEO]))
+    asyncio.run(ap.solver_tick())
+    assert store.key_updates[0]["result"] == "gave_up:not_video"
+    store = FakeStore(cands=[_cand()])
+    ap = _pilot(store, FakeHub(), FakeLLM([{"action": "give_up", "barrier": "login"}] * 2))
+    asyncio.run(ap.solver_tick())
+    assert store.key_updates[0]["result"] == "gave_up:login"
+
+
+# ---- the loop: a run a person asked for ------------------------------------------------
+
+def _ask(ap, url, **kw):
+    req = R.build_request(url, rid="req1", **kw)
+    asyncio.run(R.submit(ap.redis, req))
+    return req
+
+
+def test_a_requested_url_is_run_first_whatever_the_scheduler_would_say():
+    store = FakeStore(cands=[_cand(host="other.example")], outcomes={
+        "job1": ("success", "video_ok"), "job2": ("success", "video_ok"), "job3": ("success", "video_ok")})
+    store.usage = (10 ** 6, 0)                           # the day's budget is long gone
+    hub = FakeHub()
+    ap = _pilot(store, hub, FakeLLM([CLICK2, DONE]))
+    _ask(ap, "https://x.example/v/9/", klass="video_short")
+    assert asyncio.run(ap.solver_tick()) == A.SOLVED
+    assert store.asked_url == ("https://x.example/v/9/", "video_short")
+    # The URL the person gave is the one explored; the replay test on other URLs still applies.
+    assert [s["url"][-3:] for s in hub.submitted] == ["/9/", "/1/", "/2/"]
+    (run,) = store.runs
+    assert run["url"] == "https://x.example/v/9/" and run["reason"].startswith("[manual] ")
+    res = asyncio.run(R.wait_result(ap.redis, "req1", timeout_s=0))
+    assert (res["result"], res["host"], res["sessions"]) == (A.SOLVED, "x.example", 1)
+    assert res["urls"] == ["https://x.example/v/9/"]
+    # The queue is empty again: the next tick is the scheduler's (and the budget stops it).
+    assert asyncio.run(ap.solver_tick()) == "budget_exhausted"
+
+
+def test_a_requested_url_of_a_key_with_one_url_is_explored_but_makes_no_playbook():
+    store = FakeStore()
+    store.manual_others = []
+    hub = FakeHub()
+    ap = _pilot(store, hub, FakeLLM([CLICK2, DONE]))
+    _ask(ap, "https://x.example/v/9/")
+    assert asyncio.run(ap.solver_tick()) == A.REPLAY_FAIL
+    assert hub.clicked == [2] and hub.submitted == [] and store.playbooks == []
+    assert store.runs[0]["reason"] == "[manual] too few live URLs to test the steps on"
+
+
+def test_requests_that_cannot_be_run_are_answered_without_a_session():
+    store = FakeStore()
+    store.playbooks = [P.Playbook(id=1, host="x.example", template="/v/{int}/", intent="video",
+                                  state=P.TRIAL, actions=[{"kind": "wait"}])]
+    hub = FakeHub()
+    ap = _pilot(store, hub)
+    _ask(ap, "https://x.example/v/9/")
+    assert asyncio.run(ap.solver_tick()) == "has_playbook"
+    assert asyncio.run(R.wait_result(ap.redis, "req1", timeout_s=0))["result"] == "has_playbook"
+    asyncio.run(ap.redis.rpush(A.REQUESTS_KEY, "not json"))
+    asyncio.run(ap.redis.rpush(A.REQUESTS_KEY, json.dumps({"url": "file:///etc/passwd"})))
+    assert asyncio.run(ap.solver_tick()) == "bad_request"
+    assert asyncio.run(ap.solver_tick()) == "bad_request"
+    assert hub.clicked == [] and store.runs == []
+
+
+def test_a_request_reports_its_own_sessions_not_those_of_runs_going_on_beside_it():
+    store = FakeStore()
+    ap = _pilot(store, FakeHub(), FakeLLM([GONE, GONE, GONE, GONE]))
+    ap.stats["runs"] = 0
+
+    class Busy(FakeLLM):                                 # another run records sessions meanwhile
+        async def chat_json(self, system, user, **kw):
+            ap.stats["runs"] += 5
+            return await super().chat_json(system, user, **kw)
+
+    ap.llm = Busy([GONE, GONE])
+    store.manual_others = ["https://x.example/v/1/"]
+    _ask(ap, "https://x.example/v/9/")
+    asyncio.run(ap.solver_tick())
+    res = asyncio.run(R.wait_result(ap.redis, "req1", timeout_s=0))
+    assert res["sessions"] == 2 and res["urls"] == ["https://x.example/v/9/", "https://x.example/v/1/"]
+
+
+def test_request_validation():
+    assert R.build_request(" https://x.example/v/1/ ", now=5.0, rid="a") == {
+        "id": "a", "url": "https://x.example/v/1/", "klass": "", "ts": 5.0}
+    for bad in (("ftp://x/", ""), ("x.example/v/1", ""), ("https://x.example/", "nonsense")):
+        try:
+            R.build_request(*bad)
+        except ValueError:
+            continue
+        raise AssertionError(f"accepted {bad!r}")
+
+
+# ---- the loop: several runs at once ---------------------------------------------------
+
+class SlowHub(FakeHub):
+    """Sessions that take a moment to open, so runs really overlap."""
+
+    def __init__(self):
+        super().__init__()
+        self.opened = []
+
+    async def open_session(self, url, **_kw):
+        self.opened.append(url)
+        await asyncio.sleep(0.01)
+        return f"ses_{len(self.opened)}"
+
+
+def test_runs_at_the_same_time_never_take_the_same_key():
+    cands = [_cand(host=f"h{i}.example", urls=[f"https://h{i}.example/v/{n}/" for n in range(1, 6)])
+             for i in range(3)]
+    store = FakeStore(cands=cands)
+    hub = SlowHub()
+    ap = _pilot(store, hub, FakeLLM([GONE] * 40))
+
+    async def go():
+        return await asyncio.gather(*(ap.solver_tick() for _ in range(3)))
+
+    assert asyncio.run(go()) == [V.GAVE_UP] * 3
+    assert sorted(ku["host"] for ku in store.key_updates) == ["h0.example", "h1.example", "h2.example"]
+    assert ap._in_flight == set()                        # released, also after a failure
+    # A fourth run while all keys are taken has nothing to do.
+    ap._in_flight = {c.key for c in cands}
+    assert asyncio.run(ap.solver_tick()) == "nothing_eligible"
+
+
+def test_each_run_is_billed_only_its_own_model_calls():
+    # One run makes 1 call, the other 3; they overlap. "Counter now minus
+    # counter at start" on the shared client would bill each for both.
+    hub = SlowHub()
+
+    async def one(url, replies):
+        mine = FakeLLM(replies)
+        real = mine.chat_json
+
+        async def slow(system, user, **kw):
+            await asyncio.sleep(0.005)
+            return await real(system, user, **kw)
+
+        mine.chat_json = slow
+        return await V.solve(hub, mine, url, sleep=_nosleep)
+
+    async def go():
+        return await asyncio.gather(
+            one("https://a.example/v/1/", [GONE]),
+            one("https://b.example/v/1/", [{"action": "wait"}, {"action": "wait"}, GONE]))
+
+    a, b = asyncio.run(go())
+    assert (a.llm_calls, a.tokens) == (1, 100) and (b.llm_calls, b.tokens) == (3, 300)
+
+
+def test_the_candidate_list_is_shared_and_refreshed_after_a_while():
+    store = FakeStore(cands=[_cand(urls=FIVE)])
+    asked = []
+    real = store.candidates
+
+    async def counting(reasons=None):
+        asked.append(reasons)
+        return await real(reasons=reasons)
+
+    store.candidates = counting
+    ap = _pilot(store, FakeHub(), FakeLLM([GONE] * 20))
+    asyncio.run(ap.solver_tick())
+    asyncio.run(ap.solver_tick())
+    assert len(asked) == 1                               # the second run reused the list
+    ap._cands_at -= ap.cfg.candidates_ttl_s + 1
+    asyncio.run(ap.solver_tick())
+    assert len(asked) == 2
 
 
 def test_infra_results_are_logged_but_never_charged_to_the_key():
@@ -628,12 +1063,12 @@ def test_infra_results_are_logged_but_never_charged_to_the_key():
 
 def test_budget_and_empty_queue_stop_the_solver():
     store = FakeStore(cands=[_cand()])
-    store.usage = (40, 0)
+    store.usage = (1000, 0)
     hub = FakeHub()
     assert asyncio.run(_pilot(store, hub).solver_tick()) == "budget_exhausted"
     empty = FakeStore()
     assert asyncio.run(_pilot(empty).solver_tick()) == "no_candidates"
-    assert empty.asked_reasons == ("overlay_wall",)       # the first version works one class only
+    assert empty.asked_reasons == ("overlay_wall", "video_not_captured", "video_short")
     store = FakeStore(cands=[_cand()])
     store.playbooks = [P.Playbook(id=1, host="x.example", template="/v/{int}/", intent="video",
                                   state=P.TRIAL, actions=[{"kind": "wait"}])]

@@ -116,8 +116,9 @@ def solver_section(day_rows: list[tuple], recent_rows: list[tuple], *, today: _d
     }
 
 
-def keys_section(rows: list[tuple]) -> dict:
-    """``rows``: (klass, keys, runs, solved, dormant now)."""
+def keys_section(rows: list[tuple], label_rows: list[tuple] | None = None) -> dict:
+    """``rows``: (klass, keys, runs, solved, dormant now). ``label_rows``:
+    (last result of the key, keys) -- what the Solver concluded about them."""
     by_class = [
         {"klass": r[0] or "", "keys": int(r[1] or 0), "runs": int(r[2] or 0),
          "solved": int(r[3] or 0), "dormant": int(r[4] or 0)}
@@ -128,6 +129,7 @@ def keys_section(rows: list[tuple]) -> dict:
         "keys": sum(c["keys"] for c in by_class), "dormant": sum(c["dormant"] for c in by_class),
         "runs": sum(c["runs"] for c in by_class), "solved": sum(c["solved"] for c in by_class),
         "by_class": by_class,
+        "by_label": [{"label": r[0] or "", "keys": int(r[1] or 0)} for r in (label_rows or [])],
     }
 
 

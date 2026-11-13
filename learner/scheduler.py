@@ -27,22 +27,42 @@ from dataclasses import dataclass, field
 #: nothing; mostly players inside cross-origin iframes) is ~25x larger but
 #: is not something a click on the top document fixes; it is opened up by
 #: configuration once the Solver can do more (SchedulerConfig.target_reasons).
-TARGET_REASONS = ("overlay_wall",)
-KNOWN_REASONS = ("overlay_wall", "video_not_captured")
+TARGET_REASONS = ("overlay_wall", "video_not_captured", "video_short")
+KNOWN_REASONS = ("overlay_wall", "video_not_captured", "video_short")
+#: Which daily count holds the jobs of a target reason. "video_short" is a
+#: PARTIAL outcome (a playable but short file -- mostly an advertisement
+#: saved in place of the main video); the others are failures.
+REASON_COUNT = {"video_short": "n_partial"}
 TARGET_INTENT = "video"
 
-DORMANCY_DAYS = (1, 3, 7, 30)
+#: Days a key is left alone after its 1st, 2nd, ... consecutive failed run.
+#: Short: the engine is in-house, so a retry is cheap, and a retry opens
+#: other URLs of the key than the last one did.
+DORMANCY_DAYS = (0.25, 1, 3, 7)
 HARD_BARRIER_DAYS = 30
+#: Verdicts about the key (not one URL) that a later run will not change
+#: soon. "not_video" is the Solver's "no_video" seen on two different URLs
+#: of the key (learner/autopilot.py); a single sighting is not enough.
+KEY_BARRIERS = ("not_video",)
 MIN_URLS = 3
 
 
 @dataclass(frozen=True)
 class SchedulerConfig:
     target_reasons: tuple = TARGET_REASONS
-    daily_runs: int = 40            # Solver runs per UTC day (infra results are free)
-    daily_tokens: int = 2_000_000   # model tokens per UTC day
+    #: The engine is an in-house GPU, so these two are a runaway guard, not
+    #: a cost budget (2026-11-14). What a run does cost is one browser lane
+    #: of the fleet for about a minute, and three fetch jobs per replay.
+    daily_runs: int = 1000          # Solver sessions per UTC day (infra results are free)
+    daily_tokens: int = 50_000_000  # model tokens per UTC day
     min_fails_7d: int = 5           # do not bother below this
-    rerun_after_h: float = 20.0     # at most one run per key per day
+    #: Jobs of the key that produced a playable video in the last 7 days
+    #: (Verifier success or partial). Below this the key is not worked on:
+    #: a video is asked for on many pages that have none (shop items,
+    #: contact forms, wikis), and no click turns those into a video page.
+    #: 0 turns the check off.
+    min_video_7d: int = 1
+    rerun_after_h: float = 6.0      # never the same key twice within this
     prior_strength: float = 4.0     # how many pseudo-observations the class prior is worth
     default_prior: tuple[float, float] = (1.0, 3.0)
 
@@ -53,9 +73,10 @@ class KeyCandidate:
     template: str
     intent: str
     klass: str                      # the dominant failure reason
-    fails_7d: int = 0
+    fails_7d: int = 0               # jobs of the target kind in 7 days (REASON_COUNT)
     scored_7d: int = 0
     success_7d: int = 0
+    video_7d: int = 0               # success + partial: a playable video came out
     urls: list = field(default_factory=list)
 
     @property
@@ -103,6 +124,8 @@ def eligible(c: KeyCandidate, st: KeyState | None, busy: set, now: _dt.datetime,
         return False, "has_playbook"
     if c.fails_7d < cfg.min_fails_7d:
         return False, "low_traffic"
+    if c.video_7d < cfg.min_video_7d:
+        return False, "no_video_seen"
     if len(set(c.urls)) < MIN_URLS:
         return False, "too_few_urls"
     if st is not None:
@@ -148,7 +171,7 @@ def dormancy(fail_streak: int, barrier: str = "") -> _dt.timedelta:
     consecutive failed run."""
     from learner.solver import HARD_BARRIERS
 
-    if barrier in HARD_BARRIERS:
+    if barrier in HARD_BARRIERS or barrier in KEY_BARRIERS:
         return _dt.timedelta(days=HARD_BARRIER_DAYS)
     i = max(1, int(fail_streak)) - 1
     return _dt.timedelta(days=DORMANCY_DAYS[min(i, len(DORMANCY_DAYS) - 1)])

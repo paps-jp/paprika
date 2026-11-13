@@ -44,16 +44,50 @@ GENERALIZE_FAIL = "generalize_fail"  # they worked there, but not on other URLs 
 
 _PENDING_REASONS = ("download_in_progress",)
 
+#: Runs a person asked for (``python -m learner.request URL``): a Redis list
+#: of JSON requests, taken before anything the scheduler would pick, and a
+#: result document per request so the asker can wait for the answer.
+REQUESTS_KEY = "paprika:learn:solve_requests"
+RESULT_KEY = "paprika:learn:solve_result:"
+RESULT_TTL_S = 86400
+
+#: What ordinary fetches of a key ran into, told to the model so that it
+#: looks for the right thing. Without it the model sees an advertisement
+#: playing on a "video_short" page and answers "done".
+KLASS_NOTES = {
+    "overlay_wall": "ordinary fetches of this kind of page were stopped by something covering the page.",
+    "video_not_captured": (
+        "ordinary fetches of this kind of page found signs of a video but captured no video file. "
+        "The player may load the video only after its play button is clicked."
+    ),
+    "video_short": (
+        "ordinary fetches of this kind of page saved only a short clip of about 30 seconds, usually an "
+        "advertisement shown before the main video. The goal is the MAIN video, minutes long. A short "
+        "clip playing is NOT done: wait for it to end (one wait of about 40 seconds) or skip it, and say "
+        "done only when the longest video is well over a minute. If this kind of page has no main video at all, "
+        "give_up with no_video."
+    ),
+}
+
 
 @dataclass(frozen=True)
 class AutopilotConfig:
     solver_enabled: bool = False
     lifecycle_interval_s: float = 180.0
-    solver_interval_s: float = 600.0
+    solver_interval_s: float = 120.0  # wait when there is nothing to work on
+    #: Solver runs going on at the same time. Each holds one browser lane of
+    #: the fleet and one slot of the engine while it runs.
+    solver_concurrency: int = 3
+    #: The candidate list costs a few hundred queries; the runs share one copy.
+    candidates_ttl_s: float = 600.0
     infra_backoff_s: float = 900.0
     replay_timeout_s: float = 1800.0
     replay_poll_s: float = 20.0
     gen_urls: int = 2                 # other URLs of the template that must also succeed
+    #: URLs of one key a single exploration may open. A failing URL is
+    #: often failing for its own reason (the video was deleted), which says
+    #: nothing about the key: the Solver moves on to the next one.
+    max_explore_urls: int = 4
     publish: bool = True
 
 
@@ -76,6 +110,10 @@ class Autopilot:
         self._sleep = sleep
         self._rev = int(time.time())
         self._started = time.time()
+        self._in_flight: set = set()          # keys a Solver run is on right now
+        self._cands: list | None = None
+        self._cands_at = 0.0
+        self._cands_lock = asyncio.Lock()
         #: Set by the entry point: a callable returning the consumer's
         #: counters, shown in the status document next to our own.
         self.consumer_stats = None
@@ -160,6 +198,8 @@ class Autopilot:
                 "solver_enabled": self.cfg.solver_enabled,
                 "target_reasons": list(c.target_reasons),
                 "daily_runs": c.daily_runs, "daily_tokens": c.daily_tokens,
+                "min_video_7d": c.min_video_7d,
+                "solver_concurrency": self.cfg.solver_concurrency,
                 "trial_pct": self.life_cfg.trial_pct, "holdout_pct": self.life_cfg.holdout_pct,
                 "min_n": self.life_cfg.min_n,
             },
@@ -171,7 +211,7 @@ class Autopilot:
                 today=_utcnow().date(), daily_runs=c.daily_runs, daily_tokens=c.daily_tokens,
                 enabled=self.cfg.solver_enabled,
             ),
-            keys=ST.keys_section(await self.store.key_summary()),
+            keys=ST.keys_section(await self.store.key_summary(), await self.store.key_labels()),
             outcomes=ST.outcomes_section(await self.store.outcome_days(), await self.store.fail_reasons()),
         )
 
@@ -185,38 +225,151 @@ class Autopilot:
 
     # ---- solving ---------------------------------------------------------
 
+    async def _candidates(self) -> list:
+        async with self._cands_lock:
+            if self._cands is None or time.monotonic() - self._cands_at > self.cfg.candidates_ttl_s:
+                self._cands = await self.store.candidates(reasons=self.sched_cfg.target_reasons)
+                self._cands_at = time.monotonic()
+            return self._cands
+
+    async def manual_tick(self) -> str | None:
+        """Take one requested run off the queue and carry it out. None when
+        nobody asked. A request skips the scheduler's rules -- dormancy, the
+        daily budget, "never produced a video" -- because a person chose the
+        URL; it does not skip the replay test, so a playbook still has to
+        reproduce on other URLs of the key."""
+        try:
+            raw = await self.redis.lpop(REQUESTS_KEY)
+        except Exception:
+            log.warning("request queue unreadable", exc_info=True)
+            return None
+        if not raw:
+            return None
+        try:
+            req = json.loads(raw)
+            url = str(req["url"]).strip()
+            if not url.lower().startswith(("http://", "https://")):
+                raise ValueError("not an http(s) URL")
+        except Exception as e:
+            log.warning("bad solve request %r: %s", str(raw)[:200], e)
+            return "bad_request"
+        rid = str(req.get("id") or "")
+        klass = str(req.get("klass") or "")
+        cand = await self.store.candidate_for_url(url, klass if klass in S.KNOWN_REASONS else "")
+        playbooks = {p.key for p in await self.store.load_playbooks()}
+        opened: list[str] = []        # the URLs THIS run opened (other runs go on meanwhile)
+        if cand.key in playbooks:
+            what = "has_playbook"
+        elif cand.key in self._in_flight:
+            what = "already_running"
+        else:
+            self._in_flight.add(cand.key)
+            try:
+                what = await self.explore(cand, manual=True, opened=opened)
+            finally:
+                self._in_flight.discard(cand.key)
+        log.info("manual solve %s (%s %s): %s", url, cand.host, cand.template, what)
+        if rid:
+            doc = {"id": rid, "url": url, "host": cand.host, "template": cand.template,
+                   "klass": cand.klass, "result": what, "sessions": len(opened), "urls": opened,
+                   "ts": time.time()}
+            try:
+                await self.redis.set(RESULT_KEY + rid, json.dumps(doc, ensure_ascii=False), ex=RESULT_TTL_S)
+            except Exception:
+                log.warning("could not store the result of request %s", rid, exc_info=True)
+        return what
+
     async def solver_tick(self) -> str:
         """Run the Solver on the single most valuable key, if the budget
-        allows. Returns what happened (for logs and tests)."""
+        allows. Returns what happened (for logs and tests). Several of
+        these run at once (``solver_concurrency``)."""
+        manual = await self.manual_tick()
+        if manual is not None:
+            return manual
         runs, tokens = await self.store.usage_today()
         if not S.budget_left(runs, tokens, self.sched_cfg):
             return "budget_exhausted"
-        cands = await self.store.candidates(reasons=self.sched_cfg.target_reasons)
+        cands = await self._candidates()
         if not cands:
             return "no_candidates"
-        busy = {p.key for p in await self.store.load_playbooks()}
-        ranked = S.rank(cands, await self.store.key_states(), await self.store.class_stats(),
-                        busy, now=_utcnow(), cfg=self.sched_cfg, rng=self.rng)
+        playbooks = {p.key for p in await self.store.load_playbooks()}
+        states, class_stats = await self.store.key_states(), await self.store.class_stats()
+        # No await between reading the in-flight set and adding to it: two
+        # runs never take the same key.
+        ranked = S.rank(cands, states, class_stats, playbooks | self._in_flight,
+                        now=_utcnow(), cfg=self.sched_cfg, rng=self.rng)
         if not ranked:
             return "nothing_eligible"
         _value, cand = ranked[0]
-        return await self.explore(cand)
+        self._in_flight.add(cand.key)
+        try:
+            return await self.explore(cand)
+        finally:
+            self._in_flight.discard(cand.key)
 
-    async def explore(self, cand: S.KeyCandidate) -> str:
-        urls = S.pick_urls(cand.urls, 1 + self.cfg.gen_urls)
-        if len(urls) < 1 + self.cfg.gen_urls:
+    async def explore(self, cand: S.KeyCandidate, *, manual: bool = False,
+                      opened: list | None = None) -> str:
+        all_urls = S.pick_urls(cand.urls, len(cand.urls))
+        if len(all_urls) < 1 + self.cfg.gen_urls and not (manual and all_urls):
             return "too_few_urls"
-        explore_url = urls[0]
-        res = await V.solve(self.hub, self.llm, explore_url, cfg=self.solver_cfg, sleep=self._sleep)
-        result, reason, barrier = res.result, res.reason, res.barrier
+        tag = "[manual] " if manual else ""
+        # Open URLs of the key until one tells us something about the KEY.
+        # "This video was deleted" is about that URL; "nothing to click" may
+        # be too (the wall is not shown every time). Two URLs that both show
+        # a page with no video at all are a verdict on the key.
+        tryable = all_urls[: max(1, self.cfg.max_explore_urls)]
+        dead: list[str] = []          # URLs not worth replaying on
+        no_video = 0
+        hard: dict = {}               # hard barrier -> URLs it was named on
+        for i, explore_url in enumerate(tryable):
+            if opened is not None:
+                opened.append(explore_url)
+            res = await V.solve(self.hub, self.llm, explore_url, cfg=self.solver_cfg, sleep=self._sleep,
+                                notes=KLASS_NOTES.get(cand.klass, ""))
+            again = False
+            if res.result == V.GAVE_UP and res.barrier in V.URL_BARRIERS:
+                dead.append(explore_url)
+                again = True
+            elif res.result == V.GAVE_UP and res.barrier == "no_video":
+                dead.append(explore_url)
+                no_video += 1
+                again = no_video < 2
+            elif res.result == V.GAVE_UP and res.barrier in V.HARD_BARRIERS:
+                # "Needs a login" from one page is weak (the model says it of
+                # any page that has a login link): look at a second URL.
+                dead.append(explore_url)
+                hard[res.barrier] = hard.get(res.barrier, 0) + 1
+                again = hard[res.barrier] < 2
+            elif res.result in (V.NO_ACTION, V.EXHAUSTED):
+                again = True
+            if not again or i == len(tryable) - 1:
+                break
+            await self._record(cand, explore_url, res, res.result, tag + _run_reason(res), None, {})
+            log.info("solver %s %s: %s on %s -- trying another URL", cand.host, cand.template,
+                     _run_reason(res), explore_url)
+        result, reason, barrier = res.result, _run_reason(res), res.barrier
+        if result == V.GAVE_UP and barrier == "no_video" and no_video >= 2 and cand.success_7d == 0:
+            # Seen twice AND the ledger agrees: no fetch of this key got a
+            # whole video in 7 days. A key that does produce videos is not
+            # shelved on the model's word (it says "no video" of a player it
+            # could not start).
+            barrier = "not_video"     # a verdict on the key (scheduler.KEY_BARRIERS)
+        long_sleep = barrier
+        if barrier in V.HARD_BARRIERS and (hard.get(barrier, 0) < 2 or cand.success_7d > 0):
+            # A month of silence needs the same barrier on two URLs and a
+            # ledger that agrees (no whole video from this key in 7 days).
+            long_sleep = ""
         actions = None
         pb_id = None
         replay: dict = {}
+        urls = [explore_url] + [u for u in all_urls if u != explore_url and u not in dead][: self.cfg.gen_urls]
 
         if result == V.TRACE:
             actions, why = compiler.compile_trace(res.trace)
             if actions is None:
                 result, reason = UNCOMPILABLE, why
+            elif len(urls) < 1 + self.cfg.gen_urls:
+                result, reason = REPLAY_FAIL, "too few live URLs to test the steps on"
             else:
                 try:
                     replay = await self.replay(urls, actions, cand)
@@ -237,14 +390,7 @@ class Autopilot:
                 holdout_pct=self.life_cfg.holdout_pct,
             )
 
-        await self.store.record_run(
-            host=cand.host, template=cand.template, intent=cand.intent, klass=cand.klass,
-            url=explore_url, result=result, reason=reason, steps=len(res.trace),
-            llm_calls=res.llm_calls, tokens=res.tokens, duration_s=res.duration_s,
-            pb_id=pb_id, manifest=self.manifest(),
-            trace=res.trace + ([{"replay": replay}] if replay else []),
-        )
-        self.stats["runs"] += 1
+        await self._record(cand, explore_url, res, result, (tag + reason)[:120], pb_id, replay)
         if result in (V.INFRA, V.BAD_OUTPUT):
             # Not the site's doing: the key is not charged and may be picked
             # again once the engine / fleet is back.
@@ -255,16 +401,31 @@ class Autopilot:
         until = None
         if not solved:
             streak = await self.store.fail_streak(cand.host, cand.template, cand.intent) + 1
-            until = _utcnow() + S.dormancy(streak, barrier)
+            until = _utcnow() + S.dormancy(streak, long_sleep)
         await self.store.update_key_state(
             host=cand.host, template=cand.template, intent=cand.intent, klass=cand.klass,
-            solved=solved, result=result, dormant_until=until,
+            solved=solved, dormant_until=until,
+            # What the Solver concluded about the KEY ("gave_up:not_video").
+            result=f"{result}:{barrier}" if result == V.GAVE_UP and barrier else result,
         )
         if solved:
             self.stats["solved"] += 1
         log.info("solver %s %s: %s (%s) clicks=%s tokens=%s pb=%s", cand.host, cand.template,
                  result, reason, res.clicks, res.tokens, pb_id)
         return result
+
+    async def _record(self, cand: S.KeyCandidate, url: str, res, result: str, reason: str,
+                      pb_id: int | None, replay: dict) -> None:
+        """One Solver session = one row, whether or not it was the last
+        URL tried for the key."""
+        await self.store.record_run(
+            host=cand.host, template=cand.template, intent=cand.intent, klass=cand.klass,
+            url=url, result=result, reason=reason, steps=len(res.trace),
+            llm_calls=res.llm_calls, tokens=res.tokens, duration_s=res.duration_s,
+            pb_id=pb_id, manifest=self.manifest(),
+            trace=res.trace + ([{"replay": replay}] if replay else []),
+        )
+        self.stats["runs"] += 1
 
     async def replay(self, urls: list[str], actions: list, cand: S.KeyCandidate) -> dict:
         """Run the compiled actions -- no model involved -- as ordinary
@@ -315,8 +476,9 @@ class Autopilot:
                 log.warning("status publish failed", exc_info=True)
             await _wait(stop, self.cfg.lifecycle_interval_s)
 
-    async def _solver_loop(self, stop: asyncio.Event) -> None:
+    async def _solver_loop(self, stop: asyncio.Event, start_after: float = 0.0) -> None:
         idle = ("no_candidates", "nothing_eligible", "budget_exhausted", "too_few_urls")
+        await _wait(stop, start_after)
         while not stop.is_set():
             delay = self.cfg.solver_interval_s
             try:
@@ -327,6 +489,8 @@ class Autopilot:
                     log.info("solver idle: %s", what)
                 else:
                     delay = 5.0  # a real run finished: look for the next key
+                if what in ("has_playbook", "already_running", "bad_request"):
+                    delay = 1.0  # a request was answered without a run: next one
             except asyncio.CancelledError:
                 raise
             except Exception:
@@ -337,7 +501,8 @@ class Autopilot:
     async def run(self, stop: asyncio.Event) -> None:
         tasks = [asyncio.create_task(self._lifecycle_loop(stop))]
         if self.cfg.solver_enabled:
-            tasks.append(asyncio.create_task(self._solver_loop(stop)))
+            for i in range(max(1, self.cfg.solver_concurrency)):
+                tasks.append(asyncio.create_task(self._solver_loop(stop, start_after=7.0 * i)))
         try:
             await asyncio.gather(*tasks)
         finally:
@@ -350,6 +515,15 @@ async def _wait(stop: asyncio.Event, seconds: float) -> None:
         await asyncio.wait_for(stop.wait(), timeout=seconds)
     except asyncio.TimeoutError:
         pass
+
+
+def _run_reason(res) -> str:
+    """The reason stored for a session: a give-up carries the barrier the
+    model named, so a person (and the next query) can tell "deleted" from
+    "needs a login" without reading the sentence."""
+    if res.result == V.GAVE_UP and res.barrier:
+        return f"[{res.barrier}] {res.reason}"[:120]
+    return res.reason
 
 
 def judge_replay(replay: dict, explore_url: str, gen_required: int) -> tuple[str, str]:

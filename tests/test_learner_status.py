@@ -164,6 +164,9 @@ class _Store:
     async def key_summary(self):
         return [("overlay_wall", 3, 3, 0, 3)]
 
+    async def key_labels(self):
+        return [("gave_up:not_video", 2), ("no_action", 1)]
+
     async def outcome_days(self, days=7):
         return []
 
@@ -194,8 +197,9 @@ def test_publish_status_writes_one_expiring_document():
     assert stored["solver"]["today"]["runs"] == 3 and stored["solver"]["enabled"] is True
     assert stored["consumer"] == {"read": 10, "flushed": 10}
     assert stored["manifest"]["model"] == "test-model"
-    assert stored["config"]["daily_runs"] == 40
+    assert stored["config"]["daily_runs"] == 1000
     assert doc["keys"]["keys"] == 3
+    assert doc["keys"]["by_label"][0] == {"label": "gave_up:not_video", "keys": 2}
 
 
 def test_a_failing_status_write_does_not_stop_the_lifecycle_loop():

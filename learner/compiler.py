@@ -35,6 +35,12 @@ MAX_CLICKS = 6
 MAX_SELECTORS = 4
 WAIT_AFTER_CLICK_S = 1.5
 WAIT_BEFORE_FIRST_S = 1.0
+#: A wait the model chose is replayed only when it is long enough to be a
+#: decision ("let the advertisement finish"), not a pause between looks.
+MIN_REPLAYED_WAIT_S = 5.0
+MAX_REPLAYED_WAIT_S = 90.0
+MAX_PLAYER_CLICKS = 3
+PLAYER_MARK = "player"
 
 _UNSTABLE_RE = re.compile(r"\d{3,}|[0-9a-f]{8,}", re.I)
 
@@ -170,29 +176,93 @@ def click_actions(desc: dict, mark: str) -> list[dict] | None:
     ]
 
 
+def player_tag_js(mark: str = PLAYER_MARK) -> str:
+    """JS that marks what a click in the middle of the largest visible
+    <video> would hit, and reports it as a JSON string. That element -- an
+    overlay, a big play button, or the video itself -- is what a person
+    clicks to start a player; it is found by position because players
+    rarely give it a stable name."""
+    return (
+        "(() => { const mark = " + json.dumps(mark) + "; let best = null, area = 0;"
+        " for (const v of document.querySelectorAll('video')) {"
+        " const r = v.getBoundingClientRect(); const a = Math.max(0, r.width) * Math.max(0, r.height);"
+        " if (r.width >= 120 && r.height >= 80 && a > area) { best = v; area = a; } }"
+        " if (!best) return JSON.stringify({found: false});"
+        " try { best.scrollIntoView({block: 'center'}); } catch (e) {}"
+        " const r = best.getBoundingClientRect();"
+        " const top = document.elementFromPoint(r.left + r.width / 2, r.top + r.height / 2) || best;"
+        " const link = top.closest ? top.closest('a[href]') : null; let external = false;"
+        " if (link) { try { const h = new URL(link.href, location.href).hostname.split('.').slice(-2).join('.');"
+        " external = !!h && h !== location.hostname.split('.').slice(-2).join('.'); } catch (e) {} }"
+        " document.querySelectorAll('[data-pb-t=\"' + mark + '\"]').forEach(e => e.removeAttribute('data-pb-t'));"
+        " if (!external) top.setAttribute('data-pb-t', mark);"
+        " return JSON.stringify({found: true, external: external, tag: top.tagName.toLowerCase(),"
+        " text: (top.innerText || '').replace(/\\s+/g, ' ').trim().slice(0, 40),"
+        " w: Math.round(r.width), h: Math.round(r.height)}); })()"
+    )
+
+
+def player_click_actions(mark: str) -> list[dict]:
+    return [
+        {"kind": "evaluate", "expression": player_tag_js(mark)},
+        {"kind": "click", "selector": f'[data-pb-t="{mark}"]'},
+        {"kind": "wait", "seconds": WAIT_AFTER_CLICK_S},
+    ]
+
+
 def _target_id(desc: dict) -> tuple:
     return (tuple(stable_selectors(desc)), stable_text(desc))
+
+
+def _replayable(s: dict) -> str:
+    """'click' / 'player' / 'wait' for a step worth replaying, else ''."""
+    if not isinstance(s, dict):
+        return ""
+    act = s.get("action")
+    if act == "click" and s.get("ok") and isinstance(s.get("desc"), dict):
+        return "click"
+    if act == "click_player" and s.get("performed"):
+        return "player"
+    if act == "wait" and s.get("ok") and float(s.get("seconds") or 0) >= MIN_REPLAYED_WAIT_S:
+        return "wait"
+    return ""
 
 
 def compile_trace(trace: list[dict]) -> tuple[list[dict] | None, str]:
     """(actions, reason). ``actions`` is None when nothing replayable came
     out; ``reason`` says why.
 
-    Only clicks that were actually performed are kept; looking, scrolling
-    and waiting are things a plain fetch does by itself. Clicking the same
-    target twice in a row is kept once.
+    Kept, in the order they happened: clicks on a listed element that did
+    something, clicks on the video player, and long waits that did something
+    (an advertisement ending). Looking, scrolling and short pauses are things
+    a plain fetch does by itself. Clicking the same target twice in a row is
+    kept once -- except the player, where the first click often only opens
+    an advertisement and the second one starts the video.
+
+    A player click that changed nothing is kept only when a later step did
+    change something: it may have been the necessary first click.
     """
-    clicks = [
-        s for s in (trace or [])
-        if isinstance(s, dict) and s.get("action") == "click" and s.get("ok")
-        and isinstance(s.get("desc"), dict)
-    ]
-    if not clicks:
+    steps = [(k, s) for s in (trace or []) for k in [_replayable(s)] if k]
+    # Drop trailing player clicks without effect: nothing came of them.
+    while steps and steps[-1][0] == "player" and not steps[-1][1].get("ok"):
+        steps.pop()
+    if not steps:
         return None, "no_click_in_trace"
     actions: list[dict] = [{"kind": "wait", "seconds": WAIT_BEFORE_FIRST_S}]
     prev = None
-    n = 0
-    for s in clicks:
+    n = players = 0
+    for kind, s in steps:
+        if kind == "wait":
+            actions.append({"kind": "wait", "seconds": min(float(s["seconds"]), MAX_REPLAYED_WAIT_S)})
+            prev = None
+            continue
+        if kind == "player":
+            players += 1
+            if players > MAX_PLAYER_CLICKS:
+                continue
+            actions.extend(player_click_actions(f"p{players}"))
+            prev = None
+            continue
         tid = _target_id(s["desc"])
         if tid == prev:
             continue
@@ -213,6 +283,9 @@ def summarize(actions: list[dict]) -> list[dict]:
     out = []
     for a in actions or []:
         if a.get("kind") == "evaluate":
+            if "document.querySelectorAll('video')" in (a.get("expression") or ""):
+                out.append({"find": "the video player"})
+                continue
             m = re.search(r"const sels = (\[.*?\]), text = (\".*?\"), mark = ", a.get("expression") or "", re.S)
             if m:
                 try:
@@ -223,4 +296,6 @@ def summarize(actions: list[dict]) -> list[dict]:
             out.append({"evaluate": True})
         elif a.get("kind") == "click":
             out.append({"click": a.get("selector")})
+        elif a.get("kind") == "wait" and float(a.get("seconds") or 0) >= MIN_REPLAYED_WAIT_S:
+            out.append({"wait_s": a.get("seconds")})
     return out

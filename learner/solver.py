@@ -36,11 +36,11 @@ import time
 from dataclasses import dataclass, field
 from urllib.parse import urlsplit
 
-from learner.compiler import describe_js
+from learner.compiler import MAX_PLAYER_CLICKS, PLAYER_MARK, describe_js, player_tag_js
 from learner.hubapi import HubError, HubUnavailable
-from learner.llm import LLMBadOutput, LLMUnavailable
+from learner.llm import LLMBadOutput, LLMUnavailable, start_meter
 
-PROMPT_VERSION = 1
+PROMPT_VERSION = 4
 
 #: result values
 TRACE = "trace"                # at least one click was carried out
@@ -52,7 +52,14 @@ BAD_OUTPUT = "llm_bad_output"  # the model would not produce the JSON asked for
 
 #: barriers a give_up may name; these make the key dormant for a long time
 HARD_BARRIERS = ("login", "paywall", "captcha", "region")
-BARRIERS = HARD_BARRIERS + ("no_video", "other")
+#: barriers that are about the ONE URL that was opened, not about the key:
+#: another URL of the same template may be fine, so the autopilot moves on
+#: to the next URL instead of giving the key up (learner/autopilot.py).
+#: "redirected" is never named by the model: the Solver sets it when the
+#: page it was sent to had already left for another site before any click
+#: (an advertising redirect), so whatever the model saw was not the key.
+URL_BARRIERS = ("gone", "redirected")
+BARRIERS = HARD_BARRIERS + ("gone", "no_video", "other")
 
 SYSTEM_PROMPT = """You operate a web browser. Your goal: get the main video of the page to load and play.
 
@@ -61,9 +68,10 @@ Reply with ONE JSON object and nothing else:
 
   {"action": "click", "ref": N, "why": "..."}     click element @N
   {"action": "scroll", "why": "..."}              scroll down one screen
-  {"action": "wait", "why": "..."}                wait two seconds
+  {"action": "click_player", "why": "..."}        click the middle of the video player
+  {"action": "wait", "seconds": N, "why": "..."}  wait N seconds (2 to 60)
   {"action": "done", "why": "..."}                the video is loading / playing and nothing covers it
-  {"action": "give_up", "barrier": "login|paywall|captcha|region|no_video|other", "why": "..."}
+  {"action": "give_up", "barrier": "login|paywall|captcha|region|gone|no_video|other", "why": "..."}
 
 What you may click:
   - an age confirmation ("I am 18", "Enter", "Yes", "はい", "入場")
@@ -73,7 +81,15 @@ What you may click:
 
 Never click: log in, sign up, register, buy, subscribe, download-app, advertisements, or links to other sites.
 You cannot type. If the page needs a login, a payment, a captcha or is blocked in this region, give_up with that barrier.
+Two barriers must be told apart:
+  - "gone": THIS page's video was removed, deleted, made private or inactive, or the page says it was not found. Other pages of the site may still have their video.
+  - "no_video": this KIND of page never has a video (a shop item, an article, a form, a list, a profile, a search result).
+If the page HAS a video player but you cannot get it to start, that is "other", not "no_video".
 If a click did not change anything, do not repeat it; try something else or give_up.
+Use click_player when the video is not playing and no listed element starts it. The first click on a player
+often only opens an advertisement: clicking the player again is allowed.
+If a short advertisement is playing in the player before the main video, wait for it to end with ONE long wait
+(for a 30-second advertisement: {"action": "wait", "seconds": 40}), then read "longest" in VIDEO ELEMENTS again.
 Prefer the smallest number of clicks."""
 
 _PROBE_JS = r"""
@@ -116,13 +132,14 @@ _PROBE_JS = r"""
 @dataclass(frozen=True)
 class SolverConfig:
     max_steps: int = 12
-    max_seconds: float = 300.0
+    max_seconds: float = 900.0   # a thinking model takes ~30 s per step
     max_tokens: int = 60_000
     max_bad_outputs: int = 2
     #: Steps in a row that change nothing (a wait, a scroll, a refused or
     #: repeated click) before the run is ended: a model that is stuck does
     #: not get to spend the whole step budget finding that out.
     max_idle_steps: int = 3
+    max_wait_total_s: float = 150.0   # all waits of one run together
     outline_chars: int = 5000
     settle_s: float = 2.5
 
@@ -140,6 +157,13 @@ class SolveResult:
     @property
     def clicks(self) -> int:
         return sum(1 for s in self.trace if s.get("action") == "click" and s.get("ok"))
+
+    @property
+    def replayable(self) -> int:
+        """Steps a playbook could be made of: effective clicks, player
+        clicks and long waits (``learner/compiler.py``)."""
+        from learner.compiler import _replayable
+        return sum(1 for s in self.trace if _replayable(s) and s.get("ok"))
 
 
 def media_state(probe: dict | None) -> dict:
@@ -222,6 +246,8 @@ def describe_effect(before: dict, after: dict) -> str:
         parts.append(f"videos with a source {before['with_src']} -> {after['with_src']}")
     if after["playing"] != before["playing"]:
         parts.append(f"playing {before['playing']} -> {after['playing']}")
+    if after["longest_s"] != before["longest_s"]:
+        parts.append(f"longest video {before['longest_s']}s -> {after['longest_s']}s")
     return "; ".join(parts) or NOTHING
 
 
@@ -242,7 +268,7 @@ def build_user_prompt(url: str, probe: dict | None, outline: str, history: list[
     if p.get("password_field"):
         lines.append("NOTE: the page contains a password field.")
     if notes:
-        lines.append(f"EARLIER ATTEMPTS ON THIS SITE: {notes[:500]}")
+        lines.append(f"WHAT IS KNOWN ABOUT THIS KIND OF PAGE: {notes[:600]}")
     if history:
         lines.append("YOUR STEPS SO FAR:")
         lines.extend(f"  {i}. {h}" for i, h in enumerate(history, 1))
@@ -267,8 +293,14 @@ def parse_decision(obj: dict) -> dict:
         if ref < 1:
             raise LLMBadOutput(f"click ref out of range: {ref}")
         return {"action": "click", "ref": ref, "why": why}
-    if action in ("scroll", "wait", "done"):
+    if action in ("scroll", "done", "click_player"):
         return {"action": action, "why": why}
+    if action == "wait":
+        try:
+            seconds = float(obj.get("seconds") or 2)
+        except (TypeError, ValueError):
+            seconds = 2.0
+        return {"action": "wait", "seconds": max(2.0, min(60.0, seconds)), "why": why}
     if action == "give_up":
         barrier = str(obj.get("barrier") or "other").strip().lower()
         return {"action": "give_up", "barrier": barrier if barrier in BARRIERS else "other", "why": why}
@@ -280,14 +312,14 @@ async def solve(hub, llm, url: str, *, cfg: SolverConfig | None = None, notes: s
     """Explore ``url`` in one browser session and return the trace."""
     cfg = cfg or SolverConfig()
     t0 = time.monotonic()
-    calls0, tokens0 = llm.calls, llm.tokens
+    meter = start_meter()
     trace: list[dict] = []
     history: list[str] = []
 
     def _out(result: str, reason: str = "", barrier: str = "") -> SolveResult:
         return SolveResult(
             result=result, reason=reason[:120], barrier=barrier, trace=trace,
-            llm_calls=llm.calls - calls0, tokens=llm.tokens - tokens0,
+            llm_calls=meter.calls, tokens=meter.tokens,
             duration_s=round(time.monotonic() - t0, 1),
         )
 
@@ -299,6 +331,8 @@ async def solve(hub, llm, url: str, *, cfg: SolverConfig | None = None, notes: s
         return _out(GAVE_UP, f"open_session rejected: {e}", "other")
 
     bad = 0
+    waited = 0.0                   # seconds spent in "wait" so far
+    player_clicks = 0
     idle = 0                       # consecutive steps without any effect
     dead: set = set()              # targets whose click changed nothing
     try:
@@ -307,8 +341,9 @@ async def solve(hub, llm, url: str, *, cfg: SolverConfig | None = None, notes: s
         # Where the page settled after loading is "the site": a redirect on
         # load is the site's own doing, a change after OUR click is not.
         home = site_of(media_state(probe)["url"]) or site_of(url)
+        elsewhere = home if home != site_of(url) else ""
         for _step in range(cfg.max_steps):
-            if time.monotonic() - t0 > cfg.max_seconds or llm.tokens - tokens0 > cfg.max_tokens:
+            if time.monotonic() - t0 > cfg.max_seconds or meter.tokens > cfg.max_tokens:
                 break
             if idle >= cfg.max_idle_steps:
                 trace.append({"action": "stopped", "why": "no_progress"})
@@ -332,14 +367,68 @@ async def solve(hub, llm, url: str, *, cfg: SolverConfig | None = None, notes: s
                 break
             if act == "give_up":
                 trace.append({"action": "give_up", "barrier": decision["barrier"], "why": decision["why"]})
+                if elsewhere:
+                    # The model judged another site's page. Whatever it found
+                    # there -- no video, a login wall -- says nothing about
+                    # the key, and would shelve it for a month.
+                    return _out(GAVE_UP, f"loaded {elsewhere} instead: {decision['why']}", "redirected")
                 return _out(GAVE_UP, decision["why"], decision["barrier"])
             if act == "wait":
-                await sleep(2.0)
+                seconds = min(decision["seconds"], max(2.0, cfg.max_wait_total_s - waited))
+                waited += seconds
+                await sleep(seconds)
                 probe = await hub.evaluate(sid, _PROBE_JS)
-                trace.append({"action": "wait"})
                 effect = describe_effect(before, media_state(probe))
+                trace.append({"action": "wait", "seconds": seconds, "ok": effect != NOTHING, "effect": effect})
                 idle = 0 if effect != NOTHING else idle + 1
-                history.append("waited 2s: " + effect)
+                if waited >= cfg.max_wait_total_s:
+                    idle = cfg.max_idle_steps          # no more waiting in this run
+                history.append(f"waited {seconds:.0f}s: " + effect)
+                continue
+            if act == "click_player":
+                if player_clicks >= MAX_PLAYER_CLICKS:
+                    idle += 1
+                    trace.append({"action": "click_player", "ok": False, "refused": "too_many"})
+                    history.append("click_player: REFUSED, the player was clicked "
+                                   f"{MAX_PLAYER_CLICKS} times already")
+                    continue
+                pdesc = await hub.evaluate(sid, player_tag_js())
+                if not isinstance(pdesc, dict) or not pdesc.get("found"):
+                    idle += 1
+                    trace.append({"action": "click_player", "ok": False, "refused": "no_player"})
+                    history.append("click_player: REFUSED, there is no video player on the page")
+                    continue
+                if pdesc.get("external") or FORBIDDEN_LABEL_RE.search(str(pdesc.get("text") or "")):
+                    idle += 1
+                    trace.append({"action": "click_player", "ok": False, "refused": "covered", "desc": pdesc})
+                    history.append("click_player: REFUSED, the middle of the player is covered by a link to "
+                                   "another site or an account button")
+                    continue
+                player_clicks += 1
+                try:
+                    await hub.click(sid, f'[data-pb-t="{PLAYER_MARK}"]')
+                    ok = True
+                except HubError as e:
+                    ok = False
+                    history.append(f"click_player: FAILED ({str(e)[:60]})")
+                await sleep(cfg.settle_s)
+                probe = await hub.evaluate(sid, _PROBE_JS)
+                after = media_state(probe if isinstance(probe, dict) else None)
+                effect = describe_effect(before, after)
+                left = bool(after["url"]) and site_of(after["url"]) != home
+                login_form = after["password"] and not before["password"]
+                if ok and (left or login_form):
+                    trace.append({"action": "click_player", "ok": False, "performed": True, "desc": pdesc,
+                                  "why": decision["why"], "effect": effect})
+                    trace.append({"action": "aborted", "why": "left_site" if left else "login_form_appeared"})
+                    return _out(GAVE_UP, f"a click led to {after['url'][:80]}" if left
+                                else "a click opened a login form", "other" if left else "login")
+                changed = ok and effect != NOTHING
+                idle = 0 if changed else idle + 1
+                trace.append({"action": "click_player", "ok": changed, "performed": ok, "desc": pdesc,
+                              "why": decision["why"], "effect": effect})
+                if ok:
+                    history.append(f"clicked the player ({pdesc.get('tag')}): {effect}")
                 continue
             if act == "scroll":
                 await hub.scroll(sid, "down")
@@ -428,7 +517,7 @@ async def solve(hub, llm, url: str, *, cfg: SolverConfig | None = None, notes: s
         await hub.close_session(sid)
 
     res = _out(TRACE)
-    if res.clicks > 0:
+    if res.replayable > 0:
         return res
     ended_by_model = any(s.get("action") == "done" for s in trace)
     return _out(NO_ACTION if ended_by_model else EXHAUSTED,

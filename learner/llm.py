@@ -19,6 +19,7 @@ are supported.
 from __future__ import annotations
 
 import asyncio
+import contextvars
 import json
 import re
 import time
@@ -83,6 +84,37 @@ def chat_url(endpoint: str) -> str:
     if e.endswith("/v1"):
         return e + "/chat/completions"
     return e + "/v1/chat/completions"
+
+
+class Meter:
+    """Calls and tokens of ONE Solver run.
+
+    The client is shared by the Solver runs that go on at the same time, so
+    "the client's counter now minus the counter when I started" would bill a
+    run for its neighbours' calls. Each run starts its own meter instead; it
+    lives in a context variable, which every asyncio task has its own copy of.
+    """
+
+    def __init__(self) -> None:
+        self.calls = 0
+        self.tokens = 0
+
+
+_METER: contextvars.ContextVar = contextvars.ContextVar("learner_llm_meter", default=None)
+
+
+def start_meter() -> Meter:
+    m = Meter()
+    _METER.set(m)
+    return m
+
+
+def count(*, calls: int = 0, tokens: int = 0) -> None:
+    """Add to the current run's meter, if a run is being metered."""
+    m = _METER.get()
+    if m is not None:
+        m.calls += calls
+        m.tokens += tokens
 
 
 class LLM:
@@ -195,6 +227,7 @@ class LLM:
         """One completion call -> (answer text, was it cut off with no answer)."""
         client = await self._http()
         self.calls += 1
+        count(calls=1)
         try:
             resp = await client.post(chat_url(eng["endpoint"]), json=body, headers=headers,
                                      timeout=self._timeout)
@@ -213,6 +246,7 @@ class LLM:
             data = resp.json()
             usage = data.get("usage") or {}
             self.tokens += int(usage.get("total_tokens") or 0)
+            count(tokens=int(usage.get("total_tokens") or 0))
             choice = data["choices"][0]
             content = choice["message"].get("content") or ""
         except Exception as e:

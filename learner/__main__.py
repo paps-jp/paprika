@@ -23,11 +23,17 @@ unless asked for:
                                LEARNER_WORKER_SECRET if the hub has one)
     LEARNER_LLM_THINKING       reasoning models: 1 / 0 = ask for thinking
                                on / off, empty = the engine's default
-    LEARNER_LLM_MAX_TOKENS     cap per reply, thinking included (1500)
+    LEARNER_LLM_MAX_TOKENS     cap per reply, thinking included (4000)
     LEARNER_TARGET_REASONS     Verifier failure reasons the Solver works on,
-                               comma separated (default: overlay_wall)
-    LEARNER_SOLVER_DAILY_RUNS  Solver runs per UTC day (40)
-    LEARNER_SOLVER_DAILY_TOKENS  model tokens per UTC day (2000000)
+                               comma separated (default: all three
+                               known: overlay_wall, video_not_captured,
+                               video_short)
+    LEARNER_SOLVER_DAILY_RUNS  Solver sessions per UTC day (1000)
+    LEARNER_SOLVER_DAILY_TOKENS  model tokens per UTC day (50000000)
+    LEARNER_SOLVER_CONCURRENCY Solver runs at the same time (3)
+    LEARNER_MIN_VIDEO_7D       a key is worked on only if this many of its
+                               jobs produced a playable video in 7 days
+                               (1; 0 = work on every key)
     LEARNER_TRIAL_PCT          share of matching jobs a trial takes (20)
     LEARNER_HOLDOUT_PCT        share an active playbook is withheld from (5)
 """
@@ -101,7 +107,7 @@ def build_autopilot(ledger: MariaLedger, r):
         api_key=os.environ.get("LEARNER_LLM_API_KEY") or "",
         hub_url=hub_url, kind=os.environ.get("LEARNER_LLM_KIND") or "vision-chat",
         worker_secret=os.environ.get("LEARNER_WORKER_SECRET") or "",
-        max_tokens=int(os.environ.get("LEARNER_LLM_MAX_TOKENS") or 1500),
+        max_tokens=int(os.environ.get("LEARNER_LLM_MAX_TOKENS") or 4000),
         thinking=(None if not (os.environ.get("LEARNER_LLM_THINKING") or "").strip()
                   else _on("LEARNER_LLM_THINKING")),
     )
@@ -113,15 +119,19 @@ def build_autopilot(ledger: MariaLedger, r):
         raise SystemExit(f"learner: unknown LEARNER_TARGET_REASONS {unknown}; known: {KNOWN_REASONS}")
     ap = Autopilot(
         store=Store(ledger._pool), hub=hub, llm=llm, redis=r,
-        cfg=AutopilotConfig(solver_enabled=solver_on),
+        cfg=AutopilotConfig(
+            solver_enabled=solver_on,
+            solver_concurrency=int(os.environ.get("LEARNER_SOLVER_CONCURRENCY") or 3),
+        ),
         life_cfg=LifecycleConfig(
             trial_pct=int(os.environ.get("LEARNER_TRIAL_PCT") or 20),
             holdout_pct=int(os.environ.get("LEARNER_HOLDOUT_PCT") or 5),
         ),
         sched_cfg=SchedulerConfig(
             target_reasons=reasons,
-            daily_runs=int(os.environ.get("LEARNER_SOLVER_DAILY_RUNS") or 40),
-            daily_tokens=int(os.environ.get("LEARNER_SOLVER_DAILY_TOKENS") or 2_000_000),
+            daily_runs=int(os.environ.get("LEARNER_SOLVER_DAILY_RUNS") or 1000),
+            daily_tokens=int(os.environ.get("LEARNER_SOLVER_DAILY_TOKENS") or 50_000_000),
+            min_video_7d=int(os.environ.get("LEARNER_MIN_VIDEO_7D") or 1),
         ),
     )
     return ap, [hub, llm]
