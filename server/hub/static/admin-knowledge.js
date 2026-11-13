@@ -160,6 +160,12 @@
     exhausted: '手数切れ', infra: '基盤エラー', llm_bad_output: 'AI 出力不正',
     uncompilable: '手順化できず', replay_fail: '再生で失敗', generalize_fail: '他の URL で失敗',
   };
+  // A key's last result, with the barrier the model named (learner/autopilot.py).
+  const _LEARN_LABEL = {
+    'gave_up:not_video': '動画ページでない', 'gave_up:no_video': '動画なし（1 回だけ確認）',
+    'gave_up:gone': '削除済みの URL ばかり', 'gave_up:login': 'ログインが必要', 'gave_up:paywall': '課金が必要',
+    'gave_up:captcha': 'CAPTCHA', 'gave_up:region': '地域制限', 'gave_up:other': '断念（その他）',
+  };
   const _LEARN_STATE = { active: '適用中', trial: '試行中', candidate: '候補', retired: '引退' };
   const _LEARN_STATE_COLOR = { active: '#2e7d32', trial: '#1a6a8b', candidate: '#7a6a2a', retired: '#999' };
   const _LEARN_PB_REASON = {
@@ -287,9 +293,16 @@
       return '<tr style="border-bottom:1px solid #eef0f2;">' + _learnTd(_esc(day.day), false, 'white-space:nowrap;') +
         _learnTd(_learnNum(day.runs), true) + _learnTd(_learnNum(br.solved || 0), true) + _learnTd(chips) + _learnTd(_learnNum(day.tokens), true) + '</tr>';
     });
+    // What the Solver concluded about each key it looked at (its last run).
+    const labels = (keys.by_label || []).filter(l => l.keys > 0);
+    const labelHtml = labels.length ? '<div style="margin-top:6px;font-size:.9em;color:#555;">調べたキーの判別（' +
+      _learnNum(keys.keys) + ' キー・直近の実行結果）： ' + labels.map(l =>
+        '<span style="display:inline-block;border:1px solid #dde2e7;border-radius:10px;padding:0 7px;margin:1px 3px 1px 0;' +
+        (l.label === 'solved' ? 'background:#eef7f0;border-color:#a5d6a7;' : '') + '">' +
+        _esc(_LEARN_LABEL[l.label] || _LEARN_RESULT[l.label] || l.label) + ' ' + _learnNum(l.keys) + '</span>').join('') + '</div>' : '';
     $('aiLearnSolverDays').innerHTML = _learnTable(
       [['日 (UTC)'], ['実行', 1], ['解けた', 1], ['結果の内訳'], ['トークン', 1]], dayRows,
-      cfg.solver_enabled ? 'この 7 日間、Solver はまだ実行していません。' : 'Solver は OFF です。');
+      cfg.solver_enabled ? 'この 7 日間、Solver はまだ実行していません。' : 'Solver は OFF です。') + labelHtml;
 
     // ---- solver: recent runs
     const runRows = (solver.recent || []).slice(0, 15).map(r => {
