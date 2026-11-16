@@ -1997,8 +1997,17 @@ class _JobExecMixin:
              the finally block does ffmpeg-remux + upload + JobComplete.
         Idempotent: a second HubForceCompleteJob for the same job is a
         no-op (set membership + already-killed subprocess).
+
+        A job this process has no trace of -- no deferred task, no lane task,
+        no resume manifest, and no yt-dlp / ffmpeg to signal -- gets a
+        ``WorkerJobFailed`` instead. That is the row of a download that died
+        with an earlier process of this worker (self-update, recycle, compose
+        recreate): nothing here will ever finish it, and before this reply the
+        hub re-sent force-complete every minute while the row stayed
+        ``downloading`` for days (2026-11-16: 673 of 1244 such rows).
         """
         from server.worker.agent.video import _terminate_ytdlp_descendants_for_job
+        known = self._knows_download(job_id)
         try:
             self._force_complete_job_ids.add(job_id)
         except Exception:
@@ -2010,6 +2019,7 @@ class _JobExecMixin:
             ))
         except Exception:
             pass
+        _killed: int | None = None
         try:
             _killed = await asyncio.to_thread(
                 _terminate_ytdlp_descendants_for_job, job_id,
@@ -2023,6 +2033,48 @@ class _JobExecMixin:
                 "[%s] force-complete: descendant SIGTERM failed", job_id,
                 exc_info=True,
             )
+        if known or _killed != 0:
+            # Something here owns the job (or we could not look): the
+            # deferred task's finally block reports the outcome.
+            return
+        try:
+            self._force_complete_job_ids.discard(job_id)
+        except Exception:
+            pass
+        _logger.info(
+            "[%s] force-complete for a download this process does not have; "
+            "reporting it failed", job_id,
+        )
+        try:
+            await self._send(WorkerJobFailed(
+                job_id=job_id,
+                error=(
+                    f"downloading lost: worker {self.worker_id} has no "
+                    f"download for this job (the process that ran it "
+                    f"restarted); force-complete: {reason or '(no reason)'}"
+                ),
+            ))
+        except Exception:
+            pass
+
+    def _knows_download(self, job_id: str) -> bool:
+        """Whether this process holds anything that will finish ``job_id``:
+        a deferred download task, a lane task (a fetch-mode yt-dlp runs
+        inside the lane, and the hub flips the row to ``downloading`` on its
+        first progress line), or a resume manifest not picked up yet.
+        Errs towards True -- a wrong True only costs the hub's grace period,
+        a wrong False fails a live download."""
+        try:
+            bg = getattr(self, "_bg_video_tasks", None) or {}
+            if job_id in set(bg.values()):
+                return True
+            if job_id in (getattr(self, "_job_tasks", None) or {}):
+                return True
+            from server.worker import resume as _resume
+
+            return _resume.load(job_id) is not None
+        except Exception:
+            return True
 
     async def _salvage_partial_downloads(self, tmp: "Path") -> list:
         """Remux any partial yt-dlp output in ``tmp`` into playable .mp4 files.

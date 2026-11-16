@@ -555,6 +555,28 @@ _DOWNLOADING_TIMEOUT_S = float(
 _DOWNLOADING_REAPER_INTERVAL_S = float(
     os.environ.get("PAPRIKA_DOWNLOADING_REAPER_INTERVAL_S", "60")
 )
+#: Rows looked at per pass, oldest first (see the store's
+#: ``list_stale_downloading``).
+_DOWNLOADING_REAPER_BATCH = int(
+    os.environ.get("PAPRIKA_DOWNLOADING_REAPER_BATCH", "500")
+)
+#: How long a job may stay ``downloading`` after this hub first asked its
+#: (connected) worker to wrap it up. A real wrap-up is SIGTERM + remux +
+#: upload (upload timeout 900s) and ends in WorkerJobComplete, so anything
+#: still ``downloading`` well past that has no download behind it: the worker
+#: restarted since (self-update, recycle, compose recreate), came back under
+#: the same id, and the new process has never heard of the job, so the
+#: force-complete is a no-op on every pass. 2026-11-16: 673 of 1244
+#: ``downloading`` rows (54%) were exactly that, and their count is what the
+#: capacity endpoint subtracts from ``available`` -- they kept job-submit from
+#: filling ~130 idle lanes.
+_FORCE_COMPLETE_GRACE_S = float(
+    os.environ.get("PAPRIKA_FORCE_COMPLETE_GRACE_S", "1200")
+)
+#: job_id -> ``time.monotonic()`` of the first force-complete this hub sent.
+#: Process-local on purpose: only the hub holding the worker's WS sends, and a
+#: hub restart just starts the clock again.
+_force_complete_sent: dict[str, float] = {}
 
 
 async def _downloading_reaper_loop():
@@ -578,23 +600,50 @@ async def _downloading_reaper_loop():
 
 async def _reap_stuck_downloading() -> int:
     """One pass: find ``downloading`` jobs older than the timeout and ask
-    them to finalise. Returns the number actioned."""
+    them to finalise. Returns the number actioned.
+
+    Three outcomes per row, oldest first:
+
+    * A -- the worker holds its WS on this hub: send ``HubForceCompleteJob``.
+      If the row is still ``downloading`` ``_FORCE_COMPLETE_GRACE_S`` after
+      the first send, nothing on that worker is downloading it (see
+      ``_FORCE_COMPLETE_GRACE_S``) and the row is failed.
+    * B -- the worker is connected to another hub: that hub's pass owns it.
+    * C -- the worker is gone fleet-wide: fail the row.
+    """
+    from datetime import timedelta
+
     from server.hub._state import state
-    from server.protocol import HubForceCompleteJob, JobStatus, JobResult
+    from server.protocol import HubForceCompleteJob
 
     store = state.store
     if store is None or state.registry is None:
         return 0
+    now = datetime.utcnow()
     try:
-        infos, _ = await store.list_job_infos(
-            offset=0, limit=500, status=["downloading"],
-        )
+        lister = getattr(store, "list_stale_downloading", None)
+        if lister is not None:
+            infos = await lister(
+                started_before=now - timedelta(seconds=_DOWNLOADING_TIMEOUT_S),
+                limit=_DOWNLOADING_REAPER_BATCH,
+            )
+        else:
+            infos, _ = await store.list_job_infos(
+                offset=0, limit=500, status=["downloading"],
+            )
     except Exception:
-        log.debug("downloading reaper: list_job_infos failed", exc_info=True)
+        log.debug("downloading reaper: listing stale rows failed", exc_info=True)
         return 0
+    infos = list(infos or [])
+    # Forget clocks for jobs that left the stale set (finished, failed by a
+    # peer, wrapped up). The set is read oldest-first, so a job with a clock
+    # running is never the one a full batch cut off.
+    _live = {getattr(i, "job_id", None) for i in infos}
+    for _jid in [j for j in _force_complete_sent if j not in _live]:
+        _force_complete_sent.pop(_jid, None)
     if not infos:
         return 0
-    now = datetime.utcnow()
+    alive_ids: set[str] | None = None
     actioned = 0
     for info in infos:
         started = getattr(info, "started_at", None)
@@ -613,6 +662,25 @@ async def _reap_stuck_downloading() -> int:
         )
         # ----- Path A: worker is alive locally -> ask it to wrap up -----
         if worker is not None:
+            mono = time.monotonic()
+            first = _force_complete_sent.get(info.job_id)
+            if first is not None and mono - first >= _FORCE_COMPLETE_GRACE_S:
+                if await _fail_stale_downloading(
+                    store, info.job_id, worker_id,
+                    f"downloading exceeded {int(_DOWNLOADING_TIMEOUT_S)}s and "
+                    f"worker {worker_id} did not wrap it up within "
+                    f"{int(_FORCE_COMPLETE_GRACE_S)}s of force-complete; "
+                    f"the download is no longer running there (worker "
+                    f"restarted since)",
+                ):
+                    _force_complete_sent.pop(info.job_id, None)
+                    log.info(
+                        "downloading reaper: marked %s as failed (worker %s "
+                        "ignored force-complete for %.0fs, age=%.0fs)",
+                        info.job_id, worker_id, mono - first, age_s,
+                    )
+                    actioned += 1
+                continue
             try:
                 await state.registry.send(
                     worker,
@@ -624,6 +692,14 @@ async def _reap_stuck_downloading() -> int:
                         ),
                     ),
                 )
+            except Exception:
+                log.debug(
+                    "downloading reaper: force-complete send failed for %s",
+                    info.job_id, exc_info=True,
+                )
+                continue
+            if first is None:
+                _force_complete_sent[info.job_id] = mono
                 log.info(
                     "downloading reaper: sent force-complete to worker %s for "
                     "job %s (age=%.0fs, pct=%s)",
@@ -631,53 +707,92 @@ async def _reap_stuck_downloading() -> int:
                     getattr(info.progress, "download_pct", None) if info.progress else None,
                 )
                 actioned += 1
-            except Exception:
-                log.debug(
-                    "downloading reaper: force-complete send failed for %s",
-                    info.job_id, exc_info=True,
-                )
             continue
-        # ----- Path B: worker is not on THIS hub -> Redis-known? -----
-        # The worker's WS lives on whichever hub the worker's consistent-hash
-        # mapped to. Skip the row from this hub; the owning hub's reaper will
-        # action it. (We can't tell from here if it's owned by a peer or
-        # truly dead -- but the peer's reaper will hit the same row a few
-        # seconds later. Belt-and-braces: see Path C below.)
-        try:
-            known_workers = await state.registry._fetch_known_workers()
-        except Exception:
-            known_workers = {}
-        if worker_id and worker_id in known_workers:
+        # ----- Path B: worker is alive on ANOTHER hub -> its pass owns it -----
+        # The worker's WS lives on whichever hub it connected to; that hub's
+        # pass sends the force-complete. Liveness is the fleet-wide set
+        # GET /workers shows (local connections + Redis peers with a fresh
+        # heartbeat), the same one the stale-job reconciler uses.
+        #
+        # This used to call ``registry._fetch_known_workers()`` with no
+        # argument, which raises TypeError (it takes ``exclude_ids`` and
+        # returns a list), so the set was always empty and every hub took
+        # Path C for every peer-owned row. That went unnoticed only because
+        # the newest-first listing never reached a row past the timeout.
+        if alive_ids is None:
+            alive_ids = await _fleet_alive_worker_ids()
+        if alive_ids is None:
+            continue  # no fleet view: never read a blip as "all dead"
+        if worker_id and worker_id in alive_ids:
             continue
         # ----- Path C: worker truly gone fleet-wide -> mark failed -----
         # No live WS anywhere in the fleet to action the request. The
         # detached video subprocess died with the worker; nothing to save.
-        info.status = JobStatus.failed
-        info.error = (
+        if await _fail_stale_downloading(
+            store, info.job_id, worker_id,
             f"downloading exceeded {int(_DOWNLOADING_TIMEOUT_S)}s and worker "
-            f"{worker_id} is gone fleet-wide; no partial save possible"
-        )
-        if info.progress is not None:
-            info.progress.phase = "failed"
-        info.completed_at = datetime.utcnow()
-        try:
-            await store.save_job_info(info)
-            await store.save_job_result(JobResult(
-                job_id=info.job_id, status=JobStatus.failed, error=info.error,
-            ))
-        except Exception:
-            log.debug(
-                "downloading reaper: save_job_info failed for %s",
-                info.job_id, exc_info=True,
+            f"{worker_id} is gone fleet-wide; no partial save possible",
+        ):
+            log.info(
+                "downloading reaper: marked %s as failed (worker %s gone "
+                "fleet-wide, age=%.0fs)",
+                info.job_id, worker_id, age_s,
             )
-            continue
-        log.info(
-            "downloading reaper: marked %s as failed (worker %s gone "
-            "fleet-wide, age=%.0fs)",
-            info.job_id, worker_id, age_s,
-        )
-        actioned += 1
+            actioned += 1
     return actioned
+
+
+async def _fleet_alive_worker_ids() -> set[str] | None:
+    """Worker ids alive anywhere in the fleet, or None when there is no
+    usable view (stats failed, or an empty set -- a Redis blip, not a fleet
+    with zero workers)."""
+    if state.registry is None:
+        return None
+    try:
+        snap = await state.registry.stats_async()
+    except Exception:
+        log.debug("downloading reaper: stats_async failed", exc_info=True)
+        return None
+    ids = {
+        w.get("worker_id")
+        for w in (snap or {}).get("workers", [])
+        if w.get("alive") and w.get("worker_id")
+    }
+    return ids or None
+
+
+async def _fail_stale_downloading(
+    store, job_id: str, worker_id: str | None, error: str,
+) -> bool:
+    """Fail one ``downloading`` row, re-read first so a job that completed
+    (or moved to another worker) since the listing is left alone."""
+    from server.protocol import JobResult
+
+    try:
+        info = await store.get_job_info(job_id)
+    except Exception:
+        return False
+    if info is None or info.status != JobStatus.downloading:
+        return False
+    if getattr(info, "worker_id", None) != worker_id:
+        return False
+    info.status = JobStatus.failed
+    info.error = error
+    if info.progress is not None:
+        info.progress.phase = "failed"
+    info.completed_at = datetime.utcnow()
+    try:
+        await store.save_job_info(info)
+        await store.save_job_result(JobResult(
+            job_id=job_id, status=JobStatus.failed, error=error,
+        ))
+    except Exception:
+        log.debug(
+            "downloading reaper: save_job_info failed for %s",
+            job_id, exc_info=True,
+        )
+        return False
+    return True
 
 
 async def _stale_job_reconciler_loop():

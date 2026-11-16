@@ -572,6 +572,42 @@ class MariaDBJobStore:
         )
         return infos, total
 
+    async def list_stale_downloading(
+        self, *, started_before: datetime, limit: int = 500,
+    ) -> list[Any]:
+        """``downloading`` jobs that started before ``started_before``,
+        OLDEST first.
+
+        For the downloading reaper. It used ``list_job_infos(limit=500)``,
+        which is newest-first: with 768 rows younger than the 1h timeout
+        (2026-11-16) the page never reached a row old enough to act on, and
+        rows whose download had died with a worker restart sat there for
+        days. Ordering by age makes the rows that need action come first no
+        matter how many young ones there are. ``status`` is an equality on
+        the leading column of ``idx_status_created``, so the filesort is
+        over the downloading rows only (hundreds), not the table.
+        """
+        select_cols = (
+            "job_id, status, url, mode, goal, options, "
+            "worker_id, lane_idx, session_id, "
+            "created_at, started_at, completed_at, error, progress, "
+            "owner_id"
+        )
+        sql = (
+            f"SELECT {select_cols} FROM jobs "
+            f"WHERE status = %s AND started_at < %s "
+            f"ORDER BY started_at ASC LIMIT %s"
+        )
+        async with self._pool.acquire() as conn:
+            async with conn.cursor() as cur:
+                await cur.execute(
+                    sql, ("downloading", started_before, int(limit)),
+                )
+                rows = await cur.fetchall()
+        return await asyncio.to_thread(
+            lambda: [_row_to_job_info(r) for r in rows]
+        )
+
     async def list_jobs_after(
         self,
         completed_after: datetime,
