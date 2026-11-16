@@ -165,9 +165,10 @@ def _host_barriers(host: str | None) -> set[str]:
     try:
         import json as _json
 
-        from server.hub._state import get_storage_dir
+        from server.hub._state import config
 
-        p = get_storage_dir() / "host_knowledge" / f"{host}.json"
+        # hub state, not a job file: where the distillers write it
+        p = config.data_dir / "host_knowledge" / f"{host}.json"
         if not p.is_file():
             return out
         k = _json.loads(p.read_text("utf-8"))

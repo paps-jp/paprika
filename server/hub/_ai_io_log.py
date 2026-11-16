@@ -135,11 +135,14 @@ def _enabled() -> bool:
 # ---------------------------------------------------------------------------
 
 def _today_dir() -> Path:
-    """Today's per-day directory under storage_dir/ai_io/YYYY-MM-DD/. Created
+    """Today's per-day directory under data_dir/ai_io/YYYY-MM-DD/. Created
     lazily so the first call per day pays the mkdir cost and the rest are
-    cheap appends."""
-    from server.hub._state import get_storage_dir
-    base = get_storage_dir() / _JSONL_SUBDIR / datetime.utcnow().strftime("%Y-%m-%d")
+    cheap appends.
+
+    ``config.data_dir``, not the job-files directory: this log only grows and
+    nothing evicts it, so on a ramdisk it would fill the space job files need."""
+    from server.hub._state import config
+    base = config.data_dir / _JSONL_SUBDIR / datetime.utcnow().strftime("%Y-%m-%d")
     base.mkdir(parents=True, exist_ok=True)
     return base
 
@@ -174,15 +177,19 @@ async def _offload_to_minio(sha1: str, text: str) -> None:
     and that's still useful enough for the UI."""
     try:
         from server.hub import objstore
-        # Reuse the same data-dir-staged + mirror_file path the asset
-        # uploader uses; gives us automatic dormant-when-disabled semantics
-        # via PAPRIKA_S3_ENABLED.
-        from server.hub._state import get_storage_dir
-        staged = get_storage_dir() / _JSONL_SUBDIR / "_blobs" / f"{sha1}.bin"
+        # Staged next to the JSONL (config.data_dir, see _today_dir) and sent
+        # under the key it always had: ``{prefix}/ai_io/_blobs/<sha1>.bin``.
+        # put_object is dormant when the object store is disabled, like
+        # mirror_file; the key is spelled out because mirror_file derives it
+        # from the job-files directory, which this file is no longer under.
+        from server.hub._state import config
+        rel = f"{_JSONL_SUBDIR}/_blobs/{sha1}.bin"
+        staged = config.data_dir / _JSONL_SUBDIR / "_blobs" / f"{sha1}.bin"
         staged.parent.mkdir(parents=True, exist_ok=True)
         if not staged.exists():
             staged.write_text(text, encoding="utf-8", errors="replace")
-        await objstore.mirror_file(staged)
+        prefix = objstore._prefix()
+        await objstore.put_object(f"{prefix}/{rel}" if prefix else rel, staged)
     except Exception as e:
         _log.debug("ai_io offload (%s) failed: %s", sha1, e)
 

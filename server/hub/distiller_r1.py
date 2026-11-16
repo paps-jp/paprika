@@ -502,7 +502,10 @@ async def distill_for_job(
 
     # Load current knowledge (the light distiller will have just updated
     # stats, so this read sees the freshest version).
-    knowledge_path = data_dir / "host_knowledge" / f"{host}.json"
+    # host_knowledge is hub state, not a job file: config.data_dir, even when
+    # ``data_dir`` (the job-files directory) is a ramdisk.
+    from server.hub._state import state_dir_for
+    knowledge_path = state_dir_for(data_dir) / "host_knowledge" / f"{host}.json"
     try:
         current = json.loads(knowledge_path.read_text(encoding="utf-8"))
     except Exception:
@@ -678,7 +681,7 @@ async def distill_for_job(
 
     # history.jsonl: one entry per applied update for traceability.
     try:
-        hist_path = data_dir / "host_knowledge" / host / "history.jsonl"
+        hist_path = state_dir_for(data_dir) / "host_knowledge" / host / "history.jsonl"
         hist_path.parent.mkdir(parents=True, exist_ok=True)
         with hist_path.open("a", encoding="utf-8") as f:
             for u in updates:

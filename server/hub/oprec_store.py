@@ -357,6 +357,8 @@ _STORE: OpRecStore | None = None
 def get_store() -> OpRecStore:
     global _STORE
     if _STORE is None:
-        from server.hub._state import get_storage_dir
-        _STORE = OpRecStore(get_storage_dir() / "oprec")
+        # Recordings are kept, so they live with the hub's own state: the
+        # job-files directory can be a ramdisk that is empty after a reboot.
+        from server.hub._state import config
+        _STORE = OpRecStore(config.data_dir / "oprec")
     return _STORE

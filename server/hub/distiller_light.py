@@ -60,12 +60,19 @@ def host_from_url(url: str | None) -> str | None:
     return h or None
 
 
+def _knowledge_root(data_dir: Path) -> Path:
+    """``host_knowledge/`` is the hub's own state, not a job's file: it stays
+    in ``config.data_dir`` even when job files live on a ramdisk."""
+    from server.hub._state import state_dir_for
+    return state_dir_for(data_dir) / "host_knowledge"
+
+
 def _path_for(host: str, data_dir: Path) -> Path:
-    return data_dir / "host_knowledge" / f"{host}.json"
+    return _knowledge_root(data_dir) / f"{host}.json"
 
 
 def _history_path_for(host: str, data_dir: Path) -> Path:
-    d = data_dir / "host_knowledge" / host
+    d = _knowledge_root(data_dir) / host
     return d / "history.jsonl"
 
 

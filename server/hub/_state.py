@@ -190,4 +190,25 @@ def get_storage_dir() -> Path:
     return config.data_dir
 
 
-__all__ = ["HubConfig", "AppState", "config", "state", "get_storage_dir"]
+def state_dir_for(data_dir: Path | str) -> Path:
+    """Where hub-owned state goes when a caller was handed the job-files
+    directory.
+
+    The distillers receive ``get_storage_dir()`` as their ``data_dir`` (they
+    read a job's files from it) and used to keep ``host_knowledge/`` under the
+    same path. The job-files directory can be a ramdisk -- bounded, evicted,
+    empty after a reboot -- so anything that is not a job's own file belongs
+    in ``config.data_dir``, where the routes that read it already look.
+
+    A caller that passes some other directory (a test, a one-off tool) keeps
+    it.
+    """
+    try:
+        if Path(data_dir) == get_storage_dir():
+            return config.data_dir
+    except Exception:
+        pass
+    return Path(data_dir)
+
+
+__all__ = ["HubConfig", "AppState", "config", "state", "get_storage_dir", "state_dir_for"]
