@@ -124,6 +124,8 @@ def rig(monkeypatch):
         monkeypatch.setattr(aioredis, "from_url", lambda *a, **kw: _redis_holder[0])
         monkeypatch.setattr(httpx, "AsyncClient", lambda *a, **kw: http)
         agent = _Agent(lanes=lanes)
+        # Lets a fake hub act on the worker it is answering (the WS assign).
+        http.agent = agent
 
         async def _go():
             task = asyncio.create_task(agent._pull_loop())
@@ -238,3 +240,58 @@ async def test_an_empty_queue_releases_the_reservation(rig):
     r = _FakeRedis([])
     agent, _ = await rig(r, lanes=2)
     assert getattr(agent, "_pull_pending", 0) == 0
+
+
+class _AssignFirstHTTP(_FakeHTTP):
+    """The real hub's order: the WS assign goes out (and the worker marks a
+    lane busy) BEFORE the claim's HTTP 200 comes back, because the hub saves
+    the row in between."""
+
+    async def post(self, url, json=None):
+        self.posts.append(json.get("job_id"))
+        for lane in self.agent.lane_pool.lanes:
+            if not lane.busy:
+                lane.busy = True
+                break
+        await asyncio.sleep(0)
+        return _Resp(200)
+
+
+@pytest.mark.asyncio
+async def test_assign_before_the_200_still_fills_every_lane(rig):
+    """2026-11-16. The settle counted free lanes AFTER the 200, when the assign
+    had already taken one, then waited for a second lane to go busy. The
+    reservation sat out the 20s grace and the worker never asked for its other
+    lane: 2-lane workers ran one job at a time, the fleet sat at 52% busy lanes
+    with the pull queue full, and the hub 503'd every submit past it."""
+    r = _FakeRedis([f"j{i}" for i in range(5)])
+    agent, http = await rig(r, http=_AssignFirstHTTP(), lanes=2, seconds=0.5)
+    assert len(http.posts) == 2, f"claimed {len(http.posts)} jobs for 2 free lanes"
+    assert all(lane.busy for lane in agent.lane_pool.lanes)
+    assert getattr(agent, "_pull_pending", 0) == 0
+
+
+@pytest.mark.asyncio
+async def test_settle_releases_at_once_when_the_lane_is_already_busy():
+    """Given the pre-claim count, a lane that went busy during the claim
+    releases the reservation without waiting for the 0.25s poll."""
+    agent = _Agent(lanes=2)
+    agent._pull_pending = 1
+    agent.lane_pool.lanes[0].busy = True
+    await asyncio.wait_for(agent._pull_settle(before=2), timeout=0.1)
+    assert agent._pull_pending == 0
+
+
+@pytest.mark.asyncio
+async def test_settle_still_waits_for_an_assign_that_has_not_landed(monkeypatch):
+    """The over-claim guard stays: no lane went busy, so the slot stays
+    reserved until the assign lands or the grace runs out."""
+    monkeypatch.setattr(_mix_pull, "_ASSIGN_GRACE_S", 0.6)
+    agent = _Agent(lanes=2)
+    agent._pull_pending = 1
+    task = asyncio.create_task(agent._pull_settle(before=2))
+    await asyncio.sleep(0.3)
+    assert agent._pull_pending == 1 and not task.done()
+    agent.lane_pool.lanes[1].busy = True
+    await asyncio.wait_for(task, timeout=0.5)
+    assert agent._pull_pending == 0

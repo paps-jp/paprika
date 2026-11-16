@@ -114,20 +114,33 @@ class _PullMixin:
         # worker kills itself.
         return self._pull_free_lanes() - getattr(self, "_pull_pending", 0) > 0
 
-    async def _pull_settle(self) -> None:
+    async def _pull_settle(self, before: int | None = None) -> None:
         """Keep a won claim reserved until its lane actually goes busy.
 
         Released early the moment lane state catches up, and on a deadline
         regardless -- a claim whose assign never arrives (hub restart between
         the CAS and the send) must not reserve a lane forever.
+
+        ``before`` is the free-lane count taken BEFORE the claim was sent. The
+        hub sends the WS assign first and answers the claim's HTTP request only
+        after it has saved the row, so by the time the 200 is back the lane is
+        usually busy already. Counting here, after the 200, measured the
+        already-reduced number and then waited for a SECOND lane to go busy that
+        never came: the reservation sat out the whole grace period and the loop
+        would not ask for the other lane. Every 2-lane worker ran one job at a
+        time (2026-11-16: 52% of the fleet's lanes busy with the pull queue
+        full and the hub 503-ing every submit past it).
         """
-        before = self._pull_free_lanes()
+        if before is None:
+            before = self._pull_free_lanes()
         deadline = time.monotonic() + _ASSIGN_GRACE_S
         try:
-            while time.monotonic() < deadline:
-                await asyncio.sleep(0.25)
+            while True:
                 if self._pull_free_lanes() < before:
                     return
+                if time.monotonic() >= deadline:
+                    return
+                await asyncio.sleep(0.25)
         finally:
             self._pull_pending = max(0, getattr(self, "_pull_pending", 0) - 1)
 
@@ -245,12 +258,22 @@ class _PullMixin:
                         if not got or not got[1]:
                             continue      # timeout -- re-check our lane state
                         job_id = got[1]
+                        # Count BEFORE claiming: the assign can land over the
+                        # WS before the claim's 200 does (see _pull_settle).
+                        free_before = self._pull_free_lanes()
                         outcome = await self._pull_claim(http, job_id)
                         if outcome == "ok":
-                            # The reservation lives on until the assign lands;
-                            # _pull_settle owns releasing it from here.
-                            asyncio.create_task(self._pull_settle())
-                            handed_off = True
+                            if self._pull_free_lanes() < free_before:
+                                # The assign already landed and took its lane:
+                                # nothing left to hold, so the finally below
+                                # releases the slot now and the next pass can
+                                # ask for the other lane straight away.
+                                pass
+                            else:
+                                # The reservation lives on until the assign
+                                # lands; _pull_settle owns releasing it.
+                                asyncio.create_task(self._pull_settle(free_before))
+                                handed_off = True
                         elif outcome == "requeue":
                             await self._pull_requeue(client, job_id)
                             # Yield before popping again. Without this a queue
