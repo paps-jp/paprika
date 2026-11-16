@@ -2154,6 +2154,7 @@ class _JobExecMixin:
             url = f"{base}/hosts/{host_norm}"
             existing_notes = None
             existing_cookies: list[dict] = []
+            existing_rec: dict | None = None
             existed = False
             try:
                 async with make_async_client(timeout=10.0) as cli:
@@ -2162,9 +2163,22 @@ class _JobExecMixin:
                         rec = g.json() or {}
                         existing_notes = rec.get("notes")
                         existing_cookies = list(rec.get("cookies") or [])
+                        existing_rec = rec if isinstance(rec, dict) else None
                         existed = True
             except Exception:
                 pass
+
+            # One save rewrites this host's whole record on every hub's disk
+            # (and in MariaDB). The hub already has these same cookies from a
+            # save a moment ago -> nothing worth a write. See cookie_save.py.
+            from server.worker import cookie_save
+            _age = cookie_save.redundant_age_s(existing_rec, filtered or existing_cookies)
+            if _age is not None:
+                log(
+                    f"  ... cookie save skipped: the hub has the same cookies for "
+                    f"{host_norm}, saved {_age:.0f}s ago"
+                )
+                return
 
             if filtered:
                 cookies_to_save = filtered
