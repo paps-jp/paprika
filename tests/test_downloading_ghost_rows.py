@@ -405,3 +405,86 @@ async def test_a_process_to_signal_or_no_way_to_look_is_not_a_ghost(
     _sigterm(monkeypatch, result)
     await agent._force_complete_video_job("j1", "r")
     assert _failed(agent) == []
+
+
+# --- 5. the disconnect sweep hands the worker's downloads to the watch ----
+#
+# 2026-11-16: 1180 downloads were lost to worker restarts in 3h, 1014 of them
+# to memory-guard exits. The deferred watch (_settle_abandoned_downloading)
+# that should fail them 240s after the disconnect was fed only from this
+# hub's session registry, and a deferred download has no session -- so each
+# row stayed `downloading` for the reaper's 1h + 20min instead.
+
+
+import inspect  # noqa: E402
+
+from server.hub import mariadb_store  # noqa: E402
+from server.hub.routes import workers as workers_route  # noqa: E402
+
+
+class _PoolCur:
+    def __init__(self, rows, seen):
+        self._rows, self._seen = rows, seen
+
+    async def __aenter__(self):
+        return self
+
+    async def __aexit__(self, *a):
+        return False
+
+    async def execute(self, sql, args=None):
+        self._seen.append((sql, args))
+
+    async def fetchall(self):
+        return self._rows
+
+
+class _PoolConn:
+    def __init__(self, rows, seen):
+        self._rows, self._seen = rows, seen
+
+    async def __aenter__(self):
+        return self
+
+    async def __aexit__(self, *a):
+        return False
+
+    def cursor(self):
+        return _PoolCur(self._rows, self._seen)
+
+
+class _Pool:
+    def __init__(self, rows):
+        self.rows, self.seen = rows, []
+
+    def acquire(self):
+        return _PoolConn(self.rows, self.seen)
+
+
+async def test_store_lists_only_this_workers_downloading_ids():
+    pool = _Pool([("j1",), ("j2",)])
+    store = mariadb_store.MariaDBJobStore(pool)
+    assert await store.list_downloading_ids_for_worker("w1") == ["j1", "j2"]
+    (sql, args), = pool.seen
+    assert "status = %s" in sql and "worker_id = %s" in sql
+    assert args[:2] == ("downloading", "w1")
+
+
+async def test_store_lookup_without_a_worker_id_asks_nothing():
+    pool = _Pool([("j1",)])
+    store = mariadb_store.MariaDBJobStore(pool)
+    assert await store.list_downloading_ids_for_worker("") == []
+    assert pool.seen == []
+
+
+def test_the_disconnect_sweep_feeds_downloading_rows_to_the_watch():
+    """The lookup must land in ``orphan_job_ids`` BEFORE the settle loop,
+    whose downloading branch parks the ids for the deferred watch."""
+    src = inspect.getsource(workers_route)
+    body = src[src.index("orphan_job_ids: list[str] = []"):
+               src.index('log.info("worker disconnected: %s", worker_id)')]
+    lookup = body.index("list_downloading_ids_for_worker")
+    assert lookup < body.index("for jid in set(orphan_job_ids):")
+    assert "orphan_job_ids.extend(await _dl_lister(worker_id))" in body
+    park = body.index("elif jinfo.status == JobStatus.downloading:")
+    assert "deferred_downloading.append(jid)" in body[park:park + 1200]

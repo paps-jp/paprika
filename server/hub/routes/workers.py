@@ -1991,6 +1991,31 @@ async def worker_link(ws: WebSocket, worker_id: str):
                     "failed; falling back to the session registry only",
                     worker_id, exc_info=True,
                 )
+            # `downloading` rows go to the deferred watch below, which fails
+            # them after _ABANDONED_DOWNLOADING_GRACE_S unless the worker says
+            # it still has them (WorkerJobProgress.resumed: sent for every
+            # live download on a same-process reconnect, and for each
+            # handed-over one after a recycle). The watch was only ever fed
+            # from the session registry, which a deferred download is never in
+            # -- its lane, and the session with it, is released before the
+            # download starts. So it saw almost none, and a download killed by
+            # a restart left its row `downloading` until the 1h reaper (+20min
+            # force-complete grace). Measured 2026-11-16: 1180 downloads lost
+            # to worker restarts in 3h, 1014 of them to memory-guard exits
+            # (median 10 per exit), each row counting against job-submit's
+            # admission for ~80 minutes.
+            _dl_lister = getattr(
+                state.store, "list_downloading_ids_for_worker", None,
+            )
+            if _dl_lister is not None:
+                try:
+                    orphan_job_ids.extend(await _dl_lister(worker_id))
+                except Exception:
+                    log.info(
+                        "worker %s disconnect: store lookup for downloading "
+                        "jobs failed; the 1h downloading reaper covers them",
+                        worker_id, exc_info=True,
+                    )
             dropped = state.sessions.drop_by_worker(worker_id)
             if dropped:
                 log.info(

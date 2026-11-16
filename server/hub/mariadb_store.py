@@ -608,6 +608,29 @@ class MariaDBJobStore:
             lambda: [_row_to_job_info(r) for r in rows]
         )
 
+    async def list_downloading_ids_for_worker(
+        self, worker_id: str, *, limit: int = 200,
+    ) -> list[str]:
+        """job_ids of ``downloading`` rows assigned to ``worker_id``.
+
+        For the worker-disconnect sweep. A deferred download holds no session
+        and, under pull dispatch, was claimed through whichever hub answered,
+        so neither the session registry nor anything else in this hub's
+        memory knows about it -- only the row does. ``idx_status`` /
+        ``idx_worker_id`` both narrow this to a few hundred rows at most.
+        """
+        if not worker_id:
+            return []
+        async with self._pool.acquire() as conn:
+            async with conn.cursor() as cur:
+                await cur.execute(
+                    "SELECT job_id FROM jobs "
+                    "WHERE status = %s AND worker_id = %s LIMIT %s",
+                    ("downloading", worker_id, int(limit)),
+                )
+                rows = await cur.fetchall()
+        return [r[0] for r in rows if r and r[0]]
+
     async def list_jobs_after(
         self,
         completed_after: datetime,
