@@ -376,6 +376,11 @@ class JobProgress(BaseModel):
     download_pct: float | None = None
     download_eta: str | None = None
     download_speed: str | None = None
+    # Epoch seconds at which the worker last said it had picked this job's
+    # video download up again after restarting (WorkerJobProgress.resumed).
+    # The disconnect handling reads it to tell a download that came back
+    # from one that died with the old process.
+    resumed_at: float | None = None
 
 
 class JobInfo(BaseModel):
@@ -752,6 +757,11 @@ class WorkerJobProgress(BaseModel):
     download_pct: float | None = None
     download_eta: str | None = None
     download_speed: str | None = None
+    # True on the one message a restarted worker sends when it picks a
+    # deferred video download up again (server/worker/resume.py). An older
+    # hub ignores the field -- and has already failed the job, which the
+    # worker finds out by asking before it resumes.
+    resumed: bool = False
 
 
 class WorkerJobLog(BaseModel):

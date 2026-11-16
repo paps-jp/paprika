@@ -325,6 +325,8 @@ def _make_video_downloader(
     #              CDP-observed document URL (passed as ``referer``) is
     #              then the IFRAME url, which the CDN often rejects --
     #              the top page url is the referer it actually expects.
+    worker_id: str | None = None,  # for the ramdisk admission of a download
+    #              (scratch_pool.why_no_video_room); None skips the memory axis
     user_agent: str | None = None,  # real Chrome UA from cdp.browser.get_version()
     session_id: str | None = None,  # optional: enables noVNC operator-
     #              interaction protection. When set, the closure builds
@@ -1040,6 +1042,21 @@ def _make_video_downloader(
         if not (is_stream or is_direct):
             return
         downloaded_urls.add(target_url)
+        # A video is written to the ramdisk or not at all. assets_dir is the
+        # session's own directory: on the ramdisk, but with no reservation
+        # behind it, so the download is admitted here.
+        try:
+            from server.worker import scratch_pool as _sp
+
+            _no_room = _sp.why_no_video_room(assets_dir, worker_id)
+        except Exception:
+            _no_room = ""
+        if _no_room:
+            _both(
+                f"  !! video not downloaded: no room on the ramdisk "
+                f"({_no_room}): {target_url[:100]}"
+            )
+            return
         _both(
             f"  🎬 detected video URL ({'HLS/DASH' if is_stream else 'direct'}): {target_url[:100]}"
         )

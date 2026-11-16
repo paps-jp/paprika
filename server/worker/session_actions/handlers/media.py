@@ -273,8 +273,22 @@ async def _act_download_video(agent, ctx: "_ActionCtx") -> None:
             target_url = st or ""
         except Exception:
             target_url = ""
+    # A video is written to the ramdisk or not at all (never the CT disk).
+    # The session's directory is on the ramdisk but carries no reservation,
+    # so this is where the download is admitted.
+    from server.worker import scratch_pool as _sp
+
+    _no_room = _sp.why_no_video_room(
+        state.assets_dir, getattr(agent, "worker_id", None)
+    )
     if not target_url:
         reply.status = "ERR: no url for download_video"
+    elif _no_room:
+        reply.status = (
+            f"ERR: download_video: no room on the ramdisk ({_no_room}); "
+            f"a video is never written to disk"
+        )
+        _slog(f"[download_video] refused: {_no_room}")
     else:
         from core.fetcher import run_ytdlp
 

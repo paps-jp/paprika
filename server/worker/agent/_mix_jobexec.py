@@ -95,6 +95,7 @@ from .selfupdate import _auto_exit_on_version_mismatch, _auto_fetch_source, _che
 from .translate import _looks_non_english, _translate_to_english
 from server.worker import scratch_pool
 from .video import _make_video_downloader, _parse_dl_progress, detect_yt_dlp
+from ._mix_uploads import _is_video_asset_name
 from .workerid import WORKER_ID_FILE, _WorkerIdReassigned, hub_http_base
 
 
@@ -116,13 +117,23 @@ class _AbandonedJob(Exception):
     """
 
 
+class _NoVideoRam(Exception):
+    """Raised inside the deferred-download task when no room could be had on
+    the ramdisk for the video.
+
+    Video files are NEVER written to a disk (operator rule, 2026-11-16: the
+    ramdisk exists to spare the node's SSDs). So this is not an error to work
+    around: the job is finished without its video, and says so.
+    """
+
+
 def _looks_like_enospc(msg: object) -> bool:
     """True when a yt-dlp failure message reads as "the filesystem is full".
 
     Only consulted for downloads placed on the shared ramdisk pool, where a
     neighbouring CT can legitimately fill the tmpfs between our admission
-    check and our writes -- that case is worth one local-disk retry, unlike
-    an ordinary download failure.
+    check and our writes -- that case is worth one more try IN PLACE after a
+    pause (yt-dlp carries on from its .part), unlike an ordinary failure.
     """
     s = str(msg or "").lower()
     return (
@@ -419,20 +430,21 @@ class _JobExecMixin:
                                 f"continuing with lane default",
                             )
 
-                # Local tempdir for assets + page.html + log.txt. Optionally
-                # on the shared ramdisk pool -- default OFF, because on a
-                # small pool the video reserve is the whole budget and this
-                # dir can itself receive an inline video download. Any of the
+                # Directory for assets + page.html + log.txt: ALWAYS on the
+                # shared ramdisk pool (2026-11-16). The page's images are
+                # never written to the CT disk (an SSD) any more than its
+                # video is; with no room the job fails instead. Any of the
                 # existing rmtree(workdir) paths stay correct: a pool claim
                 # whose dir is gone is self-healing (scratch_pool).
-                workdir = None
-                if scratch_pool.job_workdirs_enabled():
-                    workdir = scratch_pool.acquire(
-                        f"paprika-{job_id}-", self.worker_id,
-                        scratch_pool.job_reserve_bytes(),
-                    )
+                workdir = await scratch_pool.acquire_small_wait(
+                    f"paprika-{job_id}-", self.worker_id,
+                )
                 if workdir is None:
-                    workdir = Path(tempfile.mkdtemp(prefix=f"paprika-{job_id}-"))
+                    raise RuntimeError(
+                        "no room on the ramdisk for this job's files "
+                        "(they are never written to disk): "
+                        + scratch_pool.why_small_refused()
+                    )
                 assets_dir = workdir / "assets"
                 assets_dir.mkdir(parents=True, exist_ok=True)
                 log_path = workdir / "log.txt"
@@ -765,6 +777,21 @@ class _JobExecMixin:
                 # every entry -- same shape the assets.json + .meta/
                 # sidecar pipeline uses.
                 page_url_for_assets = assign.url or None
+                # A VIDEO the hub never accepted (507 while .48 is full, or any
+                # other failure on both the inline and the reconcile upload)
+                # must not be listed: video-pull would make a crawl_video row
+                # for it and vfe could only fail it with NoSuchKey. Images keep
+                # the old behaviour (they go to .47, which is never gated).
+                _vid_not_up = [
+                    a["name"] for a in result.assets_saved
+                    if _is_video_asset_name(a["name"])
+                    and a["name"] not in uploaded_names
+                ]
+                if _vid_not_up:
+                    _log(
+                        f"  !! {len(_vid_not_up)} video asset(s) not uploaded, "
+                        f"left out of the result: {', '.join(_vid_not_up[:3])}"
+                    )
                 asset_infos = [
                     AssetInfo(
                         name=a["name"],
@@ -775,6 +802,7 @@ class _JobExecMixin:
                         href=f"/jobs/{job_id}/assets/{a['name']}",
                     )
                     for a in result.assets_saved
+                    if a["name"] not in _vid_not_up
                 ]
                 job_result = JobResult(
                     job_id=job_id,
@@ -1253,6 +1281,7 @@ class _JobExecMixin:
         base_result,
         page_url: str | None,
         cookie_jar: list[dict] | None = None,
+        resume: dict | None = None,
     ) -> None:
         """Run a fetch job's deferred yt-dlp download(s) in a DETACHED
         background task, upload the resulting video(s) to the job's
@@ -1275,14 +1304,19 @@ class _JobExecMixin:
         holds operator logins but not per-play session cookies. The file
         is removed when the download finishes.
 
-        That temp dir is taken from the shared node-tmpfs pool when one is
-        mounted (server/worker/scratch_pool.py) -- this is the write that
-        fills the CT's thin-pool -- and falls back to local disk when the
-        pool is absent or full.
+        That temp dir is on the shared node-tmpfs pool
+        (server/worker/scratch_pool.py) and nowhere else: when the pool has
+        no room the download waits for some and is given up if none comes --
+        video is never written to the CT disk (_acquire_video_ram).
+
+        ``resume`` is the manifest of a download the previous process handed
+        over on its way out of a recycle (server/worker/resume.py). The
+        download then runs in the SAME directories with the SAME arguments,
+        which is all yt-dlp needs to carry on from its ``.part``.
         """
         import os as _os
-        import tempfile as _tempfile
 
+        from server.worker import resume as _resume
         from server.worker import scratch_pool as _pool
 
         job_id = assign.job_id
@@ -1290,23 +1324,62 @@ class _JobExecMixin:
         async def _run() -> None:
             from core.fetcher import run_ytdlp
 
-            # Prefer the shared node-tmpfs pool: this task is THE writer that
-            # fills the CT's thin-pool (1-2GB per video, up to 2h resident).
-            # acquire() returns None when the pool isn't mounted or can't
-            # take another download, and we fall back to the CT disk exactly
-            # as before. See server/worker/scratch_pool.py.
             _prefix = f"paprika-vid-{job_id}-"
-            tmp = _pool.acquire(_prefix, self.worker_id, _pool.video_reserve_bytes())
-            _on_pool = tmp is not None
-            if tmp is None:
-                tmp = Path(_tempfile.mkdtemp(prefix=_prefix))
-            # Every directory that may hold output. Normally just one; an
-            # ENOSPC fallback appends a second (local-disk) dir mid-flight.
-            _dl_dirs: list[Path] = [tmp]
+            # A directory handed over by the previous process counts only if
+            # it is RAM-backed: one left on the CT disk by an older version
+            # is not carried on with (video is never written to a disk).
+            _resumed_dirs = [
+                Path(_d) for _d in ((resume or {}).get("dl_dirs") or [])
+                if Path(_d).is_dir() and _pool.video_dir_ok(_d)
+            ]
+            if _resumed_dirs:
+                tmp = _resumed_dirs[-1]
+                _on_pool = bool((resume or {}).get("on_pool"))
+                _dl_dirs: list[Path] = list(_resumed_dirs)
+            else:
+                # The shared node-tmpfs pool, or nowhere. This task is THE
+                # writer of video bytes (1-2GB per video, up to 2h resident),
+                # and those bytes must never land on the CT disk -- the
+                # node's SSDs are what the ramdisk exists to spare. When the
+                # pool cannot take the download right now we wait for room,
+                # and give the video up if none comes
+                # (_acquire_video_ram). See server/worker/scratch_pool.py.
+                tmp = await self._acquire_video_ram(job_id, _prefix)
+                _on_pool = tmp is not None and _pool.is_ram(tmp)
+                # Every directory that may hold output: one, or none at all.
+                _dl_dirs = [tmp] if tmp is not None else []
             _logger.info(
-                "[%s] video scratch: %s (%s)", job_id, tmp,
-                "shared ramdisk pool" if _on_pool else "local disk",
+                "[%s] video scratch: %s (%s%s)", job_id, tmp,
+                "shared ramdisk pool" if _on_pool
+                else "no room on the ramdisk" if tmp is None
+                else "local disk",
+                ", picked up after a restart" if _resumed_dirs else "",
             )
+            _resumes = int((resume or {}).get("resumes") or 0) + (1 if resume else 0)
+            try:
+                _manifest_base = {
+                    "worker_id": self.worker_id,
+                    "created": (resume or {}).get("created") or time.time(),
+                    "resumes": _resumes,
+                    "assign": assign.model_dump(mode="json"),
+                    "base_result": base_result.model_dump(mode="json"),
+                    "targets": [dict(_t) for _t in targets],
+                    "page_url": page_url,
+                }
+            except Exception:
+                # Not serialisable -> this download simply cannot be resumed.
+                _manifest_base = None
+
+            def _save_manifest() -> None:
+                # What a restarted worker needs to pick this download up
+                # again. Rewritten whenever the directories change.
+                if _manifest_base is None or not _resume.enabled():
+                    return
+                _m = dict(_manifest_base)
+                _m["dl_dirs"] = [str(_d) for _d in _dl_dirs]
+                _m["on_pool"] = _on_pool
+                _m["cookies_file"] = str(cookies_file) if cookies_file else None
+                _resume.save(job_id, _m)
             dl_timeout = int(
                 _os.environ.get("PAPRIKA_VIDEO_DOWNLOAD_TIMEOUT_S", "7200")
             )
@@ -1341,12 +1414,24 @@ class _JobExecMixin:
                 # _make_video_downloader, so this deferred path is where
                 # its progress bars come from.
                 _logger.info("[%s] [downloading] %s", job_id, line)
+                if "frame=" in line and "fps=" in line:
+                    # ffmpeg is doing the download (live stream, or a stream
+                    # yt-dlp hands over to it). It keeps nothing to carry on
+                    # from, so a restart must not try to resume this one.
+                    try:
+                        self._bg_video_noresume.add(job_id)
+                    except AttributeError:
+                        self._bg_video_noresume = {job_id}
                 try:
                     _prog = _parse_dl_progress(line.lstrip())
                 except Exception:
                     _prog = None
                 if _prog is None:
                     return
+                if _prog.get("eta"):
+                    # What the recycle reads to decide whether this download
+                    # is worth putting itself off for (_maybe_begin_recycle).
+                    self._note_download_left(job_id, _prog["eta"])
                 if _prog.get("label"):
                     _cur["label"] = _prog["label"]
                 _st = _prog.get("state")
@@ -1368,26 +1453,47 @@ class _JobExecMixin:
                 _emit_progress(JOB_PROGRESS_MARKER + json.dumps(_payload))
 
             added: list = []
+            _upload_failed = 0
             # ffprobe facts for each uploaded video (outcome verifier input).
             _media_facts: list = []
             cookies_file: Path | None = None
+            _no_ram = False
             try:
+                if not _dl_dirs:
+                    raise _NoVideoRam(job_id)
                 await self._send(WorkerJobLog(
                     job_id=job_id,
-                    line=f"  [downloading] {len(targets)} video target(s) "
-                         f"in background…",
+                    line=(
+                        f"  [downloading] {len(targets)} video target(s) "
+                        f"in background…"
+                        if not resume else
+                        f"  [downloading] picked up again after a worker "
+                        f"restart ({len(targets)} target(s), time {_resumes})"
+                    ),
                 ))
-                cookies_file, _ck_note = await self._deferred_cookies_file(
-                    assign, targets, page_url, cookie_jar,
-                )
+                _kept_ck = (resume or {}).get("cookies_file")
+                if _kept_ck and Path(_kept_ck).is_file():
+                    cookies_file, _ck_note = (
+                        Path(_kept_ck), "kept from before the restart",
+                    )
+                else:
+                    cookies_file, _ck_note = await self._deferred_cookies_file(
+                        assign, targets, page_url, cookie_jar,
+                    )
                 await self._send(WorkerJobLog(
                     job_id=job_id, line=f"  [downloading] cookies: {_ck_note}",
                 ))
+                _save_manifest()
+                _more = sum(1 for _t in targets if _t.get("url"))
                 for t in targets:
                     u = t.get("url")
                     ref = t.get("referer")
                     if not u:
                         continue
+                    # yt-dlp's estimate covers this file only; the recycle
+                    # also needs to know how many come after it.
+                    _more -= 1
+                    self._note_download_stage(job_id, more=_more)
                     if job_id in self._abandoned_job_ids:
                         # The hub finished with this job while we were on an
                         # earlier target. Starting the next download would
@@ -1406,21 +1512,25 @@ class _JobExecMixin:
                     )
                     if not ok and _on_pool and _looks_like_enospc(msg):
                         # A neighbouring CT won the race between our
-                        # admission check and its own writes. Losing a
-                        # multi-minute download to the shared pool being
-                        # full is worse than one redundant re-download, so
-                        # retry this target once on local disk.
-                        _fb = Path(_tempfile.mkdtemp(prefix=_prefix))
-                        _dl_dirs.append(_fb)
-                        _on_pool = False
+                        # admission check and its own writes. Give the pool
+                        # a moment and carry on IN PLACE -- yt-dlp resumes
+                        # from its .part. Never on the CT disk.
+                        try:
+                            _pause = float(
+                                _os.environ.get("PAPRIKA_VIDEO_ENOSPC_WAIT_S") or 30.0
+                            )
+                        except (TypeError, ValueError):
+                            _pause = 30.0
                         await self._send(WorkerJobLog(
                             job_id=job_id,
-                            line="  [downloading] ramdisk pool full -- "
-                                 "retrying on local disk",
+                            line=f"  [downloading] ramdisk pool full -- "
+                                 f"carrying on in place in {_pause:.0f}s "
+                                 f"(video is never written to disk)",
                         ))
+                        await asyncio.sleep(max(0.0, _pause))
                         _cur_last[0] = 0.0
                         ok, msg = await asyncio.to_thread(
-                            run_ytdlp, u, _fb,
+                            run_ytdlp, u, _dl_dirs[-1],
                             referer=ref, timeout=dl_timeout, log=_dl_log,
                             cookies_file=cookies_file,
                         )
@@ -1439,6 +1549,9 @@ class _JobExecMixin:
                             job_id=job_id,
                             line=f"  [downloading] FAIL {u}: {str(msg)[:200]}",
                         ))
+                # Fetched but not on the hub yet: an exit now loses it all the
+                # same, and the upload may be waiting out a full store.
+                self._note_download_stage(job_id, stage="upload")
                 # Upload every completed file (skip in-progress parts).
                 _video_ext = {".mp4", ".webm", ".mkv", ".mov", ".m4v", ".ts"}
                 if job_id in self._abandoned_job_ids:
@@ -1453,10 +1566,15 @@ class _JobExecMixin:
                     if low.endswith((".part", ".ytdl")) or ".part-" in low:
                         continue
                     mime = "video/mp4" if p.suffix.lower() in _video_ext else None
-                    await self._upload_asset(
+                    if not await self._upload_video_with_backoff(
                         assign, p, p.name,
                         mime=mime, page_url=page_url, timeout=900.0,
-                    )
+                    ):
+                        # Not on the hub/.48: listing it anyway made video-pull
+                        # create a crawl_video row that vfe could only fail
+                        # with NoSuchKey (2026-11-15).
+                        _upload_failed += 1
+                        continue
                     try:
                         sz = p.stat().st_size
                     except Exception:
@@ -1482,8 +1600,25 @@ class _JobExecMixin:
                 await self._send(WorkerJobLog(
                     job_id=job_id,
                     line=f"  [downloading] done: {len(added)} video asset(s) "
-                         f"uploaded",
+                         f"uploaded"
+                         + (f", {_upload_failed} failed (left out of the result)"
+                            if _upload_failed else ""),
                 ))
+            except _NoVideoRam:
+                _no_ram = True
+                _logger.info(
+                    "[%s] video NOT downloaded: no room on the ramdisk "
+                    "(video is never written to disk)", job_id,
+                )
+                try:
+                    await self._send(WorkerJobLog(
+                        job_id=job_id,
+                        line="  [downloading] no room on the ramdisk for the "
+                             "video; NOT downloaded (video is never written "
+                             "to disk)",
+                    ))
+                except Exception:
+                    pass
             except _AbandonedJob:
                 _logger.info(
                     "[%s] deferred download abandoned: hub already finished "
@@ -1496,6 +1631,11 @@ class _JobExecMixin:
                     line=f"  [downloading] error: {type(e).__name__}: {e}",
                 ))
             finally:
+                # This process is seeing the download through to its end (or
+                # is being stopped in an orderly way): nothing to resume.
+                # The recycle's os._exit never gets here, which is exactly
+                # how its manifests survive.
+                _resume.remove(job_id)
                 # The cookies.txt is plaintext session state -- drop it as
                 # soon as yt-dlp is done with it (same as media.py).
                 if cookies_file is not None:
@@ -1534,11 +1674,15 @@ class _JobExecMixin:
                             pass
                     for _p in _salvaged:
                         try:
-                            await self._upload_asset(
+                            if not await self._upload_asset(
                                 assign, _p, _p.name,
                                 mime="video/mp4",
                                 page_url=page_url, timeout=900.0,
-                            )
+                            ):
+                                # The hub asked us to wrap up, so no backoff
+                                # here -- but never list a file it doesn't have.
+                                _upload_failed += 1
+                                continue
                             sz = _p.stat().st_size
                             added.append(AssetInfo(
                                 name=_p.name, size=sz, mime="video/mp4",
@@ -1590,7 +1734,12 @@ class _JobExecMixin:
                         _f["deferred"] = {
                             "targets": len(targets or []),
                             "files": len(added),
+                            "upload_failed": _upload_failed,
                         }
+                        if _no_ram:
+                            # "wanted a video, had nowhere in RAM to put it"
+                            # -- distinguishable from a download that failed.
+                            _f["deferred"]["no_ram"] = True
                         base_result.facts = _f
                     except Exception:
                         pass
@@ -1628,6 +1777,170 @@ class _JobExecMixin:
             self._bg_video_tasks = {}
         self._bg_video_tasks[task] = job_id
         task.add_done_callback(lambda t: self._bg_video_tasks.pop(t, None))
+        task.add_done_callback(
+            lambda t: (getattr(self, "_bg_video_left", None) or {}).pop(job_id, None)
+        )
+        task.add_done_callback(
+            lambda t: (getattr(self, "_bg_video_stage", None) or {}).pop(job_id, None)
+        )
+        task.add_done_callback(
+            lambda t: (getattr(self, "_bg_video_noresume", None) or set()).discard(job_id)
+        )
+
+    async def _acquire_video_ram(self, job_id: str, prefix: str) -> Path | None:
+        """A directory for one video download: on the ramdisk, or None.
+
+        Video files are never written to a disk -- the node's SSDs are what
+        the ramdisk exists to spare (operator rule, 2026-11-16). Before that
+        rule a download the pool turned down went to the CT disk instead, and
+        measured over an hour that was 5,977 of 10,964 downloads.
+
+        So when the pool has no room we wait for some: nothing is held while
+        waiting (the lane is already released, no bytes are on the ramdisk),
+        and a download ending anywhere on the node frees room. After
+        PAPRIKA_VIDEO_RAM_WAIT_S seconds (default 300) the video is given up
+        and the job finishes without it. PAPRIKA_VIDEO_ALLOW_DISK=1 restores
+        the disk fallback for a development box that has no ramdisk at all.
+        """
+        from server.worker import scratch_pool as _pool
+
+        need = _pool.video_reserve_bytes()
+        try:
+            wait_s = float(os.environ.get("PAPRIKA_VIDEO_RAM_WAIT_S") or 300.0)
+        except (TypeError, ValueError):
+            wait_s = 300.0
+        deadline = time.monotonic() + max(0.0, wait_s)
+        said = False
+        while True:
+            d = _pool.acquire(prefix, self.worker_id, need)
+            if d is not None:
+                return d
+            if _pool.video_disk_allowed():
+                return Path(tempfile.mkdtemp(prefix=prefix))
+            left = deadline - time.monotonic()
+            if left <= 0 or job_id in getattr(self, "_abandoned_job_ids", ()):
+                return None
+            if not said:
+                said = True
+                why = _pool.why_refused(need, self.worker_id) or "the ramdisk is contended"
+                _logger.info(
+                    "[%s] video waits for room on the ramdisk, up to %.0fs: %s",
+                    job_id, wait_s, why,
+                )
+                try:
+                    await self._send(WorkerJobLog(
+                        job_id=job_id,
+                        line=f"  [downloading] waiting for room on the ramdisk "
+                             f"(up to {wait_s:.0f}s): {why}",
+                    ))
+                except Exception:
+                    pass
+            await asyncio.sleep(min(10.0, max(0.5, left)))
+
+    async def _hub_job_wants_download(self, job_id: str) -> str:
+        """Why the hub no longer wants ``job_id``'s video from us, or "".
+
+        The opposite bias from :meth:`_hub_job_is_finished`: there, no answer
+        means "keep downloading"; here it means "do not start". Resuming for
+        a job that is gone would hold the ramdisk for an hour to upload an
+        asset nobody can accept -- so only a positive answer counts.
+        """
+        base = (getattr(self, "hub_http_url", "") or "").rstrip("/")
+        if not base or getattr(self, "_http", None) is None:
+            return "no hub link"
+        last = "no answer from the hub"
+        for _try in range(3):
+            if _try:
+                await asyncio.sleep(3.0)
+            try:
+                r = await self._http.get(f"{base}/jobs/{job_id}", timeout=10.0)
+            except Exception as e:
+                last = f"hub unreachable ({type(e).__name__})"
+                continue
+            if r.status_code == 404:
+                return "the job is gone"
+            if r.status_code != 200:
+                last = f"hub answered {r.status_code}"
+                continue
+            try:
+                body = r.json() or {}
+            except Exception:
+                last = "unreadable answer"
+                continue
+            status = str(body.get("status") or "").split(".")[-1].lower()
+            owner = body.get("worker_id")
+            if owner and owner != self.worker_id:
+                return f"the job now belongs to {owner}"
+            # ``completed`` is still wanted: the hub closes the fetch first
+            # and takes the video afterwards (see _hub_job_is_finished).
+            if status in ("downloading", "running", "completed"):
+                return ""
+            return f"the job is {status or 'in an unknown state'}"
+        return last
+
+    async def _resume_cut_downloads(self) -> int:
+        """Pick up the downloads the previous process handed over.
+
+        Runs once, after the first hub connection of this process. Each
+        manifest is checked against the hub before a byte is fetched, and the
+        hub is told (``resumed=True``) so it stops waiting to fail the job.
+        Returns the number of downloads started."""
+        from server.worker import resume as _resume
+        from server.worker import scratch_pool as _pool
+
+        started = 0
+        try:
+            manifests = _resume.resumable(self.worker_id)
+        except Exception:
+            _logger.warning(
+                f"[worker {self.worker_id}] resume: could not read the "
+                f"manifests", exc_info=True,
+            )
+            return 0
+        for m in manifests:
+            job_id = str(m.get("job_id") or "")
+            if not job_id:
+                continue
+            why = ""
+            assign = base_result = None
+            try:
+                assign = HubAssignJob.model_validate(m["assign"])
+                base_result = JobResult.model_validate(m["base_result"])
+            except Exception as e:
+                why = f"unreadable manifest ({type(e).__name__})"
+            if not why:
+                try:
+                    why = await self._hub_job_wants_download(job_id)
+                except Exception as e:
+                    why = f"could not ask the hub ({type(e).__name__})"
+            if why:
+                _logger.info(
+                    f"[worker {self.worker_id}] resume: dropping {job_id}: {why}",
+                )
+                for _d in m.get("dl_dirs") or []:
+                    try:
+                        _pool.release(Path(_d))
+                    except Exception:
+                        pass
+                _resume.discard(m, rmdirs=False)
+                continue
+            try:
+                await self._send(WorkerJobProgress(
+                    job_id=job_id, phase="downloading", resumed=True,
+                ))
+            except Exception:
+                pass
+            _logger.info(
+                f"[worker {self.worker_id}] resume: picking {job_id} up again "
+                f"({len(m.get('targets') or [])} target(s), "
+                f"time {int(m.get('resumes') or 0) + 1})",
+            )
+            self._spawn_deferred_video_download(
+                assign, list(m.get("targets") or []), base_result,
+                m.get("page_url"), resume=m,
+            )
+            started += 1
+        return started
 
     async def _abandon_video_job(self, job_id: str, reason: str) -> int:
         """Stop an in-flight deferred download whose job the hub has ENDED.

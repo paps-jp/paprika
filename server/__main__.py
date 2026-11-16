@@ -269,6 +269,40 @@ def _run_all(args) -> int:
     return _run_hub_only(args)
 
 
+def _wipe_job_tmpdirs(keep: set[str] | None = None) -> int:
+    """Remove the per-job tempdirs a previous worker process left behind.
+
+    ``keep`` holds the (resolved) directories of downloads that process handed
+    over for resuming; they and the manifest directory itself are spared.
+    Returns the number of directories removed.
+    """
+    import shutil as _sh
+    import tempfile as _tf
+
+    wiped = 0
+    for _d in Path(_tf.gettempdir()).glob("paprika-*"):
+        # ONLY per-job workdirs (mkdtemp prefix "paprika-<job_id>-"). Do NOT
+        # touch the live prefetched infra that also lives under /tmp:
+        # paprika-profile-cache (~80 MB), paprika-profile-* lane clones,
+        # paprika-extensions -- wiping those just forces a needless re-fetch
+        # on every restart. A hex job_id can't collide with these prefixes.
+        # paprika-resume holds the manifests of the downloads to pick up.
+        if _d.name.startswith(
+            ("paprika-profile", "paprika-extensions", "paprika-resume")
+        ):
+            continue
+        if keep:
+            try:
+                if str(_d.resolve()) in keep:
+                    continue
+            except OSError:
+                pass
+        if _d.is_dir():
+            _sh.rmtree(_d, ignore_errors=True)
+            wiped += 1
+    return wiped
+
+
 def _run_worker(args) -> int:
     # Bypass docker's flaky embedded DNS (127.0.0.11) BEFORE any hostname
     # resolution or Chrome lane spawns -- see server/worker/dns_fix.py. The
@@ -288,21 +322,22 @@ def _run_worker(args) -> int:
     # fill the CT disk (cf. the hub-side .part fill that took the fleet down
     # 2026-07-12). On a clean start no job is running, so every such tempdir is
     # abandoned -> safe to remove wholesale. Best-effort; never fatal.
+    #
+    # The one exception: a download the previous process handed over on its
+    # way out of a recycle (server/worker/resume.py). Its directory holds the
+    # bytes yt-dlp will carry on from, so it is spared here and picked up
+    # again once the hub link is back.
+    _resume_keep: set[str] = set()
+    try:
+        from server.worker import resume as _resume
+
+        _resume_keep = _resume.keep_dirs()
+    except Exception as e:
+        log.warning("resume: startup scan failed (continuing): %s", e)
     try:
         import tempfile as _tf
-        import shutil as _sh
-        _wiped = 0
-        for _d in Path(_tf.gettempdir()).glob("paprika-*"):
-            # ONLY per-job workdirs (mkdtemp prefix "paprika-<job_id>-"). Do NOT
-            # touch the live prefetched infra that also lives under /tmp:
-            # paprika-profile-cache (~80 MB), paprika-profile-* lane clones,
-            # paprika-extensions -- wiping those just forces a needless re-fetch
-            # on every restart. A hex job_id can't collide with these prefixes.
-            if _d.name.startswith(("paprika-profile", "paprika-extensions")):
-                continue
-            if _d.is_dir():
-                _sh.rmtree(_d, ignore_errors=True)
-                _wiped += 1
+
+        _wiped = _wipe_job_tmpdirs(_resume_keep)
         if _wiped:
             log.info(
                 "startup: wiped %d abandoned per-job tempdir(s) (interrupted "
@@ -330,7 +365,23 @@ def _run_worker(args) -> int:
         from server.worker import scratch_pool as _scratch_pool
 
         log.info("%s", _scratch_pool.status_line())
-        _n, _freed = _scratch_pool.purge_own(worker_id)
+        # Now that the id is known, drop the handed-over downloads that are
+        # not ours to resume (another worker's, too old, resumed too often)
+        # and keep the directories of the rest out of the purge.
+        _keep: set[str] = set()
+        try:
+            from server.worker import resume as _resume
+
+            _kept, _dropped = _resume.prune(worker_id)
+            _keep = _resume.keep_dirs(worker_id)
+            if _kept or _dropped:
+                log.info(
+                    "startup: %d download(s) to resume after the restart, "
+                    "%d not resumable", _kept, _dropped,
+                )
+        except Exception as e:
+            log.warning("resume: startup prune failed (continuing): %s", e)
+        _n, _freed = _scratch_pool.purge_own(worker_id, keep=_keep)
         if _n:
             log.info(
                 "startup: purged %d abandoned scratch-pool dir(s) "

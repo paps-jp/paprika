@@ -94,8 +94,18 @@ node's worker CTs, so it is node policy like the two knobs above::
 ``PAPRIKA_WORKER_MEM_LIMIT_MB`` is honoured as a fallback for the limit.
 
 Pool file wins over env, which wins over the default.
-``PAPRIKA_SCRATCH_JOB``            1 = also pool per-job workdirs (default 0)
-``PAPRIKA_SCRATCH_JOB_RESERVE_MB`` per-job-workdir claim (default 256)
+``PAPRIKA_SCRATCH_JOB``            no longer read: job and session directories
+                                   are always on the pool (``acquire_small``)
+``PAPRIKA_SCRATCH_SMALL_MB``       free space, above the floor, a job/session
+                                   directory needs to be handed out (default 64)
+``PAPRIKA_JOB_RAM_WAIT_S``         how long a job waits for that room before it
+                                   fails (default 60)
+``PAPRIKA_VIDEO_ALLOW_DISK``       1 = development box: no ramdisk, use the disk
+
+2026-11-16: nothing falls back to the CT disk any more -- not video
+(``video_dir_ok``), and not a job's images, page and log either
+(``acquire_small``). Where the paragraphs above say "falls back to disk", read
+"waits, then is given up".
 ``PAPRIKA_SCRATCH_CLAIM_TTL_S``    a claim not refreshed for this long stops
                                    counting against admission (default 10800)
 """
@@ -252,10 +262,16 @@ def claim_ttl_s() -> int:
 
 
 def job_workdirs_enabled() -> bool:
-    """Per-job workdirs (assets/page.html/log) on the pool. Default OFF: on a
-    4GB pool the video reserve is the whole budget, and a workdir can itself
-    receive an inline video download. Flip this on once the pool is grown."""
+    """Superseded 2026-11-16: job and session directories are ALWAYS on the
+    pool now (:func:`acquire_small`), whatever ``PAPRIKA_SCRATCH_JOB`` says.
+    Kept so an old caller keeps importing."""
     return _truthy("PAPRIKA_SCRATCH_JOB")
+
+
+def small_free_bytes() -> int:
+    """How much must be actually free (above the floor) before a job's own
+    directory is handed out. ``PAPRIKA_SCRATCH_SMALL_MB``, default 64."""
+    return _env_int("PAPRIKA_SCRATCH_SMALL_MB", 64) * _MB
 
 
 def _is_tmpfs(p: Path) -> bool:
@@ -290,6 +306,99 @@ def _is_tmpfs(p: Path) -> bool:
     except OSError:
         return False
     return best_fstype in ("tmpfs", "ramfs")
+
+
+def is_ram(path: Path | str) -> bool:
+    """True when *path* is on a tmpfs / ramfs. Never raises."""
+    try:
+        return _is_tmpfs(Path(path))
+    except Exception:
+        return False
+
+
+def video_disk_allowed() -> bool:
+    """Development escape hatch: let a video be written to a plain directory.
+
+    OFF by default and it must stay off in production. Video files are never
+    written to a disk there -- the node's SSDs are what the ramdisk exists to
+    spare (operator rule, 2026-11-16) -- so a download that cannot get room on
+    the ramdisk waits or is given up, and nothing falls back to the CT disk.
+    A dev box has no ramdisk to offer at all, hence the switch
+    (``PAPRIKA_VIDEO_ALLOW_DISK=1``)."""
+    return _truthy("PAPRIKA_VIDEO_ALLOW_DISK")
+
+
+def video_dir_ok(path: Path | str) -> bool:
+    """May a video file be written under *path*? Only when it is RAM-backed
+    (or the development switch says a disk is acceptable)."""
+    return is_ram(path) or video_disk_allowed()
+
+
+def why_refused(need_bytes: int, worker_id: str) -> str:
+    """Why :func:`acquire` would turn *need_bytes* down right now, or "".
+
+    For the log line of a download that is waiting for room; the decision
+    itself is always acquire()'s."""
+    pool = pool_dir()
+    if pool is None:
+        return "no ramdisk is mounted"
+    need = max(0, int(need_bytes))
+    free = free_bytes(pool)
+    promised = outstanding_bytes(pool)
+    floor = min_free_bytes()
+    if free - promised - floor < need:
+        return (
+            f"ramdisk has {free // _MB} MB free, {promised // _MB} MB of it "
+            f"promised to running downloads, {floor // _MB} MB kept back; "
+            f"{need // _MB} MB needed"
+        )
+    headroom = cgroup_headroom_bytes(pool, worker_id)
+    if headroom is not None and headroom < need:
+        return (
+            f"this worker's memory budget has {headroom // _MB} MB left; "
+            f"{need // _MB} MB needed"
+        )
+    return ""
+
+
+def why_no_video_room(path: Path | str, worker_id: str | None = None) -> str:
+    """Why a video may NOT be downloaded into *path* right now, or "".
+
+    For a download that lands in a directory the caller already holds -- a
+    session's own directory, which :func:`acquire_small` handed out with no
+    claim behind it. Such a download never went through :func:`acquire`, so
+    this is its admission: the directory must be RAM, the pool must really
+    have a video's worth of space above the floor, and this CT's memory
+    budget must be able to take it (tmpfs pages are charged to the cgroup
+    that writes them -- see the module docstring).
+
+    Real space and real memory only; other downloads' promises are not
+    counted, because those were made against the same free space this one
+    would be using and a session cannot wait for them.
+    """
+    if video_disk_allowed():
+        return ""
+    if not is_ram(path):
+        return "its directory is not on the ramdisk"
+    pool = pool_dir()
+    if pool is None:
+        return ""
+    need = video_reserve_bytes()
+    free = free_bytes(pool)
+    floor = min_free_bytes()
+    if free - floor < need:
+        return (
+            f"the ramdisk has {free // _MB} MB free, {floor // _MB} MB kept "
+            f"back; {need // _MB} MB needed"
+        )
+    if worker_id:
+        headroom = cgroup_headroom_bytes(pool, worker_id)
+        if headroom is not None and headroom < need:
+            return (
+                f"this worker's memory budget has {headroom // _MB} MB left; "
+                f"{need // _MB} MB needed"
+            )
+    return ""
 
 
 def configured_dir() -> Path:
@@ -549,8 +658,10 @@ def acquire(prefix: str, worker_id: str, need_bytes: int) -> Path | None:
     a stuck download by searching argv for ``paprika-vid-<job_id>``, and the
     tmp sweeper protects live work by matching job/session ids in the name.
 
-    Returns None whenever the pool cannot take the job -- the caller must fall
-    back to ``tempfile.mkdtemp()`` on local disk.
+    Returns None whenever the pool cannot take the job. What the caller does
+    then: a VIDEO download waits for room or is given up (see
+    ``video_dir_ok``); it never goes to local disk. A job's own directory
+    does not come through here at all -- see :func:`acquire_small`.
     """
     pool = pool_dir()
     if pool is None:
@@ -573,7 +684,7 @@ def acquire(prefix: str, worker_id: str, need_bytes: int) -> Path | None:
     if headroom is not None and headroom < need:
         log.info(
             "scratch pool: %s needs %d MB but cgroup headroom is %d MB "
-            "(limit %d MB, reserve %d MB); using local disk",
+            "(limit %d MB, reserve %d MB); not on the ramdisk",
             prefix, need // _MB, headroom // _MB,
             cgroup_limit_bytes() // _MB, cgroup_reserve_bytes() // _MB,
         )
@@ -582,7 +693,7 @@ def acquire(prefix: str, worker_id: str, need_bytes: int) -> Path | None:
     try:
         d = Path(tempfile.mkdtemp(prefix=f"{prefix}{worker_id}-", dir=str(pool)))
     except OSError as e:
-        log.info("scratch pool: mkdtemp failed (%s); using local disk", e)
+        log.info("scratch pool: mkdtemp failed (%s); not on the ramdisk", e)
         return None
     claim = claims / f"{d.name}.claim"
     try:
@@ -593,13 +704,115 @@ def acquire(prefix: str, worker_id: str, need_bytes: int) -> Path | None:
 
     # Double-check after publishing our claim. Two CTs can pass the check
     # above at the same instant; whoever notices the over-subscription backs
-    # off to local disk. Both backing off is fine (safe direction) -- a
-    # needless disk write is cheap, an ENOSPC 90 minutes into a download is
-    # not.
+    # off. Both backing off is fine (safe direction): the caller asks again
+    # shortly, and an ENOSPC 90 minutes into a download is far worse.
     if free_bytes(pool) - outstanding_bytes(pool) < floor:
         release(d)
         return None
     return d
+
+
+def acquire_small(prefix: str, worker_id: str) -> Path | None:
+    """A directory on the pool for a job's or a session's OWN files: the
+    page, its images, the log, a screenshot.
+
+    These never go to the CT disk either (operator rule, 2026-11-16: images
+    as well as video -- "SSDではなく ramdisk"). Before this they nearly always
+    did, on every worker: the 108 with ``PAPRIKA_SCRATCH_JOB=0`` by setting,
+    and the 150 with ``=1`` because :func:`acquire` wanted a 256 MB claim
+    from a pool whose promises already matched its free space -- 252 job
+    directories on CT disks against 11 on the ramdisk, fleet-wide.
+
+    So this does NOT go through the claim arithmetic. A job directory is
+    small (measured: p50 0.3 MB, max 3.4 MB) and short-lived, while a video
+    claim is a deliberately pessimistic promise about the next hour; letting
+    the second starve the first is what sent the images to the SSD. The only
+    question asked is whether the bytes are really there: actual free space
+    above the floor. The pools had 16-87 GB of that when this was written.
+
+    The directory gets a claim of 0 -- it promises nothing, so it takes
+    nothing from the videos' admission -- but it has one, so the owner-scoped
+    sweeps and purges treat it like every other pool directory. The cgroup
+    axis is skipped for the same reason of scale.
+
+    None when no ramdisk is mounted or it is truly full.
+    """
+    pool = pool_dir()
+    if pool is None:
+        return None
+    try:
+        claims = _claims_dir(pool)
+        claims.mkdir(parents=True, exist_ok=True)
+    except OSError:
+        return None
+    if free_bytes(pool) - min_free_bytes() < small_free_bytes():
+        return None
+    try:
+        d = Path(tempfile.mkdtemp(prefix=f"{prefix}{worker_id}-", dir=str(pool)))
+    except OSError as e:
+        log.info("scratch pool: mkdtemp failed (%s); not on the ramdisk", e)
+        return None
+    try:
+        (claims / f"{d.name}.claim").write_text("0", encoding="utf-8")
+    except OSError:
+        shutil.rmtree(d, ignore_errors=True)
+        return None
+    return d
+
+
+def why_small_refused() -> str:
+    """Why :func:`acquire_small` has nothing to give, in words for a log."""
+    pool = pool_dir()
+    if pool is None:
+        return "no ramdisk is mounted"
+    return (
+        f"the ramdisk has {free_bytes(pool) // _MB} MB free "
+        f"({(min_free_bytes() + small_free_bytes()) // _MB} MB needed)"
+    )
+
+
+async def acquire_small_wait(
+    prefix: str, worker_id: str, wait_s: float | None = None,
+) -> Path | None:
+    """:func:`acquire_small`, waiting a little for room.
+
+    A job cannot run without a place for its files, and that place is the
+    ramdisk or nothing. So a full pool is waited out for
+    ``PAPRIKA_JOB_RAM_WAIT_S`` seconds (default 60); after that the caller
+    gets None and fails the job rather than write to the CT disk.
+
+    ``PAPRIKA_VIDEO_ALLOW_DISK=1`` (a development box, which has no ramdisk)
+    gets a plain temp directory instead of None.
+    """
+    import asyncio
+
+    if wait_s is None:
+        try:
+            wait_s = float(os.environ.get("PAPRIKA_JOB_RAM_WAIT_S") or 60.0)
+        except (TypeError, ValueError):
+            wait_s = 60.0
+    deadline = time.monotonic() + max(0.0, wait_s)
+    said = False
+    while True:
+        d = acquire_small(prefix, worker_id)
+        if d is not None:
+            return d
+        if video_disk_allowed():
+            return Path(tempfile.mkdtemp(prefix=prefix))
+        left = deadline - time.monotonic()
+        if left <= 0:
+            log.warning(
+                "scratch pool: no room for %s after %.0fs (%s); nothing is "
+                "written to disk", prefix, wait_s, why_small_refused(),
+            )
+            return None
+        if not said:
+            said = True
+            log.info(
+                "scratch pool: %s waits for room, up to %.0fs: %s",
+                prefix, wait_s, why_small_refused(),
+            )
+        await asyncio.sleep(min(2.0, max(0.2, left)))
 
 
 def release(path: Path | str | None) -> None:
@@ -645,12 +858,16 @@ def touch_own(worker_id: str) -> int:
     return n
 
 
-def purge_own(worker_id: str) -> tuple[int, int]:
+def purge_own(worker_id: str, keep: set[str] | None = None) -> tuple[int, int]:
     """Remove every directory this worker owns. Startup only.
 
     Safe wholesale precisely because it is owner-scoped AND runs before any
     job: our own leftovers are from a dead prior process, while a neighbour's
     directory (same pool, different ``worker_id``) is never touched.
+
+    ``keep`` is the set of (resolved) directories of downloads the previous
+    process handed over for resuming -- see ``server/worker/resume.py``. They
+    are the one kind of leftover that is still wanted.
     """
     pool = pool_dir()
     if pool is None:
@@ -665,6 +882,12 @@ def purge_own(worker_id: str) -> tuple[int, int]:
     for d in entries:
         if d.name == _CLAIMS_DIRNAME or tok not in d.name:
             continue
+        if keep:
+            try:
+                if str(d.resolve()) in keep:
+                    continue
+            except OSError:
+                pass
         try:
             if not d.is_dir():
                 continue
@@ -731,7 +954,7 @@ def status_line() -> str:
     if pool is None:
         return (
             f"scratch pool: not active at {p} (no tmpfs mounted) -- "
-            f"downloads stay on local disk"
+            f"videos cannot be downloaded (never written to disk)"
         )
     return (
         f"scratch pool: {pool} tmpfs {total_bytes(pool) // _MB} MB "

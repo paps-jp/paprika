@@ -157,17 +157,19 @@ class _SessionsMixin:
                             f"with lane default",
                         )
 
-            # Same opt-in as the per-job workdir (PAPRIKA_SCRATCH_JOB): the
-            # shared ramdisk pool when it is mounted and configured to take
-            # these, otherwise the CT disk exactly as before.
-            assets_dir = None
-            if scratch_pool.job_workdirs_enabled():
-                assets_dir = scratch_pool.acquire(
-                    f"paprika-ses-{sid}-", self.worker_id,
-                    scratch_pool.job_reserve_bytes(),
-                )
+            # 2026-11-16: ALWAYS on the ramdisk, like the per-job workdir --
+            # a session's screenshots, captured images and downloaded videos
+            # are never written to the CT disk. No room = the session does
+            # not start.
+            assets_dir = await scratch_pool.acquire_small_wait(
+                f"paprika-ses-{sid}-", self.worker_id,
+            )
             if assets_dir is None:
-                assets_dir = Path(tempfile.mkdtemp(prefix=f"paprika-ses-{sid}-"))
+                raise RuntimeError(
+                    "no room on the ramdisk for this session's files "
+                    "(they are never written to disk): "
+                    + scratch_pool.why_small_refused()
+                )
             (assets_dir / "assets").mkdir(parents=True, exist_ok=True)
 
             # Derive the parent job_id from the asset_upload_base URL
@@ -360,6 +362,7 @@ class _SessionsMixin:
 
             _raw_downloader, drain_video_session = _make_video_downloader(
                 assets_dir=state.assets_dir,
+                worker_id=self.worker_id,
                 min_asset_size=int(
                     os.environ.get("MIN_ASSET_SIZE_BYTES", "0") or 0
                 ),
@@ -935,6 +938,7 @@ class _SessionsMixin:
             _agent_ua = await _get_browser_user_agent(state.browser) if state.browser else None
             maybe_download_video, drain_video_downloads = _make_video_downloader(
                 assets_dir=state.assets_dir,
+                worker_id=self.worker_id,
                 min_asset_size=int(os.environ.get("MIN_ASSET_SIZE_BYTES", "0") or 0),
                 on_saved=_on_session_video_saved,
                 log=lambda s: _slog(s),

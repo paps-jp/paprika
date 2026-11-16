@@ -212,6 +212,12 @@ async def _act_screenshot(agent, ctx: "_ActionCtx") -> None:
             # Fall back to a plain viewport capture if metrics fail.
             pass
 
+    if not ctx.state.is_fetch_owned:
+        # An interactive session's tab may have been pushed behind an
+        # advertisement's new tab; Chrome does not paint a page it is not
+        # showing, so the capture would never return. (A fetch-owned tab is
+        # left alone: the fetch loop decides what is in front.)
+        await browser_ops.bring_to_front(ctx.tab)
     img_b64 = await ctx.tab.send(cdp.page.capture_screenshot(**cap_kwargs))
     ctx.reply.result = img_b64
     # Optional: publish to the parent job's gallery when a ``label``
@@ -328,7 +334,13 @@ async def _act_set_input_files(agent, ctx: "_ActionCtx") -> None:
         ctx.reply.status = "ERR: set_input_files: empty selector"
     else:
         try:
-            updir = tempfile.mkdtemp(prefix="paprika_upload_")
+            # Inside the session's own directory, which is on the ramdisk:
+            # what the caller hands us to upload may be an image or a video.
+            _sroot = getattr(ctx.state, "assets_dir", None)
+            updir = tempfile.mkdtemp(
+                prefix="paprika_upload_",
+                dir=str(_sroot.parent) if _sroot is not None else None,
+            )
             paths: list[str] = []
             for f in files:
                 name = (

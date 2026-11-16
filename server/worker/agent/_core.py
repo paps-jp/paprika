@@ -128,6 +128,8 @@ class WorkerAgent(
     _TMP_SWEEP_PROTECTED = {
         "paprika-profile-cache",     # canonical sync cache root
         "paprika-extensions",        # CRX cache, populated on register
+        "paprika-resume",            # manifests of downloads to pick up after
+                                     # a recycle (server/worker/resume.py)
     }
 
     _TMP_SWEEP_PREFIXES = (

@@ -97,6 +97,53 @@ from .video import _make_video_downloader, _parse_dl_progress, detect_yt_dlp
 from .workerid import WORKER_ID_FILE, _WorkerIdReassigned, hub_http_base
 
 
+# Same extension set the hub's objstore uses to route a key to the video tier
+# (.48), so "direct as video" here means the presigned URL points at .48.
+_VIDEO_ASSET_EXTS = frozenset(
+    {".mp4", ".webm", ".m3u8", ".ts", ".mkv", ".mov", ".avi", ".m4v", ".mpd", ".flv"}
+)
+
+
+def _is_video_asset_name(name: str) -> bool:
+    k = (name or "").lower()
+    dot = k.rfind(".")
+    return dot >= 0 and k[dot:] in _VIDEO_ASSET_EXTS
+
+
+_PUT_CHUNK = 1 << 20
+
+
+async def _iter_file_chunks(path: Path, chunk: int = _PUT_CHUNK):
+    """Async byte stream of a file for httpx; disk reads run off the loop."""
+    f = await asyncio.to_thread(open, path, "rb")
+    try:
+        while True:
+            b = await asyncio.to_thread(f.read, chunk)
+            if not b:
+                break
+            yield b
+    finally:
+        await asyncio.to_thread(f.close)
+
+
+def _video_via_hub_allowed() -> bool:
+    """Development escape hatch (``PAPRIKA_VIDEO_ALLOW_DISK=1``): let a video
+    that could not be sent to the video store go through the hub instead.
+
+    Off in production, always. The hub writes an uploaded asset to its own
+    job directory before it mirrors it to the object store, and that directory
+    is on an NVMe SSD -- so "through the hub" means "onto an SSD", which is
+    exactly what video must never do (operator rule, 2026-11-16; see
+    ``scratch_pool.video_disk_allowed``). A dev stack has no object store at
+    all, and there the hub's disk is the only place a video can go."""
+    try:
+        from server.worker import scratch_pool
+
+        return scratch_pool.video_disk_allowed()
+    except Exception:
+        return False
+
+
 class _UploadsMixin:
     async def _upload_files(
         self,
@@ -197,6 +244,26 @@ class _UploadsMixin:
         name = asset_name or path.name
         if name in state.uploaded_assets:
             return False
+        # A VIDEO never goes through the hub (it would land on the hub's SSD
+        # first): straight to the video store, or not at all.
+        if _is_video_asset_name(name) and self._minio_direct_video_enabled():
+            _vjid = getattr(state, "job_id", None)
+            if await self._send_video_direct(
+                state.asset_upload_base, path, name,
+                job_id=_vjid, source_url=source_url, mime=mime, page_url=page_url,
+            ):
+                state.uploaded_assets.add(name)
+                if _vjid:
+                    try:
+                        await self._send(
+                            WorkerJobLog(job_id=_vjid, line=ASSET_CAPTURE_MARKER)
+                        )
+                    except Exception:
+                        pass
+                return True
+            if not _video_via_hub_allowed():
+                return False
+            # dev box only (PAPRIKA_VIDEO_ALLOW_DISK=1): the POST below
         try:
             with open(path, "rb") as f:
                 files = {
@@ -255,25 +322,50 @@ class _UploadsMixin:
         mime: str | None = None,
         page_url: str | None = None,
         timeout: float | None = None,
+        status_out: dict | None = None,
     ) -> bool:
         """Upload one fetch-mode asset to the hub. Returns True on
         success, False on failure. The bool lets the incremental
         on_asset_saved callback track which names actually landed so the
         end-of-fetch reconcile pass can re-try only the ones that didn't.
+
+        ``status_out``: when given, the HTTP status of the final failed
+        attempt is stored under ``"status"`` (absent for network errors), so
+        a caller can tell "hub says .48 is full, retry later" (507) apart
+        from a hard failure. See ``_upload_video_with_backoff``.
         """
-        # Worker->MinIO-direct (off by default; PAPRIKA_WORKER_MINIO_DIRECT=1).
-        # Bytes go straight to MinIO, never through the hub event loop (~45% of
-        # hub load is these uploads). ALWAYS falls back to the legacy
+        # A VIDEO goes to the video store directly and to nowhere else: the hub
+        # writes every asset it is handed to its own disk first, and that disk
+        # is an SSD (see _send_video_direct). No fallback to the POST below.
+        if _is_video_asset_name(name) and self._minio_direct_video_enabled():
+            if await self._send_video_direct(
+                assign.asset_upload_base, path, name,
+                job_id=assign.job_id, source_url=source_url, mime=mime,
+                page_url=page_url, status_out=status_out,
+            ):
+                try:
+                    await self._send(
+                        WorkerJobLog(job_id=assign.job_id, line=ASSET_CAPTURE_MARKER)
+                    )
+                except Exception:
+                    pass
+                return True
+            if not _video_via_hub_allowed():
+                return False
+            # dev box only (PAPRIKA_VIDEO_ALLOW_DISK=1): the POST below
+        # Worker->MinIO-direct for everything else (off by default;
+        # PAPRIKA_WORKER_MINIO_DIRECT=1). Bytes go straight to MinIO, never
+        # through the hub event loop. ALWAYS falls back to the legacy
         # bytes-through-hub POST below on any failure OR for files over the size
-        # cap (default 100 MB -- big videos stream via the hub as before), so no
-        # asset is ever lost. Cap via PAPRIKA_WORKER_MINIO_DIRECT_MAX_MB.
-        if self._minio_direct_enabled():
+        # cap (default 100 MB), so no asset is ever lost. Cap via
+        # PAPRIKA_WORKER_MINIO_DIRECT_MAX_MB.
+        elif self._minio_direct_enabled():
             try:
                 _sz = path.stat().st_size
             except OSError:
                 _sz = 0
             try:
-                _cap_mb = float(os.environ.get("PAPRIKA_WORKER_MINIO_DIRECT_MAX_MB") or 100)
+                _cap_mb = float(os.environ.get("PAPRIKA_WORKER_MINIO_DIRECT_MAX_MB") or 100.0)
             except (TypeError, ValueError):
                 _cap_mb = 100.0
             if 0 < _sz <= _cap_mb * 1024 * 1024:
@@ -331,6 +423,10 @@ class _UploadsMixin:
                 pass
             return True
         except Exception as e:
+            if status_out is not None:
+                _code = getattr(getattr(e, "response", None), "status_code", None)
+                if _code is not None:
+                    status_out["status"] = int(_code)
             await self._send(
                 WorkerJobLog(
                     job_id=assign.job_id,
@@ -338,6 +434,82 @@ class _UploadsMixin:
                 )
             )
             return False
+
+    async def _upload_video_with_backoff(
+        self,
+        assign: HubAssignJob,
+        path: Path,
+        name: str,
+        *,
+        mime: str | None = None,
+        page_url: str | None = None,
+        timeout: float | None = None,
+    ) -> bool:
+        """``_upload_asset`` that waits out a full .48 instead of losing the file.
+
+        The hub answers a VIDEO upload with 507 while the .48 RAM tier is at or
+        above ``asset_ram_reject_pct`` (92%), or while its usage can't be
+        measured; the hub's own comment says "retry with backoff". Before this,
+        nobody did: the deferred-download loop ignored the False, put the video
+        in the job result anyway, video-pull made a crawl_video row for it, and
+        video-face-extract failed it with NoSuchKey on .48 and .8. On 2026-11-15,
+        292 of 339 failed rows in one burst were videos that never reached .48.
+
+        Only 507 is retried. Anything else fails right away, as before. The
+        file is still on the worker's disk, so waiting costs nothing but
+        scratch space. Stops early when the hub gives up on the job (abandon or
+        force-complete).
+
+        Env:
+          PAPRIKA_WORKER_VIDEO_FULL_RETRY_S   total wait budget, default 900; 0 = no retry
+          PAPRIKA_WORKER_VIDEO_FULL_BACKOFF_S first wait, default 15 (doubles, cap 120)
+        """
+        try:
+            budget = float(os.environ.get("PAPRIKA_WORKER_VIDEO_FULL_RETRY_S") or 900.0)
+        except (TypeError, ValueError):
+            budget = 900.0
+        try:
+            delay = float(os.environ.get("PAPRIKA_WORKER_VIDEO_FULL_BACKOFF_S") or 15.0)
+        except (TypeError, ValueError):
+            delay = 15.0
+        cap = 120.0
+        job_id = assign.job_id
+        deadline = time.monotonic() + max(0.0, budget)
+        attempt = 0
+        while True:
+            attempt += 1
+            st: dict = {}
+            if await self._upload_asset(
+                assign, path, name,
+                mime=mime, page_url=page_url, timeout=timeout, status_out=st,
+            ):
+                if attempt > 1:
+                    await self._send(WorkerJobLog(
+                        job_id=job_id,
+                        line=f"  [downloading] {name}: uploaded on attempt {attempt}",
+                    ))
+                return True
+            if st.get("status") != 507:
+                return False
+            if (job_id in getattr(self, "_abandoned_job_ids", ())
+                    or job_id in getattr(self, "_force_complete_job_ids", ())):
+                return False
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                await self._send(WorkerJobLog(
+                    job_id=job_id,
+                    line=f"  [downloading] {name}: .48 still full after "
+                         f"{attempt} attempt(s), giving up",
+                ))
+                return False
+            wait = min(delay * random.uniform(0.75, 1.25), remaining)
+            await self._send(WorkerJobLog(
+                job_id=job_id,
+                line=f"  [downloading] {name}: .48 full (507), "
+                     f"retry in {wait:.0f}s (attempt {attempt})",
+            ))
+            await asyncio.sleep(wait)
+            delay = min(delay * 2.0, cap)
 
     def _minio_direct_enabled(self) -> bool:
         """Gate for the worker->MinIO-direct asset upload (off by default).
@@ -373,6 +545,131 @@ class _UploadsMixin:
             "1", "true", "yes", "on",
         )
 
+    def _minio_direct_video_enabled(self) -> bool:
+        """Worker->MinIO-direct upload of VIDEO assets. ON by default since
+        2026-11-16; ``PAPRIKA_WORKER_MINIO_DIRECT_VIDEO=0`` switches it off.
+
+        On because of the SSD rule: a video sent through the hub is written to
+        the hub's NVMe before it reaches .48 (measured 2026-11-15: every one of
+        them, 8,347 asset POSTs in 10 minutes on one hub and no presign at
+        all). Switching this off puts videos back on that SSD -- it is an
+        emergency lever for a broken direct path, not a tuning knob.
+
+        The 2026-08-16 rollback above was about request COUNT: images are many
+        per job, and presign+complete doubled the hub's asset requests. Videos
+        are ~1 per job (~40/min fleet-wide) but carry most of the bytes, so
+        sending only them direct costs the hub ~+40 small requests/min and takes
+        the bulk of the upload bytes off it.
+
+        It also closes the hole that made video-face-extract fail with
+        NoSuchKey (2026-11-12): bytes-through-hub land on the hub's local cache
+        first and are mirrored to .48 afterwards, and the hub's cache-evict
+        could rmtree the dir in between (``mirror_file`` then returns silently,
+        so the POST still said 200). A direct PUT puts the video on .48 before
+        the hub ever records it. Measured 2026-11-16 on one hub over 3 minutes:
+        8 of 4,977 files written were videos (0.2%), carrying most of the
+        bytes."""
+        return (os.environ.get("PAPRIKA_WORKER_MINIO_DIRECT_VIDEO") or "1").strip().lower() not in (
+            "0", "false", "no", "off",
+        )
+
+    async def _send_video_direct(
+        self,
+        base: str,
+        path: Path,
+        name: str,
+        *,
+        job_id: str | None = None,
+        source_url: str | None = None,
+        mime: str | None = None,
+        page_url: str | None = None,
+        status_out: dict | None = None,
+    ) -> bool:
+        """Put one VIDEO on the video store without the hub seeing a byte.
+
+        ``base`` is the job's asset URL on the hub (``{hub}/jobs/{id}/assets``);
+        the hub only signs the upload and records it afterwards.
+
+        This never falls back to the bytes-through-hub POST, and neither may
+        its callers (outside a dev box): the hub would write the file to its
+        SSD. So what used to be covered by that fallback is handled here:
+
+        * a network error or a 5xx is tried again (``PAPRIKA_WORKER_VIDEO_
+          DIRECT_TRIES``, default 3) -- the file is still on the ramdisk;
+        * 507 = the store is full. Not retried here: ``_upload_video_with_
+          backoff`` owns that wait, and it learns of it through ``status_out``;
+        * any other 4xx (the job is gone, bad secret) will not get better;
+        * a file over the single-PUT limit (``PAPRIKA_WORKER_MINIO_DIRECT_
+          VIDEO_MAX_MB``, default 4096; S3/MinIO stop at 5 GiB) is not
+          uploaded at all.
+
+        Returns False when the video is not on the store. One log line says
+        why."""
+        async def _say(line: str) -> None:
+            if job_id:
+                try:
+                    await self._send(WorkerJobLog(job_id=job_id, line=line))
+                    return
+                except Exception:
+                    pass
+            _logger.info(f"[worker {self.worker_id}]{line}")
+
+        try:
+            size = path.stat().st_size
+        except OSError:
+            size = 0
+        try:
+            cap_mb = float(os.environ.get("PAPRIKA_WORKER_MINIO_DIRECT_VIDEO_MAX_MB") or 4096.0)
+        except (TypeError, ValueError):
+            cap_mb = 4096.0
+        if size <= 0:
+            await _say(f"  !! video not uploaded: {name}: empty file")
+            return False
+        if size > cap_mb * 1024 * 1024:
+            await _say(
+                f"  !! video not uploaded: {name}: {size / 1048576:.0f} MB is over the "
+                f"{cap_mb:.0f} MB the video store takes in one upload "
+                f"(a video is never sent through the hub)"
+            )
+            return False
+        try:
+            tries = max(1, int(os.environ.get("PAPRIKA_WORKER_VIDEO_DIRECT_TRIES") or 3))
+        except (TypeError, ValueError):
+            tries = 3
+        err: Any = None
+        for attempt in range(1, tries + 1):
+            code = None
+            if status_out is not None:
+                status_out.pop("status", None)
+            try:
+                if await self._upload_asset_direct(
+                    None, path, name,
+                    source_url=source_url, mime=mime, page_url=page_url,
+                    size=size, base=base,
+                ):
+                    return True
+                err = "the hub issued no upload URL"
+            except Exception as e:
+                err = e
+                code = getattr(getattr(e, "response", None), "status_code", None)
+            if code is not None and status_out is not None:
+                status_out["status"] = int(code)
+            if code is not None and 400 <= int(code) < 500:
+                break
+            if code == 507 or attempt >= tries:
+                break
+            if job_id and (
+                job_id in getattr(self, "_abandoned_job_ids", ())
+                or job_id in getattr(self, "_force_complete_job_ids", ())
+            ):
+                break
+            await asyncio.sleep(min(2.0 * attempt, 10.0) * random.uniform(0.75, 1.25))
+        await _say(
+            f"  !! video upload failed: {name}: {err} "
+            f"(not sent through the hub: a video is never written to its disk)"
+        )
+        return False
+
     async def _upload_asset_direct(
         self,
         assign: HubAssignJob,
@@ -383,16 +680,21 @@ class _UploadsMixin:
         mime: str | None = None,
         page_url: str | None = None,
         size: int | None = None,
+        base: str | None = None,
     ) -> bool:
         """Upload one asset WORKER->MinIO-direct: ask the hub for a presigned PUT
         URL (tiny, no bytes), PUT the bytes STRAIGHT to MinIO (the hub never sees
         them; the signed URL is the only authorization -- no MinIO creds on the
         worker), then POST /complete so the hub records the .meta sidecar +
-        confirms the object. Returns True on full success, False on any failure
-        so the caller falls back to the legacy POST (no asset is ever lost).
+        confirms the object. Returns True on full success; False or an
+        exception on any failure. What the caller does then depends on the
+        kind: a non-video asset falls back to the legacy POST, a video does not
+        (see ``_send_video_direct``).
 
-        Buffers the file in memory for the PUT, so the caller gates on size."""
-        base = assign.asset_upload_base.rstrip("/")  # {hub}/jobs/{id}/assets
+        ``base`` overrides ``assign.asset_upload_base`` (a session has no
+        assign). Streams the file from disk; the caller still gates on size
+        (per-kind cap)."""
+        base = (base or assign.asset_upload_base).rstrip("/")  # {hub}/jobs/{id}/assets
         body: dict[str, Any] = {"filename": name}
         if mime:
             body["mime"] = mime
@@ -408,10 +710,15 @@ class _UploadsMixin:
         put_url = (r.json() or {}).get("put_url")
         if not put_url:
             return False
-        # 2) PUT bytes STRAIGHT to MinIO (signed URL = auth; not via the hub)
-        with open(path, "rb") as f:
-            blob = f.read()
-        headers = {"Content-Type": mime} if mime else None
+        # 2) PUT bytes STRAIGHT to MinIO (signed URL = auth; not via the hub).
+        # Streamed from disk in chunks (a video can be GBs -- the old
+        # f.read() held the whole file in worker memory). A presigned S3 PUT
+        # needs an explicit Content-Length (MinIO rejects chunked encoding
+        # here); httpx then sends the stream without Transfer-Encoding.
+        _len = path.stat().st_size if size is None else int(size)
+        headers = {"Content-Length": str(_len)}
+        if mime:
+            headers["Content-Type"] = mime
         # Bound the CONNECT phase separately from read/write: a bare
         # ``timeout=300.0`` applies 300s to connect too, so if MinIO is
         # unreachable from this worker (e.g. an egress-firewall DROP, or the
@@ -421,13 +728,26 @@ class _UploadsMixin:
         # so the caller falls back to the bytes-through-hub POST in seconds,
         # holding no socket; read/write stay generous for large blobs.
         _put_timeout = httpx.Timeout(connect=10.0, read=300.0, write=300.0, pool=10.0)
-        pr = await self._http.put(put_url, content=blob, headers=headers, timeout=_put_timeout)
+        pr = await self._http.put(
+            put_url, content=_iter_file_chunks(path), headers=headers, timeout=_put_timeout
+        )
         pr.raise_for_status()
         # 3) complete -> hub writes the sidecar + HEAD-confirms the object
         cbody = dict(body)
-        cbody["size"] = size if size is not None else len(blob)
-        cr = await self._http.post(base + "/complete", json=cbody, timeout=30.0)
-        cr.raise_for_status()
+        cbody["size"] = _len
+        # The bytes are on the store by now, so a hub that is restarting (502/
+        # 503/504, a dropped connection) or has not seen the object yet (409)
+        # is worth a moment's patience rather than a second PUT of the file.
+        for _try in range(3):
+            try:
+                cr = await self._http.post(base + "/complete", json=cbody, timeout=30.0)
+                cr.raise_for_status()
+                break
+            except Exception as e:
+                _code = getattr(getattr(e, "response", None), "status_code", None)
+                if _try >= 2 or (_code is not None and _code not in (409, 500, 502, 503, 504)):
+                    raise
+                await asyncio.sleep(2.0 * (_try + 1))
         return True
 
     async def _upload_special(self, assign: HubAssignJob, path: Path, kind: str) -> None:

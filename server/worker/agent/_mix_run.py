@@ -138,6 +138,21 @@ _DISK_CLEANUP_MIN_INTERVAL_S = float(
 _NPROC = os.cpu_count() or 0
 
 
+def _eta_seconds(eta) -> float | None:
+    """yt-dlp's ``ETA`` field (``MM:SS`` / ``HH:MM:SS``) as seconds; None for
+    anything else (``Unknown``, empty)."""
+    try:
+        parts = [int(p) for p in str(eta).strip().split(":")]
+    except (TypeError, ValueError):
+        return None
+    if not 2 <= len(parts) <= 3 or any(p < 0 for p in parts):
+        return None
+    secs = 0
+    for p in parts:
+        secs = secs * 60 + p
+    return float(secs)
+
+
 def _num_env(name: str, default: float) -> float:
     """Numeric env override. Unset / unparseable -> the caller's default, so a
     typo in a compose file degrades to the shipped behaviour instead of
@@ -621,6 +636,28 @@ class _RunMixin:
         # message loop concurrently. The sweeper is the production
         # backstop for stranded /tmp/paprika-* dirs from crashes /
         # ungraceful teardown -- see _disk_cleanup_loop docstring.
+        # Downloads the previous process handed over on its way out of a
+        # recycle (server/worker/resume.py). Once per process, on the first
+        # connection: it asks the hub about each one before fetching a byte.
+        # Deliberately not tied to this connection's lifetime -- a download
+        # outlives a WS flap, like any other deferred download.
+        if not getattr(self, "_resume_started", False):
+            self._resume_started = True
+            self._resume_task = asyncio.create_task(self._resume_cut_downloads())
+        else:
+            # Same process, new connection (a WS flap, a hub restart). The hub
+            # parked this worker's `downloading` jobs when the old socket
+            # dropped and fails them after a grace unless it hears they are
+            # still being worked on -- so say so. Without this a flap costs
+            # every download in flight, although nothing here ever stopped.
+            _bg = getattr(self, "_bg_video_tasks", None) or {}
+            for _jid in sorted({j for j in _bg.values() if j}):
+                try:
+                    await self._send(WorkerJobProgress(
+                        job_id=_jid, phase="downloading", resumed=True,
+                    ))
+                except Exception:
+                    break
         hb_task = asyncio.create_task(self._heartbeat_loop())
         reaper_task = asyncio.create_task(self._idle_tab_reaper_loop())
         disk_task = asyncio.create_task(self._disk_cleanup_loop())
@@ -711,6 +748,10 @@ class _RunMixin:
                     # window safe: _in_flight is ++'d at the top of job exec,
                     # before lane.acquire(), so during that sliver the job counter
                     # is the higher (safe) number.
+                    # A recycle put off for a long video download is taken
+                    # up again here, not only when a job ends: an idle worker
+                    # ends no jobs.
+                    self._maybe_begin_recycle()
                     if self._draining:
                         # Stamp the drain clock for whichever owner set the
                         # flag (recycle / memory guard / self-update). The
@@ -845,6 +886,9 @@ class _RunMixin:
                             f"{self._drain_reason or 'unknown'}) -- force-exiting "
                             f"now (docker will restart)",
                         )
+                        # Hands a recycle's downloads over for resuming; a
+                        # no-op for the other drains.
+                        self._note_cut_downloads()
                         os._exit(0)
                     # Recycle: once the drain has emptied in-flight, exit so
                     # docker restarts us fresh -- UNLESS a rolling self-update
@@ -852,7 +896,10 @@ class _RunMixin:
                     # the same old code and the mismatch just fires again (see
                     # _selfupdate_owns_recycle).
                     if self._draining and self._in_flight <= 0:
-                        _hold = self._selfupdate_owns_recycle()
+                        _hold = (
+                            self._selfupdate_owns_recycle()
+                            or self._downloads_own_recycle()
+                        )
                         if _hold:
                             if not self._recycle_hold_logged:
                                 self._recycle_hold_logged = True
@@ -861,6 +908,7 @@ class _RunMixin:
                                     f"deferred: {_hold}",
                                 )
                         else:
+                            self._note_cut_downloads()
                             _logger.info(
                                 f"[worker {self.worker_id}] drained after "
                                 f"{self._jobs_done} job(s); exiting for recycle "
@@ -1224,6 +1272,310 @@ class _RunMixin:
     # always gets to finish, and bounded so an update task that dies without
     # exiting still lets the worker recycle instead of draining forever.
     _SELFUPDATE_RECYCLE_DEFER_S = 1800.0
+
+    # ---- recycle vs. deferred video downloads ---------------------------
+    #
+    # A deferred video download runs after its lane is released and holds no
+    # in-flight slot, so the recycle never saw it: the worker exited ~10s
+    # after its 200th job and took every running download with it. Measured
+    # 2026-11-14 over 5.5h: 1,130 worker restarts cut 2,368 downloads (a third
+    # of all failed jobs); a 1GiB download died at 98.6% after 51 minutes.
+    #
+    # Simply waiting for them at the exit is not affordable -- a draining
+    # worker takes no work, and a 10-minute wait would have idled ~10% of the
+    # fleet (30 minutes: 24%). So the wait is split in two:
+    #   1. the drain does not START while a download has long to go; the
+    #      worker keeps working, and the recycle happens once the longest one
+    #      is nearly done (or after _RECYCLE_DEFER_MAX_S);
+    #   2. the EXIT then waits the short rest (up to _RECYCLE_DL_WAIT_S).
+    # Only the recycle is touched. The memory guard, the fd-budget gate and a
+    # self-update drain for reasons that cannot wait an hour.
+    #: A download with more than this left puts the recycle off.
+    #: Env: PAPRIKA_RECYCLE_DL_LEFT_S (0 = never put it off).
+    _RECYCLE_DL_LEFT_S = 180.0
+    #: The longest a recycle is put off. A download that cannot finish inside
+    #: what is left of this does not put it off at all -- it would be cut
+    #: anyway, and the wait would be for nothing.
+    #: Env: PAPRIKA_RECYCLE_DEFER_MAX_S (0 = never put it off).
+    _RECYCLE_DEFER_MAX_S = 3600.0
+    #: How long a drained recycle waits for the downloads still running
+    #: (their last minutes, and the upload after them) before it exits.
+    #: Env: PAPRIKA_RECYCLE_DL_WAIT_S (0 = exit at once, as before).
+    _RECYCLE_DL_WAIT_S = 300.0
+    #: An estimate older than this is not believed: the download has stalled.
+    _DL_LEFT_STALE_S = 120.0
+    #: How many of yt-dlp's estimates (one a second at most) are kept per
+    #: download; the middle one is used.
+    _DL_LEFT_SAMPLES = 21
+
+    def _note_download_left(self, job_id: str, eta) -> None:
+        """Remember how long yt-dlp says a deferred download still needs
+        (``eta`` as it prints it: ``MM:SS`` or ``HH:MM:SS``). Called from the
+        download's log thread; one dict store, nothing to lock."""
+        try:
+            secs = _eta_seconds(eta)
+            if secs is None or not job_id:
+                return
+            left = getattr(self, "_bg_video_left", None)
+            if not isinstance(left, dict):
+                left = self._bg_video_left = {}
+            now = time.monotonic()
+            prev = left.get(job_id) or ()
+            if prev and now - prev[-1][0] < 1.0:
+                return                 # one sample a second is plenty
+            # A new tuple each time, never a list appended to: the reader is
+            # on another thread and must always see a whole one.
+            left[job_id] = (prev + ((now, secs),))[-self._DL_LEFT_SAMPLES:]
+        except Exception:
+            pass                       # never let bookkeeping break a download
+
+    def _note_download_stage(self, job_id: str, *, more: int = 0,
+                             stage: str = "download") -> None:
+        """A deferred download moved on: to its next file (``more`` still to
+        come after it), or to uploading what it fetched.
+
+        yt-dlp's estimate only ever covers the file in hand. Seen 2026-11-15:
+        a job's first file reached "46 seconds left", the recycle started, the
+        second file began at 0% with 24 minutes to go and was cut. And a
+        finished download waiting for a full store to take it has no estimate
+        at all."""
+        try:
+            if not job_id:
+                return
+            st = getattr(self, "_bg_video_stage", None)
+            if not isinstance(st, dict):
+                st = self._bg_video_stage = {}
+            st[job_id] = (stage, max(0, int(more)), time.monotonic())
+            left = getattr(self, "_bg_video_left", None)
+            if isinstance(left, dict):
+                # The last file's estimate says nothing about this one.
+                left.pop(job_id, None)
+        except Exception:
+            pass                       # never let bookkeeping break a download
+
+    def _downloads_left(self) -> list:
+        """``(job_id, seconds left | None)`` for each running deferred
+        download. None: no estimate yet, or a stale one."""
+        bg = getattr(self, "_bg_video_tasks", None)
+        live = {j for j in bg.values() if j} if isinstance(bg, dict) else set()
+        left = getattr(self, "_bg_video_left", None)
+        left = left if isinstance(left, dict) else {}
+        now = time.monotonic()
+        out = []
+        for job_id in sorted(live):
+            rec = left.get(job_id) or ()
+            if rec and now - rec[-1][0] <= self._DL_LEFT_STALE_S:
+                # The median of the last samples, each brought forward to now.
+                # yt-dlp's figure follows the speed of the moment: one
+                # download read 44, 64 and 47 minutes within ten seconds
+                # (2026-11-14), and a single 64 was enough to cross the
+                # put-off limit and have it cut.
+                vals = sorted(max(0.0, s - (now - t)) for t, s in rec)
+                out.append((job_id, vals[len(vals) // 2]))
+            else:
+                out.append((job_id, None))
+        return out
+
+    def _recycle_should_wait(self) -> str:
+        """Why the recycle drain must not START yet, or ""."""
+        left_s = _num_env("PAPRIKA_RECYCLE_DL_LEFT_S", self._RECYCLE_DL_LEFT_S)
+        max_s = _num_env("PAPRIKA_RECYCLE_DEFER_MAX_S", self._RECYCLE_DEFER_MAX_S)
+        if left_s <= 0 or max_s <= 0:
+            return ""
+        now = time.monotonic()
+        # Counted from the first time the threshold was reached, and across a
+        # drain that went back to work (_recycle_back_to_work): however often
+        # it is put off, the recycle happens inside max_s.
+        since = getattr(self, "_recycle_since_m", 0.0) or now
+        budget = max_s - (now - since)
+        try:
+            stages = getattr(self, "_bg_video_stage", None)
+            stages = stages if isinstance(stages, dict) else {}
+            long_ = []
+            for j, s in self._downloads_left():
+                if s is not None and left_s < s <= budget:
+                    long_.append((j, s, ""))
+                    continue
+                if budget <= left_s or (s is not None and s > budget):
+                    continue           # cannot make it: not worth the wait
+                # No telling how long these take, only that the job is not
+                # near its end. The budget bounds the wait all the same.
+                stage, more, since_m = stages.get(j) or ("", 0, 0.0)
+                if stage == "upload":
+                    long_.append((j, None, "is uploading what it fetched"))
+                elif more > 0:
+                    long_.append((j, None, f"has {more} more file(s) to fetch"))
+                elif (s is None and since_m
+                        and now - since_m <= self._DL_LEFT_STALE_S):
+                    long_.append((j, None, "has only just started"))
+        except Exception:
+            # Whatever went wrong reading the downloads, the recycle itself
+            # must go on as it always has.
+            return ""
+        if not long_:
+            return ""
+        known = [(j, s) for j, s, _ in long_ if s is not None]
+        if known:
+            job_id, secs = max(known, key=lambda x: x[1])
+            detail = f"the longest ({job_id}) about {secs / 60:.0f} min"
+        else:
+            detail = f"{long_[0][0]} {long_[0][2]}"
+        return f"{len(long_)} video download(s) with long to go, {detail}"
+
+    def _maybe_begin_recycle(self) -> None:
+        """Start the recycle drain once the job count calls for it -- unless a
+        video download still has long to go, in which case keep working and
+        look again on the next finished job or heartbeat."""
+        if not (
+            self._recycle_after > 0
+            and not self._draining
+            and self._jobs_done >= self._recycle_after
+        ):
+            return
+        if not getattr(self, "_recycle_since_m", 0.0):
+            self._recycle_since_m = time.monotonic()
+        why = self._recycle_should_wait()
+        since = getattr(self, "_recycle_deferred_m", 0.0)
+        if why:
+            if not since:
+                self._recycle_deferred_m = time.monotonic()
+                _logger.info(
+                    f"[worker {self.worker_id}] recycle threshold reached "
+                    f"({self._jobs_done} >= {self._recycle_after}); put off, "
+                    f"still taking jobs: {why}",
+                )
+            return
+        self._recycle_deferred_m = 0.0
+        self._recycle_dl_wait_m = 0.0
+        self._recycle_hold_logged = False
+        self._draining = True
+        self._drain_reason = (
+            f"recycle after {self._jobs_done} job(s)"
+        )
+        _logger.info(
+            f"[worker {self.worker_id}] recycle threshold reached "
+            f"({self._jobs_done} >= {self._recycle_after}); draining "
+            f"(no new jobs) then exiting for a fresh restart"
+            + (f" (put off {time.monotonic() - since:.0f}s for video "
+               f"downloads)" if since else ""),
+        )
+
+    def _recycle_back_to_work(self) -> str:
+        """A drained RECYCLE that should not exit after all: why, or "".
+
+        The drain starts when no download has long to go. By the time the
+        jobs in flight have ended that can have changed -- they start
+        downloads of their own, a job moves on to its next file, an estimate
+        was off. Then the worker takes jobs again and the recycle is put off
+        as it would have been, inside the same overall limit. Seen 2026-11-15:
+        1.6 downloads cut per recycle exit, most of them with 6-60 minutes
+        left."""
+        if not str(getattr(self, "_drain_reason", "") or "").startswith("recycle after"):
+            return ""
+        if getattr(self, "_pending_update_to", None):
+            return ""                  # a self-update is waiting for this exit
+        try:
+            why = self._recycle_should_wait()
+        except Exception:
+            return ""
+        if not why:
+            return ""
+        self._draining = False         # the heartbeat clears the drain clock
+        self._recycle_deferred_m = time.monotonic()
+        self._recycle_dl_wait_m = 0.0
+        _logger.info(
+            f"[worker {self.worker_id}] recycle put off after draining, "
+            f"taking jobs again: {why}",
+        )
+        return why
+
+    def _downloads_own_recycle(self) -> str:
+        """Why a drained RECYCLE must not exit right now, or "".
+
+        Bounded like its siblings: a download that never ends must not keep
+        the worker draining -- and idle -- for good."""
+        if not str(getattr(self, "_drain_reason", "") or "").startswith("recycle after"):
+            return ""
+        limit = _num_env("PAPRIKA_RECYCLE_DL_WAIT_S", self._RECYCLE_DL_WAIT_S)
+        if limit <= 0:
+            return ""
+        back = self._recycle_back_to_work()
+        if back:
+            return back                # not exiting: taking jobs again
+        try:
+            live = self._downloads_left()
+        except Exception:
+            return ""                  # the heartbeat must never trip on this
+        if not live:
+            return ""
+        now = time.monotonic()
+        since = getattr(self, "_recycle_dl_wait_m", 0.0)
+        if not since:
+            since = self._recycle_dl_wait_m = now
+        held = now - since
+        if held > limit:
+            return ""
+        # Only a download that can still make it is worth idling for. One
+        # that says it needs longer than the wait has left is cut either way
+        # (seen 2026-11-14: a worker sat out the full 300s for a download
+        # with 197 minutes to go).
+        worth = [(j, s) for j, s in live if s is None or s <= limit - held]
+        if not worth:
+            return ""
+        return (
+            f"{len(worth)} video download(s) still finishing "
+            f"({held:.0f}s of {limit:.0f}s)"
+        )
+
+    def _note_cut_downloads(self) -> None:
+        """Say which downloads an exit is about to cut, so a failed job can
+        be traced to it -- and, when the exit is a recycle, hand them over to
+        the process that comes back (:meth:`_hand_over_downloads`)."""
+        try:
+            live = self._downloads_left()
+        except Exception:
+            return
+        if live:
+            _logger.warning(
+                f"[worker {self.worker_id}] exiting with {len(live)} video "
+                f"download(s) unfinished: "
+                + ", ".join(
+                    f"{j} ({'no estimate' if s is None else f'{s / 60:.0f} min left'})"
+                    for j, s in live[:8]
+                ),
+            )
+            try:
+                handed = self._hand_over_downloads([j for j, _s in live])
+            except Exception:
+                handed = 0                 # an exit must never trip on this
+            if handed:
+                _logger.info(
+                    f"[worker {self.worker_id}] {handed} of them handed over "
+                    f"to be picked up again after the restart",
+                )
+
+    def _hand_over_downloads(self, job_ids: list[str]) -> int:
+        """Stamp the manifests of the downloads a RECYCLE is about to cut, so
+        the next process resumes them instead of purging their bytes.
+
+        Recycle only. The memory guard exits because this CT is short of
+        memory, and a download on the node ramdisk is charged to this CT for
+        as long as its file exists -- carrying it across the restart would
+        bring the pressure straight back. A crash never gets here at all.
+        Also skipped: downloads ffmpeg is doing (nothing to resume from) and
+        ones the hub has already ended or asked us to wrap up."""
+        if not str(getattr(self, "_drain_reason", "") or "").startswith("recycle after"):
+            return 0
+        from server.worker import resume as _resume
+
+        if not _resume.enabled():
+            return 0
+        skip = (
+            set(getattr(self, "_bg_video_noresume", None) or ())
+            | set(getattr(self, "_abandoned_job_ids", None) or ())
+            | set(getattr(self, "_force_complete_job_ids", None) or ())
+        )
+        return sum(1 for j in job_ids if j not in skip and _resume.mark_ok(j))
 
     def _selfupdate_owns_recycle(self) -> str:
         """Why the heartbeat's recycle exit must NOT fire right now, or "".
@@ -1830,18 +2182,5 @@ class _RunMixin:
                 f"{type(exc).__name__}: {exc}",
             )
         self._jobs_done += 1
-        if (
-            self._recycle_after > 0
-            and not self._draining
-            and self._jobs_done >= self._recycle_after
-        ):
-            self._draining = True
-            self._drain_reason = (
-                f"recycle after {self._jobs_done} job(s)"
-            )
-            _logger.info(
-                f"[worker {self.worker_id}] recycle threshold reached "
-                f"({self._jobs_done} >= {self._recycle_after}); draining "
-                f"(no new jobs) then exiting for a fresh restart",
-            )
+        self._maybe_begin_recycle()
 

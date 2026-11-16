@@ -124,6 +124,18 @@ class _VideoDownloadMixin:
             root = download_dir_from_env()
             root.mkdir(parents=True, exist_ok=True)
 
+            # A video is never written to a disk: without its tmpfs mount the
+            # download dir is a plain directory on the CT's SSD.
+            from server.worker import scratch_pool as _pool
+
+            if not _pool.video_dir_ok(root):
+                message = (
+                    f"{root} is not a ramdisk; declining handoff "
+                    f"(video is never written to disk)"
+                )
+                _log(message)
+                return
+
             # Admission check: refuse rather than fill the shared ramdisk.
             # Reporting ok=False lets the hub fall back to the legacy path.
             min_free = int(

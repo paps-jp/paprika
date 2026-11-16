@@ -2011,6 +2011,8 @@ async def worker_link(ws: WebSocket, worker_id: str):
         # just lose a session and recover via the session-404 path --
         # so skip anything with a live local task.
         deferred_running: list[str] = []
+        deferred_downloading: list[str] = []
+        _disconnected_at = time.time()
         if state.store is not None and orphan_job_ids:
             for jid in set(orphan_job_ids):
                 if jid in state.local_tasks:
@@ -2089,6 +2091,22 @@ async def worker_link(ws: WebSocket, worker_id: str):
                         worker_id, jid,
                     )
                     continue
+                elif jinfo.status == JobStatus.downloading:
+                    # The fetch is done and only the video download was still
+                    # going. A worker that left for a recycle hands that
+                    # download over to the process that comes back, which
+                    # carries on from the bytes already on disk and says so
+                    # (WorkerJobProgress.resumed). Failing the job here threw
+                    # that away: 686 downloads and 310 GiB already fetched in
+                    # 150 minutes, measured 2026-11-15. So give it the time a
+                    # restart takes, then fail whatever was not picked up.
+                    deferred_downloading.append(jid)
+                    log.info(
+                        "worker %s disconnect: leaving downloading job %s to "
+                        "the deferred watch (may be resumed after a restart)",
+                        worker_id, jid,
+                    )
+                    continue
                 else:
                     jinfo.status = JobStatus.failed
                     jinfo.error = (
@@ -2113,6 +2131,12 @@ async def worker_link(ws: WebSocket, worker_id: str):
         if deferred_running:
             asyncio.create_task(
                 _settle_abandoned_running(worker_id, deferred_running)
+            )
+        if deferred_downloading:
+            asyncio.create_task(
+                _settle_abandoned_downloading(
+                    worker_id, deferred_downloading, _disconnected_at,
+                )
             )
         log.info("worker disconnected: %s", worker_id)
         try:
@@ -2379,6 +2403,11 @@ async def _settle_abandoned_running(worker_id: str, job_ids: list[str]) -> None:
         if getattr(jinfo, "worker_id", None) != worker_id:
             continue  # re-dispatched elsewhere; not ours to settle
         phase = getattr(jinfo.progress, "phase", "") if jinfo.progress else ""
+        if phase == "downloading" and getattr(jinfo.progress, "resumed_at", None):
+            # The restarted worker picked the video download up again; the
+            # row just has not seen a progress line to move it to
+            # `downloading` yet. It has an owner.
+            continue
         if phase == "keepalive":
             jinfo.status = JobStatus.completed
             if jinfo.progress is not None:
@@ -2403,6 +2432,73 @@ async def _settle_abandoned_running(worker_id: str, job_ids: list[str]) -> None:
         log.info(
             "worker %s: settled %d abandoned running job(s) after the %.0fs grace",
             worker_id, settled, _ABANDONED_RUNNING_GRACE_S,
+        )
+
+
+#: How long a `downloading` job waits for its restarted worker to pick the
+#: download up again. A recycle is back on the hub in about half a minute
+#: (process start, lanes, WS), then asks about each handed-over download before
+#: resuming it; this is several times that. Kept well under the running grace:
+#: nothing is being computed meanwhile, the job is simply parked.
+_ABANDONED_DOWNLOADING_GRACE_S = float(
+    os.environ.get("PAPRIKA_ABANDONED_DOWNLOADING_GRACE_S", "240")
+)
+
+
+async def _settle_abandoned_downloading(
+    worker_id: str, job_ids: list[str], since: float,
+) -> None:
+    """Fail the `downloading` jobs a restarted worker did not pick up again.
+
+    The counterpart of :func:`_settle_abandoned_running` for the phase after
+    the fetch. The worker says it resumed with ``WorkerJobProgress.resumed``,
+    which stamps ``progress.resumed_at`` on the ROW -- so the answer is the
+    same whichever hub the worker reconnected to. Anything not stamped since
+    the disconnect is settled exactly as the sweep used to settle it at once,
+    with the same message, just ``_ABANDONED_DOWNLOADING_GRACE_S`` later.
+    """
+    try:
+        await asyncio.sleep(_ABANDONED_DOWNLOADING_GRACE_S)
+    except asyncio.CancelledError:
+        return
+    if state.store is None:
+        return
+    settled = resumed = 0
+    for jid in job_ids:
+        try:
+            jinfo = await state.store.get_job_info(jid)
+        except Exception:
+            continue
+        if jinfo is None or jinfo.status != JobStatus.downloading:
+            continue  # finished, failed or deleted meanwhile
+        if getattr(jinfo, "worker_id", None) != worker_id:
+            continue  # not this worker's any more
+        _at = getattr(jinfo.progress, "resumed_at", None) if jinfo.progress else None
+        # ``since`` and the stamp may come from two different hubs' clocks;
+        # the 2s is for that, not for a stamp from before the disconnect.
+        if isinstance(_at, (int, float)) and _at >= since - 2.0:
+            resumed += 1
+            continue  # picked up again; the download owns the job
+        jinfo.status = JobStatus.failed
+        jinfo.error = (
+            f"worker {worker_id} disconnected before the job "
+            f"finished (restart / crash / self-update); "
+            f"re-submit to retry"
+        )
+        if jinfo.progress is not None:
+            jinfo.progress.phase = "failed"
+        jinfo.completed_at = jinfo.completed_at or datetime.utcnow()
+        try:
+            await state.store.save_job_info(jinfo)
+            await state.store.publish_log(jid, DONE_SENTINEL)
+        except Exception:
+            continue
+        settled += 1
+    if settled or resumed:
+        log.info(
+            "worker %s: after the %.0fs grace, %d downloading job(s) were "
+            "resumed and %d settled as failed",
+            worker_id, _ABANDONED_DOWNLOADING_GRACE_S, resumed, settled,
         )
 
 
@@ -2478,6 +2574,8 @@ async def _reconcile_worker_sessions(worker, snapshots: list) -> None:
     # reconnecting process re-announces it (and is skipped here), while a fresh
     # process announces nothing and its abandoned jobs land in dropped_job_ids.
     settled = 0
+    resumable_job_ids: list[str] = []
+    _announced_at = time.time()
     for jid in set(dropped_job_ids):
         if jid in state.local_tasks:
             continue  # runs in-process on this hub; the worker never owned it
@@ -2486,6 +2584,13 @@ async def _reconcile_worker_sessions(worker, snapshots: list) -> None:
         except Exception:
             continue
         if jinfo is None or jinfo.status not in IN_FLIGHT_STATUSES:
+            continue
+        if jinfo.status == JobStatus.downloading:
+            # No session is exactly what a resumed download looks like: the
+            # fetch (and its session) ended before the restart, and the new
+            # process carries on with the download alone. Give it the same
+            # grace the disconnect sweep does instead of failing it here.
+            resumable_job_ids.append(jid)
             continue
         phase = getattr(jinfo.progress, "phase", "") if jinfo.progress else ""
         if phase == "keepalive":
@@ -2513,6 +2618,12 @@ async def _reconcile_worker_sessions(worker, snapshots: list) -> None:
             "worker %s announce: settled abandoned job %s -> %s "
             "(session dropped, worker holds none)",
             worker.worker_id, jid, jinfo.status,
+        )
+    if resumable_job_ids:
+        asyncio.create_task(
+            _settle_abandoned_downloading(
+                worker.worker_id, resumable_job_ids, _announced_at,
+            )
         )
 
     # Pass 2: confirm / rebuild / orphan-cleanup per worker snapshot.
@@ -2817,7 +2928,19 @@ async def _handle_worker_message(worker, msg) -> None:
 
     if isinstance(msg, WorkerJobProgress):
         info = await state.store.get_job_info(msg.job_id)
-        if info is not None:
+        if info is not None and getattr(msg, "resumed", False):
+            # "I still have this job's video download" -- sent by a worker
+            # that restarted and picked it up again, or that merely
+            # reconnected with it still running. Stamp the row so the
+            # deferred watch (_settle_abandoned_downloading) leaves the job
+            # alone, and touch nothing else: this message carries no counters,
+            # and a job the hub already closed keeps its status.
+            if info.status in IN_FLIGHT_STATUSES:
+                info.progress.resumed_at = time.time()
+                if msg.phase and info.status != JobStatus.queued:
+                    info.progress.phase = msg.phase
+                await state.store.save_job_info(info)
+        elif info is not None:
             if msg.phase:
                 info.progress.phase = msg.phase
             info.progress.assets_saved = msg.assets_saved
