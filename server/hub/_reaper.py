@@ -577,6 +577,13 @@ _FORCE_COMPLETE_GRACE_S = float(
 #: Process-local on purpose: only the hub holding the worker's WS sends, and a
 #: hub restart just starts the clock again.
 _force_complete_sent: dict[str, float] = {}
+#: How long a worker must stay out of the fleet-wide alive set before its
+#: ``downloading`` rows are failed as "gone" (Path C).
+_DOWNLOADING_GONE_GRACE_S = float(
+    os.environ.get("PAPRIKA_DOWNLOADING_GONE_GRACE_S", "300")
+)
+#: worker_id -> ``time.monotonic()`` this hub first saw it absent.
+_worker_absent_since: dict[str, float] = {}
 
 
 async def _downloading_reaper_loop():
@@ -641,6 +648,9 @@ async def _reap_stuck_downloading() -> int:
     _live = {getattr(i, "job_id", None) for i in infos}
     for _jid in [j for j in _force_complete_sent if j not in _live]:
         _force_complete_sent.pop(_jid, None)
+    _owners = {getattr(i, "worker_id", None) or "" for i in infos}
+    for _w in [w for w in _worker_absent_since if w not in _owners]:
+        _worker_absent_since.pop(_w, None)
     if not infos:
         return 0
     alive_ids: set[str] | None = None
@@ -682,8 +692,12 @@ async def _reap_stuck_downloading() -> int:
                     actioned += 1
                 continue
             try:
-                await state.registry.send(
-                    worker,
+                # ConnectedWorker.send -- WorkerRegistry has no send(). The
+                # old ``state.registry.send(worker, msg)`` raised
+                # AttributeError into the debug-level except below on every
+                # call since this path was added, so no worker ever got a
+                # force-complete (found 2026-11-16).
+                await worker.send(
                     HubForceCompleteJob(
                         job_id=info.job_id,
                         reason=(
@@ -721,9 +735,20 @@ async def _reap_stuck_downloading() -> int:
         # the newest-first listing never reached a row past the timeout.
         if alive_ids is None:
             alive_ids = await _fleet_alive_worker_ids()
+            if alive_ids is not None:
+                for _w in [w for w in _worker_absent_since if w in alive_ids]:
+                    _worker_absent_since.pop(_w, None)
         if alive_ids is None:
             continue  # no fleet view: never read a blip as "all dead"
         if worker_id and worker_id in alive_ids:
+            continue
+        # Absent from one snapshot is not gone: a worker re-homing during a
+        # rolling hub restart drops out for seconds (2026-11-16 14:07: w5161
+        # was failed as "gone" while it reconnected to hub-55). Its download
+        # keeps running meanwhile, so wait it out.
+        _mono = time.monotonic()
+        _since = _worker_absent_since.setdefault(worker_id or "", _mono)
+        if _mono - _since < _DOWNLOADING_GONE_GRACE_S:
             continue
         # ----- Path C: worker truly gone fleet-wide -> mark failed -----
         # No live WS anywhere in the fleet to action the request. The

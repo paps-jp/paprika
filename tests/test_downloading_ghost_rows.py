@@ -84,16 +84,25 @@ class _Store:
         self.saved_results.append(result)
 
 
+class _Conn:
+    """Stands in for scheduler.ConnectedWorker: the message goes out through
+    the CONNECTION. WorkerRegistry itself has no send() -- the reaper calling
+    one is exactly the bug these fakes must not paper over."""
+
+    def __init__(self, sent):
+        self._sent = sent
+
+    async def send(self, msg):
+        self._sent.append(msg)
+
+
 class _Registry:
     def __init__(self, local=(), alive=(), stats_exc=None):
-        self.connections = {w: object() for w in local}
+        self.sent = []
+        self.connections = {w: _Conn(self.sent) for w in local}
         self._alive = set(alive) | set(local)
         self._stats_exc = stats_exc
-        self.sent = []
         self.stats_calls = 0
-
-    async def send(self, worker, msg):
-        self.sent.append(msg)
 
     async def stats_async(self):
         self.stats_calls += 1
@@ -109,8 +118,13 @@ def _state(monkeypatch):
     monkeypatch.setattr(state, "store", None)
     monkeypatch.setattr(state, "registry", None)
     _reaper._force_complete_sent.clear()
+    _reaper._worker_absent_since.clear()
+    # Path C's absence grace is covered by its own tests below; elsewhere a
+    # worker missing from the alive set is gone at once.
+    monkeypatch.setattr(_reaper, "_DOWNLOADING_GONE_GRACE_S", 0.0)
     yield
     _reaper._force_complete_sent.clear()
+    _reaper._worker_absent_since.clear()
 
 
 def _install(monkeypatch, store, registry):
@@ -252,6 +266,42 @@ async def test_worker_gone_fleet_wide_is_failed(monkeypatch):
     assert await _reaper._reap_stuck_downloading() == 1
     assert store.rows["g1"].status == JobStatus.failed
     assert "gone fleet-wide" in store.rows["g1"].error
+
+
+async def test_registry_has_no_send_so_the_connection_is_used():
+    """Guard the real class, not just the fake: Path A must not go through
+    ``state.registry.send``."""
+    from server.scheduler import WorkerRegistry
+
+    assert not hasattr(WorkerRegistry, "send")
+
+
+async def test_worker_briefly_absent_is_not_failed_as_gone(monkeypatch):
+    """A worker re-homing during a rolling hub restart drops out of the alive
+    set for seconds; its download is still running."""
+    monkeypatch.setattr(_reaper, "_DOWNLOADING_GONE_GRACE_S", 300.0)
+    store = _Store([_row("g1", "w-flap", 2 * HOUR)])
+    reg = _Registry(alive={"w-other"})
+    _install(monkeypatch, store, reg)
+
+    assert await _reaper._reap_stuck_downloading() == 0
+    assert store.rows["g1"].status == JobStatus.downloading
+    assert "w-flap" in _reaper._worker_absent_since
+
+    # back in the alive set -> the absence clock is dropped
+    reg._alive.add("w-flap")
+    await _reaper._reap_stuck_downloading()
+    assert "w-flap" not in _reaper._worker_absent_since
+    assert store.rows["g1"].status == JobStatus.downloading
+
+
+async def test_worker_absent_past_the_grace_is_failed_as_gone(monkeypatch):
+    monkeypatch.setattr(_reaper, "_DOWNLOADING_GONE_GRACE_S", 300.0)
+    store = _Store([_row("g1", "w-gone", 2 * HOUR)])
+    _install(monkeypatch, store, _Registry(alive={"w-other"}))
+    _reaper._worker_absent_since["w-gone"] = time.monotonic() - 301
+    assert await _reaper._reap_stuck_downloading() == 1
+    assert store.rows["g1"].status == JobStatus.failed
 
 
 @pytest.mark.parametrize("registry", [
