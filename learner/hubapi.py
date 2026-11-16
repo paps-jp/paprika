@@ -54,7 +54,8 @@ class Hub:
             self._client = None
 
     async def _call(self, method: str, path: str, *, json_body: dict | None = None,
-                    params: dict | None = None, timeout: float | None = None) -> Any:
+                    params: dict | None = None, timeout: float | None = None,
+                    raw: bool = False) -> Any:
         client = await self._http()
         headers = {"Authorization": f"Bearer {self._token}"} if self._token else {}
         try:
@@ -71,6 +72,8 @@ class Hub:
             raise HubUnavailable(f"{method} {path}: HTTP {code}: {_short(resp)}")
         if code >= 400:
             raise HubError(f"{method} {path}: HTTP {code}: {_short(resp)}", code)
+        if raw:
+            return resp.content
         try:
             return resp.json()
         except Exception:
@@ -126,13 +129,47 @@ class Hub:
                 return res
         return res
 
-    async def click(self, sid: str, selector: str) -> dict:
-        return await self._call("POST", f"/sessions/{sid}/click",
-                                json_body={"selector": selector}) or {}
+    async def click(self, sid: str, selector: str, *, mouse: bool = False,
+                    dx: float | None = None, dy: float | None = None) -> dict:
+        """Click the element. ``mouse=True`` asks for a real mouse click
+        instead of ``el.click()`` -- the only kind that reaches into an
+        embedded frame -- at the middle of its box moved by (dx, dy) pixels."""
+        body: dict = {"selector": selector}
+        if mouse:
+            body["mouse"] = True
+            if dx:
+                body["dx"] = float(dx)
+            if dy:
+                body["dy"] = float(dy)
+        return await self._call("POST", f"/sessions/{sid}/click", json_body=body) or {}
+
+    async def screenshot(self, sid: str) -> bytes:
+        """The visible part of the page as PNG bytes (one image pixel is one
+        CSS pixel)."""
+        out = await self._call("GET", f"/sessions/{sid}/screenshot", timeout=30.0, raw=True)
+        return out if isinstance(out, (bytes, bytearray)) else b""
+
+    async def network(self, sid: str, since: float = 0.0) -> list[dict]:
+        """Media requests the browser made in this session after ``since``
+        (a UNIX time): [{url, mime, document_url, timestamp, ...}]. Requests
+        made inside an embedded frame are included, with that frame's
+        document as ``document_url``."""
+        out = await self._call("GET", f"/sessions/{sid}/network", params={"since": since}, timeout=20.0)
+        entries = (out or {}).get("entries")
+        return [e for e in entries if isinstance(e, dict)] if isinstance(entries, list) else []
 
     async def scroll(self, sid: str, direction: str = "down", pixels: int = 800) -> dict:
         return await self._call("POST", f"/sessions/{sid}/scroll",
                                 json_body={"direction": direction, "pixels": pixels}) or {}
+
+    async def job_status(self, job_id: str) -> str:
+        """The hub's status of a job ("completed", "downloading", ...), or ""
+        when it cannot be read."""
+        try:
+            out = await self._call("GET", f"/jobs/{job_id}", timeout=15.0)
+        except (HubUnavailable, HubError):
+            return ""
+        return str((out or {}).get("status") or "")
 
     # ---- jobs (replaying a compiled playbook) --------------------------
 

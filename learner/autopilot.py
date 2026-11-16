@@ -83,6 +83,12 @@ class AutopilotConfig:
     infra_backoff_s: float = 900.0
     replay_timeout_s: float = 1800.0
     replay_poll_s: float = 20.0
+    #: A replay job the hub reports finished but whose outcome never reaches
+    #: the ledger is submitted again (the hub does not emit an outcome for
+    #: every completion path; seen 2026-11-13 on jobs whose video download
+    #: ended them). How long to wait for the outcome first, and how often.
+    replay_lost_after_s: float = 120.0
+    replay_resubmits: int = 2
     gen_urls: int = 2                 # other URLs of the template that must also succeed
     #: URLs of one key a single exploration may open. A failing URL is
     #: often failing for its own reason (the video was deleted), which says
@@ -100,8 +106,11 @@ class Autopilot:
                  life_cfg: P.LifecycleConfig | None = None,
                  sched_cfg: S.SchedulerConfig | None = None,
                  solver_cfg: V.SolverConfig | None = None,
-                 rng: random.Random | None = None, sleep=asyncio.sleep) -> None:
+                 rng: random.Random | None = None, sleep=asyncio.sleep, vision=None) -> None:
         self.store, self.hub, self.llm, self.redis = store, hub, llm, redis
+        #: Proposes where on a screenshot to click the player (learner/vision.py).
+        #: None, or an engine that is not configured: the middle is clicked.
+        self.vision = vision if (vision is not None and getattr(vision, "enabled", True)) else None
         self.cfg = cfg or AutopilotConfig()
         self.life_cfg = life_cfg or P.LifecycleConfig()
         self.sched_cfg = sched_cfg or S.SchedulerConfig()
@@ -125,6 +134,7 @@ class Autopilot:
         model / compiler / verifier generation a result belongs to."""
         return {
             "solver_prompt": V.PROMPT_VERSION, "model": getattr(self.llm, "model", "") or "",
+            "vision": (getattr(self.vision, "model", "") or "") if self.vision is not None else "",
             "compiler": compiler.COMPILER_VERSION, "verifier": VERIFIER_VERSION,
         }
 
@@ -255,6 +265,12 @@ class Autopilot:
             return "bad_request"
         rid = str(req.get("id") or "")
         klass = str(req.get("klass") or "")
+        actions = req.get("actions")
+        if actions is not None:
+            why = compiler.check_manual_actions(actions)
+            if why:
+                log.warning("bad solve request %s: %s", url, why)
+                return "bad_request"
         cand = await self.store.candidate_for_url(url, klass if klass in S.KNOWN_REASONS else "")
         playbooks = {p.key for p in await self.store.load_playbooks()}
         opened: list[str] = []        # the URLs THIS run opened (other runs go on meanwhile)
@@ -265,7 +281,10 @@ class Autopilot:
         else:
             self._in_flight.add(cand.key)
             try:
-                what = await self.explore(cand, manual=True, opened=opened)
+                if actions is not None:
+                    what = await self.try_actions(cand, actions, opened=opened)
+                else:
+                    what = await self.explore(cand, manual=True, opened=opened)
             finally:
                 self._in_flight.discard(cand.key)
         log.info("manual solve %s (%s %s): %s", url, cand.host, cand.template, what)
@@ -325,7 +344,7 @@ class Autopilot:
             if opened is not None:
                 opened.append(explore_url)
             res = await V.solve(self.hub, self.llm, explore_url, cfg=self.solver_cfg, sleep=self._sleep,
-                                notes=KLASS_NOTES.get(cand.klass, ""))
+                                notes=KLASS_NOTES.get(cand.klass, ""), vision=self.vision)
             again = False
             if res.result == V.GAVE_UP and res.barrier in V.URL_BARRIERS:
                 dead.append(explore_url)
@@ -379,6 +398,25 @@ class Autopilot:
                     result, reason = REPLAY_FAIL, f"replay rejected: {e}"[:120]
                 else:
                     result, reason = judge_replay(replay, explore_url, self.cfg.gen_urls)
+                    if (result in (REPLAY_FAIL, GENERALIZE_FAIL) and "video_short" in reason
+                            and not compiler.has_long_wait(actions)):
+                        # The steps started the player, but what was saved is a
+                        # short clip: in a plain fetch an advertisement plays
+                        # first and the job ends before the main video loads.
+                        # The Solver's own session often never shows that
+                        # advertisement, so it had no reason to wait. Try the
+                        # same steps once more with a wait behind them.
+                        longer = compiler.with_ad_wait(actions)
+                        try:
+                            replay2 = await self.replay(urls, longer, cand)
+                        except (HubUnavailable, HubError) as e:
+                            reason = f"{reason}; retry with a wait: {e}"[:120]
+                        else:
+                            result2, reason2 = judge_replay(replay2, explore_url, self.cfg.gen_urls)
+                            if result2 == SOLVED:
+                                actions, replay, result, reason = longer, replay2, result2, reason2
+                            else:
+                                reason = f"{reason}; with a {compiler.AD_WAIT_S:.0f}s wait: {reason2}"[:120]
         if result == SOLVED:
             pb_id = await self.store.insert_candidate(
                 host=cand.host, template=cand.template, intent=cand.intent, actions=actions,
@@ -427,28 +465,106 @@ class Autopilot:
         )
         self.stats["runs"] += 1
 
+    async def try_actions(self, cand: S.KeyCandidate, actions: list, *, opened: list | None = None) -> str:
+        """Steps a person wrote, put through the same test as steps the
+        Solver found: replayed without a model on the URL given and on other
+        URLs of the key, judged by the Verifier, and only then a candidate
+        playbook. No exploration, so no model is involved at all."""
+        all_urls = S.pick_urls(cand.urls, len(cand.urls))
+        urls = all_urls[: 1 + self.cfg.gen_urls]
+        res = V.SolveResult(result=V.TRACE, trace=[{"action": "manual_actions", "n": len(actions)}])
+        pb_id = None
+        replay: dict = {}
+        if opened is not None and urls:
+            opened.append(urls[0])
+        if len(urls) < 1 + self.cfg.gen_urls:
+            result, reason = REPLAY_FAIL, "too few URLs of this key to test the steps on"
+        else:
+            try:
+                replay = await self.replay(urls, actions, cand)
+            except HubUnavailable as e:
+                result, reason = V.INFRA, f"replay: {e}"[:120]
+            except HubError as e:
+                result, reason = REPLAY_FAIL, f"replay rejected: {e}"[:120]
+            else:
+                result, reason = judge_replay(replay, urls[0], self.cfg.gen_urls)
+        if result == SOLVED:
+            pb_id = await self.store.insert_candidate(
+                host=cand.host, template=cand.template, intent=cand.intent, actions=actions,
+                provenance={
+                    "manifest": self.manifest(), "klass": cand.klass, "explore_url": urls[0],
+                    "generalization": urls[1:], "replay": replay, "source": "manual",
+                    "steps": compiler.summarize(actions),
+                },
+                holdout_pct=self.life_cfg.holdout_pct,
+            )
+        await self._record(cand, urls[0] if urls else "", res, result, ("[manual steps] " + reason)[:120],
+                           pb_id, replay)
+        if result in (V.INFRA, V.BAD_OUTPUT):
+            self.stats["infra"] += 1
+            return result
+        solved = result == SOLVED
+        until = None
+        if not solved:
+            streak = await self.store.fail_streak(cand.host, cand.template, cand.intent) + 1
+            until = _utcnow() + S.dormancy(streak, "")
+        await self.store.update_key_state(
+            host=cand.host, template=cand.template, intent=cand.intent, klass=cand.klass,
+            solved=solved, dormant_until=until, result=result,
+        )
+        if solved:
+            self.stats["solved"] += 1
+        log.info("manual steps %s %s: %s (%s) pb=%s", cand.host, cand.template, result, reason, pb_id)
+        return result
+
     async def replay(self, urls: list[str], actions: list, cand: S.KeyCandidate) -> dict:
         """Run the compiled actions -- no model involved -- as ordinary
-        fetch jobs and collect the Verifier's outcome for each URL."""
-        jobs: dict[str, str] = {}
-        for i, u in enumerate(urls):
-            jobs[u] = await self.hub.submit_fetch(
+        fetch jobs and collect the Verifier's outcome for each URL.
+
+        A job the hub reports finished whose outcome does not arrive is
+        submitted again (``replay_resubmits`` times): losing the outcome is
+        the hub's doing, and without this one lost event throws away steps
+        that worked on every URL."""
+        async def submit(i: int, u: str) -> str:
+            return await self.hub.submit_fetch(
                 u, actions=actions,
                 learn={"arm": "solver", "role": "explore" if i == 0 else "gen"},
                 download_video=(cand.intent == "video"),
             )
+
+        jobs: dict[str, str] = {}
+        for i, u in enumerate(urls):
+            jobs[u] = await submit(i, u)
         deadline = time.monotonic() + self.cfg.replay_timeout_s
         out: dict[str, dict] = {u: {"job_id": j, "outcome": None, "reason": "timeout"}
                                 for u, j in jobs.items()}
+        finished_at: dict[str, float] = {}     # job_id -> when the hub first said it was over
+        resubmits = {u: 0 for u in urls}
         while True:
             got = await self.store.outcomes(list(jobs.values()))
             pending = 0
-            for u, j in jobs.items():
+            for i, (u, j) in enumerate(list(jobs.items())):
                 oc = got.get(j)
-                if oc is None or oc[1] in _PENDING_REASONS:
-                    pending += 1
+                if oc is not None and oc[1] not in _PENDING_REASONS:
+                    out[u] = {"job_id": j, "outcome": oc[0], "reason": oc[1]}
                     continue
-                out[u] = {"job_id": j, "outcome": oc[0], "reason": oc[1]}
+                pending += 1
+                if resubmits[u] >= self.cfg.replay_resubmits:
+                    continue
+                status_of = getattr(self.hub, "job_status", None)
+                status = await status_of(j) if status_of else ""
+                if status not in ("completed", "failed", "review"):
+                    continue
+                first = finished_at.setdefault(j, time.monotonic())
+                if time.monotonic() - first < self.cfg.replay_lost_after_s:
+                    continue
+                try:
+                    jobs[u] = await submit(i, u)
+                except (HubUnavailable, HubError):
+                    continue
+                resubmits[u] += 1
+                out[u] = {"job_id": jobs[u], "outcome": None, "reason": "timeout", "resubmitted": resubmits[u]}
+                log.info("replay: the outcome of %s (%s) never arrived; submitted again as %s", j, u, jobs[u])
             if not pending or time.monotonic() >= deadline:
                 return out
             await self._sleep(self.cfg.replay_poll_s)

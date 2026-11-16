@@ -36,11 +36,12 @@ import time
 from dataclasses import dataclass, field
 from urllib.parse import urlsplit
 
-from learner.compiler import MAX_PLAYER_CLICKS, PLAYER_MARK, describe_js, player_tag_js
+from learner.compiler import MAX_PLAYER_CLICKS, PLAYER_MARK, describe_js, player_tag_js, spot_offset
 from learner.hubapi import HubError, HubUnavailable
 from learner.llm import LLMBadOutput, LLMUnavailable, start_meter
+from learner.vision import VisionUnavailable
 
-PROMPT_VERSION = 4
+PROMPT_VERSION = 7
 
 #: result values
 TRACE = "trace"                # at least one click was carried out
@@ -60,6 +61,12 @@ HARD_BARRIERS = ("login", "paywall", "captcha", "region")
 #: (an advertising redirect), so whatever the model saw was not the key.
 URL_BARRIERS = ("gone", "redirected")
 BARRIERS = HARD_BARRIERS + ("gone", "no_video", "other")
+#: a give_up with one of these is the model's reading of the player, not of
+#: the page; it is overruled once a click made the player request a stream
+SOFT_BARRIERS = ("no_video", "other")
+#: how many more times a click on the player is looked at (``settle_s`` apart)
+#: while nothing shows the video starting
+START_LOOKS = 4
 
 SYSTEM_PROMPT = """You operate a web browser. Your goal: get the main video of the page to load and play.
 
@@ -68,7 +75,7 @@ Reply with ONE JSON object and nothing else:
 
   {"action": "click", "ref": N, "why": "..."}     click element @N
   {"action": "scroll", "why": "..."}              scroll down one screen
-  {"action": "click_player", "why": "..."}        click the middle of the video player
+  {"action": "click_player", "why": "..."}        click the video player with the mouse
   {"action": "wait", "seconds": N, "why": "..."}  wait N seconds (2 to 60)
   {"action": "done", "why": "..."}                the video is loading / playing and nothing covers it
   {"action": "give_up", "barrier": "login|paywall|captcha|region|gone|no_video|other", "why": "..."}
@@ -86,8 +93,13 @@ Two barriers must be told apart:
   - "no_video": this KIND of page never has a video (a shop item, an article, a form, a list, a profile, a search result).
 If the page HAS a video player but you cannot get it to start, that is "other", not "no_video".
 If a click did not change anything, do not repeat it; try something else or give_up.
-Use click_player when the video is not playing and no listed element starts it. The first click on a player
-often only opens an advertisement: clicking the player again is allowed.
+Use click_player when the video is not playing and no listed element starts it. It is a real mouse click, and the
+exact spot -- the play button, or the close button of an advertisement lying over the player -- is found on a
+screenshot for you. The first click on a player often only opens an advertisement: clicking the player again is allowed.
+A player may sit inside an embedded frame, or in a frame inside that frame. Its buttons are NOT in your list and
+VIDEO ELEMENTS cannot see it; click_player is the only way to reach it. What shows such a player starting is MEDIA
+REQUESTS. After a click, "the player requested media" means the video has started loading: do NOT click the player
+again (a second click pauses it or opens an advertisement), wait about 10 seconds, then say done.
 If a short advertisement is playing in the player before the main video, wait for it to end with ONE long wait
 (for a 30-second advertisement: {"action": "wait", "seconds": 40}), then read "longest" in VIDEO ELEMENTS again.
 Prefer the smallest number of clicks."""
@@ -178,10 +190,139 @@ def media_state(probe: dict | None) -> dict:
         "overlay": float((p.get("overlay") or {}).get("cover") or 0.0),
         "url": str(p.get("url") or ""),
         "password": bool(p.get("password_field")),
+        "media": int(p.get("player_media") or 0),
     }
 
 
 NOTHING = "nothing changed"
+CENTRE = "centre"
+
+_MEDIA_URL_RE = re.compile(r"\.(m3u8|mpd|mp4|webm|m4v|mov|ts|m4s|m4a|aac)(\?|$)", re.I)
+_STREAM_URL_RE = re.compile(r"\.(m3u8|mpd|ts|m4s)(\?|$)", re.I)
+
+
+def host_of(url) -> str:
+    try:
+        return (urlsplit(str(url or "")).hostname or "").lower()
+    except Exception:
+        return ""
+
+
+def is_media_entry(entry: dict) -> bool:
+    """Is this network-log entry a video / audio file, a stream playlist or a
+    piece of a stream?"""
+    mime = str(entry.get("mime") or "").lower()
+    if mime.startswith(("video/", "audio/")) or "mpegurl" in mime or "dash+xml" in mime:
+        return True
+    return bool(_MEDIA_URL_RE.search(str(entry.get("url") or "")))
+
+
+def is_stream_entry(entry: dict) -> bool:
+    """Is this network-log entry a stream playlist or a piece of a stream?"""
+    mime = str(entry.get("mime") or "").lower()
+    if "mpegurl" in mime or "dash+xml" in mime:
+        return True
+    return bool(_STREAM_URL_RE.search(str(entry.get("url") or "")))
+
+
+class PlayerMedia:
+    """How many requests for a video the page's player has made.
+
+    A player inside a frame of another site is invisible to the page probe:
+    no ``<video>`` to look at, so a click on it "changes nothing" even when
+    it started the video. What can be seen is the session's network log.
+    Two kinds of request are counted:
+
+      * a stream -- a playlist or a piece of one -- whoever asked for it.
+        The frame that plays the video is often not the frame the page
+        embeds but one nested inside it, on yet another site (seen live
+        2026-11-14: one click started the stream and the run gave up,
+        because only the outer frame's own requests were counted);
+      * any video / audio file requested by the player frame itself, once
+        that frame is known.
+
+    A video FILE requested by some other frame is not counted: advertising
+    banners play those all the time.
+    """
+
+    def __init__(self) -> None:
+        self.host = ""       # host of the player frame's document, once known
+        self.since = 0.0
+        self.n = 0
+
+    def watch_frame(self, host: str) -> bool:
+        """Also count the files this frame asks for. True when that is new
+        (the count then starts over, to include what it asked for before)."""
+        if not host or host == self.host:
+            return False
+        self.host, self.since, self.n = host, 0.0, 0
+        return True
+
+    async def read(self, hub, sid: str) -> int:
+        try:
+            entries = await hub.network(sid, self.since)
+        except (HubError, HubUnavailable):
+            return self.n    # an extra signal: the page probe carries the run
+        for e in entries:
+            try:
+                self.since = max(self.since, float(e.get("timestamp") or 0.0))
+            except (TypeError, ValueError):
+                pass
+            if is_stream_entry(e) or (self.host and is_media_entry(e)
+                                      and host_of(e.get("document_url")) == self.host):
+                self.n += 1
+        return self.n
+
+
+async def choose_spot(hub, vision, sid: str, box: dict, *, sleep=asyncio.sleep) -> tuple[dict, dict]:
+    """Where to click to start the player: (spot, box).
+
+    ``spot`` is {"dx", "dy", "by", "pick", ...}: the point as pixels from the
+    middle of the player, who chose it, and which kind of element the player
+    is. ``box`` is the player's description for THAT point -- it may be
+    another element than the one passed in, when the proposed point lies in
+    the page's other candidate.
+
+    The vision model proposes a point on a screenshot; it is used only when
+    it lies inside something that can be a player (the model has picked an
+    advertisement outside one before). In every other case -- no engine, no
+    answer, no proposal, a point elsewhere -- the click goes to the middle
+    of the player, which is what a person tries first."""
+    spot = {"dx": 0, "dy": 0, "by": CENTRE, "pick": str(box.get("pick") or "")}
+    if vision is None or not getattr(vision, "enabled", True):
+        return spot, box
+    try:
+        vw, vh = float(box["vw"]), float(box["vh"])
+    except (KeyError, TypeError, ValueError):
+        return spot, box
+    if min(vw, vh) <= 0:
+        return spot, box
+    try:
+        await sleep(0.4)             # the scroll that brought the player into view
+        png = await hub.screenshot(sid)
+        ans = await vision.next_click(png) if png else None
+    except (VisionUnavailable, HubError, HubUnavailable) as e:
+        spot["note"] = f"vision unavailable: {str(e)[:60]}"
+        return spot, box
+    if ans is None:
+        spot["note"] = "vision proposed no click"
+        return spot, box
+    # Mark again for THAT point: the page decides which candidate it lies in,
+    # and what lies there is what gets clicked.
+    at = await hub.evaluate(sid, player_tag_js(PLAYER_MARK, hint=(ans["x"] * vw, ans["y"] * vh)))
+    if not isinstance(at, dict) or not at.get("found"):
+        return spot, {"found": False}
+    if not at.get("hinted"):
+        spot["note"] = "vision pointed outside the player"
+        return spot, at
+    return {"dx": spot_offset(at.get("dx")), "dy": spot_offset(at.get("dy")), "by": "vision",
+            "target": ans["target"], "pick": str(at.get("pick") or "")}, at
+
+
+def spot_words(spot: dict) -> str:
+    if spot.get("by") != "vision":
+        return "its middle"
+    return "the close button of what covers it" if spot.get("target") == "close" else "its play button"
 
 #: Labels the Solver never clicks, whatever the model says. Deliberately
 #: broad: a wrongly refused click costs one step, a wrongly allowed one
@@ -248,6 +389,8 @@ def describe_effect(before: dict, after: dict) -> str:
         parts.append(f"playing {before['playing']} -> {after['playing']}")
     if after["longest_s"] != before["longest_s"]:
         parts.append(f"longest video {before['longest_s']}s -> {after['longest_s']}s")
+    if after.get("media", 0) > before.get("media", 0):
+        parts.append(f"the player requested media {before.get('media', 0)} -> {after['media']} files")
     return "; ".join(parts) or NOTHING
 
 
@@ -265,6 +408,9 @@ def build_user_prompt(url: str, probe: dict | None, outline: str, history: list[
         f"LARGEST OVERLAY: covers {ms['overlay']:.0%} of the screen"
         + (f', text: "{ov.get("text")}"' if ov.get("text") else ""),
     ]
+    if "player_media" in p:
+        lines.append(f"MEDIA REQUESTS: {ms['media']} (playlists and pieces of a video stream requested so far by "
+                     "the page and the frames in it)")
     if p.get("password_field"):
         lines.append("NOTE: the page contains a password field.")
     if notes:
@@ -308,13 +454,25 @@ def parse_decision(obj: dict) -> dict:
 
 
 async def solve(hub, llm, url: str, *, cfg: SolverConfig | None = None, notes: str = "",
-                sleep=asyncio.sleep) -> SolveResult:
-    """Explore ``url`` in one browser session and return the trace."""
+                sleep=asyncio.sleep, vision=None) -> SolveResult:
+    """Explore ``url`` in one browser session and return the trace.
+
+    ``vision`` (``learner/vision.py``, optional) proposes where inside the
+    player a ``click_player`` should land; without it the click goes to the
+    middle."""
     cfg = cfg or SolverConfig()
     t0 = time.monotonic()
     meter = start_meter()
     trace: list[dict] = []
     history: list[str] = []
+    player_media = PlayerMedia()
+
+    async def look():
+        """The page probe, plus what the player has requested."""
+        p = await hub.evaluate(sid, _PROBE_JS)
+        if isinstance(p, dict):
+            p["player_media"] = await player_media.read(hub, sid)
+        return p
 
     def _out(result: str, reason: str = "", barrier: str = "") -> SolveResult:
         return SolveResult(
@@ -333,11 +491,12 @@ async def solve(hub, llm, url: str, *, cfg: SolverConfig | None = None, notes: s
     bad = 0
     waited = 0.0                   # seconds spent in "wait" so far
     player_clicks = 0
+    stream_started = False         # a click on the player made it request a stream
     idle = 0                       # consecutive steps without any effect
     dead: set = set()              # targets whose click changed nothing
     try:
         await sleep(cfg.settle_s)
-        probe = await hub.evaluate(sid, _PROBE_JS)
+        probe = await look()
         # Where the page settled after loading is "the site": a redirect on
         # load is the site's own doing, a change after OUR click is not.
         home = site_of(media_state(probe)["url"]) or site_of(url)
@@ -365,6 +524,16 @@ async def solve(hub, llm, url: str, *, cfg: SolverConfig | None = None, notes: s
             if act == "done":
                 trace.append({"action": "done", "why": decision["why"]})
                 break
+            if act == "give_up" and stream_started and not elsewhere and decision["barrier"] in SOFT_BARRIERS:
+                # Decided here, not by the model: a click made the player
+                # request a stream, which is the only sign a player inside a
+                # frame ever gives. The model then sees "nothing changed" and
+                # concludes the video did not start (2026-11-14, twice on the
+                # same page). The replay test is the judge of the steps.
+                trace.append({"action": "done", "by": "stream_started",
+                              "why": "the player requested a stream after the click",
+                              "model": {"barrier": decision["barrier"], "why": decision["why"]}})
+                break
             if act == "give_up":
                 trace.append({"action": "give_up", "barrier": decision["barrier"], "why": decision["why"]})
                 if elsewhere:
@@ -377,12 +546,15 @@ async def solve(hub, llm, url: str, *, cfg: SolverConfig | None = None, notes: s
                 seconds = min(decision["seconds"], max(2.0, cfg.max_wait_total_s - waited))
                 waited += seconds
                 await sleep(seconds)
-                probe = await hub.evaluate(sid, _PROBE_JS)
+                probe = await look()
                 effect = describe_effect(before, media_state(probe))
                 trace.append({"action": "wait", "seconds": seconds, "ok": effect != NOTHING, "effect": effect})
                 idle = 0 if effect != NOTHING else idle + 1
                 if waited >= cfg.max_wait_total_s:
                     idle = cfg.max_idle_steps          # no more waiting in this run
+                if effect == NOTHING and stream_started:
+                    effect = ("nothing new on the page, which is normal for a player inside a frame; the stream "
+                              "it requested after your click is the sign that the video started")
                 history.append(f"waited {seconds:.0f}s: " + effect)
                 continue
             if act == "click_player":
@@ -398,42 +570,81 @@ async def solve(hub, llm, url: str, *, cfg: SolverConfig | None = None, notes: s
                     trace.append({"action": "click_player", "ok": False, "refused": "no_player"})
                     history.append("click_player: REFUSED, there is no video player on the page")
                     continue
+                if pdesc.get("playing"):
+                    # Decided here, not by a model looking at a still image:
+                    # a second click on a playing video pauses it.
+                    idle += 1
+                    trace.append({"action": "click_player", "ok": False, "refused": "playing"})
+                    history.append("click_player: REFUSED, the main video is already playing and another "
+                                   "click would pause it; wait, or say done")
+                    continue
+                if pdesc.get("kind") == "iframe" and player_media.watch_frame(host_of(pdesc.get("src"))):
+                    before["media"] = await player_media.read(hub, sid)
+                spot, pdesc = await choose_spot(hub, vision, sid, pdesc, sleep=sleep)
+                if not pdesc.get("found"):
+                    idle += 1
+                    trace.append({"action": "click_player", "ok": False, "refused": "no_player"})
+                    history.append("click_player: REFUSED, the video player is no longer on the page")
+                    continue
                 if pdesc.get("external") or FORBIDDEN_LABEL_RE.search(str(pdesc.get("text") or "")):
                     idle += 1
-                    trace.append({"action": "click_player", "ok": False, "refused": "covered", "desc": pdesc})
-                    history.append("click_player: REFUSED, the middle of the player is covered by a link to "
+                    trace.append({"action": "click_player", "ok": False, "refused": "covered", "desc": pdesc,
+                                  "spot": spot})
+                    history.append("click_player: REFUSED, that spot of the player is covered by a link to "
                                    "another site or an account button")
                     continue
                 player_clicks += 1
                 try:
-                    await hub.click(sid, f'[data-pb-t="{PLAYER_MARK}"]')
-                    ok = True
+                    out = await hub.click(sid, f'[data-pb-t="{PLAYER_MARK}"]', mouse=True,
+                                          dx=spot["dx"], dy=spot["dy"])
+                    status = str((out or {}).get("status") or "OK")
+                    ok = status.startswith("OK")
+                    if not ok:
+                        history.append(f"click_player: FAILED ({status[:60]})")
                 except HubError as e:
                     ok = False
                     history.append(f"click_player: FAILED ({str(e)[:60]})")
                 await sleep(cfg.settle_s)
-                probe = await hub.evaluate(sid, _PROBE_JS)
+                probe = await look()
                 after = media_state(probe if isinstance(probe, dict) else None)
                 effect = describe_effect(before, after)
+                for _look in range(START_LOOKS):
+                    # A player in a frame shows its start only as requests,
+                    # and those come later than a change in the page: a frame
+                    # has to load, then the frame inside it, then its player.
+                    # Another change (the poster going away) is not the start;
+                    # reporting only that made the model click again and open
+                    # an advertisement (2026-11-14).
+                    started = (after["media"] > before["media"] or after["playing"] > before["playing"]
+                               or after["longest_s"] > before["longest_s"])
+                    if not ok or started or (after["url"] and site_of(after["url"]) != home):
+                        break
+                    await sleep(cfg.settle_s)
+                    probe = await look()
+                    after = media_state(probe if isinstance(probe, dict) else None)
+                    effect = describe_effect(before, after)
                 left = bool(after["url"]) and site_of(after["url"]) != home
                 login_form = after["password"] and not before["password"]
                 if ok and (left or login_form):
                     trace.append({"action": "click_player", "ok": False, "performed": True, "desc": pdesc,
-                                  "why": decision["why"], "effect": effect})
+                                  "spot": spot, "why": decision["why"], "effect": effect})
                     trace.append({"action": "aborted", "why": "left_site" if left else "login_form_appeared"})
                     return _out(GAVE_UP, f"a click led to {after['url'][:80]}" if left
                                 else "a click opened a login form", "other" if left else "login")
                 changed = ok and effect != NOTHING
                 idle = 0 if changed else idle + 1
+                if ok and after.get("media", 0) > before.get("media", 0):
+                    stream_started = True
                 trace.append({"action": "click_player", "ok": changed, "performed": ok, "desc": pdesc,
-                              "why": decision["why"], "effect": effect})
+                              "spot": spot, "why": decision["why"], "effect": effect})
                 if ok:
-                    history.append(f"clicked the player ({pdesc.get('tag')}): {effect}")
+                    history.append(f"clicked the player ({pdesc.get('kind') or 'video'}, at "
+                                   f"{spot_words(spot)}): {effect}")
                 continue
             if act == "scroll":
                 await hub.scroll(sid, "down")
                 await sleep(1.0)
-                probe = await hub.evaluate(sid, _PROBE_JS)
+                probe = await look()
                 trace.append({"action": "scroll"})
                 effect = describe_effect(before, media_state(probe))
                 idle = 0 if effect != NOTHING else idle + 1
@@ -478,7 +689,7 @@ async def solve(hub, llm, url: str, *, cfg: SolverConfig | None = None, notes: s
                 history.append(f"click {label}: FAILED ({str(e)[:60]})")
             await sleep(cfg.settle_s)
             gone = (await hub.evaluate(sid, gone_js(ref))) is True if ok else False
-            probe = await hub.evaluate(sid, _PROBE_JS)
+            probe = await look()
             after = media_state(probe if isinstance(probe, dict) else None)
             effect = describe_effect(before, after)
             if gone and after["url"] == before["url"]:

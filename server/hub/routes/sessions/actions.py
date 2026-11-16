@@ -109,10 +109,29 @@ async def session_navigate(session_id: str, body: dict) -> dict:
 
 @router.post("/sessions/{session_id}/click")
 async def session_click(session_id: str, body: dict) -> dict:
-    sel = (body or {}).get("selector")
+    body = body or {}
+    sel = body.get("selector")
     if not sel:
         raise HTTPException(400, "missing selector")
-    action = _route_to_page({"kind": "click", "selector": sel}, body)
+    action: dict = {"kind": "click", "selector": sel}
+    if body.get("mouse"):
+        # A real mouse click (CDP Input) at a point inside the element
+        # instead of ``el.click()``: it is hit-tested at the pixel, so it
+        # also reaches the content of an embedded frame. ``fx`` / ``fy`` =
+        # the point as fractions of the element's box (default: the middle),
+        # ``dx`` / ``dy`` = pixels to move it by.
+        action["mouse"] = True
+        for key, lo, hi in (("fx", 0.0, 1.0), ("fy", 0.0, 1.0), ("dx", -5000.0, 5000.0), ("dy", -5000.0, 5000.0)):
+            if body.get(key) is None:
+                continue
+            try:
+                num = float(body[key])
+            except (TypeError, ValueError):
+                num = float("nan")
+            if not lo <= num <= hi:
+                raise HTTPException(400, f"'{key}' must be a number between {lo:g} and {hi:g}")
+            action[key] = num
+    action = _route_to_page(action, body)
     return await _send_session_action(session_id, action)
 
 

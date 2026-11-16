@@ -11,6 +11,12 @@ a video" filter.
 
 Every session of the run is a row of ``learn_solver_runs`` (reason starts
 with ``[manual]``) and shows on the admin page (#ai -> 学習ループ).
+
+With ``--actions FILE`` you hand in the steps yourself (you worked out by
+hand what the page needs). No model runs: the steps are replayed on the URL
+and on two other URLs of its key, and become a candidate playbook only when
+the Verifier calls all three a success -- the same bar as for steps the
+Solver finds. From there the trial against a control group decides.
 """
 from __future__ import annotations
 
@@ -18,21 +24,30 @@ import argparse
 import asyncio
 import json
 import os
+import sys
 import time
 import uuid
 
 from learner.autopilot import REQUESTS_KEY, RESULT_KEY
+from learner.compiler import check_manual_actions
 from learner.scheduler import KNOWN_REASONS
 
 
-def build_request(url: str, klass: str = "", *, now: float | None = None, rid: str | None = None) -> dict:
+def build_request(url: str, klass: str = "", *, actions: list | None = None,
+                  now: float | None = None, rid: str | None = None) -> dict:
     url = (url or "").strip()
     if not url.lower().startswith(("http://", "https://")):
         raise ValueError("URL must start with http:// or https://")
     if klass and klass not in KNOWN_REASONS:
         raise ValueError(f"--klass must be one of {', '.join(KNOWN_REASONS)}")
-    return {"id": rid or uuid.uuid4().hex[:12], "url": url, "klass": klass,
-            "ts": float(now if now is not None else time.time())}
+    req = {"id": rid or uuid.uuid4().hex[:12], "url": url, "klass": klass,
+           "ts": float(now if now is not None else time.time())}
+    if actions is not None:
+        why = check_manual_actions(actions)
+        if why:
+            raise ValueError(why)
+        req["actions"] = actions
+    return req
 
 
 async def submit(redis, req: dict) -> None:
@@ -55,11 +70,25 @@ async def _main() -> int:
     ap.add_argument("url")
     ap.add_argument("--klass", default="", help="what ordinary fetches of this page run into: "
                     + ", ".join(KNOWN_REASONS) + " (default: taken from the ledger)")
+    ap.add_argument("--actions", default="", metavar="FILE",
+                    help="a JSON file with steps you wrote ('-' = stdin): a list of "
+                         '{"kind": "wait", "seconds": N} / {"kind": "click", "selector": CSS} / '
+                         '{"kind": "evaluate", "expression": JS}. The Solver is skipped; the steps go '
+                         "straight to the replay test on this URL and two others of its key, and become "
+                         "a candidate playbook only if all three succeed")
     ap.add_argument("--no-wait", action="store_true", help="queue the request and return")
     ap.add_argument("--timeout", type=float, default=2700.0, help="seconds to wait for the result (2700)")
     args = ap.parse_args()
+    actions = None
+    if args.actions:
+        try:
+            text = sys.stdin.read() if args.actions == "-" else open(args.actions, encoding="utf-8").read()
+            actions = json.loads(text)
+        except (OSError, ValueError) as e:
+            print(f"error: cannot read --actions: {e}")
+            return 2
     try:
-        req = build_request(args.url, args.klass)
+        req = build_request(args.url, args.klass, actions=actions)
     except ValueError as e:
         print(f"error: {e}")
         return 2

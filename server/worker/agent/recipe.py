@@ -154,6 +154,12 @@ async def _apply_fetch_recipe(tab, recipe: dict, log) -> dict:
     Supported action kinds (each is a JSON dict):
       {"kind": "click",    "selector": "..."}              # CSS selector
       {"kind": "click",    "paprika_id": 5}                # outline @N
+      {"kind": "click",    "selector": "...", "mouse": true, "dx": 0, "dy": 160}
+                                                           # real mouse click inside the
+                                                           # element's box: its middle
+                                                           # (or fx, fy fractions) moved
+                                                           # by dx, dy px. Reaches into
+                                                           # an iframe.
       {"kind": "fill",     "selector": "...", "value": "..."}
       {"kind": "press",    "key": "Enter", "count": 1}
       {"kind": "type",     "text": "hello"}
@@ -214,6 +220,11 @@ async def _apply_fetch_recipe(tab, recipe: dict, log) -> dict:
                 elif "paprika_id" in raw:
                     pid = raw["paprika_id"]
                     op_action["selector"] = f'[data-paprika-id="{int(pid)}"]'
+                if kind == "click" and raw.get("mouse"):
+                    op_action["mouse"] = True
+                    for _k in ("fx", "fy", "dx", "dy"):
+                        if raw.get(_k) is not None:
+                            op_action[_k] = raw[_k]
                 if kind == "fill":
                     op_action["text"] = raw.get("value") or ""
                 elif kind == "type":

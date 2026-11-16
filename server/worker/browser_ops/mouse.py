@@ -15,7 +15,7 @@ from typing import Callable, Optional
 from nodriver import cdp
 
 from ._base import *  # noqa: F401,F403
-from ._base import ACTION_SETTLE_S, LogFn, short_error
+from ._base import ACTION_SETTLE_S, LogFn, normalize_selector, short_error
 
 _HUMAN_MOUSE_ENABLED = os.environ.get("PAPRIKA_HUMAN_MOUSE", "1") != "0"
 
@@ -308,6 +308,122 @@ async def click_at(
         return f"ERR: {short_error(e)}"
     await asyncio.sleep(ACTION_SETTLE_S)
     return "OK"
+
+
+#: A mouse click that has not come back after this long never will: Chrome
+#: does not answer for a page it is not showing.
+_CLICK_TIMEOUT_S = 20.0
+
+
+async def bring_to_front(tab, log: LogFn | None = None) -> bool:
+    """Make ``tab`` the page Chrome is showing. Never raises.
+
+    A click on a video player very often opens an advertisement in a new
+    tab or window, in front of ours. Chrome delivers no input to a page
+    that is not visible and does not paint it either: the next mouse click
+    or screenshot on our tab then waits for an answer that never comes
+    (seen live 2026-11-14 -- ``document.visibilityState`` was "hidden" 13 s
+    after loading such a page, and every action on it timed out).
+    """
+    try:
+        await asyncio.wait_for(tab.send(cdp.page.bring_to_front()), timeout=5.0)
+        return True
+    except Exception as e:
+        if log:
+            log(f"  [agent] bring_to_front: {short_error(e)}")
+        return False
+
+
+def _fraction(value, default: float = 0.5) -> float:
+    """``value`` as a position inside a box, 0..1 (anything else: the middle)."""
+    try:
+        f = float(value)
+    except (TypeError, ValueError):
+        return default
+    if f != f:  # NaN
+        return default
+    return min(1.0, max(0.0, f))
+
+
+def _offset(value) -> int:
+    """``value`` as a pixel offset (anything unusable: none)."""
+    try:
+        f = float(value)
+    except (TypeError, ValueError):
+        return 0
+    if f != f:  # NaN
+        return 0
+    return int(round(min(5000.0, max(-5000.0, f))))
+
+
+async def click_in(
+    tab,
+    selector: str,
+    log: LogFn,
+    *,
+    fx: float | None = 0.5,
+    fy: float | None = 0.5,
+    dx: float | None = 0,
+    dy: float | None = 0,
+) -> str:
+    """A real mouse click at a point inside the element ``selector`` matches.
+
+    The plain ``click`` primitive calls ``el.click()`` in the page: no
+    pointer events, not a user gesture, and nothing at all when the element
+    is an ``<iframe>`` -- the click never reaches the document inside it.
+    This one goes through CDP Input like a person's click (:func:`click_at`),
+    so it is hit-tested at the pixel and reaches whatever is drawn there,
+    including the content of a cross-origin frame (an embedded video player).
+
+    The point is ``(fx, fy)`` as a fraction of the element's box -- (0.5,
+    0.5) is the middle, (0, 0) the top-left corner -- moved by ``(dx, dy)``
+    pixels, and kept inside the box. The offset exists because controls keep
+    their size when the box does not: a play button 160 px below the middle
+    of a player stays 160 px below the middle when the player is larger on
+    the next page load, which no fraction describes. A point outside the
+    viewport is scrolled into view first. Returns ``"OK"`` / ``"NO_MATCH"``
+    / ``"NO_BOX"`` (matched, but nothing is drawn) / ``"ERR: ..."``.
+    """
+    if not selector:
+        return "ERR: empty selector"
+    selector = normalize_selector(selector)
+    await bring_to_front(tab, log)
+    js = (
+        "(()=>{try{const el=document.querySelector(" + json.dumps(selector) + ");"
+        "if(!el)return 'NO_MATCH';"
+        "const fx=" + repr(_fraction(fx)) + ",fy=" + repr(_fraction(fy)) + ","
+        "dx=" + repr(_offset(dx)) + ",dy=" + repr(_offset(dy)) + ";"
+        "let r=el.getBoundingClientRect();"
+        "if(r.width<1||r.height<1)return 'NO_BOX';"
+        "const at=()=>[Math.min(Math.max(r.left+r.width*fx+dx,r.left+1),r.right-1),"
+        "Math.min(Math.max(r.top+r.height*fy+dy,r.top+1),r.bottom-1)];"
+        "let [x,y]=at();"
+        "if(x<0||y<0||x>innerWidth-1||y>innerHeight-1){"
+        "el.scrollIntoView({block:'center',inline:'center',behavior:'instant'});"
+        "r=el.getBoundingClientRect();[x,y]=at();}"
+        "x=Math.min(Math.max(Math.round(x),1),Math.max(1,innerWidth-2));"
+        "y=Math.min(Math.max(Math.round(y),1),Math.max(1,innerHeight-2));"
+        "return 'XY:'+x+','+y;}"
+        "catch(e){return 'ERR: '+e.message;}})()"
+    )
+    try:
+        result = await tab.evaluate(js)
+    except Exception as e:
+        result = f"ERR: {short_error(e)}"
+    if not isinstance(result, str) or not result.startswith("XY:"):
+        result = result if isinstance(result, str) and result else "ERR: no position"
+        log(f"  [agent] mouse click {selector!r}: {result}")
+        return result
+    try:
+        xs, ys = result[3:].split(",", 1)
+        x, y = int(xs), int(ys)
+    except ValueError:
+        return f"ERR: bad position {result!r}"
+    try:
+        return await asyncio.wait_for(click_at(tab, x, y, log), timeout=_CLICK_TIMEOUT_S)
+    except asyncio.TimeoutError:
+        log(f"  [agent] mouse click {selector!r} at ({x},{y}): no answer in {_CLICK_TIMEOUT_S:.0f}s")
+        return "ERR: mouse click timed out (is the page visible?)"
 
 
 async def hover_at(tab, x: int, y: int, log: LogFn) -> str:

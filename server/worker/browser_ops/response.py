@@ -17,6 +17,7 @@ from nodriver import cdp
 from ._base import *  # noqa: F401,F403
 from ._base import LogFn
 from .input import click, fill, press_key, scroll, type_text
+from .mouse import click_in
 from .nav import back, forward, history_first, navigate, wait_for_load
 
 _VAR_PLACEHOLDER_RE = re.compile(r"\$\{([A-Za-z_][A-Za-z0-9_]*)\}")
@@ -414,6 +415,12 @@ async def execute(tab, action: dict, log: LogFn) -> str:
     vars_map = action.get("variables") or None
     if kind == "click":
         sel = _apply_variables(action.get("selector") or "", vars_map)
+        if action.get("mouse"):
+            # A real mouse click at a point inside the element (fx, fy =
+            # fractions of its box, moved by dx, dy pixels) instead of
+            # el.click(): the only kind that reaches into an embedded frame.
+            return await click_in(tab, sel, log, fx=action.get("fx"), fy=action.get("fy"),
+                                  dx=action.get("dx"), dy=action.get("dy"))
         return await click(tab, sel, log)
     if kind == "type":
         # Two flavours under the same action kind:

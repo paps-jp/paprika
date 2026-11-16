@@ -10,13 +10,19 @@ and a different URL of the same template:
        anything that looks URL-specific (long digit or hex runs) dropped;
     2. the element's visible text as a last resort.
 
-The emitted actions use only what the worker's existing recipe player
-already runs (server/worker/agent/recipe.py -- ``evaluate`` / ``click`` /
-``wait``), so a playbook needs no worker change:
+The emitted actions use only what the worker's recipe player runs
+(server/worker/agent/recipe.py -- ``evaluate`` / ``click`` / ``wait``):
 
     evaluate   find the target by (1) then (2) and mark it
-    click      a real click on the marked element
+    click      ``el.click()`` on the marked element
     wait       let the page react
+
+The video player is the exception. It is found by size, not by name, and
+clicked with a real mouse click at a point inside its box (``"mouse":
+true`` with ``dx`` / ``dy``, pixels from its middle): the only click that is
+a user gesture and the only one that reaches a player inside an embedded
+frame. A worker too old
+to know ``mouse`` falls back to ``el.click()``.
 
 If the target is not on the page the ``click`` fails with "not found",
 which the worker reports in ``facts.recipe`` -- a cache miss, and the job
@@ -30,7 +36,7 @@ from __future__ import annotations
 import json
 import re
 
-COMPILER_VERSION = 1
+COMPILER_VERSION = 2
 MAX_CLICKS = 6
 MAX_SELECTORS = 4
 WAIT_AFTER_CLICK_S = 1.5
@@ -176,36 +182,166 @@ def click_actions(desc: dict, mark: str) -> list[dict] | None:
     ]
 
 
-def player_tag_js(mark: str = PLAYER_MARK) -> str:
-    """JS that marks what a click in the middle of the largest visible
-    <video> would hit, and reports it as a JSON string. That element -- an
-    overlay, a big play button, or the video itself -- is what a person
-    clicks to start a player; it is found by position because players
-    rarely give it a stable name."""
+def spot_offset(value) -> int:
+    """A distance in pixels from the middle of the player (anything
+    unusable: 0, the middle itself).
+
+    Pixels, not a share of the box: a player's buttons keep their size and
+    their distance from its middle when the player is drawn larger or
+    smaller, and it is drawn at a different size from one page load to the
+    next (seen live 2026-11-14: the same embedded player 587, 840 and 988 px
+    high, its play button 162 px below the middle every time)."""
+    try:
+        f = float(value)
+    except (TypeError, ValueError):
+        return 0
+    if f != f:  # NaN
+        return 0
+    return int(round(min(4000.0, max(-4000.0, f))))
+
+
+_PLAYER_JS = r"""
+(() => {
+  const mark = __MARK__, want = __WANT__, hint = __HINT__;
+  let dx = __DX__, dy = __DY__;
+  const largest = (sel, lo, hi) => {
+    let best = null, area = 0;
+    for (const e of document.querySelectorAll(sel)) {
+      const r = e.getBoundingClientRect();
+      if (r.width < 320 || r.height < 180) continue;
+      const ratio = r.width / r.height;
+      if (ratio < lo || ratio > hi) continue;
+      const cs = getComputedStyle(e);
+      if (cs.display === 'none' || cs.visibility === 'hidden') continue;
+      const a = r.width * r.height;
+      if (a > area) { best = e; area = a; }
+    }
+    return best;
+  };
+  const media = largest('video, iframe', 0.5, 2.6);
+  const box = (() => {
+    // Wrappers around a player are named like one too, and their size
+    // changes with whatever else they hold. Of the boxes that are not
+    // small next to the largest (a related-video thumbnail is), take the
+    // one shaped most like a screen: that is the player itself.
+    const all = [];
+    for (const e of document.querySelectorAll('[id*="player" i], [class*="player" i], [id*="video" i], [class*="video" i]')) {
+      if (e.tagName === 'VIDEO' || e.tagName === 'IFRAME') continue;
+      const r = e.getBoundingClientRect();
+      if (r.width < 320 || r.height < 180 || r.width > innerWidth || r.height > innerHeight * 1.1) continue;
+      const ratio = r.width / r.height;
+      if (ratio < 1.2 || ratio > 2.4) continue;
+      const cs = getComputedStyle(e);
+      if (cs.display === 'none' || cs.visibility === 'hidden') continue;
+      all.push({e: e, area: r.width * r.height, off: Math.abs(ratio - 16 / 9)});
+    }
+    const most = Math.max(0, ...all.map(c => c.area));
+    let best = null;
+    for (const c of all) {
+      if (c.area < most * 0.25) continue;
+      if (!best || c.off < best.off - 0.02 || (Math.abs(c.off - best.off) <= 0.02 && c.area < best.area)) best = c;
+    }
+    return best ? best.e : null;
+  })();
+  const inside = (e, p) => {
+    if (!e) return false;
+    const r = e.getBoundingClientRect();
+    return p[0] >= r.left - 4 && p[0] <= r.right + 4 && p[1] >= r.top - 4 && p[1] <= r.bottom + 4;
+  };
+  let best = want === 'media' ? media : want === 'box' ? box : (media || box);
+  let hinted = false;
+  if (hint) {
+    const h = inside(media, hint) ? media : inside(box, hint) ? box : null;
+    if (h) {
+      const r = h.getBoundingClientRect();
+      best = h; hinted = true;
+      dx = Math.round(hint[0] - (r.left + r.width / 2));
+      dy = Math.round(hint[1] - (r.top + r.height / 2));
+    }
+  }
+  document.querySelectorAll('[data-pb-t="' + mark + '"]').forEach(e => e.removeAttribute('data-pb-t'));
+  if (!best) return JSON.stringify({found: false});
+  try { best.scrollIntoView({block: 'center', behavior: 'instant'}); } catch (e) {}
+  const r = best.getBoundingClientRect();
+  const px = Math.min(Math.max(r.left + r.width / 2 + dx, r.left + 1), r.right - 1);
+  const py = Math.min(Math.max(r.top + r.height / 2 + dy, r.top + 1), r.bottom - 1);
+  const top = document.elementFromPoint(px, py) || best;
+  const link = top.closest ? top.closest('a[href]') : null;
+  let external = false;
+  if (link) {
+    try {
+      const h = new URL(link.href, location.href).hostname.split('.').slice(-2).join('.');
+      external = !!h && h !== location.hostname.split('.').slice(-2).join('.');
+    } catch (e) {}
+  }
+  if (!external) best.setAttribute('data-pb-t', mark);
+  const frame = best.tagName === 'IFRAME';
+  const vid = best.tagName === 'VIDEO' ? best : (frame ? null : best.querySelector('video'));
+  return JSON.stringify({
+    found: true, hinted: hinted, external: external,
+    kind: frame ? 'iframe' : (best.tagName === 'VIDEO' ? 'video' : 'box'), pick: best === media ? 'media' : 'box',
+    src: frame ? (best.src || '').slice(0, 200) : '',
+    playing: !!vid && !vid.paused && !vid.ended && vid.currentTime > 0,
+    tag: top.tagName.toLowerCase(), text: (top.innerText || '').replace(/\s+/g, ' ').trim().slice(0, 40),
+    x: Math.round(r.left), y: Math.round(r.top), w: Math.round(r.width), h: Math.round(r.height),
+    vw: innerWidth, vh: innerHeight, dx: dx, dy: dy,
+  });
+})()
+""".strip()
+
+PLAYER_PICKS = ("media", "box")
+
+
+def player_tag_js(mark: str = PLAYER_MARK, dx: float = 0, dy: float = 0, *, want: str = "",
+                  hint: tuple | None = None) -> str:
+    """JS that finds the page's main video player, marks it, and reports as
+    a JSON string what a click (dx, dy) pixels from its middle would hit.
+
+    Players rarely have a stable name, so the player is found by what it
+    is. Two kinds of element can be one, and each kind has ONE candidate,
+    the largest that is big enough (320x180) and shaped like a player:
+
+      media   a ``<video>`` or an embedded frame. The player inside a frame
+              has no ``<video>`` the page can see at all.
+      box     an element named like a player (``player`` / ``video`` in its
+              id or class) and shaped like a screen. Many players have
+              neither a ``<video>`` nor a frame until they are clicked:
+              only a poster in such a box. Of several, the one closest to
+              16:9 is taken, not the largest: wrappers are named like a
+              player too, and a point measured from the middle of a wrapper
+              is somewhere else on the next page load.
+
+    The size and shape rules are what keeps advertising out: a banner that
+    plays a video is 300x250 or a wide strip, never a 16:9 box.
+
+    Which candidate is used: ``want`` ("media" / "box") names the kind;
+    without it, the media candidate if there is one, else the box. With
+    ``hint`` -- a point on the screen, in pixels -- the candidate that point
+    lies in is used and (dx, dy) become that point; a hint in neither
+    candidate is ignored (``hinted`` false in the report).
+
+    The MARK goes on the player itself; the click is then a real mouse
+    click at that point of its box, which lands on whatever is drawn there
+    -- a play button, an overlay, the content of the frame. The player is
+    left unmarked (so the click finds nothing) when that point is covered
+    by a link to another site."""
+    hint_js = "null"
+    if hint is not None:
+        hint_js = json.dumps([spot_offset(hint[0]), spot_offset(hint[1])])
     return (
-        "(() => { const mark = " + json.dumps(mark) + "; let best = null, area = 0;"
-        " for (const v of document.querySelectorAll('video')) {"
-        " const r = v.getBoundingClientRect(); const a = Math.max(0, r.width) * Math.max(0, r.height);"
-        " if (r.width >= 120 && r.height >= 80 && a > area) { best = v; area = a; } }"
-        " if (!best) return JSON.stringify({found: false});"
-        " try { best.scrollIntoView({block: 'center'}); } catch (e) {}"
-        " const r = best.getBoundingClientRect();"
-        " const top = document.elementFromPoint(r.left + r.width / 2, r.top + r.height / 2) || best;"
-        " const link = top.closest ? top.closest('a[href]') : null; let external = false;"
-        " if (link) { try { const h = new URL(link.href, location.href).hostname.split('.').slice(-2).join('.');"
-        " external = !!h && h !== location.hostname.split('.').slice(-2).join('.'); } catch (e) {} }"
-        " document.querySelectorAll('[data-pb-t=\"' + mark + '\"]').forEach(e => e.removeAttribute('data-pb-t'));"
-        " if (!external) top.setAttribute('data-pb-t', mark);"
-        " return JSON.stringify({found: true, external: external, tag: top.tagName.toLowerCase(),"
-        " text: (top.innerText || '').replace(/\\s+/g, ' ').trim().slice(0, 40),"
-        " w: Math.round(r.width), h: Math.round(r.height)}); })()"
+        _PLAYER_JS.replace("__MARK__", json.dumps(str(mark)))
+        .replace("__WANT__", json.dumps(want if want in PLAYER_PICKS else ""))
+        .replace("__HINT__", hint_js)
+        .replace("__DX__", repr(spot_offset(dx)))
+        .replace("__DY__", repr(spot_offset(dy)))
     )
 
 
-def player_click_actions(mark: str) -> list[dict]:
+def player_click_actions(mark: str, dx: float = 0, dy: float = 0, want: str = "") -> list[dict]:
+    dx, dy = spot_offset(dx), spot_offset(dy)
     return [
-        {"kind": "evaluate", "expression": player_tag_js(mark)},
-        {"kind": "click", "selector": f'[data-pb-t="{mark}"]'},
+        {"kind": "evaluate", "expression": player_tag_js(mark, dx, dy, want=want)},
+        {"kind": "click", "selector": f'[data-pb-t="{mark}"]', "mouse": True, "dx": dx, "dy": dy},
         {"kind": "wait", "seconds": WAIT_AFTER_CLICK_S},
     ]
 
@@ -260,7 +396,9 @@ def compile_trace(trace: list[dict]) -> tuple[list[dict] | None, str]:
             players += 1
             if players > MAX_PLAYER_CLICKS:
                 continue
-            actions.extend(player_click_actions(f"p{players}"))
+            spot = s.get("spot") if isinstance(s.get("spot"), dict) else {}
+            actions.extend(player_click_actions(f"p{players}", spot.get("dx", 0), spot.get("dy", 0),
+                                                str(spot.get("pick") or "")))
             prev = None
             continue
         tid = _target_id(s["desc"])
@@ -277,13 +415,73 @@ def compile_trace(trace: list[dict]) -> tuple[list[dict] | None, str]:
     return actions, "ok"
 
 
+#: The wait added when replayed steps start a player but only a short clip
+#: is saved: long enough for a 30-second advertisement to play out.
+AD_WAIT_S = 40.0
+
+
+def has_long_wait(actions: list[dict] | None, at_least_s: float = 30.0) -> bool:
+    for a in actions or []:
+        try:
+            if a.get("kind") == "wait" and float(a.get("seconds") or 0) >= at_least_s:
+                return True
+        except (TypeError, ValueError, AttributeError):
+            continue
+    return False
+
+
+def with_ad_wait(actions: list[dict]) -> list[dict]:
+    """The same steps, followed by one wait for an advertisement to end."""
+    return list(actions) + [{"kind": "wait", "seconds": AD_WAIT_S}]
+
+
+MANUAL_KINDS = ("wait", "click", "evaluate")
+MAX_MANUAL_ACTIONS = 20
+MAX_MANUAL_BYTES = 8000
+
+
+def check_manual_actions(actions) -> str:
+    """'' when ``actions`` is a list of steps a person may hand in, else what
+    is wrong with it. The same three kinds the Compiler itself emits -- so
+    whatever is accepted here the worker's recipe player already runs."""
+    if not isinstance(actions, list) or not actions:
+        return "actions must be a non-empty list"
+    if len(actions) > MAX_MANUAL_ACTIONS:
+        return f"more than {MAX_MANUAL_ACTIONS} actions"
+    if len(json.dumps(actions, ensure_ascii=False)) > MAX_MANUAL_BYTES:
+        return "actions too large"
+    for i, a in enumerate(actions, 1):
+        if not isinstance(a, dict) or a.get("kind") not in MANUAL_KINDS:
+            return f"action {i}: kind must be one of {', '.join(MANUAL_KINDS)}"
+        if a["kind"] == "wait":
+            try:
+                if not 0 < float(a.get("seconds") or 0) <= MAX_REPLAYED_WAIT_S:
+                    return f"action {i}: wait needs 0 < seconds <= {MAX_REPLAYED_WAIT_S:.0f}"
+            except (TypeError, ValueError):
+                return f"action {i}: wait needs a number of seconds"
+        if a["kind"] == "click" and not str(a.get("selector") or "").strip():
+            return f"action {i}: click needs a selector"
+        if a["kind"] == "click":
+            for k, lo, hi in (("fx", 0.0, 1.0), ("fy", 0.0, 1.0), ("dx", -4000.0, 4000.0), ("dy", -4000.0, 4000.0)):
+                if a.get(k) is None:
+                    continue
+                try:
+                    if not lo <= float(a[k]) <= hi:
+                        return f"action {i}: {k} must be between {lo:g} and {hi:g}"
+                except (TypeError, ValueError):
+                    return f"action {i}: {k} must be a number between {lo:g} and {hi:g}"
+        if a["kind"] == "evaluate" and not str(a.get("expression") or "").strip():
+            return f"action {i}: evaluate needs an expression"
+    return ""
+
+
 def summarize(actions: list[dict]) -> list[dict]:
     """A compact, human-readable form of compiled actions for the audit
     trail (the JS is recoverable from the playbook row itself)."""
     out = []
     for a in actions or []:
         if a.get("kind") == "evaluate":
-            if "document.querySelectorAll('video')" in (a.get("expression") or ""):
+            if "largest('video, iframe'" in (a.get("expression") or ""):
                 out.append({"find": "the video player"})
                 continue
             m = re.search(r"const sels = (\[.*?\]), text = (\".*?\"), mark = ", a.get("expression") or "", re.S)
@@ -293,7 +491,10 @@ def summarize(actions: list[dict]) -> list[dict]:
                     continue
                 except Exception:
                     pass
-            out.append({"evaluate": True})
+            out.append({"evaluate": str(a.get("expression") or "")[:80]})
+        elif a.get("kind") == "click" and a.get("mouse"):
+            out.append({"mouse_click": a.get("selector"),
+                        "from_middle": [spot_offset(a.get("dx")), spot_offset(a.get("dy"))]})
         elif a.get("kind") == "click":
             out.append({"click": a.get("selector")})
         elif a.get("kind") == "wait" and float(a.get("seconds") or 0) >= MIN_REPLAYED_WAIT_S:

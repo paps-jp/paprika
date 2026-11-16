@@ -70,6 +70,7 @@ class FakeHub:
         self.page = page or FakePage()
         self.open_error, self.click_error = open_error, click_error
         self.clicked, self.closed, self.submitted = [], [], []
+        self.player_looks, self.mouse = [], []           # player lookups / real mouse clicks (dx, dy)
 
     async def open_session(self, url, **_kw):
         if self.open_error:
@@ -88,18 +89,30 @@ class FakeHub:
             return self.page.elements.get(int(m.group(1)))
         if m:                                            # gone_js: did the clicked element vanish?
             return int(m.group(1)) == 2 and not self.page.gate
-        if "document.querySelectorAll('video')" in expr and "data-pb-t" in expr:
-            return getattr(self.page, "player", {"found": False})
+        if "largest('video, iframe'" in expr and "data-pb-t" in expr:
+            self.player_looks.append(expr)
+            player = getattr(self.page, "player", {"found": False})
+            m = re.search(r"hint = \[(-?\d+), (-?\d+)\]", expr)
+            if m and player.get("found"):
+                # What the page does with a proposed point: is it inside the player?
+                hx, hy = int(m.group(1)), int(m.group(2))
+                inside = (player["x"] <= hx <= player["x"] + player["w"]
+                          and player["y"] <= hy <= player["y"] + player["h"])
+                return dict(player, hinted=inside,
+                            dx=hx - (player["x"] + player["w"] // 2) if inside else 0,
+                            dy=hy - (player["y"] + player["h"] // 2) if inside else 0)
+            return player
         assert "password_field" in expr
         return self.page.probe()
 
-    async def click(self, sid, selector):
+    async def click(self, sid, selector, *, mouse=False, dx=None, dy=None):
         if self.click_error:
             raise self.click_error
         if "data-pb-t" in selector:                      # the video player
             self.clicked.append("player")
+            self.mouse.append((dx, dy) if mouse else None)
             self.page.player_clicked()
-            return {}
+            return {"status": "OK"}
         ref = int(re.search(r'data-paprika-id="(\d+)"', selector).group(1))
         self.clicked.append(ref)
         if ref == 2:
@@ -112,6 +125,12 @@ class FakeHub:
 
     async def scroll(self, sid, direction="down", pixels=800):
         return {}
+
+    async def screenshot(self, sid):
+        return b"PNG fake"
+
+    async def network(self, sid, since=0.0):
+        return [e for e in getattr(self.page, "net", []) if e.get("timestamp", 0) > since]
 
     async def submit_fetch(self, url, *, actions, learn, download_video=True, retries=6):
         jid = f"job{len(self.submitted) + 1}"
@@ -491,7 +510,9 @@ class AdPage(FakePage):
         self.gate = False
         self.waited = 0.0
         self.needs_clicks, self.clicks = needs_clicks, 0
-        self.player = {"found": True, "external": False, "tag": "div", "text": "", "w": 800, "h": 450}
+        self.player = {"found": True, "external": False, "kind": "video", "pick": "media", "src": "",
+                       "playing": False, "tag": "div", "text": "", "x": 100, "y": 50, "w": 800, "h": 450,
+                       "vw": 1000, "vh": 1000}
 
     def player_clicked(self):
         self.clicks += 1
@@ -559,8 +580,13 @@ def test_the_player_may_be_clicked_again_when_the_first_click_only_opened_an_adv
     # Both player clicks are replayed (the first may be the necessary one), then the wait.
     assert [a["kind"] for a in actions] == ["wait", "evaluate", "click", "wait", "evaluate", "click", "wait", "wait"]
     assert actions[2]["selector"] == '[data-pb-t="p1"]' and actions[5]["selector"] == '[data-pb-t="p2"]'
-    assert C.summarize(actions) == [{"find": "the video player"}, {"click": '[data-pb-t="p1"]'},
-                                    {"find": "the video player"}, {"click": '[data-pb-t="p2"]'}, {"wait_s": 40}]
+    # The player is clicked with a real mouse click, in its middle when nothing proposes a spot.
+    assert hub.mouse == [(0, 0), (0, 0)]
+    assert actions[2]["mouse"] is True and (actions[2]["dx"], actions[2]["dy"]) == (0, 0)
+    assert C.summarize(actions) == [
+        {"find": "the video player"}, {"mouse_click": '[data-pb-t="p1"]', "from_middle": [0, 0]},
+        {"find": "the video player"}, {"mouse_click": '[data-pb-t="p2"]', "from_middle": [0, 0]},
+        {"wait_s": 40}]
 
 
 def test_player_clicks_that_led_nowhere_are_not_replayed_and_are_limited():
@@ -573,13 +599,348 @@ def test_player_clicks_that_led_nowhere_are_not_replayed_and_are_limited():
 
 def test_a_player_covered_by_a_link_to_another_site_is_not_clicked():
     page = AdPage()
-    page.player = {"found": True, "external": True, "tag": "a", "text": "Visit sponsor", "w": 800, "h": 450}
+    page.player = dict(page.player, external=True, tag="a", text="Visit sponsor")
     hub = FakeHub(page)
     res = asyncio.run(V.solve(hub, FakeLLM([PLAYER, DONE]), "https://x.example/v/1/", sleep=_nosleep))
     assert hub.clicked == [] and res.trace[0]["refused"] == "covered"
     page.player = {"found": False}
     res = asyncio.run(V.solve(hub, FakeLLM([PLAYER, DONE]), "https://x.example/v/1/", sleep=_nosleep))
     assert hub.clicked == [] and res.trace[0]["refused"] == "no_player"
+
+
+# ---- the player: a real mouse click, at a spot chosen on a screenshot -------
+
+class FakeVision:
+    """Answers with a point in fractions of the screenshot, an exception, or None."""
+    enabled = True
+    model = "fake-vision"
+
+    def __init__(self, *answers):
+        self.answers = list(answers)
+        self.asked = 0
+
+    async def next_click(self, png):
+        self.asked += 1
+        a = self.answers.pop(0) if self.answers else None
+        if isinstance(a, Exception):
+            raise a
+        return a
+
+
+class FramePage(AdPage):
+    """A player inside an embedded frame of another site: the page itself has
+    no <video>, so the only sign that a click started it is what the frame
+    requests."""
+
+    def __init__(self, *, needs_clicks=1):
+        super().__init__(needs_clicks=needs_clicks)
+        self.player = dict(self.player, kind="iframe", src="https://embed.cdn.test/?id=1", tag="iframe")
+        self.net = [
+            # An advertising banner elsewhere on the page plays videos all the time.
+            {"url": "https://ads.test/banner.mp4", "mime": "video/mp4", "document_url": "https://ads.test/f",
+             "timestamp": 10.0},
+            {"url": "https://embed.cdn.test/poster.jpg", "mime": "image/jpeg",
+             "document_url": "https://embed.cdn.test/?id=1", "timestamp": 11.0},
+        ]
+
+    def player_clicked(self):
+        super().player_clicked()
+        if self.started():
+            t = 100.0 + self.clicks
+            self.net += [
+                {"url": "https://v.cdn.test/main.m3u8", "mime": "application/vnd.apple.mpegurl",
+                 "document_url": "https://embed.cdn.test/?id=1", "timestamp": t},
+                {"url": "https://v.cdn.test/seg1.ts", "mime": "video/mp2t",
+                 "document_url": "https://embed.cdn.test/?id=1", "timestamp": t + 0.1},
+            ]
+
+    def probe(self):
+        return {"url": self.url, "title": "A video", "videos": [], "iframes": 1,
+                "overlay": {"cover": 0.0, "text": ""}, "password_field": False}
+
+
+def test_the_spot_on_the_player_comes_from_the_screenshot_and_is_replayed():
+    page = FramePage()
+    hub = FakeHub(page)
+    # The play button is below the middle of the frame: player box x 100..900, y 50..500 (middle 500, 275)
+    # on a 1000x1000 screen, the proposed point at 500, 400.
+    vision = FakeVision({"target": "play", "x": 0.5, "y": 0.4, "why": "the play button"})
+    llm = FakeLLM([PLAYER, WAIT40, DONE])
+    res = asyncio.run(V.solve(hub, llm, "https://x.example/v/1/", sleep=_nosleep, vision=vision))
+    assert res.result == V.TRACE and vision.asked == 1
+    assert hub.mouse == [(0, 125)]                        # pixels from the middle of the player
+    step = res.trace[0]
+    assert step["ok"] and step["spot"] == {"dx": 0, "dy": 125, "by": "vision", "target": "play", "pick": "media"}
+    # The page shows nothing; the frame's own requests do. The banner's video is not counted.
+    assert step["effect"] == "the player requested media 0 -> 2 files"
+    assert "its play button" in llm.prompts[1] and "MEDIA REQUESTS: 2 " in llm.prompts[1]
+    # The player was looked up again for that spot: what lies THERE must not be a foreign link.
+    assert len(hub.player_looks) == 2 and "hint = [500, 400]" in hub.player_looks[1]
+    actions, why = C.compile_trace(res.trace)
+    assert why == "ok" and actions[2] == {"kind": "click", "selector": '[data-pb-t="p1"]', "mouse": True,
+                                           "dx": 0, "dy": 125}
+    assert "dy = 125" in actions[1]["expression"] and 'want = "media"' in actions[1]["expression"]
+    assert C.summarize(actions) == [{"find": "the video player"},
+                                    {"mouse_click": '[data-pb-t="p1"]', "from_middle": [0, 125]}]
+
+
+class PosterPage(AdPage):
+    """A poster in a box; the first click replaces it with a frame of the same
+    site, and the video is played by ANOTHER site's frame nested in that one.
+    A second click on the player opens an advertisement and ends the run."""
+
+    def __init__(self):
+        super().__init__(needs_clicks=1)
+        self.player = dict(self.player, kind="box", pick="box", tag="i")
+        self.net = [{"url": "https://ads.test/banner.mp4", "mime": "video/mp4",
+                     "document_url": "https://ads.test/f", "timestamp": 10.0}]
+
+    def player_clicked(self):
+        super().player_clicked()
+        if self.clicks == 1:
+            self.player = dict(self.player, kind="iframe", pick="media", tag="iframe",
+                               src="https://x.example/iframe/abc")
+            self.net += [{"url": "https://cdn.far.test/v/master.m3u8", "mime": "application/vnd.apple.mpegurl",
+                          "document_url": "https://player.other.test/e/1", "timestamp": 100.0},
+                         {"url": "https://cdn.far.test/v/720.m3u8", "mime": "",
+                          "document_url": "https://player.other.test/e/1", "timestamp": 100.2}]
+        else:
+            self.url = "https://ads.test/landing"
+
+    def probe(self):
+        return {"url": self.url, "title": "A video", "videos": [], "iframes": 1 if self.clicks else 0,
+                "overlay": {"cover": 0.0, "text": ""}, "password_field": False}
+
+
+def test_a_stream_started_by_a_frame_inside_the_frame_counts_as_the_player_starting():
+    page = PosterPage()
+    hub = FakeHub(page)
+    llm = FakeLLM([PLAYER, DONE])
+    res = asyncio.run(V.solve(hub, llm, "https://x.example/v/1/", sleep=_nosleep))
+    # One click was enough, and the run can tell: the model is not left to click again.
+    assert res.result == V.TRACE and hub.clicked == ["player"]
+    assert res.trace[0]["ok"] and res.trace[0]["effect"] == "the player requested media 0 -> 2 files"
+    assert "MEDIA REQUESTS: 0 " in llm.prompts[0] and "MEDIA REQUESTS: 2 " in llm.prompts[1]
+    actions, why = C.compile_trace(res.trace)
+    assert why == "ok" and [a["kind"] for a in actions] == ["wait", "evaluate", "click", "wait"]
+    assert 'want = "box"' in actions[1]["expression"]     # replayed on the poster box, as it was found
+
+
+def test_a_model_that_gives_up_after_the_stream_started_is_overruled():
+    # 2026-11-14: the click started the stream, the model waited, saw "nothing
+    # changed" in the page (the video is in another site's frame) and gave up.
+    page = PosterPage()
+    hub = FakeHub(page)
+    wait = {"action": "wait", "seconds": 10, "why": "let it load"}
+    quit_ = {"action": "give_up", "barrier": "other", "why": "the video did not start playing"}
+    llm = FakeLLM([PLAYER, wait, quit_])
+    res = asyncio.run(V.solve(hub, llm, "https://x.example/v/1/", sleep=_nosleep))
+    assert res.result == V.TRACE and hub.clicked == ["player"]
+    assert res.trace[-1]["action"] == "done" and res.trace[-1]["by"] == "stream_started"
+    assert res.trace[-1]["model"]["barrier"] == "other"   # what the model said is kept for the record
+    assert "normal for a player inside a frame" in llm.prompts[2]
+    actions, why = C.compile_trace(res.trace)
+    assert why == "ok" and "click" in [a["kind"] for a in actions]
+
+
+class SlowPosterPage(PosterPage):
+    """The poster goes away at once; the nested frame asks for the stream only
+    some seconds later."""
+
+    def __init__(self, late_looks=3):
+        super().__init__()
+        self.late_looks = late_looks
+        self.looks_after_click = 0
+        self.late = []
+
+    def player_clicked(self):
+        n = len(self.net)
+        super().player_clicked()
+        if self.clicks == 1:
+            self.late, self.net = self.net[n:], self.net[:n]
+
+    def probe(self):
+        if self.clicks:
+            self.looks_after_click += 1
+            if self.looks_after_click == self.late_looks:
+                self.net += self.late
+        p = super().probe()
+        p["overlay"] = {"cover": 0.0 if self.clicks else 0.19, "text": ""}
+        return p
+
+
+def test_a_click_is_watched_until_the_stream_shows_not_only_until_the_page_changes():
+    # 2026-11-14: the first look saw only the poster going away, the model
+    # clicked the player again and that click opened an advertisement.
+    page = SlowPosterPage()
+    hub = FakeHub(page)
+    llm = FakeLLM([PLAYER, DONE])
+    res = asyncio.run(V.solve(hub, llm, "https://x.example/v/1/", sleep=_nosleep))
+    assert res.result == V.TRACE and hub.clicked == ["player"]
+    assert res.trace[0]["effect"] == "overlay 0.19 -> 0.00; the player requested media 0 -> 2 files"
+    # It is not watched for ever: a stream that never shows leaves the page change as the effect.
+    page = SlowPosterPage(late_looks=99)
+    res = asyncio.run(V.solve(FakeHub(page), FakeLLM([PLAYER, DONE]), "https://x.example/v/1/", sleep=_nosleep))
+    assert res.trace[0]["effect"] == "overlay 0.19 -> 0.00" and page.looks_after_click == 1 + V.START_LOOKS
+
+
+def test_a_give_up_stands_when_no_stream_started_or_the_page_itself_is_the_barrier():
+    # No click made the player request anything: the model's give_up is the result.
+    hub = FakeHub(PosterPage())
+    llm = FakeLLM([{"action": "give_up", "barrier": "other", "why": "nothing to click"}])
+    res = asyncio.run(V.solve(hub, llm, "https://x.example/v/1/", sleep=_nosleep))
+    assert res.result == V.GAVE_UP and res.barrier == "other"
+    # A login wall is a fact about the page, whatever the player requested.
+    hub = FakeHub(PosterPage())
+    llm = FakeLLM([PLAYER, {"action": "give_up", "barrier": "login", "why": "members only"}])
+    res = asyncio.run(V.solve(hub, llm, "https://x.example/v/1/", sleep=_nosleep))
+    assert res.result == V.GAVE_UP and res.barrier == "login"
+
+
+def test_what_counts_as_the_player_asking_for_a_video():
+    pm = V.PlayerMedia()
+    entries = [
+        {"url": "https://a.test/x.m3u8", "mime": "", "document_url": "https://nested.test/p", "timestamp": 1.0},
+        {"url": "https://a.test/seg-1.ts?t=1", "mime": "video/mp2t", "document_url": "", "timestamp": 2.0},
+        {"url": "https://a.test/init.mpd", "mime": "application/dash+xml", "document_url": "https://x.test/", "timestamp": 3.0},
+        {"url": "https://ads.test/banner.mp4", "mime": "video/mp4", "document_url": "https://ads.test/f", "timestamp": 4.0},
+        {"url": "https://embed.test/file.mp4", "mime": "video/mp4", "document_url": "https://embed.test/e", "timestamp": 5.0},
+        {"url": "https://a.test/poster.jpg", "mime": "image/jpeg", "document_url": "https://nested.test/p", "timestamp": 6.0},
+    ]
+
+    class Hub:
+        async def network(self, sid, since=0.0):
+            return [e for e in entries if e["timestamp"] > since]
+
+    assert asyncio.run(pm.read(Hub(), "s")) == 3          # the three stream requests, whoever made them
+    assert asyncio.run(pm.read(Hub(), "s")) == 3          # nothing new: nothing counted twice
+    # Once the player frame is known, the plain video file IT asked for counts too -- the banner's never does.
+    assert pm.watch_frame("embed.test") and not pm.watch_frame("embed.test") and not pm.watch_frame("")
+    assert asyncio.run(pm.read(Hub(), "s")) == 4
+
+    class Down:
+        async def network(self, sid, since=0.0):
+            raise HubUnavailable("504")
+
+    assert asyncio.run(pm.read(Down(), "s")) == 4          # an extra signal: its failure is not the run's
+
+
+def test_a_spot_outside_the_player_or_no_answer_falls_back_to_the_middle():
+    from learner.vision import VisionUnavailable
+    for answer, note in (
+        ({"target": "play", "x": 0.5, "y": 0.9, "why": "a small video below"}, "vision pointed outside the player"),
+        (None, "vision proposed no click"),
+        (VisionUnavailable("both engines down"), "vision unavailable: both engines down"),
+    ):
+        page = FramePage()
+        hub = FakeHub(page)
+        res = asyncio.run(V.solve(hub, FakeLLM([PLAYER, DONE]), "https://x.example/v/1/", sleep=_nosleep,
+                                  vision=FakeVision(answer)))
+        assert hub.mouse == [(0, 0)] and res.trace[0]["spot"]["by"] == "centre"
+        assert res.trace[0]["spot"]["note"] == note
+        # Only a proposed point is put to the page a second time.
+        assert len(hub.player_looks) == (2 if isinstance(answer, dict) else 1)
+
+
+def test_a_spot_covered_by_a_link_to_another_site_is_not_clicked():
+    page = FramePage()
+    hub = FakeHub(page)
+
+    async def evaluate(sid, expr, _orig=hub.evaluate):
+        out = await _orig(sid, expr)
+        if "data-pb-t" in expr and "hint = [500, 400]" in expr:   # the look-up for the proposed spot
+            return dict(out, external=True, tag="a", text="")
+        return out
+
+    hub.evaluate = evaluate
+    vision = FakeVision({"target": "play", "x": 0.5, "y": 0.4, "why": ""})
+    res = asyncio.run(V.solve(hub, FakeLLM([PLAYER, DONE]), "https://x.example/v/1/", sleep=_nosleep, vision=vision))
+    assert hub.clicked == [] and res.trace[0]["refused"] == "covered"
+
+
+def test_a_playing_video_is_not_clicked_whatever_the_models_say():
+    page = AdPage()
+    page.player = dict(page.player, playing=True)
+    hub = FakeHub(page)
+    vision = FakeVision({"target": "play", "x": 0.5, "y": 0.3, "why": "a play icon in the control bar"})
+    res = asyncio.run(V.solve(hub, FakeLLM([PLAYER, DONE]), "https://x.example/v/1/", sleep=_nosleep, vision=vision))
+    assert hub.clicked == [] and vision.asked == 0 and res.trace[0]["refused"] == "playing"
+
+
+def test_a_click_in_a_frame_that_started_nothing_is_not_replayed():
+    page = FramePage(needs_clicks=99)                     # the frame never requests any media
+    hub = FakeHub(page)
+    res = asyncio.run(V.solve(hub, FakeLLM([PLAYER, PLAYER, DONE]), "https://x.example/v/1/", sleep=_nosleep))
+    assert hub.clicked == ["player", "player"] and [s["ok"] for s in res.trace[:2]] == [False, False]
+    assert C.compile_trace(res.trace)[0] is None
+
+
+def test_vision_replies_are_only_ever_a_point_or_nothing():
+    from learner import vision as VI
+    ok = VI.parse_click('```json\n{"target": "play", "point_2d": [380, 559], "why": "centre"}\n```')
+    assert ok == {"target": "play", "x": 0.38, "y": 0.559, "why": "centre"}
+    assert VI.parse_click('{"target": "close", "point_2d": [555, 360]}')["target"] == "close"
+    for bad in ('{"target": "none", "point_2d": [1, 1]}', '{"target": "play"}', '{"target": "play", "point_2d": [1]}',
+                '{"target": "play", "point_2d": [1200, 10]}', '{"target": "gate", "point_2d": [10, 10]}',
+                '{"target": "play", "point_2d": ["a", "b"]}', "I cannot see a player.", ""):
+        assert VI.parse_click(bad) is None, bad
+
+
+def test_vision_uses_the_other_engine_when_one_is_down():
+    from learner import vision as VI
+
+    class Resp:
+        def __init__(self, code, content=""):
+            self.status_code = code
+            self._content = content
+
+        def json(self):
+            return {"choices": [{"message": {"content": self._content}}], "usage": {"total_tokens": 2500}}
+
+    class Http:
+        def __init__(self):
+            self.urls = []
+
+        async def post(self, url, json=None, headers=None, timeout=None):
+            self.urls.append(url)
+            assert json["messages"][0]["content"][0]["image_url"]["url"].startswith("data:image/png;base64,")
+            assert "response_format" not in json          # JSON mode has crashed this engine before
+            if "a.test" in url:
+                return Resp(503)
+            return Resp(200, '{"target": "play", "point_2d": [500, 500], "why": ""}')
+
+    http = Http()
+    v = VI.Vision(endpoints=["http://a.test:1", " http://b.test:2/v1 ", ""], model="m", client=http)
+    got = asyncio.run(v.next_click(b"png"))
+    assert got["x"] == 0.5 and http.urls == ["http://a.test:1/v1/chat/completions", "http://b.test:2/v1/chat/completions"]
+
+    async def metered():
+        m = V.start_meter()
+        await v.next_click(b"png")                        # starts with the second engine this time
+        return m
+
+    m = asyncio.run(metered())
+    assert m.calls == 1 and m.tokens == 2500 and len(http.urls) == 3
+
+    dead = VI.Vision(endpoints=["http://a.test:1"], model="m", client=http)
+    try:
+        asyncio.run(dead.next_click(b"png"))
+        raise AssertionError("expected VisionUnavailable")
+    except VI.VisionUnavailable as e:
+        assert "503" in str(e)
+    assert not VI.Vision(endpoints=[""], model="m").enabled and not VI.Vision(endpoints=["x"], model="").enabled
+
+
+def test_hand_written_steps_may_use_the_mouse_click():
+    ok = [{"kind": "click", "selector": "#player", "mouse": True, "dx": 0, "dy": 160}]
+    assert C.check_manual_actions(ok) == ""
+    assert C.check_manual_actions([dict(ok[0], fx=0.5, fy=0.8)]) == ""
+    assert "dy must be" in C.check_manual_actions([dict(ok[0], dy=9000)])
+    assert "fx must be" in C.check_manual_actions([dict(ok[0], fx="left")])
+    # A trace from before the spot was recorded still compiles: the middle.
+    old = [{"action": "click_player", "ok": True, "performed": True}]
+    assert C.compile_trace(old)[0][2] == {"kind": "click", "selector": '[data-pb-t="p1"]', "mouse": True,
+                                          "dx": 0, "dy": 0}
 
 
 def test_solver_without_a_click_is_not_a_trace():
@@ -739,7 +1100,7 @@ def test_explore_creates_a_candidate_only_after_the_replays_succeed():
     (pb,) = store.playbooks
     assert pb.state == P.CANDIDATE and pb.actions == hub.submitted[0]["actions"]
     prov = pb.provenance
-    assert prov["manifest"] == {"solver_prompt": V.PROMPT_VERSION, "model": "fake-model",
+    assert prov["manifest"] == {"solver_prompt": V.PROMPT_VERSION, "model": "fake-model", "vision": "",
                                 "compiler": C.COMPILER_VERSION, "verifier": prov["manifest"]["verifier"]}
     assert prov["generalization"] == ["https://x.example/v/2/", "https://x.example/v/3/"]
     (run,) = store.runs
@@ -758,6 +1119,40 @@ def test_a_one_url_trick_is_rejected_and_the_key_backs_off():
     assert store.playbooks == []
     (ku,) = store.key_updates
     assert ku["solved"] is False and 0.9 < (ku["dormant_until"] - _utc()).days + 1 <= 1.1
+
+
+def test_a_short_clip_on_replay_is_retried_once_with_a_wait_for_the_advertisement():
+    # In a plain fetch the player shows an advertisement first; the Solver's session did not, so it never waited.
+    short = ("partial", "video_short")
+    store = FakeStore(cands=[_cand()], outcomes={
+        "job1": short, "job2": short, "job3": short,
+        "job4": ("success", "video_ok"), "job5": ("success", "video_ok"), "job6": ("success", "video_ok")})
+    hub = FakeHub()
+    ap = _pilot(store, hub, FakeLLM([CLICK2, DONE]))
+    assert asyncio.run(ap.solver_tick()) == A.SOLVED
+    assert len(hub.submitted) == 6
+    first, second = hub.submitted[0]["actions"], hub.submitted[3]["actions"]
+    assert second == first + [{"kind": "wait", "seconds": C.AD_WAIT_S}] and not C.has_long_wait(first)
+    (pb,) = store.playbooks
+    assert pb.actions == second                          # the steps that passed are the ones kept
+
+
+def test_the_retry_with_a_wait_happens_once_and_only_for_a_short_clip():
+    short = ("partial", "video_short")
+    store = FakeStore(cands=[_cand()], outcomes={f"job{i}": short for i in range(1, 7)})
+    hub = FakeHub()
+    ap = _pilot(store, hub, FakeLLM([CLICK2, DONE]))
+    assert asyncio.run(ap.solver_tick()) == A.REPLAY_FAIL
+    assert len(hub.submitted) == 6 and store.playbooks == []
+    assert "with a 40s wait" in store.runs[0]["reason"]
+    # Nothing saved at all is not "an advertisement played first": no second attempt.
+    store = FakeStore(cands=[_cand()], outcomes={f"job{i}": ("fail", "video_not_captured") for i in range(1, 7)})
+    hub = FakeHub()
+    assert asyncio.run(_pilot(store, hub, FakeLLM([CLICK2, DONE])).solver_tick()) == A.REPLAY_FAIL
+    assert len(hub.submitted) == 3
+    # Steps that already wait for an advertisement are not given another wait.
+    assert C.has_long_wait(C.with_ad_wait([{"kind": "wait", "seconds": 1}]))
+    assert not C.has_long_wait([{"kind": "wait", "seconds": 5}, {"kind": "click", "selector": "#a"}])
 
 
 def test_a_login_wall_puts_the_key_to_sleep_for_a_month():
@@ -959,6 +1354,85 @@ def test_a_request_reports_its_own_sessions_not_those_of_runs_going_on_beside_it
     asyncio.run(ap.solver_tick())
     res = asyncio.run(R.wait_result(ap.redis, "req1", timeout_s=0))
     assert res["sessions"] == 2 and res["urls"] == ["https://x.example/v/9/", "https://x.example/v/1/"]
+
+
+# ---- the loop: steps a person wrote ---------------------------------------------------
+
+STEPS = [{"kind": "wait", "seconds": 2},
+         {"kind": "evaluate", "expression": "location.href = document.querySelector('iframe').src"},
+         {"kind": "click", "selector": "#close-ad"},
+         {"kind": "wait", "seconds": 15}]
+
+
+def test_steps_a_person_wrote_pass_the_same_replay_test_and_become_a_candidate():
+    store = FakeStore(outcomes={
+        "job1": ("success", "video_ok"), "job2": ("success", "video_ok"), "job3": ("success", "video_ok")})
+    hub = FakeHub()
+    llm = FakeLLM([])
+    ap = _pilot(store, hub, llm)
+    asyncio.run(R.submit(ap.redis, R.build_request("https://x.example/v/9/", actions=STEPS, rid="req1")))
+    assert asyncio.run(ap.solver_tick()) == A.SOLVED
+    assert llm.calls == 0 and hub.clicked == []          # no model, no exploring session
+    assert [s["url"][-3:] for s in hub.submitted] == ["/9/", "/1/", "/2/"]
+    assert all(s["actions"] == STEPS for s in hub.submitted)
+    (pb,) = store.playbooks
+    assert pb.actions == STEPS and pb.provenance["source"] == "manual" and pb.state == P.CANDIDATE
+    (run,) = store.runs
+    assert run["reason"] == "[manual steps] replayed_on_all_urls" and run["pb_id"] == 1 and run["tokens"] == 0
+    res = asyncio.run(R.wait_result(ap.redis, "req1", timeout_s=0))
+    assert res["result"] == A.SOLVED and res["urls"] == ["https://x.example/v/9/"]
+
+
+def test_steps_that_do_not_work_everywhere_make_no_playbook():
+    store = FakeStore(outcomes={
+        "job1": ("success", "video_ok"), "job2": ("fail", "video_not_captured"), "job3": ("success", "video_ok")})
+    ap = _pilot(store, FakeHub(), FakeLLM([]))
+    asyncio.run(R.submit(ap.redis, R.build_request("https://x.example/v/9/", actions=STEPS)))
+    assert asyncio.run(ap.solver_tick()) == A.GENERALIZE_FAIL
+    assert store.playbooks == [] and len(store.key_updates) == 1
+
+
+def test_only_the_three_kinds_the_recipe_player_runs_are_accepted():
+    assert C.check_manual_actions(STEPS) == ""
+    for bad in ([], "x", [{"kind": "navigate", "url": "https://x"}], [{"kind": "wait", "seconds": 0}],
+                [{"kind": "wait", "seconds": 9999}], [{"kind": "click"}], [{"kind": "evaluate", "expression": " "}],
+                [{"kind": "wait", "seconds": 1}] * 21):
+        assert C.check_manual_actions(bad) != "", bad
+        try:
+            R.build_request("https://x.example/v/1/", actions=bad)
+        except ValueError:
+            continue
+        raise AssertionError(f"accepted {bad!r}")
+    ap = _pilot(FakeStore(), FakeHub())
+    asyncio.run(ap.redis.rpush(A.REQUESTS_KEY, json.dumps({"url": "https://x.example/v/1/", "actions": [{"kind": "type"}]})))
+    assert asyncio.run(ap.solver_tick()) == "bad_request"
+
+
+class LossyHub(FakeHub):
+    """A hub that finishes every job but whose outcome for some never arrives."""
+
+    async def job_status(self, job_id):
+        return "completed"
+
+
+def test_a_replay_job_whose_outcome_is_lost_is_submitted_again():
+    # job3 (the third URL) finishes, but its outcome never reaches the ledger;
+    # the second attempt for that URL (job4) is judged normally.
+    store = FakeStore(cands=[_cand()], outcomes={
+        "job1": ("success", "video_ok"), "job2": ("success", "video_ok"), "job4": ("success", "video_ok")})
+    hub = LossyHub()
+    ap = _pilot(store, hub, FakeLLM([CLICK2, DONE]), replay_lost_after_s=0.0)
+    assert asyncio.run(ap.solver_tick()) == A.SOLVED
+    assert [s["url"][-3:] for s in hub.submitted] == ["/1/", "/2/", "/3/", "/3/"]
+    assert store.playbooks[0].provenance["replay"]["https://x.example/v/3/"]["job_id"] == "job4"
+
+
+def test_a_lost_outcome_is_resubmitted_only_so_often_and_then_counts_as_infrastructure():
+    store = FakeStore(cands=[_cand()], outcomes={"job1": ("success", "video_ok"), "job2": ("success", "video_ok")})
+    hub = LossyHub()
+    ap = _pilot(store, hub, FakeLLM([CLICK2, DONE]), replay_lost_after_s=0.0, replay_timeout_s=0.05)
+    assert asyncio.run(ap.solver_tick()) == V.INFRA
+    assert len(hub.submitted) <= 3 + ap.cfg.replay_resubmits and store.key_updates == []
 
 
 def test_request_validation():

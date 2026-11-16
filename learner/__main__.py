@@ -24,6 +24,11 @@ unless asked for:
     LEARNER_LLM_THINKING       reasoning models: 1 / 0 = ask for thinking
                                on / off, empty = the engine's default
     LEARNER_LLM_MAX_TOKENS     cap per reply, thinking included (4000)
+    LEARNER_VISION_ENDPOINTS   OpenAI-compatible vision engines, comma
+                               separated; they propose where on a screenshot
+                               to click the video player. Empty = off (the
+                               middle of the player is clicked)
+    LEARNER_VISION_MODEL/_API_KEY
     LEARNER_TARGET_REASONS     Verifier failure reasons the Solver works on,
                                comma separated (default: all three
                                known: overlay_wall, video_not_captured,
@@ -95,6 +100,7 @@ def build_autopilot(ledger: MariaLedger, r):
     from learner.playbook import LifecycleConfig
     from learner.scheduler import KNOWN_REASONS, TARGET_REASONS, SchedulerConfig
     from learner.store import Store
+    from learner.vision import Vision
 
     solver_on = _on("LEARNER_SOLVER_ENABLED")
     hub_url = os.environ.get("LEARNER_HUB_URL") or ""
@@ -111,6 +117,11 @@ def build_autopilot(ledger: MariaLedger, r):
         thinking=(None if not (os.environ.get("LEARNER_LLM_THINKING") or "").strip()
                   else _on("LEARNER_LLM_THINKING")),
     )
+    vision = Vision(
+        endpoints=(os.environ.get("LEARNER_VISION_ENDPOINTS") or "").split(","),
+        model=os.environ.get("LEARNER_VISION_MODEL") or "",
+        api_key=os.environ.get("LEARNER_VISION_API_KEY") or "",
+    )
     reasons = tuple(
         x.strip() for x in (os.environ.get("LEARNER_TARGET_REASONS") or "").split(",") if x.strip()
     ) or TARGET_REASONS
@@ -118,7 +129,7 @@ def build_autopilot(ledger: MariaLedger, r):
     if unknown:
         raise SystemExit(f"learner: unknown LEARNER_TARGET_REASONS {unknown}; known: {KNOWN_REASONS}")
     ap = Autopilot(
-        store=Store(ledger._pool), hub=hub, llm=llm, redis=r,
+        store=Store(ledger._pool), hub=hub, llm=llm, redis=r, vision=vision,
         cfg=AutopilotConfig(
             solver_enabled=solver_on,
             solver_concurrency=int(os.environ.get("LEARNER_SOLVER_CONCURRENCY") or 3),
@@ -134,7 +145,7 @@ def build_autopilot(ledger: MariaLedger, r):
             min_video_7d=int(os.environ.get("LEARNER_MIN_VIDEO_7D") or 1),
         ),
     )
-    return ap, [hub, llm]
+    return ap, [hub, llm, vision]
 
 
 async def main() -> None:
@@ -178,7 +189,8 @@ async def main() -> None:
     if autopilot is not None:
         autopilot.consumer_stats = lambda: consumer.stats
         await autopilot.store.ensure_schema()
-        log.info("autopilot on: solver=%s", autopilot.cfg.solver_enabled)
+        log.info("autopilot on: solver=%s vision=%s", autopilot.cfg.solver_enabled,
+                 getattr(autopilot.vision, "model", None) or "off")
         tasks.append(asyncio.create_task(autopilot.run(stop)))
     try:
         await tasks[0]
