@@ -336,7 +336,7 @@ _URL_CAPTURE_HOOK_JS = r"""
     window.fetch = function(input) {
       try {
         var u = typeof input === 'string' ? input : (input && input.url) || '';
-        if (u) _record({api: 'fetch', url: u, t: Date.now()});
+        if (u) _record({api: 'fetch', url: u, t: Date.now(), doc: String(location.href)});
       } catch (e) {}
       return origFetch.apply(this, arguments);
     };
@@ -346,7 +346,7 @@ _URL_CAPTURE_HOOK_JS = r"""
     var origOpen = OrigXHR.prototype.open;
     OrigXHR.prototype.open = function(method, url) {
       try {
-        if (url) _record({api: 'xhr', method: method, url: String(url), t: Date.now()});
+        if (url) _record({api: 'xhr', method: method, url: String(url), t: Date.now(), doc: String(location.href)});
       } catch (e) {}
       return origOpen.apply(this, arguments);
     };

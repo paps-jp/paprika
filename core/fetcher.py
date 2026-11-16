@@ -28,7 +28,7 @@ import time
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Callable, Optional
-from urllib.parse import urlparse
+from urllib.parse import urljoin, urlparse
 
 from core.url_blacklist import is_manifest_url
 
@@ -1904,6 +1904,33 @@ async def probe_occlusion(tab) -> dict:
     return out if isinstance(out, dict) else {}
 
 
+_STREAM_DOC_URL_RE = re.compile(r"\.(mp4|webm|m3u8|mpd|mov|m4v|ts)(\?|$)", re.I)
+_STREAM_DOCS_MAX = 2000
+
+
+def note_stream_document(docs: dict, url: str, document_url: str) -> None:
+    """Remember which document asked for a video-like URL (first one wins).
+
+    The downloader has to present itself the way the browser did. A stream
+    requested from inside an embedded frame was sent with THAT frame as its
+    referer, and hosts check it: handing yt-dlp the top page instead got an
+    HTTP 403 where the frame's URL got the playlist (seen live 2026-11-14;
+    the player sat in a frame nested inside the page's own frame)."""
+    if not url or url in docs or len(docs) >= _STREAM_DOCS_MAX:
+        return
+    if not isinstance(document_url, str) or not document_url.startswith(("http://", "https://")):
+        return
+    if not _STREAM_DOC_URL_RE.search(url):
+        return
+    docs[url] = document_url
+
+
+def stream_referer(docs: dict, url: str, page_url: str | None) -> str | None:
+    """The referer to download ``url`` with: the document that requested it,
+    else the page that was fetched (the behaviour before documents were tracked)."""
+    return docs.get(url) or page_url
+
+
 async def trigger_videos(tab) -> dict:
     """Find videos, play() new <video>s, click the center of visible ones.
     If nothing detected, click viewport center once."""
@@ -2503,6 +2530,20 @@ async def fetch(opts: FetchOptions) -> FetchResult:
         def _fetch_blacklisted(u: str) -> str | None:
             return _fetch_bl_matcher.match(u)
 
+        # video-like URL -> the document (page or frame) that requested it;
+        # becomes the referer its download is made with (stream_referer()).
+        _stream_docs: dict[str, str] = {}
+
+        async def on_request(event: cdp.network.RequestWillBeSent):
+            try:
+                note_stream_document(
+                    _stream_docs,
+                    getattr(event.request, "url", "") or "",
+                    getattr(event, "document_url", "") or "",
+                )
+            except Exception:
+                pass
+
         async def on_response(event: cdp.network.ResponseReceived):
             nonlocal in_flight, last_activity
             server_mime = (event.response.mime_type or "").lower()
@@ -2751,6 +2792,7 @@ async def fetch(opts: FetchOptions) -> FetchResult:
 
         if assets_dir is not None:
             assets_dir.mkdir(parents=True, exist_ok=True)
+            tab.handlers[cdp.network.RequestWillBeSent].append(on_request)
             tab.handlers[cdp.network.ResponseReceived].append(on_response)
             tab.handlers[cdp.network.LoadingFinished].append(on_finished)
             tab.handlers[cdp.network.LoadingFailed].append(on_failed)
@@ -2843,6 +2885,13 @@ async def fetch(opts: FetchOptions) -> FetchResult:
                         if not u or u in _hook_seen_urls:
                             continue
                         _hook_seen_urls.add(u)
+                        # The hook runs inside the frame that made the
+                        # request, so it knows the requesting document --
+                        # and what a relative URL is relative to.
+                        _doc = entry.get("doc") or ""
+                        note_stream_document(
+                            _stream_docs, urljoin(_doc, u) if _doc else u, _doc,
+                        )
                         # Blacklist gate (Y bugfix): the JS fetch/XHR
                         # hook is a separate capture surface that
                         # bypasses the CDP on_response gate. Without
@@ -3411,7 +3460,9 @@ async def fetch(opts: FetchOptions) -> FetchResult:
                 # functional regression either.
                 _dedup_targets = pick_stream_urls(result.video_urls_seen)
             for s in _dedup_targets:
-                add_target(s, url, "network-stream")
+                # Referer = the document that asked for the stream (a frame,
+                # when the player is embedded), as the browser sent it.
+                add_target(s, stream_referer(_stream_docs, s, url), "network-stream")
 
             # Classification probe (measurement "E", 2026-07-08): fire-and-
             # forget a no-browser reachability test per detected target so the
