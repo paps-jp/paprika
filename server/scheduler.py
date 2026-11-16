@@ -479,6 +479,14 @@ class ConnectedWorker:
     # of differing core counts. 0 = pre-2026-07-09 build (treated as healthy).
     nproc: int = 0
     send_lock: asyncio.Lock = field(default_factory=asyncio.Lock)
+    # True once the hub has sent HubRegistered on this link. The worker's
+    # handshake reads exactly ONE frame and requires it to be HubRegistered,
+    # but the hub registers the connection (making it visible to background
+    # loops) and then awaits other work before sending the ack. A background
+    # send landing in that window (the downloading reaper's force-complete,
+    # 2026-11-16) made the worker raise "unexpected ack" and exit, dropping
+    # every download it held. Background senders must wait for this flag.
+    registered_acked: bool = False
     # Operator-controlled status set from the admin UI:
     #   active   = normal -- receives new jobs (default)
     #   drain    = no new jobs; in-flight ones finish; will be brought

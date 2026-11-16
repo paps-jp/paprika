@@ -672,6 +672,12 @@ async def _reap_stuck_downloading() -> int:
         )
         # ----- Path A: worker is alive locally -> ask it to wrap up -----
         if worker is not None:
+            if not getattr(worker, "registered_acked", True):
+                # Mid-handshake: the worker reads exactly one frame and needs
+                # it to be HubRegistered. A force-complete here made it raise
+                # "unexpected ack" and exit, dropping every download it held
+                # (4790419 -> 2026-11-16). The next pass picks this row up.
+                continue
             mono = time.monotonic()
             first = _force_complete_sent.get(info.job_id)
             if first is not None and mono - first >= _FORCE_COMPLETE_GRACE_S:

@@ -1877,6 +1877,9 @@ async def worker_link(ws: WebSocket, worker_id: str):
                 expected_worker_version=_hub_version(),
             )
         )
+        # Background loops (the downloading reaper) may only send once the
+        # worker has its ack -- see ConnectedWorker.registered_acked.
+        worker.registered_acked = True
         # Re-sync every registered Chrome profile so the worker's
         # local cache reflects the hub's authoritative state. Fires
         # before the main message loop so prefetches can start

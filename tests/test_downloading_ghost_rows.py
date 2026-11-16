@@ -488,3 +488,110 @@ def test_the_disconnect_sweep_feeds_downloading_rows_to_the_watch():
     assert "orphan_job_ids.extend(await _dl_lister(worker_id))" in body
     park = body.index("elif jinfo.status == JobStatus.downloading:")
     assert "deferred_downloading.append(jid)" in body[park:park + 1200]
+
+
+# --- 6. no force-complete before the register ack -----------------------
+# The hub registers a link, then awaits other work before sending
+# HubRegistered. A force-complete in that window was the first frame the
+# worker read; it raised "unexpected ack" out of run() and exited, dropping
+# every download it held (4790419, found 2026-11-16).
+
+from server.protocol import HubRegistered, encode_msg  # noqa: E402
+from server.scheduler import ConnectedWorker  # noqa: E402
+from server.worker.agent._mix_run import _RunMixin  # noqa: E402
+
+
+async def test_a_worker_mid_handshake_gets_no_force_complete(monkeypatch):
+    store = _Store([_row("j1", "w1", 2 * HOUR)])
+    reg = _Registry(local={"w1"})
+    reg.connections["w1"].registered_acked = False
+    _install(monkeypatch, store, reg)
+
+    assert await _reaper._reap_stuck_downloading() == 0
+
+    assert reg.sent == []
+    assert store.rows["j1"].status == JobStatus.downloading
+    assert "j1" not in _reaper._force_complete_sent  # grace clock not started
+    assert reg.stats_calls == 0  # nor treated as absent (Path B/C)
+
+
+async def test_once_acked_the_same_worker_gets_it(monkeypatch):
+    store = _Store([_row("j1", "w1", 2 * HOUR)])
+    reg = _Registry(local={"w1"})
+    reg.connections["w1"].registered_acked = True
+    _install(monkeypatch, store, reg)
+
+    await _reaper._reap_stuck_downloading()
+
+    assert [type(m) for m in reg.sent] == [HubForceCompleteJob]
+
+
+def test_a_new_connection_starts_unacked():
+    import dataclasses
+    f = {x.name: x for x in dataclasses.fields(ConnectedWorker)}
+    assert f["registered_acked"].default is False
+
+
+def test_the_hub_marks_the_link_acked_right_after_sending_the_ack():
+    src = inspect.getsource(workers_route)
+    send = src.index("await worker.send(\n            HubRegistered(")
+    mark = src.index("worker.registered_acked = True")
+    assert send < mark
+    # Nothing else awaited in between: the flag must not lag the ack.
+    assert src[send:mark].count("await") == 1
+
+
+class _HandshakeWs:
+    def __init__(self, frames):
+        self._frames = list(frames)
+        self.recv_calls = 0
+
+    async def recv(self):
+        self.recv_calls += 1
+        return self._frames.pop(0)
+
+
+class _PastTheAck(Exception):
+    pass
+
+
+class _HandshakeAgent:
+    """Just enough of the worker to run the handshake. Setting
+    ``_last_inbound_ok`` is the first thing done after the ack, so it stops
+    the run there."""
+
+    worker_id = "w1"
+    capabilities = None
+    worker_secret = None
+
+    def __init__(self, ws):
+        object.__setattr__(self, "_ws", ws)
+
+    async def _send(self, msg):
+        pass
+
+    def __setattr__(self, name, value):
+        if name == "_last_inbound_ok":
+            raise _PastTheAck()
+        object.__setattr__(self, name, value)
+
+
+async def test_the_worker_handshake_survives_a_frame_before_the_ack(monkeypatch):
+    monkeypatch.setattr(
+        "server.worker.agent._mix_run.WorkerRegister", lambda **kw: None,
+    )
+    ws = _HandshakeWs([
+        encode_msg(HubForceCompleteJob(job_id="j1", reason="r")),
+        encode_msg(HubRegistered(worker_id="w1", expected_worker_version=None)),
+    ])
+    with pytest.raises(_PastTheAck):
+        await _RunMixin._handshake_and_loop(_HandshakeAgent(ws))
+    assert ws.recv_calls == 2
+
+
+def test_frames_before_the_ack_are_handled_before_the_main_loop():
+    src = inspect.getsource(_RunMixin._handshake_and_loop)
+    assert "early.append(ack)" in src
+    replay = src.index("for msg in early:")
+    assert src.index("_handle_hub_message(msg)", replay) < src.index("async for raw in self._ws:")
+    assert 'raise RuntimeError(f"unexpected ack' not in src

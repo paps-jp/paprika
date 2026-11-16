@@ -136,6 +136,10 @@ _DISK_CLEANUP_MIN_INTERVAL_S = float(
 # for an LXC CT is the Proxmox node's core count (matching load1's host scope)
 # and for bare-metal is the box's own -- exactly the denominator we want in both.
 _NPROC = os.cpu_count() or 0
+# Frames the hub may send before its HubRegistered ack (see
+# _handshake_and_loop). Past this many the link is not a paprika hub
+# handshake any more, so give up on it.
+_EARLY_FRAMES_MAX = 64
 
 
 def _eta_seconds(eta) -> float | None:
@@ -452,11 +456,40 @@ class _RunMixin:
                 secret=self.worker_secret,
             )
         )
-        # Wait for hub's HubRegistered ack
-        raw = await asyncio.wait_for(self._ws.recv(), timeout=10.0)
-        ack = decode_hub_msg(raw)
-        if not isinstance(ack, HubRegistered):
-            raise RuntimeError(f"unexpected ack: {ack}")
+        # Wait for hub's HubRegistered ack. The hub registers this link
+        # (making it visible to its background loops) BEFORE it sends the
+        # ack, so another frame can arrive first -- the downloading reaper's
+        # force-complete did, 2026-11-16. Reading exactly one frame and
+        # raising on anything else crashed the worker out of run() (the
+        # reconnect loop only catches ws/socket errors) and dropped every
+        # download it held. Keep reading until the ack and replay what came
+        # before it once the main loop is up.
+        early: list = []
+        deadline = time.monotonic() + 10.0
+        while True:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                raise asyncio.TimeoutError()
+            raw = await asyncio.wait_for(self._ws.recv(), timeout=remaining)
+            try:
+                ack = decode_hub_msg(raw)
+            except Exception as e:
+                _logger.info(
+                    f"[worker {self.worker_id}] decode error before the "
+                    f"register ack: {e}",
+                )
+                continue
+            if isinstance(ack, HubRegistered):
+                break
+            if len(early) >= _EARLY_FRAMES_MAX:
+                raise RuntimeError(
+                    f"no register ack after {len(early)} frames; last: {ack}",
+                )
+            _logger.info(
+                f"[worker {self.worker_id}] {type(ack).__name__} arrived "
+                f"before the register ack; handling it once the link is up",
+            )
+            early.append(ack)
         # The HubRegistered ack is a real inbound frame from the hub. Stamp the
         # inbound-liveness clock NOW so the watchdog's ghost arm is enabled from
         # the moment the link is up. Without this, if the proxied WS ghosts
@@ -676,6 +709,9 @@ class _RunMixin:
             self._lag_task = asyncio.create_task(self._loop_lag_sampler())
         pull_task = asyncio.create_task(self._pull_loop())
         try:
+            for msg in early:
+                await self._handle_hub_message(msg)
+            early.clear()
             async for raw in self._ws:
                 # Any frame from the hub -- even an undecodable one -- proves a
                 # hub is still consuming/serving this link at the APPLICATION
