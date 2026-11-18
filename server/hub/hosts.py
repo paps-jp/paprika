@@ -36,11 +36,15 @@ Timestamps:
 
 from __future__ import annotations
 
+import hashlib
+import json
 import re
+import threading
+import time
 from dataclasses import asdict, dataclass, field
 from datetime import datetime
 
-from server.hub._jsonstore import JsonRecordRegistry
+from server.hub._jsonstore import JsonRecordRegistry, atomic_write_json
 
 
 def _normalise_host(host: str) -> str:
@@ -559,6 +563,200 @@ class HostRegistry(JsonRecordRegistry[HostRecord]):
 
     def _from_json(self, d: dict) -> HostRecord:
         return HostRecord.from_json(d)
+
+    # ---- write-behind for cookie-only saves -------------------------------
+    #
+    # Where the hub has MariaDB, the file under ``hosts/`` is a cache: every
+    # save is written through to MariaDB and replayed onto every peer hub, and
+    # a restart mirrors MariaDB back onto the files. A worker saving a host's
+    # cookies therefore made each hub rewrite that host's whole file (cookie
+    # jar + recipes, tens of KB, fsync-ed) -- for a change the hub can serve
+    # from memory. Measured 2026-11-18 on one hub: 139 rewrites a minute,
+    # ~100 of them replays of saves made elsewhere.
+    #
+    # With write-behind on, a save that changes nothing but the volatile
+    # fields below is kept in memory and reaches the file at most once per
+    # ``interval`` per host. Anything else -- a recipe, a login setup, notes,
+    # ownership, a brand-new host -- is written at once, exactly as before.
+    # So the file on disk is always current in everything except cookies and
+    # timestamps, which may trail by up to the interval; the hub itself always
+    # answers from the newest copy. Off (interval 0, the default until the hub
+    # turns it on) every save goes straight to the file.
+
+    _VOLATILE_FIELDS = ("cookies", "updated_at", "last_used_at", "last_login_at")
+
+    def __init__(self, data_dir) -> None:
+        super().__init__(data_dir)
+        self._wb_interval_s: float = 0.0
+        # Held across every file write of this registry, so the flusher
+        # thread can never put an older copy over a newer one.
+        self._wb_lock = threading.RLock()
+        # slug -> (record as compact JSON text, time.monotonic() when the
+        # host first had something not yet on disk)
+        self._wb_pending: dict[str, tuple[str, float]] = {}
+        # slug -> digest of the on-disk record minus the volatile fields
+        self._wb_stable: dict[str, bytes] = {}
+
+    @classmethod
+    def _stable_digest(cls, data: dict) -> bytes:
+        rest = {k: v for k, v in data.items() if k not in cls._VOLATILE_FIELDS}
+        text = json.dumps(rest, sort_keys=True, ensure_ascii=False, default=str)
+        return hashlib.blake2b(text.encode("utf-8"), digest_size=16).digest()
+
+    def _disk_digest(self, slug: str) -> bytes | None:
+        """Digest of what the file holds now; ``None`` when there is no
+        readable file (then the save must create it)."""
+        try:
+            raw = json.loads((self.dir / f"{slug}.json").read_text(encoding="utf-8"))
+            return self._stable_digest(self._to_json(self._from_json(raw)))
+        except Exception:
+            return None
+
+    @property
+    def write_behind_s(self) -> float:
+        return self._wb_interval_s
+
+    def set_write_behind(self, interval_s: float) -> int:
+        """Keep cookie-only saves in memory for up to ``interval_s`` seconds.
+        ``0`` turns it off and writes out whatever is waiting. Returns the
+        number of files written by this call."""
+        try:
+            interval = max(0.0, float(interval_s))
+        except (TypeError, ValueError):
+            interval = 0.0
+        with self._wb_lock:
+            self._wb_interval_s = interval
+        return self.flush() if interval <= 0 else 0
+
+    def pending_count(self) -> int:
+        with self._wb_lock:
+            return len(self._wb_pending)
+
+    def flush(self, *, only_due: bool = False) -> int:
+        """Write waiting records to their files. ``only_due`` limits it to
+        hosts that have waited a full interval. Never fsyncs: MariaDB already
+        has the record, the file is its cache. Returns the number written."""
+        now = time.monotonic()
+        with self._wb_lock:
+            slugs = [
+                slug for slug, (_, since) in self._wb_pending.items()
+                if not only_due or now - since >= self._wb_interval_s
+            ]
+        written = 0
+        for slug in slugs:
+            # One host per lock hold, so a save arriving on the event loop
+            # waits for a single small write, not for the whole batch.
+            with self._wb_lock:
+                ent = self._wb_pending.pop(slug, None)
+                if ent is None:
+                    continue
+                try:
+                    atomic_write_json(
+                        self.dir / f"{slug}.json", json.loads(ent[0]),
+                        durable=False,
+                    )
+                    written += 1
+                except Exception:
+                    # Keep it for the next pass rather than drop the update.
+                    self._wb_pending.setdefault(slug, ent)
+        return written
+
+    def resync_with_disk(self) -> None:
+        """Call after something rewrote the files behind this registry's back
+        (the MariaDB mirror). The next save of each host re-reads its file,
+        and a waiting record the mirror has overtaken is dropped: where the
+        file now differs in more than cookies / timestamps -- or is gone --
+        the waiting copy was built from the state the mirror just replaced,
+        and keeping it would hide (and later write back over) what MariaDB
+        holds. That is the outcome the mirror always had: its file wins."""
+        with self._wb_lock:
+            self._wb_stable.clear()
+            for slug, (text, _since) in list(self._wb_pending.items()):
+                disk = self._disk_digest(slug)
+                try:
+                    same = disk is not None and disk == self._stable_digest(
+                        json.loads(text)
+                    )
+                except Exception:
+                    same = False
+                if same:
+                    self._wb_stable[slug] = disk
+                else:
+                    del self._wb_pending[slug]
+
+    def _write(self, rec: HostRecord, *, durable: bool = True) -> None:
+        data = self._to_json(rec)
+        slug = self._slug(self._key_of(rec))
+        path = self.dir / f"{slug}.json"
+        with self._wb_lock:
+            if self._wb_interval_s <= 0:
+                atomic_write_json(path, data, durable=durable)
+                self._wb_stable.pop(slug, None)
+                self._wb_pending.pop(slug, None)
+                return
+            digest = self._stable_digest(data)
+            known = self._wb_stable.get(slug)
+            if known is None:
+                known = self._disk_digest(slug)
+                if known is not None:
+                    self._wb_stable[slug] = known
+            if known == digest:
+                prev = self._wb_pending.get(slug)
+                self._wb_pending[slug] = (
+                    json.dumps(data, ensure_ascii=False),
+                    prev[1] if prev else time.monotonic(),
+                )
+                return
+            atomic_write_json(path, data, durable=durable)
+            self._wb_stable[slug] = digest
+            self._wb_pending.pop(slug, None)
+
+    def get(self, key: str) -> HostRecord | None:
+        slug = self._slug(key)
+        with self._wb_lock:
+            ent = self._wb_pending.get(slug)
+        if ent is not None:
+            try:
+                return self._from_json(json.loads(ent[0]))
+            except Exception:
+                pass
+        return super().get(key)
+
+    def list_all(self) -> list[HostRecord]:
+        with self._wb_lock:
+            waiting = {slug: ent[0] for slug, ent in self._wb_pending.items()}
+        if not waiting:
+            return super().list_all()
+        records: list[HostRecord] = []
+        for p in sorted(self.dir.glob("*.json")):
+            if p.name.startswith("_"):
+                continue
+            text = waiting.pop(p.name[: -len(".json")], None)
+            try:
+                if text is None:
+                    text = p.read_text(encoding="utf-8")
+                records.append(self._from_json(json.loads(text)))
+            except Exception:
+                continue
+        # A waiting record whose file went away underneath us still exists
+        # as far as this hub is concerned.
+        for text in waiting.values():
+            try:
+                records.append(self._from_json(json.loads(text)))
+            except Exception:
+                continue
+        try:
+            records.sort(key=self._sort_key, reverse=self._sort_reverse)
+        except Exception:
+            pass
+        return records
+
+    def delete(self, key: str) -> bool:
+        slug = self._slug(key)
+        with self._wb_lock:
+            had = self._wb_pending.pop(slug, None) is not None
+            self._wb_stable.pop(slug, None)
+            return super().delete(key) or had
 
     def upsert(
         self,

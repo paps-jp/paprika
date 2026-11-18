@@ -1028,6 +1028,14 @@ async def lifespan(app: FastAPI):
     # mariadb / when MariaDB isn't configured.
     repromote_task = asyncio.create_task(_store_repromote_loop())
 
+    # Host records: cookie-only saves wait in memory and reach the file at
+    # most once per host_cache_flush_s -- only while MariaDB holds the records
+    # (the file is then a cache). Both roles: the admin service applies peer
+    # saves to its own files too. See _host_cache.py.
+    from server.hub._host_cache import _host_cache_flush_loop
+
+    host_cache_task = asyncio.create_task(_host_cache_flush_loop())
+
     # Redis auto-reattach: the store heals itself above, but the presence
     # heartbeat / worker mirror / session map are wired once from the boot-time
     # Redis client. If that was None (Redis mid-LOADING during a fleet-wide
@@ -1087,9 +1095,20 @@ async def lifespan(app: FastAPI):
                storage_metrics_task, nightly_review_task, repromote_task,
                reattach_task, role_rollup_task,
                retention_task, review_retention_task, failed_asset_expiry_task,
-               spill_task, maintenance_task):
+               spill_task, maintenance_task, host_cache_task):
         if _t is not None:
             _t.cancel()
+    # Host records still waiting in memory go to their files now (no fsync,
+    # a few hundred small writes at most). Early in shutdown on purpose: if a
+    # later step hangs and the container is killed, this has already run.
+    try:
+        from server.hub._host_cache import flush_on_shutdown
+
+        _n = flush_on_shutdown()
+        if _n:
+            log.info("host cache: wrote %d waiting record(s) on shutdown", _n)
+    except Exception:
+        pass
     # Tasks the Redis reattach heal started late (invalidation subscriber).
     for _t in _healed_tasks:
         _t.cancel()

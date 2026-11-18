@@ -477,6 +477,15 @@ _SCHEMA: dict[str, tuple[Any, str]] = {
     "maintenance_plugin_name": ("", "str"),          # e.g. "video-gc"
     "maintenance_plugin_interval_s": (300, "int"),
     "maintenance_plugin_params": ("{}", "str"),      # JSON
+    # ---- Host records: how long a cookie-only save may wait in memory -----
+    # Where MariaDB holds the host records, the files under ``hosts/`` are a
+    # cache of it. A save that changes only cookies / timestamps is answered
+    # from memory and written to the file at most once per this many seconds
+    # per host; recipes, login setup and every other field are still written
+    # at once. 0 = write every save to the file immediately (the behaviour
+    # before 2026-11-18). Shared cross-hub, picked up within 30 s, no restart.
+    # See server/hub/_host_cache.py and HostRegistry in server/hub/hosts.py.
+    "host_cache_flush_s": (3600, "int"),
     # ---- RAM-tier admission back-pressure (2026-09-07) ------------------
     # RAM-only video (no spill target): instead of letting the .48 tmpfs fill
     # to 100% and freeze the host, refuse work BEFORE it fills. Two gates off

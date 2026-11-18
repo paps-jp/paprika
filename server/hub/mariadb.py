@@ -1688,6 +1688,16 @@ def _restore_hosts_to_disk(rows: list, host_registry: Any) -> int:
     from server.hub._jsonstore import atomic_write_json
     from server.hub.hosts import HostRecord, _normalise_host as _norm_host
 
+    # The registry may be holding cookie-only saves in memory (write-behind).
+    # Put them on disk first so the files are what this hub actually holds,
+    # which is the state this mirror has always started from.
+    _flush = getattr(host_registry, "flush", None)
+    if callable(_flush):
+        try:
+            _flush()
+        except Exception as e:
+            log.warning("restore: flushing waiting host saves failed: %s", e)
+
     wanted: dict[str, dict] = {}
     for row in rows:
         host = _norm_host(row[0] or "")
@@ -1748,6 +1758,15 @@ def _restore_hosts_to_disk(rows: list, host_registry: Any) -> int:
             restored += 1
         except Exception as e:
             log.warning("restore host %s failed: %s", host, e)
+    # The files were just rewritten / removed without going through the
+    # registry, so what it remembers about them is no longer true -- and a
+    # save that arrived mid-pass must not shadow a file this pass replaced.
+    _resync = getattr(host_registry, "resync_with_disk", None)
+    if callable(_resync):
+        try:
+            _resync()
+        except Exception as e:
+            log.warning("restore: resyncing the host registry failed: %s", e)
     return restored
 
 
