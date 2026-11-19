@@ -486,6 +486,14 @@ _SCHEMA: dict[str, tuple[Any, str]] = {
     # before 2026-11-18). Shared cross-hub, picked up within 30 s, no restart.
     # See server/hub/_host_cache.py and HostRegistry in server/hub/hosts.py.
     "host_cache_flush_s": (3600, "int"),
+    # ---- Host knowledge: how long job outcomes may be counted in memory ---
+    # Every finished job bumps the counters in ``host_knowledge/{host}.json``
+    # (total / successful jobs, last success / failure, confidence tier).
+    # They are counted in memory and added to the file at most once per this
+    # many seconds per host. 0 = rewrite the file for every job (the
+    # behaviour before this setting). Shared cross-hub, picked up within
+    # 30 s, no restart. See server/hub/distiller_light.py.
+    "host_stats_flush_s": (3600, "int"),
     # ---- RAM-tier admission back-pressure (2026-09-07) ------------------
     # RAM-only video (no spill target): instead of letting the .48 tmpfs fill
     # to 100% and freeze the host, refuse work BEFORE it fills. Two gates off

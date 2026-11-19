@@ -254,6 +254,8 @@ async def test_the_tick_follows_the_setting_and_flushes_what_is_due(
 
     monkeypatch.setattr(state, "hosts", on)
     monkeypatch.setattr(_host_cache, "wanted_interval_s", lambda: 3600.0)
+    # the same tick paces the job counters; they have their own tests
+    monkeypatch.setattr(_host_cache, "wanted_stats_interval_s", lambda: 0.0)
     on.upsert(HOST, [_c("sid", "new")])
 
     await _host_cache.tick()
