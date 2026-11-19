@@ -16,11 +16,23 @@ from __future__ import annotations
 import asyncio
 import logging
 from collections import defaultdict
-from typing import AsyncIterator, Protocol
+from datetime import datetime
+from typing import Any, AsyncIterator, Protocol
 
-from server.protocol import JobInfo, JobResult
+from server.protocol import JobInfo, JobResult, JobStatus
 
 log = logging.getLogger(__name__)
+
+
+def _as_datetime(v: Any) -> datetime | None:
+    """started_at arrives as a datetime from every current caller; accept an
+    ISO string too so the signature matches MariaDBJobStore's ``_parse_dt``."""
+    if v is None or isinstance(v, datetime):
+        return v
+    try:
+        return datetime.fromisoformat(str(v))
+    except ValueError:
+        return None
 
 
 # ----------------------------------------------------------------------------
@@ -154,6 +166,15 @@ class JobStore(Protocol):
     async def count_jobs(self) -> int: ...
     async def delete_job(self, job_id: str) -> bool: ...
 
+    # dispatch CAS (POST /jobs + _redrive call these unconditionally)
+    async def claim_queued_job(
+        self, job_id: str, worker_id: str, started_at: datetime | None
+    ) -> bool: ...
+    async def release_claimed_job(self, job_id: str) -> bool: ...
+    async def reclaim_stranded_queued_job(
+        self, job_id: str, expected_worker_id: str
+    ) -> bool: ...
+
     # full job result (only after job finishes)
     async def save_job_result(self, result: JobResult) -> None: ...
     async def get_job_result(self, job_id: str) -> JobResult | None: ...
@@ -218,6 +239,46 @@ class InMemoryJobStore:
         self._logs.pop(job_id, None)
         self._subscribers.pop(job_id, None)
         return existed
+
+    # dispatch CAS ------------------------------------------------------
+    # Same contract as MariaDBJobStore (server/hub/mariadb_store.py). The
+    # dispatch path (POST /jobs, _redrive) calls these unconditionally, so
+    # every store must have them. Single process + no await between the
+    # check and the write = atomic under asyncio.
+
+    async def claim_queued_job(
+        self, job_id: str, worker_id: str, started_at: datetime | None
+    ) -> bool:
+        info = self._infos.get(job_id)
+        if info is None or info.status != JobStatus.queued or info.worker_id:
+            return False
+        info.status = JobStatus.running
+        info.worker_id = worker_id
+        info.started_at = _as_datetime(started_at)
+        return True
+
+    async def release_claimed_job(self, job_id: str) -> bool:
+        info = self._infos.get(job_id)
+        if info is None or info.status != JobStatus.running:
+            return False
+        info.status = JobStatus.queued
+        info.worker_id = None
+        info.started_at = None
+        return True
+
+    async def reclaim_stranded_queued_job(
+        self, job_id: str, expected_worker_id: str
+    ) -> bool:
+        info = self._infos.get(job_id)
+        if (
+            info is None
+            or info.status != JobStatus.queued
+            or info.worker_id != expected_worker_id
+        ):
+            return False
+        info.worker_id = None
+        info.started_at = None
+        return True
 
     async def save_job_result(self, result: JobResult) -> None:
         self._results[result.job_id] = result
@@ -314,6 +375,82 @@ class RedisJobStore:
 
     async def count_jobs(self) -> int:
         return await self._r.zcard(_K_INDEX)
+
+    # dispatch CAS ------------------------------------------------------
+    # Same contract as MariaDBJobStore (server/hub/mariadb_store.py): the
+    # dispatch path (POST /jobs, _redrive) calls these unconditionally, and
+    # several hubs may share one Redis, so the check+write must be atomic.
+    # WATCH/MULTI optimistic transaction: read the JSON, decide, write back;
+    # if another client touched the key in between, EXEC aborts and we
+    # re-read. (Lua + cjson was avoided: cjson encodes empty lists as ``{}``,
+    # which would corrupt JobInfo's list fields.)
+
+    _CAS_RETRIES = 8
+
+    async def _cas_info(self, job_id: str, mutate) -> bool:
+        """Apply ``mutate(info) -> bool`` atomically. ``mutate`` returns False
+        to decline (no write). Returns True iff the write committed."""
+        from redis.exceptions import WatchError
+
+        key = _K_INFO.format(job_id)
+        for _ in range(self._CAS_RETRIES):
+            async with self._r.pipeline(transaction=True) as pipe:
+                try:
+                    await pipe.watch(key)
+                    raw = await pipe.get(key)
+                    if not raw:
+                        return False
+                    info = JobInfo.model_validate_json(raw)
+                    if not mutate(info):
+                        return False
+                    pipe.multi()
+                    pipe.set(key, info.model_dump_json())
+                    await pipe.execute()
+                    return True
+                except WatchError:
+                    continue
+        log.warning("job %s: Redis CAS gave up after %d retries",
+                    job_id, self._CAS_RETRIES)
+        return False
+
+    async def claim_queued_job(
+        self, job_id: str, worker_id: str, started_at: datetime | None
+    ) -> bool:
+        def _m(info: JobInfo) -> bool:
+            if info.status != JobStatus.queued or info.worker_id:
+                return False
+            info.status = JobStatus.running
+            info.worker_id = worker_id
+            info.started_at = _as_datetime(started_at)
+            return True
+
+        return await self._cas_info(job_id, _m)
+
+    async def release_claimed_job(self, job_id: str) -> bool:
+        def _m(info: JobInfo) -> bool:
+            if info.status != JobStatus.running:
+                return False
+            info.status = JobStatus.queued
+            info.worker_id = None
+            info.started_at = None
+            return True
+
+        return await self._cas_info(job_id, _m)
+
+    async def reclaim_stranded_queued_job(
+        self, job_id: str, expected_worker_id: str
+    ) -> bool:
+        def _m(info: JobInfo) -> bool:
+            if (
+                info.status != JobStatus.queued
+                or info.worker_id != expected_worker_id
+            ):
+                return False
+            info.worker_id = None
+            info.started_at = None
+            return True
+
+        return await self._cas_info(job_id, _m)
 
     async def delete_job(self, job_id: str) -> bool:
         existed = await self._r.exists(_K_INFO.format(job_id))
