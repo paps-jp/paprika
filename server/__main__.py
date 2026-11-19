@@ -19,6 +19,7 @@ import argparse
 import asyncio
 import logging
 import os
+import re
 import sys
 from pathlib import Path
 
@@ -163,8 +164,21 @@ def _build_parser() -> argparse.ArgumentParser:
     return parser
 
 
+# What an interrupted download leaves behind: ``x.mp4.part``, yt-dlp's
+# fragment files ``x.mp4.part-Frag12`` / ``x.mp4.part-Frag12.part``, and the
+# hub's own ``.upload-<id>.part``. The name has to END that way: ``.part``
+# anywhere in the name also matches the hub's per-host files for every host
+# whose name contains it (``fr.example.party.json``), and those were being
+# deleted on every start.
+_PARTIAL_NAME = re.compile(r"\.part(?:-Frag\d+(?:\.part)?)?$")
+
+
+def _is_download_partial(name: str) -> bool:
+    return _PARTIAL_NAME.search(name) is not None
+
+
 def _purge_stale_part_files(base: Path) -> int:
-    """Delete leftover ``*.part*`` download partials under ``base`` at startup.
+    """Delete leftover download partials under ``base`` at startup.
     An interrupted yt-dlp video download leaves a big ``.mp4.part`` (hundreds of
     MB); across restarts these pile up and fill the disk -- a hub's /data/jobs
     filling with .part is what killed its Redis client and took the whole fleet
@@ -175,6 +189,8 @@ def _purge_stale_part_files(base: Path) -> int:
     try:
         for f in base.rglob("*.part*"):
             try:
+                if not _is_download_partial(f.name):
+                    continue
                 if f.is_file():
                     freed += f.stat().st_size
                     f.unlink()
