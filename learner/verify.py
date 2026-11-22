@@ -24,8 +24,8 @@ Outcomes
                 reason ``overlay_wall`` -- exactly the kind a learned
                 click sequence can get past.
     dead        the URL itself is gone (DNS / 404 / TLS) -- nothing to learn
-    infra       our own machinery failed (worker lost, timeout of ours) --
-                NEVER a learning signal
+    infra       our own machinery failed (worker lost, timeout of ours, no
+                room in RAM to put the video) -- NEVER a learning signal
     na          the goal does not apply (video requested, page has none)
     unknown     the facts cannot decide; counted and monitored, and the only
                 bucket an LLM judge may later settle
@@ -36,7 +36,9 @@ import re
 from dataclasses import asdict, dataclass, field
 
 #: Bump on ANY change to the rules below. Stored with every ledger row.
-VERSION = 1
+#:   2  a video download the worker never attempted for want of room on the
+#:      ramdisk is ``infra``/``no_ram``, not a failure of the fetch.
+VERSION = 2
 
 SUCCESS = "success"
 PARTIAL = "partial"
@@ -207,6 +209,17 @@ def _video_verdict(ev: dict, cfg: VerifyConfig, blocked: str | None,
         dur = float(m.get("duration_s") or 0.0)
         if dur <= 0.0 and int(m.get("bytes") or 0) >= cfg.nodur_min_bytes:
             return Verdict(SUCCESS, "video_ok_nodur", INTENT_VIDEO, evidence=_ev())
+
+    # 1b. The worker found a video to download and had nowhere in RAM to put
+    #     it (video is never written to disk), so the download was never
+    #     attempted. Whatever else the job holds -- nothing, or a short clip
+    #     caught on the way -- says nothing about whether the fetch works:
+    #     this is our capacity, not the site. Counting it as a failure halved
+    #     every measured rate and retired playbooks that still worked
+    #     (2026-11-15 .. 11-19).
+    if deferred.get("no_ram"):
+        return Verdict(INFRA, "no_ram", INTENT_VIDEO,
+                       evidence=_ev(targets=int(deferred.get("targets") or 0)))
 
     # 2. Something playable, but not the goal.
     if whole:

@@ -1435,6 +1435,34 @@ def test_a_lost_outcome_is_resubmitted_only_so_often_and_then_counts_as_infrastr
     assert len(hub.submitted) <= 3 + ap.cfg.replay_resubmits and store.key_updates == []
 
 
+def test_a_replay_job_the_worker_had_no_room_to_download_is_run_again():
+    # job2 ended without its download being attempted (no room on the
+    # ramdisk): that says nothing about the steps, so the URL goes again
+    # (job4) and that run is the one judged.
+    store = FakeStore(cands=[_cand()], outcomes={
+        "job1": ("success", "video_ok"), "job2": ("infra", "no_ram"), "job3": ("success", "video_ok"),
+        "job4": ("success", "video_ok")})
+    hub = FakeHub()
+    ap = _pilot(store, hub, FakeLLM([CLICK2, DONE]))
+    assert asyncio.run(ap.solver_tick()) == A.SOLVED
+    assert [s["url"][-3:] for s in hub.submitted] == ["/1/", "/2/", "/3/", "/2/"]
+    again = store.playbooks[0].provenance["replay"]["https://x.example/v/2/"]
+    assert (again["job_id"], again["outcome"], again["rerun"]) == ("job4", "success", 1)
+
+
+def test_no_room_every_time_ends_as_infrastructure_and_the_key_is_not_charged():
+    store = FakeStore(cands=[_cand()], outcomes={
+        "job1": ("success", "video_ok"), "job3": ("success", "video_ok"),
+        **{f"job{n}": ("infra", "no_ram") for n in (2, 4, 5, 6, 7, 8, 9)}})
+    hub = FakeHub()
+    ap = _pilot(store, hub, FakeLLM([CLICK2, DONE]))
+    assert asyncio.run(ap.solver_tick()) == V.INFRA
+    assert len(hub.submitted) == 3 + ap.cfg.replay_reruns          # tried again, but not for ever
+    assert store.key_updates == [] and store.playbooks == []
+    (run,) = store.runs
+    assert run["result"] == V.INFRA and "replay_unsettled" in run["reason"]
+
+
 def test_request_validation():
     assert R.build_request(" https://x.example/v/1/ ", now=5.0, rid="a") == {
         "id": "a", "url": "https://x.example/v/1/", "klass": "", "ts": 5.0}
@@ -1606,6 +1634,52 @@ def test_a_decayed_active_playbook_retires_itself():
     ap = _pilot(store)
     assert asyncio.run(ap.lifecycle_tick()) == [(1, P.RETIRED, "active_decayed")]
     assert json.loads(ap.redis.kv[P.REDIS_KEY])["items"] == []
+
+
+class _WindowStore(FakeStore):
+    """Counts per day back from today (0 = today), so the window asked for decides."""
+
+    def __init__(self, by_day_back):
+        super().__init__()
+        self.by_day_back, self.windows = by_day_back, []
+
+    async def playbook_counts(self, ids, since_days=None):
+        if since_days is None:
+            return await super().playbook_counts(ids)
+        self.windows.append((tuple(ids), since_days))
+        out = {}
+        for i in ids:
+            for back, arms in self.by_day_back.get(i, {}).items():
+                if back >= since_days:
+                    continue
+                for arm, c in arms.items():
+                    tot = out.setdefault(i, {}).setdefault(arm, {})
+                    for k, v in c.items():
+                        tot[k] = tot.get(k, 0) + v
+        return out
+
+
+def test_a_playbook_put_back_is_not_judged_on_the_days_before_it_came_back():
+    # Two days ago the numbers were bad enough to retire it (and they were our
+    # own measuring error); it was put back today. Decay looks at today only.
+    bad = {"active": {"n_success": 40, "n_fail": 60}, "pb_holdout": {"n_success": 0, "n_fail": 20}}
+    good = {"active": {"n_success": 50, "n_fail": 10}, "pb_holdout": {"n_success": 0, "n_fail": 10}}
+    store = _WindowStore({1: {2: bad, 0: good}, 2: {2: bad, 0: good}})
+    store.playbooks = [
+        _pb(P.ACTIVE, promoted_diff=1.0, state_changed_at=_utc()),                             # back today
+        _pb(P.ACTIVE, id=2, promoted_diff=1.0, state_changed_at=_utc() - dt.timedelta(days=9)),  # never left
+    ]
+    store.idle = {1: 0.0, 2: 0.0}
+    ap = _pilot(store)
+    # #1: 50/60 today, above the floor of 0.5. #2: 90/160 over the window, above too --
+    # but its window is the full three days.
+    assert asyncio.run(ap.lifecycle_tick()) == []
+    assert sorted(store.windows) == [((1,), 1), ((2,), ap.life_cfg.decay_window_days)]
+    # The same playbook judged on all three days would have gone: 90/160 is fine,
+    # so make the old days worse and see that only #2 is retired by them.
+    worse = {"active": {"n_success": 10, "n_fail": 190}, "pb_holdout": {"n_success": 0, "n_fail": 20}}
+    store.by_day_back = {1: {2: worse, 0: good}, 2: {2: worse, 0: good}}
+    assert asyncio.run(ap.lifecycle_tick()) == [(2, P.RETIRED, "active_decayed")]
 
 
 def test_nothing_due_still_republishes_so_the_set_never_goes_stale():

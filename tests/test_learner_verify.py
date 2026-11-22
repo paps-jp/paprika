@@ -77,6 +77,29 @@ def test_video_seen_but_not_captured_is_fail():
     assert v2.outcome == V.FAIL
 
 
+def test_a_download_skipped_for_want_of_ram_is_ours_not_the_sites():
+    # The worker saw the stream and had no room on the ramdisk, so it never
+    # downloaded (video is never written to disk). Before 2026-11-20 this was
+    # "video_not_captured": half of all video jobs, which retired playbooks
+    # that still worked.
+    skipped = {"deferred": {"targets": 1, "files": 0, "upload_failed": 0, "no_ram": True}}
+    v = V.verify(_ev(video_seen={"urls": 3}, facts=skipped))
+    assert (v.outcome, v.reason, v.intent) == (V.INFRA, "no_ram", "video")
+    assert not v.scored and v.evidence["targets"] == 1
+    # A short clip caught during the fetch does not make it a verdict either:
+    # the main video is the one that was not attempted.
+    clip = dict(skipped, media=[_media(duration_s=30.0, bytes=3_000_000)])
+    assert V.verify(_ev(assets={"n_video": 1}, facts=clip)).reason == "no_ram"
+    # Nor does a wall the hub saw on the page.
+    assert V.verify(_ev(status="review", occlusion={"covered": True}, facts=skipped)).outcome == V.INFRA
+    # A whole video that did arrive is still a success ...
+    whole = dict(skipped, media=[_media()])
+    assert V.verify(_ev(assets={"n_video": 1}, facts=whole)).outcome == V.SUCCESS
+    # ... and a download that was attempted and brought nothing is still a fail.
+    tried = {"deferred": {"targets": 1, "files": 0, "upload_failed": 0}}
+    assert V.verify(_ev(facts=tried)).reason == "video_not_captured"
+
+
 def test_no_trace_of_video_is_na_not_fail():
     v = V.verify(_ev(assets={"n_image": 30}, video_seen={"iframes": 2}))
     assert (v.outcome, v.reason) == (V.NA, "no_video_evidence")

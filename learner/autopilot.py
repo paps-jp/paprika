@@ -43,6 +43,10 @@ REPLAY_FAIL = "replay_fail"       # the compiled steps did not work on the URL t
 GENERALIZE_FAIL = "generalize_fail"  # they worked there, but not on other URLs of the template
 
 _PENDING_REASONS = ("download_in_progress",)
+#: Verifier reasons that say a replay job was never really run: the worker
+#: had no room on the ramdisk for the video, so nothing was downloaded. That
+#: is no verdict on the steps -- the URL is submitted again.
+_RERUN_REASONS = ("no_ram",)
 
 #: Runs a person asked for (``python -m learner.request URL``): a Redis list
 #: of JSON requests, taken before anything the scheduler would pick, and a
@@ -89,7 +93,13 @@ class AutopilotConfig:
     #: ended them). How long to wait for the outcome first, and how often.
     replay_lost_after_s: float = 120.0
     replay_resubmits: int = 2
-    gen_urls: int = 2                 # other URLs of the template that must also succeed
+    #: A replay job that ended without its download being attempted (no room
+    #: on the worker's ramdisk) is run again, up to this often per URL. With
+    #: half the downloads of the fleet skipped that way (2026-11-19), three
+    #: URLs all getting through in one go is a 1-in-8 chance; four more tries
+    #: each make it 9 in 10.
+    replay_reruns: int = 4
+    gen_urls: int = 2                # other URLs of the template that must also succeed
     #: URLs of one key a single exploration may open. A failing URL is
     #: often failing for its own reason (the video was deleted), which says
     #: nothing about the key: the Solver moves on to the next one.
@@ -148,7 +158,7 @@ class Autopilot:
         live = [p for p in pbs if p.state in (P.TRIAL, P.ACTIVE)]
         ids = [p.id for p in live]
         counts = await self.store.playbook_counts(ids)
-        recent = await self.store.playbook_counts(ids, since_days=self.life_cfg.decay_window_days)
+        recent = await self._recent_counts([p for p in live if p.state == P.ACTIVE], now)
         idle = await self.store.last_applied_days(ids)
         moved: list[tuple[int, str, str]] = []
         for p in live:
@@ -187,6 +197,24 @@ class Autopilot:
         if self.cfg.publish:
             await self.publish(pbs)
         return moved
+
+    async def _recent_counts(self, active: list[P.Playbook], now: _dt.datetime) -> dict:
+        """The counts decay is judged on: the last ``decay_window_days``,
+        but never from before the day the playbook entered its present
+        state. A playbook put back into service (after a retirement that
+        turned out to be our own measuring error) would otherwise be judged
+        on the very days that got it retired, and go again within minutes."""
+        win = max(1, int(self.life_cfg.decay_window_days))
+        by_days: dict[int, list[int]] = {}
+        for p in active:
+            days = win
+            if p.state_changed_at is not None:
+                days = min(win, max(1, (now.date() - p.state_changed_at.date()).days + 1))
+            by_days.setdefault(days, []).append(p.id)
+        out: dict = {}
+        for days, ids in by_days.items():
+            out.update(await self.store.playbook_counts(ids, since_days=days))
+        return out
 
     async def publish(self, pbs: list[P.Playbook]) -> dict:
         self._rev += 1
@@ -524,7 +552,11 @@ class Autopilot:
         A job the hub reports finished whose outcome does not arrive is
         submitted again (``replay_resubmits`` times): losing the outcome is
         the hub's doing, and without this one lost event throws away steps
-        that worked on every URL."""
+        that worked on every URL.
+
+        A job whose video was not downloaded because the worker had no room
+        for it (``_RERUN_REASONS``) is submitted again too
+        (``replay_reruns`` times): the steps were not put to the test."""
         async def submit(i: int, u: str) -> str:
             return await self.hub.submit_fetch(
                 u, actions=actions,
@@ -540,13 +572,29 @@ class Autopilot:
                                 for u, j in jobs.items()}
         finished_at: dict[str, float] = {}     # job_id -> when the hub first said it was over
         resubmits = {u: 0 for u in urls}
+        reruns = {u: 0 for u in urls}
         while True:
             got = await self.store.outcomes(list(jobs.values()))
             pending = 0
             for i, (u, j) in enumerate(list(jobs.items())):
                 oc = got.get(j)
+                if oc is not None and oc[1] in _RERUN_REASONS and reruns[u] < self.cfg.replay_reruns:
+                    try:
+                        jobs[u] = await submit(i, u)
+                    except (HubUnavailable, HubError):
+                        pass                   # judged as it stands, below
+                    else:
+                        reruns[u] += 1
+                        out[u] = {"job_id": jobs[u], "outcome": None, "reason": "timeout",
+                                  "rerun": reruns[u]}
+                        pending += 1
+                        log.info("replay: %s (%s) was not downloaded (%s); submitted again as %s",
+                                 j, u, oc[1], jobs[u])
+                        continue
                 if oc is not None and oc[1] not in _PENDING_REASONS:
                     out[u] = {"job_id": j, "outcome": oc[0], "reason": oc[1]}
+                    if reruns[u]:
+                        out[u]["rerun"] = reruns[u]
                     continue
                 pending += 1
                 if resubmits[u] >= self.cfg.replay_resubmits:
